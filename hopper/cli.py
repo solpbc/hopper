@@ -49,15 +49,11 @@ def cmd_ping() -> int:
 
 def cmd_tui() -> int:
     """Run the TUI (default command)."""
+    from hopper.tui import run_tui
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     term = Terminal()
-    print(term.clear)
-    print(term.bold("hopper") + " - TUI for managing coding agents")
-    print()
-    print("Press any key to exit...")
-    with term.cbreak():
-        term.inkey()
-    return 0
+    return run_tui(term)
 
 
 def main() -> int:
