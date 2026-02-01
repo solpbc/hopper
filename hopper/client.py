@@ -66,3 +66,22 @@ def ping(socket_path: Path, timeout: float = 2.0) -> bool:
     message = {"type": "ping", "ts": int(time.time() * 1000)}
     response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
     return response is not None and response.get("type") == "pong"
+
+
+def session_exists(socket_path: Path, session_id: str, timeout: float = 2.0) -> bool:
+    """Check if a session exists and is active.
+
+    Args:
+        socket_path: Path to the Unix socket
+        session_id: The session ID to check
+        timeout: Timeout in seconds
+
+    Returns:
+        True if session exists and is active, False otherwise
+    """
+    message = {"type": "session_list", "ts": int(time.time() * 1000)}
+    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
+    if response is None or response.get("type") != "session_list":
+        return False
+    sessions = response.get("sessions", [])
+    return any(s.get("id") == session_id for s in sessions)

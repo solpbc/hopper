@@ -1,17 +1,58 @@
+import os
 import sys
-from pathlib import Path
 
-from blessed import Terminal
-from platformdirs import user_data_dir
+from hopper.config import DATA_DIR, SOCKET_PATH
 
-DATA_DIR = Path(user_data_dir("hopper"))
-SOCKET_PATH = DATA_DIR / "server.sock"
+COMMANDS = {"up", "ping"}
+
+
+def require_server() -> int | None:
+    """Check that the server is running. Returns exit code on failure, None on success."""
+    from hopper.client import ping
+
+    if not ping(SOCKET_PATH):
+        print("Server not running. Start it with: hopper up")
+        return 1
+    return None
+
+
+def require_no_server() -> int | None:
+    """Check that the server is NOT running. Returns exit code on failure, None on success."""
+    from hopper.client import ping
+
+    if ping(SOCKET_PATH):
+        print("Server already running.")
+        return 1
+    return None
+
+
+def validate_hopper_sid() -> int | None:
+    """Validate HOPPER_SID if set. Returns exit code on failure, None on success."""
+    from hopper.client import session_exists
+
+    session_id = os.environ.get("HOPPER_SID")
+    if not session_id:
+        return None
+
+    if not session_exists(SOCKET_PATH, session_id):
+        print(f"Session {session_id} not found or archived.")
+        print("Unset HOPPER_SID to continue: unset HOPPER_SID")
+        return 1
+    return None
+
+
+def get_hopper_sid() -> str | None:
+    """Get HOPPER_SID from environment if set."""
+    return os.environ.get("HOPPER_SID")
 
 
 def cmd_up() -> int:
     """Start the server."""
     from hopper.server import start_server
     from hopper.tmux import get_tmux_sessions, is_inside_tmux
+
+    if err := require_no_server():
+        return err
 
     if not is_inside_tmux():
         print("hopper up must run inside tmux.")
@@ -40,15 +81,22 @@ def cmd_ping() -> int:
     from hopper.client import ping
 
     if ping(SOCKET_PATH):
-        print("pong")
+        session_id = get_hopper_sid()
+        if session_id:
+            print(f"pong (session: {session_id})")
+        else:
+            print("pong")
         return 0
     else:
-        print("failed to connect")
+        # Use require_server for consistent error message
+        require_server()
         return 1
 
 
 def cmd_tui() -> int:
     """Run the TUI (default command)."""
+    from blessed import Terminal
+
     from hopper.tui import run_tui
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,14 +109,25 @@ def main() -> int:
     args = sys.argv[1:]
 
     if not args:
+        # Default: TUI - requires server and valid session
+        if err := require_server():
+            return err
+        if err := validate_hopper_sid():
+            return err
         return cmd_tui()
 
     command = args[0]
 
-    if command == "up":
-        return cmd_up()
-    elif command == "ping":
-        return cmd_ping()
-    else:
+    # Check for unknown commands first, before health checks
+    if command not in COMMANDS:
         print(f"unknown command: {command}")
         return 1
+
+    if command == "up":
+        # up checks for no server internally
+        return cmd_up()
+    elif command == "ping":
+        # ping handles its own connectivity check
+        return cmd_ping()
+
+    return 1  # unreachable, but satisfies type checker

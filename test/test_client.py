@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hopper.client import ping, send_message
+from hopper.client import ping, send_message, session_exists
 from hopper.server import Server
 
 
@@ -62,3 +62,33 @@ def test_send_message_connection_failure():
         timeout=0.5,
     )
     assert result is None
+
+
+def test_session_exists_no_server(socket_path):
+    """session_exists returns False when server not running."""
+    result = session_exists(socket_path, "any-session", timeout=0.5)
+    assert result is False
+
+
+def test_session_exists_not_found(server, socket_path):
+    """session_exists returns False when session doesn't exist."""
+    result = session_exists(socket_path, "nonexistent-session")
+    assert result is False
+
+
+def test_session_exists_found(server, socket_path):
+    """session_exists returns True when session exists."""
+    # Create a session first
+    response = send_message(socket_path, {"type": "session_create"}, wait_for_response=False)
+    # Give server time to process
+    time.sleep(0.1)
+
+    # Get the session list to find the created session
+    response = send_message(socket_path, {"type": "session_list"}, wait_for_response=True)
+    assert response is not None
+    sessions = response.get("sessions", [])
+    assert len(sessions) > 0
+
+    session_id = sessions[0]["id"]
+    result = session_exists(socket_path, session_id)
+    assert result is True
