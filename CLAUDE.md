@@ -85,6 +85,15 @@ Don't assume APIs based on similar-looking patterns. When in doubt, verify.
 - **Atomic writes** - Write to `.tmp` then `os.replace()` for persistence
 - **Test the render path** - TUI bugs are easy to miss without render tests
 
+## TUI Design Principles
+
+- **Unicode only, no emoji** - Use Unicode symbols (●, ○, ✗, +, ─, ━) for indicators and box-drawing. Never use emoji.
+- **Color for meaning** - Green=running, red=error, cyan=action, dim=idle/secondary
+- **Dynamic width** - Adapt to `term.width`, don't hardcode layouts
+- **Status at row start** - Put status indicators at the beginning of rows for quick scanning
+- **Visual hierarchy** - Title bar, section headers with column labels, footer with keybindings
+- **Box-drawing for structure** - Use ─ and ━ for separators and borders
+
 ## Quick Reference
 
 ### File Locations

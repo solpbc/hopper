@@ -11,7 +11,9 @@ from hopper.sessions import (
     Session,
     archive_session,
     create_session,
+    current_time_ms,
     find_by_short_id,
+    format_age,
     get_session_dir,
     load_sessions,
     save_sessions,
@@ -30,13 +32,23 @@ def temp_config(tmp_path, monkeypatch):
 
 def test_session_to_dict_and_from_dict():
     """Test Session serialization roundtrip."""
-    session = Session(id="abc-123", stage="ore", created_at=1234567890)
+    session = Session(
+        id="abc-123",
+        stage="ore",
+        created_at=1234567890,
+        updated_at=1234567890,
+        state="idle",
+        tmux_window=None,
+    )
     data = session.to_dict()
     restored = Session.from_dict(data)
 
     assert restored.id == session.id
     assert restored.stage == session.stage
     assert restored.created_at == session.created_at
+    assert restored.updated_at == session.updated_at
+    assert restored.state == session.state
+    assert restored.tmux_window == session.tmux_window
 
 
 def test_load_sessions_empty(temp_config):
@@ -253,3 +265,90 @@ def test_find_by_short_id_empty():
     """find_by_short_id returns None for empty list."""
     result = find_by_short_id([], "aaaa")
     assert result is None
+
+
+# Tests for format_age
+
+
+def test_format_age_now():
+    """Timestamps less than 1 minute ago return 'now'."""
+    now = current_time_ms()
+    assert format_age(now) == "now"
+    assert format_age(now - 30_000) == "now"  # 30 seconds ago
+
+
+def test_format_age_minutes():
+    """Timestamps 1-59 minutes ago return Xm."""
+    now = current_time_ms()
+    assert format_age(now - 60_000) == "1m"  # 1 minute
+    assert format_age(now - 5 * 60_000) == "5m"  # 5 minutes
+    assert format_age(now - 59 * 60_000) == "59m"  # 59 minutes
+
+
+def test_format_age_hours():
+    """Timestamps 1-23 hours ago return Xh."""
+    now = current_time_ms()
+    assert format_age(now - 60 * 60_000) == "1h"  # 1 hour
+    assert format_age(now - 5 * 60 * 60_000) == "5h"  # 5 hours
+    assert format_age(now - 23 * 60 * 60_000) == "23h"  # 23 hours
+
+
+def test_format_age_days():
+    """Timestamps 1-6 days ago return Xd."""
+    now = current_time_ms()
+    assert format_age(now - 24 * 60 * 60_000) == "1d"  # 1 day
+    assert format_age(now - 3 * 24 * 60 * 60_000) == "3d"  # 3 days
+    assert format_age(now - 6 * 24 * 60 * 60_000) == "6d"  # 6 days
+
+
+def test_format_age_weeks():
+    """Timestamps 7+ days ago return Xw."""
+    now = current_time_ms()
+    assert format_age(now - 7 * 24 * 60 * 60_000) == "1w"  # 1 week
+    assert format_age(now - 14 * 24 * 60 * 60_000) == "2w"  # 2 weeks
+
+
+def test_format_age_future():
+    """Future timestamps return 'now'."""
+    now = current_time_ms()
+    assert format_age(now + 60_000) == "now"  # 1 minute in future
+
+
+# Tests for updated_at
+
+
+def test_session_updated_at_default():
+    """Session with updated_at=0 uses created_at as effective value."""
+    session = Session(id="test", stage="ore", created_at=1000, updated_at=0)
+    assert session.effective_updated_at == 1000
+
+
+def test_session_updated_at_set():
+    """Session with updated_at set uses that value."""
+    session = Session(id="test", stage="ore", created_at=1000, updated_at=2000)
+    assert session.effective_updated_at == 2000
+
+
+def test_session_touch():
+    """touch() updates the updated_at timestamp."""
+    session = Session(id="test", stage="ore", created_at=1000, updated_at=1000)
+    session.touch()
+    assert session.updated_at > 1000
+
+
+def test_session_to_dict_includes_updated_at():
+    """to_dict includes updated_at field."""
+    session = Session(id="test", stage="ore", created_at=1000, updated_at=2000)
+    data = session.to_dict()
+    assert data["updated_at"] == 2000
+
+
+def test_update_session_stage_touches(temp_config):
+    """update_session_stage updates the timestamp."""
+    sessions_list = [Session(id="test-id", stage="ore", created_at=1000, updated_at=1000)]
+    save_sessions(sessions_list)
+
+    updated = update_session_stage(sessions_list, "test-id", "processing")
+
+    assert updated is not None
+    assert updated.updated_at > 1000

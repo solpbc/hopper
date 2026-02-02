@@ -4,67 +4,83 @@ from unittest.mock import MagicMock
 
 from hopper.sessions import Session
 from hopper.tui import (
+    STATUS_ACTION,
+    STATUS_ERROR,
+    STATUS_IDLE,
+    STATUS_RUNNING,
     Row,
     TUIState,
+    format_row,
+    handle_archive,
+    new_shovel_row,
     render,
-    session_label,
+    session_to_row,
 )
 
-# Tests for session_label
+# Tests for session_to_row
 
 
-def test_session_label_idle():
-    """Idle session shows just the 8-char short ID."""
+def test_session_to_row_idle():
+    """Idle session has idle status indicator."""
     session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="idle")
-    result = session_label(session)
-    assert result == "abcd1234"
+    row = session_to_row(session)
+    assert row.short_id == "abcd1234"
+    assert row.status == STATUS_IDLE
 
 
-def test_session_label_running():
-    """Running session shows (running) suffix."""
+def test_session_to_row_running():
+    """Running session has running status indicator."""
     session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="running")
-    result = session_label(session)
-    assert result == "abcd1234 (running)"
+    row = session_to_row(session)
+    assert row.short_id == "abcd1234"
+    assert row.status == STATUS_RUNNING
 
 
-def test_session_label_error():
-    """Error session shows (error) suffix."""
+def test_session_to_row_error():
+    """Error session has error status indicator."""
     session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="error")
-    result = session_label(session)
-    assert result == "abcd1234 (error)"
+    row = session_to_row(session)
+    assert row.short_id == "abcd1234"
+    assert row.status == STATUS_ERROR
 
 
 # Tests for TUIState
 
 
+def _make_row(id: str, status: str = STATUS_IDLE) -> Row:
+    """Helper to create a test row."""
+    return Row(id=id, short_id=id[:8], age="1m", updated="1m", status=status)
+
+
 def test_tuistate_default():
-    """Default state has new shovel row and cursor at 0."""
+    """Default state has new session row and cursor at 0."""
     state = TUIState()
     assert len(state.ore_rows) == 1
     assert state.ore_rows[0].id == "new"
-    assert state.ore_rows[0].label == "new shovel"
+    assert state.ore_rows[0].is_action is True
+    assert state.ore_rows[0].status == STATUS_ACTION
     assert state.cursor_index == 0
 
 
 def test_tuistate_total_rows():
     """total_rows counts both tables."""
     state = TUIState(
-        ore_rows=[Row("new", "new shovel"), Row("a", "a")],
-        processing_rows=[Row("b", "b"), Row("c", "c")],
+        ore_rows=[new_shovel_row(), _make_row("a")],
+        processing_rows=[_make_row("b"), _make_row("c")],
     )
     assert state.total_rows == 4
 
 
 def test_tuistate_cursor_up():
     """cursor_up wraps around."""
-    state = TUIState(ore_rows=[Row("a", "a"), Row("b", "b")], cursor_index=0)
+    state = TUIState(ore_rows=[_make_row("a"), _make_row("b")], cursor_index=0)
     new_state = state.cursor_up()
     assert new_state.cursor_index == 1  # Wrapped to end
 
 
 def test_tuistate_cursor_down():
     """cursor_down wraps around."""
-    state = TUIState(ore_rows=[Row("a", "a"), Row("b", "b")], cursor_index=1)
+    state = TUIState(ore_rows=[_make_row("a"), _make_row("b")], cursor_index=1)
     new_state = state.cursor_down()
     assert new_state.cursor_index == 0  # Wrapped to start
 
@@ -72,7 +88,7 @@ def test_tuistate_cursor_down():
 def test_tuistate_get_selected_row_ore():
     """get_selected_row returns correct ore row."""
     state = TUIState(
-        ore_rows=[Row("new", "new shovel"), Row("a", "session a")],
+        ore_rows=[new_shovel_row(), _make_row("a")],
         cursor_index=1,
     )
     row = state.get_selected_row()
@@ -83,8 +99,8 @@ def test_tuistate_get_selected_row_ore():
 def test_tuistate_get_selected_row_processing():
     """get_selected_row returns correct processing row."""
     state = TUIState(
-        ore_rows=[Row("new", "new shovel")],
-        processing_rows=[Row("b", "session b")],
+        ore_rows=[new_shovel_row()],
+        processing_rows=[_make_row("b")],
         cursor_index=1,
     )
     row = state.get_selected_row()
@@ -132,7 +148,7 @@ def test_tuistate_rebuild_rows_clamps_cursor():
     """rebuild_rows clamps cursor to valid range."""
     state = TUIState(
         sessions=[],
-        ore_rows=[Row("new", "new shovel"), Row("deleted", "gone")],
+        ore_rows=[new_shovel_row(), _make_row("deleted")],
         cursor_index=1,
     )
     # After rebuild, only "new shovel" remains, cursor should clamp to 0
@@ -143,20 +159,24 @@ def test_tuistate_rebuild_rows_clamps_cursor():
 # Tests for render
 
 
-def _mock_terminal():
+def _mock_terminal(width: int = 40):
     """Create a mock Terminal that returns strings for capabilities."""
     term = MagicMock()
     term.home = "[HOME]"
     term.clear = "[CLEAR]"
     term.normal = "[NORMAL]"
     term.dim = "[DIM]"
+    term.width = width
     term.bold = lambda s: f"[BOLD]{s}[/BOLD]"
     term.reverse = lambda s: f"[REV]{s}[/REV]"
+    term.green = lambda s: f"[GREEN]{s}[/GREEN]"
+    term.red = lambda s: f"[RED]{s}[/RED]"
+    term.cyan = lambda s: f"[CYAN]{s}[/CYAN]"
     return term
 
 
 def test_render_empty_processing(capsys):
-    """render doesn't crash with empty processing table."""
+    """render shows header, tables, and footer."""
     term = _mock_terminal()
     state = TUIState()
     state = state.rebuild_rows()
@@ -164,9 +184,16 @@ def test_render_empty_processing(capsys):
     render(term, state)
 
     captured = capsys.readouterr()
+    # Header
+    assert "HOPPER" in captured.out
+    # Tables
     assert "[BOLD]ORE[/BOLD]" in captured.out
     assert "[BOLD]PROCESSING[/BOLD]" in captured.out
-    assert "[DIM]  (empty)[NORMAL]" in captured.out
+    assert "(empty)" in captured.out
+    # Footer
+    assert "Navigate" in captured.out
+    assert "Archive" in captured.out
+    assert "Quit" in captured.out
 
 
 def test_render_with_sessions(capsys):
@@ -182,10 +209,12 @@ def test_render_with_sessions(capsys):
     render(term, state)
 
     captured = capsys.readouterr()
-    # Cursor on "new shovel" (first row)
-    assert "[REV]> new shovel[/REV]" in captured.out
-    assert "  aaaa1111" in captured.out
-    assert "  bbbb2222" in captured.out
+    # Action row with + indicator (cyan)
+    assert "[CYAN]+[/CYAN]" in captured.out
+    assert "new session" in captured.out
+    # Sessions with status indicators
+    assert "aaaa1111" in captured.out
+    assert "bbbb2222" in captured.out
 
 
 def test_render_cursor_on_session(capsys):
@@ -198,8 +227,11 @@ def test_render_cursor_on_session(capsys):
     render(term, state)
 
     captured = capsys.readouterr()
-    assert "  new shovel" in captured.out  # Not selected
-    assert "[REV]> aaaa1111[/REV]" in captured.out  # Selected
+    # Action row not selected (no >)
+    assert "  [CYAN]+[/CYAN] new session" in captured.out
+    # Session row selected
+    assert "[REV]>" in captured.out
+    assert "aaaa1111" in captured.out
 
 
 def test_render_cursor_on_processing(capsys):
@@ -212,4 +244,102 @@ def test_render_cursor_on_processing(capsys):
     render(term, state)
 
     captured = capsys.readouterr()
-    assert "[REV]> bbbb2222[/REV]" in captured.out
+    assert "[REV]>" in captured.out
+    assert "bbbb2222" in captured.out
+
+
+# Tests for format_row
+
+
+def test_format_row_action():
+    """format_row for action row shows + and label."""
+    term = _mock_terminal()
+    row = new_shovel_row()
+    result = format_row(term, row, 40)
+    assert "[CYAN]+[/CYAN]" in result
+    assert "new session" in result
+
+
+def test_format_row_session_running():
+    """format_row formats running session with green indicator."""
+    term = _mock_terminal()
+    row = Row(id="test-id", short_id="abcd1234", age="3m", updated="1m", status=STATUS_RUNNING)
+    result = format_row(term, row, 40)
+    assert "[GREEN]●[/GREEN]" in result
+    assert "abcd1234" in result
+    assert "3m" in result
+    assert "1m" in result
+
+
+def test_format_row_session_error():
+    """format_row formats error session with red indicator."""
+    term = _mock_terminal()
+    row = Row(id="test-id", short_id="abcd1234", age="3m", updated="1m", status=STATUS_ERROR)
+    result = format_row(term, row, 40)
+    assert "[RED]✗[/RED]" in result
+    assert "abcd1234" in result
+
+
+def test_format_row_session_idle():
+    """format_row formats idle session with dim indicator."""
+    term = _mock_terminal()
+    row = Row(id="test-id", short_id="abcd1234", age="2h", updated="1h", status=STATUS_IDLE)
+    result = format_row(term, row, 40)
+    assert "[DIM]○[NORMAL]" in result
+    assert "abcd1234" in result
+    assert "2h" in result
+    assert "1h" in result
+
+
+# Tests for handle_archive
+
+
+def test_handle_archive_removes_session():
+    """handle_archive removes the selected session."""
+    sessions = [
+        Session(
+            id="keep-id",
+            stage="ore",
+            created_at=1000,
+            updated_at=1000,
+            state="idle",
+            tmux_window=None,
+        ),
+        Session(
+            id="archive-id",
+            stage="ore",
+            created_at=2000,
+            updated_at=2000,
+            state="idle",
+            tmux_window=None,
+        ),
+    ]
+    state = TUIState(sessions=sessions, cursor_index=2)  # cursor on archive-id (after new + keep)
+    state = state.rebuild_rows()
+
+    new_state = handle_archive(state)
+
+    # Session should be removed from list
+    assert len(new_state.sessions) == 1
+    assert new_state.sessions[0].id == "keep-id"
+
+
+def test_handle_archive_ignores_action_row():
+    """handle_archive does nothing when action row is selected."""
+    sessions = [
+        Session(
+            id="test-id",
+            stage="ore",
+            created_at=1000,
+            updated_at=1000,
+            state="idle",
+            tmux_window=None,
+        ),
+    ]
+    state = TUIState(sessions=sessions, cursor_index=0)  # cursor on "new session" action
+    state = state.rebuild_rows()
+
+    new_state = handle_archive(state)
+
+    # Session should still be there
+    assert len(new_state.sessions) == 1

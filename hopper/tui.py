@@ -5,7 +5,29 @@ from dataclasses import dataclass, field
 from blessed import Terminal
 
 from hopper.claude import spawn_claude, switch_to_window
-from hopper.sessions import Session, create_session, load_sessions, save_sessions
+from hopper.sessions import (
+    Session,
+    archive_session,
+    create_session,
+    format_age,
+    load_sessions,
+    save_sessions,
+)
+
+# Box-drawing characters (Unicode, no emoji)
+BOX_H = "─"  # horizontal line
+BOX_H_BOLD = "━"  # bold horizontal line
+
+# Status indicators (Unicode symbols, no emoji)
+STATUS_RUNNING = "●"  # filled circle
+STATUS_IDLE = "○"  # empty circle
+STATUS_ERROR = "✗"  # x mark
+STATUS_ACTION = "+"  # plus for action rows
+
+# Column widths for table formatting
+COL_STATUS = 1  # status indicator
+COL_ID = 8  # short_id length
+COL_AGE = 3  # "now", "3m", "4h", "2d", "1w"
 
 
 @dataclass
@@ -13,17 +35,41 @@ class Row:
     """A row in a table."""
 
     id: str
-    label: str
+    short_id: str
+    age: str  # formatted age string
+    updated: str  # formatted updated string
+    status: str  # STATUS_RUNNING, STATUS_IDLE, STATUS_ERROR, or STATUS_ACTION
+    is_action: bool = False  # True for action rows like "new session"
 
 
-def session_label(session: Session) -> str:
-    """Generate a display label for a session."""
+def session_to_row(session: Session) -> Row:
+    """Convert a session to a display row."""
     if session.state == "error":
-        return f"{session.short_id} (error)"
+        status = STATUS_ERROR
     elif session.state == "running":
-        return f"{session.short_id} (running)"
+        status = STATUS_RUNNING
     else:
-        return session.short_id
+        status = STATUS_IDLE
+
+    return Row(
+        id=session.id,
+        short_id=session.short_id,
+        age=format_age(session.created_at),
+        updated=format_age(session.effective_updated_at),
+        status=status,
+    )
+
+
+def new_shovel_row() -> Row:
+    """Create the 'new session' action row."""
+    return Row(
+        id="new",
+        short_id="new session",
+        age="",
+        updated="",
+        status=STATUS_ACTION,
+        is_action=True,
+    )
 
 
 @dataclass
@@ -31,7 +77,7 @@ class TUIState:
     """State for the TUI."""
 
     sessions: list[Session] = field(default_factory=list)
-    ore_rows: list[Row] = field(default_factory=lambda: [Row("new", "new shovel")])
+    ore_rows: list[Row] = field(default_factory=lambda: [new_shovel_row()])
     processing_rows: list[Row] = field(default_factory=list)
     cursor_index: int = 0
 
@@ -65,11 +111,11 @@ class TUIState:
 
     def rebuild_rows(self) -> "TUIState":
         """Rebuild row lists from sessions."""
-        ore_rows = [Row("new", "new shovel")]
+        ore_rows = [new_shovel_row()]
         processing_rows = []
 
         for session in self.sessions:
-            row = Row(session.id, session_label(session))
+            row = session_to_row(session)
             if session.stage == "ore":
                 ore_rows.append(row)
             else:
@@ -82,38 +128,117 @@ class TUIState:
         return TUIState(self.sessions, ore_rows, processing_rows, cursor)
 
 
+def format_status(term: Terminal, status: str) -> str:
+    """Format a status indicator with color."""
+    if status == STATUS_RUNNING:
+        return term.green(status)
+    elif status == STATUS_ERROR:
+        return term.red(status)
+    elif status == STATUS_ACTION:
+        return term.cyan(status)
+    else:  # STATUS_IDLE
+        return term.dim + status + term.normal
+
+
+def format_row(term: Terminal, row: Row, width: int) -> str:
+    """Format a row for display.
+
+    Args:
+        term: Terminal for color formatting
+        row: Row data to format
+        width: Available width for the row content (excluding cursor prefix)
+
+    Returns a string like:
+      "● abcd1234   now   now"
+      "+ new session"
+    """
+    status_str = format_status(term, row.status)
+
+    if row.is_action:
+        return f"{status_str} {row.short_id}"
+
+    # Build columns: status, id, age, updated
+    # Format: "● abcd1234   now   now"
+    id_part = row.short_id.ljust(COL_ID)
+    age_part = row.age.rjust(COL_AGE) if row.age else "".rjust(COL_AGE)
+    updated_part = row.updated.rjust(COL_AGE) if row.updated else "".rjust(COL_AGE)
+
+    return f"{status_str} {id_part}  {age_part}  {updated_part}"
+
+
+def render_line(term: Terminal, width: int, char: str = BOX_H) -> str:
+    """Render a horizontal line of the given width."""
+    return char * width
+
+
+def render_header(term: Terminal, width: int) -> None:
+    """Render the title header."""
+    title = " HOPPER "
+    # Center the title in the line
+    line_len = width - len(title)
+    left = line_len // 2
+    right = line_len - left
+    print(term.bold(BOX_H_BOLD * left + title + BOX_H_BOLD * right))
+    print()
+
+
+def render_table_header(term: Terminal, title: str, width: int) -> None:
+    """Render a table section header with column labels."""
+    # Table title
+    print(term.bold(title))
+    # Column headers: aligned with data columns
+    # "  ● ID        AGE   UPD"
+    header = f"    {'ID'.ljust(COL_ID)}  {'AGE'.rjust(COL_AGE)}  {'UPD'.rjust(COL_AGE)}"
+    print(term.dim + header + term.normal)
+
+
+def render_footer(term: Terminal, width: int) -> None:
+    """Render the footer with keybindings."""
+    print()
+    print(render_line(term, width))
+    hints = " ↑↓/jk Navigate  ⏎ Select  a Archive  q Quit"
+    print(term.dim + hints + term.normal)
+
+
 def render(term: Terminal, state: TUIState) -> None:
     """Render the TUI to the terminal."""
+    width = term.width or 40  # Fallback for tests
+
     print(term.home + term.clear, end="")
+
+    # Header
+    render_header(term, width)
 
     row_num = 0
 
     # ORE table
-    print(term.bold("ORE"))
-    print()
+    render_table_header(term, "ORE", width)
     for row in state.ore_rows:
+        line = format_row(term, row, width - 2)  # -2 for cursor prefix
         if row_num == state.cursor_index:
-            print(term.reverse(f"> {row.label}"))
+            print(term.reverse(f"> {line}"))
         else:
-            print(f"  {row.label}")
+            print(f"  {line}")
         row_num += 1
 
     # Spacing between tables
     print()
-    print()
 
     # PROCESSING table
-    print(term.bold("PROCESSING"))
-    print()
+    render_table_header(term, "PROCESSING", width)
     if state.processing_rows:
         for row in state.processing_rows:
+            line = format_row(term, row, width - 2)
             if row_num == state.cursor_index:
-                print(term.reverse(f"> {row.label}"))
+                print(term.reverse(f"> {line}"))
             else:
-                print(f"  {row.label}")
+                print(f"  {line}")
             row_num += 1
     else:
-        print(term.dim + "  (empty)" + term.normal)
+        print(term.dim + "    (empty)" + term.normal)
+
+    # Footer
+    render_footer(term, width)
 
 
 def handle_enter(state: TUIState) -> TUIState:
@@ -123,9 +248,10 @@ def handle_enter(state: TUIState) -> TUIState:
         return state
 
     if row.id == "new":
-        # Create a new session (create_session saves to disk)
+        # Create a new session (create_session saves to disk with timestamps)
         session = create_session(state.sessions)
         session.state = "running"
+        session.touch()
 
         # Spawn claude
         window_id = spawn_claude(session.id, resume=False)
@@ -148,10 +274,12 @@ def handle_enter(state: TUIState) -> TUIState:
         # Successfully switched - ensure state reflects running
         if session.state != "running":
             session.state = "running"
+            session.touch()
             save_sessions(state.sessions)
     else:
         # Window doesn't exist or switch failed - respawn claude with resume
         session.state = "running"
+        session.touch()
         window_id = spawn_claude(session.id, resume=True)
         if window_id:
             session.tmux_window = window_id
@@ -159,6 +287,18 @@ def handle_enter(state: TUIState) -> TUIState:
             session.state = "error"
         save_sessions(state.sessions)
 
+    return state.rebuild_rows()
+
+
+def handle_archive(state: TUIState) -> TUIState:
+    """Handle 'a' key press to archive the selected session."""
+    row = state.get_selected_row()
+    if not row or row.is_action:
+        # Can't archive action rows
+        return state
+
+    # Archive the session (removes from list and persists)
+    archive_session(state.sessions, row.id)
     return state.rebuild_rows()
 
 
@@ -192,6 +332,8 @@ def run_tui(term: Terminal, server=None) -> int:
                 state = state.cursor_down()
             elif key.name == "KEY_ENTER" or key == "\n" or key == "\r":
                 state = handle_enter(state)
+            elif key == "a":
+                state = handle_archive(state)
             elif key == "q" or key.name == "KEY_ESCAPE":
                 break
 

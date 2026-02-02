@@ -4,7 +4,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +17,43 @@ State = Literal["idle", "running", "error"]
 SHORT_ID_LEN = 8  # Standard short ID length (first segment of UUID)
 
 
+def current_time_ms() -> int:
+    """Return current time in milliseconds since epoch."""
+    return int(time.time() * 1000)
+
+
+def format_age(timestamp_ms: int) -> str:
+    """Format a timestamp as a friendly age string.
+
+    Args:
+        timestamp_ms: Timestamp in milliseconds since epoch
+
+    Returns:
+        Friendly string like "now", "3m", "4h", "2d", "1w"
+    """
+    now = current_time_ms()
+    diff_ms = now - timestamp_ms
+
+    # Handle future timestamps or very recent
+    if diff_ms < 60_000:  # < 1 minute
+        return "now"
+
+    minutes = diff_ms // 60_000
+    if minutes < 60:
+        return f"{minutes}m"
+
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+
+    days = hours // 24
+    if days < 7:
+        return f"{days}d"
+
+    weeks = days // 7
+    return f"{weeks}w"
+
+
 @dataclass
 class Session:
     """A hopper session."""
@@ -24,6 +61,7 @@ class Session:
     id: str
     stage: Stage
     created_at: int  # milliseconds since epoch
+    updated_at: int = field(default=0)  # milliseconds since epoch, 0 means use created_at
     state: State = "idle"
     tmux_window: str | None = None  # tmux window ID (e.g., "@1")
 
@@ -32,11 +70,21 @@ class Session:
         """Return the 8-character short ID (first segment of UUID)."""
         return self.id[:SHORT_ID_LEN]
 
+    @property
+    def effective_updated_at(self) -> int:
+        """Return updated_at, falling back to created_at if not set."""
+        return self.updated_at if self.updated_at else self.created_at
+
+    def touch(self) -> None:
+        """Update the updated_at timestamp to now."""
+        self.updated_at = current_time_ms()
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "stage": self.stage,
             "created_at": self.created_at,
+            "updated_at": self.effective_updated_at,
             "state": self.state,
             "tmux_window": self.tmux_window,
         }
@@ -47,8 +95,9 @@ class Session:
             id=data["id"],
             stage=data["stage"],
             created_at=data["created_at"],
-            state=data.get("state", "idle"),
-            tmux_window=data.get("tmux_window"),
+            updated_at=data["updated_at"],
+            state=data["state"],
+            tmux_window=data["tmux_window"],
         )
 
 
@@ -86,10 +135,12 @@ def save_sessions(sessions: list[Session]) -> None:
 
 def create_session(sessions: list[Session]) -> Session:
     """Create a new session, add to list, and create its directory."""
+    now = current_time_ms()
     session = Session(
         id=str(uuid.uuid4()),
         stage="ore",
-        created_at=int(time.time() * 1000),
+        created_at=now,
+        updated_at=now,
     )
     sessions.append(session)
     get_session_dir(session.id).mkdir(parents=True, exist_ok=True)
@@ -102,6 +153,7 @@ def update_session_stage(sessions: list[Session], session_id: str, stage: Stage)
     for session in sessions:
         if session.id == session_id:
             session.stage = stage
+            session.touch()
             save_sessions(sessions)
             return session
     return None
