@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 from hopper import __version__
 from hopper.cli import (
+    cmd_ore,
+    cmd_ping,
     cmd_status,
+    cmd_up,
     get_hopper_sid,
     main,
     require_no_server,
@@ -76,6 +79,93 @@ def test_unknown_command(capsys):
     captured = capsys.readouterr()
     assert "unknown command: unknown" in captured.out
     assert "Usage:" in captured.out
+
+
+# Tests for subcommand help
+
+
+def test_ping_help(capsys):
+    """ping --help shows help and returns 0."""
+    result = cmd_ping(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop ping" in captured.out
+    assert "Check if the hopper server is running" in captured.out
+
+
+def test_up_help(capsys):
+    """up --help shows help and returns 0."""
+    result = cmd_up(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop up" in captured.out
+    assert "Start the hopper server and TUI" in captured.out
+
+
+def test_ore_help(capsys):
+    """ore --help shows help and returns 0."""
+    result = cmd_ore(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop ore" in captured.out
+    assert "session_id" in captured.out
+
+
+def test_status_help(capsys):
+    """status --help shows help and returns 0."""
+    result = cmd_status(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop status" in captured.out
+    assert "message" in captured.out
+
+
+# Tests for subcommand unknown args
+
+
+def test_ping_unknown_arg(capsys):
+    """ping rejects unknown arguments."""
+    result = cmd_ping(["--unknown"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error: unrecognized arguments: --unknown" in captured.out
+    assert "usage: hop ping" in captured.out
+
+
+def test_up_unknown_arg(capsys):
+    """up rejects unknown arguments."""
+    result = cmd_up(["--unknown"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error: unrecognized arguments: --unknown" in captured.out
+    assert "usage: hop up" in captured.out
+
+
+def test_ore_unknown_arg(capsys):
+    """ore rejects unknown arguments."""
+    result = cmd_ore(["session-123", "--unknown"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error: unrecognized arguments: --unknown" in captured.out
+    assert "usage: hop ore" in captured.out
+
+
+def test_status_unknown_arg(capsys):
+    """status rejects unknown arguments."""
+    result = cmd_status(["--unknown"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error: unrecognized arguments: --unknown" in captured.out
+    assert "usage: hop status" in captured.out
+
+
+def test_ore_missing_session_id(capsys):
+    """ore requires session_id argument."""
+    result = cmd_ore([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.out
+    assert "session_id" in captured.out
 
 
 # Tests for ping command

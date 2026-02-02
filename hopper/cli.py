@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 from collections.abc import Callable
@@ -20,6 +21,37 @@ def command(name: str, description: str):
         return func
 
     return decorator
+
+
+class ArgumentError(Exception):
+    """Raised when argument parsing fails."""
+
+    pass
+
+
+def make_parser(cmd: str, description: str) -> argparse.ArgumentParser:
+    """Create an argument parser for a subcommand.
+
+    Returns a parser configured with:
+    - prog set to 'hop <cmd>' for proper usage lines
+    - exit_on_error=False so we can handle errors gracefully
+    """
+    return argparse.ArgumentParser(
+        prog=f"hop {cmd}",
+        description=description,
+        exit_on_error=False,
+    )
+
+
+def parse_args(parser: argparse.ArgumentParser, args: list[str]) -> argparse.Namespace:
+    """Parse arguments, raising ArgumentError on failure."""
+    try:
+        return parser.parse_args(args)
+    except argparse.ArgumentError as e:
+        raise ArgumentError(str(e)) from e
+    except SystemExit:
+        # Raised by argparse for --help (exits with 0)
+        raise
 
 
 def print_help() -> None:
@@ -83,6 +115,16 @@ def cmd_up(args: list[str]) -> int:
     from hopper.server import start_server_with_tui
     from hopper.tmux import get_tmux_sessions, is_inside_tmux
 
+    parser = make_parser("up", "Start the hopper server and TUI (must run inside tmux).")
+    try:
+        parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
     if err := require_no_server():
         return err
 
@@ -113,11 +155,18 @@ def cmd_ore(args: list[str]) -> int:
     from hopper.client import session_exists
     from hopper.ore import run_ore
 
-    if not args:
-        print("Usage: hop ore <session-id>")
+    parser = make_parser("ore", "Run Claude for a session (internal command).")
+    parser.add_argument("session_id", help="Session ID to run")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
         return 1
 
-    session_id = args[0]
+    session_id = parsed.session_id
 
     # Server must be running (but we proceed gracefully if it dies mid-session)
     if err := require_server():
@@ -136,6 +185,22 @@ def cmd_status(args: list[str]) -> int:
     """Show or update the current session's status message."""
     from hopper.client import get_session, set_session_message
 
+    parser = make_parser(
+        "status",
+        "Show or update session status message. "
+        "Without arguments, displays the current status. "
+        "With arguments, sets the status to the provided message.",
+    )
+    parser.add_argument("message", nargs="*", help="New status message (optional)")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
     if err := require_server():
         return err
 
@@ -147,7 +212,7 @@ def cmd_status(args: list[str]) -> int:
     if err := validate_hopper_sid():
         return err
 
-    if not args:
+    if not parsed.message:
         # Show current status
         session = get_session(SOCKET_PATH, session_id)
         if not session:
@@ -161,7 +226,7 @@ def cmd_status(args: list[str]) -> int:
         return 0
 
     # Update status - join all args as the message
-    new_message = " ".join(args)
+    new_message = " ".join(parsed.message)
     if not new_message.strip():
         print("Status message required.")
         return 1
@@ -184,6 +249,16 @@ def cmd_status(args: list[str]) -> int:
 def cmd_ping(args: list[str]) -> int:
     """Ping the server."""
     from hopper.client import ping
+
+    parser = make_parser("ping", "Check if the hopper server is running.")
+    try:
+        parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
 
     if not ping(SOCKET_PATH):
         require_server()
