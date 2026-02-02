@@ -6,12 +6,14 @@ from unittest.mock import patch
 
 from hopper import __version__
 from hopper.cli import (
+    cmd_config,
     cmd_ore,
     cmd_ping,
     cmd_status,
     cmd_up,
     get_hopper_sid,
     main,
+    require_config_name,
     require_no_server,
     require_server,
     validate_hopper_sid,
@@ -214,9 +216,10 @@ def test_up_command_requires_tmux(capsys):
     """Up command returns 1 when not inside tmux."""
     with patch.object(sys, "argv", ["hopper", "up"]):
         with patch("hopper.cli.require_no_server", return_value=None):
-            with patch("hopper.tmux.is_inside_tmux", return_value=False):
-                with patch("hopper.tmux.get_tmux_sessions", return_value=[]):
-                    result = main()
+            with patch("hopper.cli.require_config_name", return_value=None):
+                with patch("hopper.tmux.is_inside_tmux", return_value=False):
+                    with patch("hopper.tmux.get_tmux_sessions", return_value=[]):
+                        result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "hop up must run inside tmux" in captured.out
@@ -227,9 +230,10 @@ def test_up_command_shows_existing_sessions(capsys):
     """Up command shows existing sessions when tmux is running."""
     with patch.object(sys, "argv", ["hopper", "up"]):
         with patch("hopper.cli.require_no_server", return_value=None):
-            with patch("hopper.tmux.is_inside_tmux", return_value=False):
-                with patch("hopper.tmux.get_tmux_sessions", return_value=["main", "dev"]):
-                    result = main()
+            with patch("hopper.cli.require_config_name", return_value=None):
+                with patch("hopper.tmux.is_inside_tmux", return_value=False):
+                    with patch("hopper.tmux.get_tmux_sessions", return_value=["main", "dev"]):
+                        result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "tmux attach -t main" in captured.out
@@ -244,6 +248,42 @@ def test_up_command_fails_if_server_running(capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "Server already running" in captured.out
+
+
+def test_up_command_requires_name_config(tmp_path, monkeypatch, capsys):
+    """Up command returns 1 if name not configured."""
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", tmp_path / "config.json")
+    with patch.object(sys, "argv", ["hopper", "up"]):
+        with patch("hopper.cli.require_no_server", return_value=None):
+            result = main()
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Please set your name first" in captured.out
+    assert "hop config name" in captured.out
+
+
+# Tests for require_config_name
+
+
+def test_require_config_name_success(tmp_path, monkeypatch):
+    """require_config_name returns None when name is set."""
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"name": "jer"}')
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", config_file)
+
+    result = require_config_name()
+    assert result is None
+
+
+def test_require_config_name_failure(tmp_path, monkeypatch, capsys):
+    """require_config_name returns 1 when name not set."""
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", tmp_path / "config.json")
+
+    result = require_config_name()
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Please set your name first" in captured.out
+    assert "hop config name" in captured.out
 
 
 # Tests for require_server
@@ -436,3 +476,93 @@ def test_status_empty_message_error(capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "Status message required" in captured.out
+
+
+# Tests for config command
+
+
+def test_config_help(capsys):
+    """config --help shows help and returns 0."""
+    result = cmd_config(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop config" in captured.out
+    assert "$variables" in captured.out
+
+
+def test_config_list_empty(tmp_path, monkeypatch, capsys):
+    """config with no args and no config shows help message."""
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", tmp_path / "config.json")
+    result = cmd_config([])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "No config set" in captured.out
+
+
+def test_config_list_values(tmp_path, monkeypatch, capsys):
+    """config with no args lists all values."""
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"name": "jer", "org": "acme"}')
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", config_file)
+
+    result = cmd_config([])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "name=jer" in captured.out
+    assert "org=acme" in captured.out
+
+
+def test_config_get_existing(tmp_path, monkeypatch, capsys):
+    """config name returns value when set."""
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"name": "jer"}')
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", config_file)
+
+    result = cmd_config(["name"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "jer" in captured.out
+
+
+def test_config_get_missing(tmp_path, monkeypatch, capsys):
+    """config name returns error when not set."""
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", tmp_path / "config.json")
+
+    result = cmd_config(["name"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Config 'name' not set" in captured.out
+
+
+def test_config_set_value(tmp_path, monkeypatch, capsys):
+    """config name value sets the value."""
+    config_file = tmp_path / "config.json"
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", config_file)
+    monkeypatch.setattr("hopper.config.DATA_DIR", tmp_path)
+
+    result = cmd_config(["name", "jer"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "name=jer" in captured.out
+
+    # Verify file was written
+    import json
+
+    saved = json.loads(config_file.read_text())
+    assert saved == {"name": "jer"}
+
+
+def test_config_set_updates_existing(tmp_path, monkeypatch, capsys):
+    """config name value updates existing config."""
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"name": "old", "other": "keep"}')
+    monkeypatch.setattr("hopper.config.CONFIG_FILE", config_file)
+    monkeypatch.setattr("hopper.config.DATA_DIR", tmp_path)
+
+    result = cmd_config(["name", "new"])
+    assert result == 0
+
+    import json
+
+    saved = json.loads(config_file.read_text())
+    assert saved == {"name": "new", "other": "keep"}

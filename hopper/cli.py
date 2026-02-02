@@ -89,6 +89,19 @@ def require_no_server() -> int | None:
     return None
 
 
+def require_config_name() -> int | None:
+    """Check that 'name' is configured. Returns exit code on failure, None on success."""
+    from hopper.config import load_config
+
+    config = load_config()
+    if "name" not in config:
+        print("Please set your name first:")
+        print()
+        print("    hop config name <your-name>")
+        return 1
+    return None
+
+
 def validate_hopper_sid() -> int | None:
     """Validate HOPPER_SID if set. Returns exit code on failure, None on success."""
     from hopper.client import session_exists
@@ -126,6 +139,9 @@ def cmd_up(args: list[str]) -> int:
         return 1
 
     if err := require_no_server():
+        return err
+
+    if err := require_config_name():
         return err
 
     if not is_inside_tmux():
@@ -242,6 +258,53 @@ def cmd_status(args: list[str]) -> int:
     else:
         print(f"Updated to '{new_message}'")
 
+    return 0
+
+
+@command("config", "Get or set config values")
+def cmd_config(args: list[str]) -> int:
+    """Get or set config values used as prompt template variables."""
+    from hopper.config import load_config, save_config
+
+    parser = make_parser(
+        "config",
+        "Get or set config values. Config values are available as $variables in prompts.",
+    )
+    parser.add_argument("name", nargs="?", help="Config key name")
+    parser.add_argument("value", nargs="?", help="Value to set")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    config = load_config()
+
+    # No args: list all config
+    if not parsed.name:
+        if not config:
+            print("No config set. Use: hop config <name> <value>")
+            return 0
+        for key, value in sorted(config.items()):
+            print(f"{key}={value}")
+        return 0
+
+    # One arg: get value
+    if not parsed.value:
+        if parsed.name in config:
+            print(config[parsed.name])
+        else:
+            print(f"Config '{parsed.name}' not set.")
+            return 1
+        return 0
+
+    # Two args: set value
+    config[parsed.name] = parsed.value
+    save_config(config)
+    print(f"{parsed.name}={parsed.value}")
     return 0
 
 

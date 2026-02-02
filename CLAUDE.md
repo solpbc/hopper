@@ -71,6 +71,7 @@ Don't assume APIs based on similar-looking patterns. When in doubt, verify.
 - All new code paths should have tests
 - TUI rendering code should be tested with mock Terminal objects
 - Use `temp_config` fixture pattern (see `test_sessions.py`) for file-based tests
+- **ALWAYS mock external state** - Tests must NEVER read real user config, files, or system state. Use fixtures/monkeypatch to isolate tests completely. A test that passes on your machine but fails on another due to user-specific state is a critical bug.
 
 ### Error Handling
 
