@@ -3,9 +3,6 @@
 import json
 import uuid
 
-import pytest
-
-from hopper import sessions
 from hopper.sessions import (
     SHORT_ID_LEN,
     Session,
@@ -20,15 +17,6 @@ from hopper.sessions import (
     update_session_stage,
     update_session_state,
 )
-
-
-@pytest.fixture
-def temp_config(tmp_path, monkeypatch):
-    """Set up temporary paths for session files."""
-    monkeypatch.setattr(sessions, "SESSIONS_FILE", tmp_path / "sessions.jsonl")
-    monkeypatch.setattr(sessions, "ARCHIVED_FILE", tmp_path / "archived.jsonl")
-    monkeypatch.setattr(sessions, "SESSIONS_DIR", tmp_path / "sessions")
-    return tmp_path
 
 
 def test_session_to_dict_and_from_dict():

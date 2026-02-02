@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -9,6 +10,31 @@ from pathlib import Path
 from typing import Literal
 
 from hopper.config import ARCHIVED_FILE, SESSIONS_DIR, SESSIONS_FILE
+
+
+def _check_test_isolation() -> None:
+    """Raise an error if running under pytest without path isolation.
+
+    This is a safety guard to prevent test code from accidentally writing
+    to the real user config directory. If pytest is detected and the paths
+    still point to the real config dir, something is wrong with test setup.
+    """
+    if "pytest" not in sys.modules:
+        return
+
+    # Check if paths are pointing to the real user config dir
+    # If properly isolated, they should be pointing to a tmp_path
+    from platformdirs import user_data_dir
+
+    real_data_dir = Path(user_data_dir("hopper"))
+    if SESSIONS_FILE.is_relative_to(real_data_dir):
+        raise RuntimeError(
+            "Test isolation failure: sessions.py is trying to write to the real "
+            f"config directory ({real_data_dir}). Ensure the isolate_config fixture "
+            "from conftest.py is active. This usually means a test is missing the "
+            "fixture or running outside pytest."
+        )
+
 
 Stage = Literal["ore", "processing"]
 State = Literal["new", "idle", "running", "error"]
@@ -126,6 +152,7 @@ def load_sessions() -> list[Session]:
 
 def save_sessions(sessions: list[Session]) -> None:
     """Atomically save sessions to JSONL file."""
+    _check_test_isolation()
     SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_path = SESSIONS_FILE.with_suffix(".jsonl.tmp")
@@ -170,6 +197,7 @@ def archive_session(sessions: list[Session], session_id: str) -> Session | None:
     The session directory is left intact.
     Returns the archived session or None if not found.
     """
+    _check_test_isolation()
     for i, session in enumerate(sessions):
         if session.id == session_id:
             archived = sessions.pop(i)

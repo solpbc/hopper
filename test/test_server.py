@@ -7,17 +7,7 @@ import time
 
 import pytest
 
-from hopper import sessions
 from hopper.server import Server
-
-
-@pytest.fixture
-def temp_config(tmp_path, monkeypatch):
-    """Set up temporary paths for session files."""
-    monkeypatch.setattr(sessions, "SESSIONS_FILE", tmp_path / "sessions.jsonl")
-    monkeypatch.setattr(sessions, "ARCHIVED_FILE", tmp_path / "archived.jsonl")
-    monkeypatch.setattr(sessions, "SESSIONS_DIR", tmp_path / "sessions")
-    return tmp_path
 
 
 @pytest.fixture
