@@ -8,6 +8,14 @@ import threading
 import time
 from pathlib import Path
 
+from hopper.sessions import (
+    Session,
+    archive_session,
+    create_session,
+    load_sessions,
+    update_session_stage,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,10 +34,12 @@ class Server:
         self.server_socket: socket.socket | None = None
         self.broadcast_queue: queue.Queue = queue.Queue(maxsize=10000)
         self.writer_thread: threading.Thread | None = None
+        self.sessions: list[Session] = []
 
     def start(self) -> None:
         """Start the server (blocking)."""
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sessions = load_sessions()
 
         # Remove stale socket file
         if self.socket_path.exists():
@@ -107,15 +117,44 @@ class Server:
         msg_type = message.get("type")
 
         if msg_type == "ping":
-            # Respond directly to the sender
-            response = json.dumps({"type": "pong", "ts": int(time.time() * 1000)}) + "\n"
-            try:
-                conn.sendall(response.encode("utf-8"))
-            except Exception as e:
-                logger.debug(f"Failed to send pong: {e}")
+            self._send_response(conn, {"type": "pong"})
+
+        elif msg_type == "session_list":
+            sessions_data = [s.to_dict() for s in self.sessions]
+            self._send_response(conn, {"type": "session_list", "sessions": sessions_data})
+
+        elif msg_type == "session_create":
+            session = create_session(self.sessions)
+            self.broadcast({"type": "session_created", "session": session.to_dict()})
+
+        elif msg_type == "session_update":
+            session_id = message.get("session_id")
+            stage = message.get("stage")
+            if session_id and stage:
+                session = update_session_stage(self.sessions, session_id, stage)
+                if session:
+                    self.broadcast({"type": "session_updated", "session": session.to_dict()})
+
+        elif msg_type == "session_archive":
+            session_id = message.get("session_id")
+            if session_id:
+                session = archive_session(self.sessions, session_id)
+                if session:
+                    self.broadcast({"type": "session_archived", "session": session.to_dict()})
+
         else:
             # Broadcast other messages
             self.broadcast(message)
+
+    def _send_response(self, conn: socket.socket, message: dict) -> None:
+        """Send a response directly to a client."""
+        if "ts" not in message:
+            message["ts"] = int(time.time() * 1000)
+        response = json.dumps(message) + "\n"
+        try:
+            conn.sendall(response.encode("utf-8"))
+        except Exception as e:
+            logger.debug(f"Failed to send response: {e}")
 
     def _writer_loop(self) -> None:
         """Dedicated writer thread that serializes all broadcasts."""
@@ -177,11 +216,35 @@ class Server:
             self.writer_thread.join(timeout=1.0)
 
 
-def start_server(socket_path: Path) -> None:
-    """Start the server, handling KeyboardInterrupt."""
+def start_server_with_tui(socket_path: Path) -> int:
+    """Start the server in a background thread and run the TUI."""
+    from blessed import Terminal
+
+    from hopper.tui import run_tui
+
     server = Server(socket_path)
+
+    # Start server in background thread
+    server_thread = threading.Thread(target=server.start, name="server", daemon=True)
+    server_thread.start()
+
+    # Wait for socket to be ready
+    for _ in range(50):
+        if socket_path.exists():
+            break
+        time.sleep(0.1)
+    else:
+        print("Server failed to start")
+        server.stop()
+        return 1
+
+    # Run TUI in main thread
+    term = Terminal()
     try:
-        server.start()
+        return run_tui(term, server)
     except KeyboardInterrupt:
+        return 0
+    finally:
         logger.info("Shutting down server")
         server.stop()
+        server_thread.join(timeout=2.0)

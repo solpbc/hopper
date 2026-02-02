@@ -184,10 +184,19 @@ def handle_enter(state: TUIState) -> TUIState:
     return state.rebuild_rows()
 
 
-def run_tui(term: Terminal) -> int:
-    """Run the TUI main loop."""
-    # Load existing sessions
-    sessions = load_sessions()
+def run_tui(term: Terminal, server=None) -> int:
+    """Run the TUI main loop.
+
+    Args:
+        term: blessed Terminal instance
+        server: Optional Server instance. If provided, uses server's session list
+                for shared state. Otherwise loads from disk.
+    """
+    # Use server's session list if available, otherwise load from disk
+    if server is not None:
+        sessions = server.sessions
+    else:
+        sessions = load_sessions()
 
     # Build initial state
     state = TUIState(sessions=sessions)
