@@ -227,16 +227,82 @@ class TestOreRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        # Simulate: first call fails (during _run_claude), second succeeds (blocking retry)
+        call_count = [0]
+
+        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
+            call_count[0] += 1
+            # First call (running) fails, subsequent calls succeed
+            return call_count[0] > 1
+
         with (
             patch("hopper.ore.get_session_state", return_value=None),
-            patch("hopper.ore.set_session_state", return_value=False),
+            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
             patch("hopper.ore.ping", return_value=False),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             runner.run()
 
-        # Should have marked as disconnected
-        assert runner.server_connected is False
+        # Should have reconnected via blocking retry
+        assert runner.server_connected is True
+
+    def test_blocking_notify_retries_until_success(self):
+        """_notify_state_blocking retries until server responds."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        call_count = [0]
+
+        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
+            call_count[0] += 1
+            # Fail first 2 attempts, succeed on third
+            return call_count[0] >= 3
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = None
+
+        with (
+            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.ping", return_value=True),
+            patch("subprocess.Popen", return_value=mock_proc),
+            patch("hopper.ore.RECONNECT_INTERVAL", 0.01),  # Speed up test
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        # running (call 1 fails), idle (call 2 fails), idle retry (call 3 succeeds)
+        assert call_count[0] >= 3
+        assert runner.server_connected is True
+
+    def test_blocking_notify_respects_stop_event(self):
+        """_notify_state_blocking stops when stop_event is set."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        call_count = [0]
+
+        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
+            call_count[0] += 1
+            # Always fail, but set stop event after first call
+            if call_count[0] == 1:
+                runner.stop_event.set()
+            return False
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = None
+
+        with (
+            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.ping", return_value=True),
+            patch("subprocess.Popen", return_value=mock_proc),
+            patch("hopper.ore.RECONNECT_INTERVAL", 0.01),
+        ):
+            runner.run()
+
+        # Should have stopped after stop_event was set (1-2 calls max)
+        assert call_count[0] <= 2
 
 
 class TestRunOre:

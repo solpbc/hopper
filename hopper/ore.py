@@ -71,17 +71,17 @@ class OreRunner:
             # Run Claude (blocking) - notifies "running" after successful start
             exit_code, error_msg = self._run_claude()
 
-            # Notify server we're done with appropriate message
+            # Notify server we're done with appropriate message (blocks until delivered)
             if exit_code == 0:
-                self._notify_state("idle", "Completed successfully")
+                self._notify_state_blocking("idle", "Completed successfully")
             elif exit_code == 127:
-                self._notify_state("error", error_msg or "Command not found")
+                self._notify_state_blocking("error", error_msg or "Command not found")
             elif exit_code == 130:
-                self._notify_state("idle", "Interrupted")
+                self._notify_state_blocking("idle", "Interrupted")
             else:
                 # Use captured stderr if available, otherwise generic message
                 msg = error_msg or f"Exited with code {exit_code}"
-                self._notify_state("error", msg)
+                self._notify_state_blocking("error", msg)
 
             return exit_code
 
@@ -129,6 +129,16 @@ class OreRunner:
         else:
             self.server_connected = False
             logger.debug(f"Failed to notify server: state={state}")
+
+    def _notify_state_blocking(self, state: str, message: str) -> None:
+        """Notify server of state change, retrying until success or interrupted."""
+        while not self.stop_event.is_set():
+            if set_session_state(self.socket_path, self.session_id, state, message):
+                self.server_connected = True
+                logger.debug(f"Notified server: state={state}, message={message}")
+                return
+            logger.debug(f"Failed to notify server, retrying in {RECONNECT_INTERVAL}s")
+            self.stop_event.wait(timeout=RECONNECT_INTERVAL)
 
     def _run_claude(self) -> tuple[int, str | None]:
         """Run Claude with the session ID. Returns (exit_code, error_message)."""
