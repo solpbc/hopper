@@ -16,36 +16,14 @@ class Row:
     label: str
 
 
-def truncate_id(session_id: str, all_ids: list[str], min_len: int = 4) -> str:
-    """Truncate a session ID to the shortest unique prefix.
-
-    Uses the first segment of the UUID (before the first dash) and finds
-    the minimum length that's unique among all IDs.
-    """
-    # Use the first segment of the UUID (8 hex chars)
-    first_segment = session_id.split("-")[0]
-    other_segments = [s.split("-")[0] for s in all_ids if s != session_id]
-
-    # Find minimum unique prefix
-    for length in range(min_len, len(first_segment) + 1):
-        prefix = first_segment[:length]
-        if not any(other.startswith(prefix) for other in other_segments):
-            return prefix
-
-    return first_segment
-
-
-def session_label(session: Session, all_sessions: list[Session]) -> str:
+def session_label(session: Session) -> str:
     """Generate a display label for a session."""
-    all_ids = [s.id for s in all_sessions]
-    short_id = truncate_id(session.id, all_ids)
-
     if session.state == "error":
-        return f"{short_id} (error)"
+        return f"{session.short_id} (error)"
     elif session.state == "running":
-        return f"{short_id} (running)"
+        return f"{session.short_id} (running)"
     else:
-        return short_id
+        return session.short_id
 
 
 @dataclass
@@ -91,7 +69,7 @@ class TUIState:
         processing_rows = []
 
         for session in self.sessions:
-            row = Row(session.id, session_label(session, self.sessions))
+            row = Row(session.id, session_label(session))
             if session.stage == "ore":
                 ore_rows.append(row)
             else:

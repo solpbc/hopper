@@ -7,9 +7,11 @@ import pytest
 
 from hopper import sessions
 from hopper.sessions import (
+    SHORT_ID_LEN,
     Session,
     archive_session,
     create_session,
+    find_by_short_id,
     get_session_dir,
     load_sessions,
     save_sessions,
@@ -176,3 +178,78 @@ def test_get_session_dir(temp_config):
     """Test session directory path."""
     path = get_session_dir("my-session-id")
     assert path == temp_config / "sessions" / "my-session-id"
+
+
+# Tests for short_id
+
+
+def test_short_id_length():
+    """short_id returns exactly SHORT_ID_LEN characters."""
+    session = Session(id="abcd1234-5678-90ab-cdef-1234567890ab", stage="ore", created_at=1000)
+    assert len(session.short_id) == SHORT_ID_LEN
+    assert session.short_id == "abcd1234"
+
+
+def test_short_id_is_prefix():
+    """short_id is the first segment of the full ID."""
+    session = Session(id="deadbeef-1234-5678-90ab-cdef12345678", stage="ore", created_at=1000)
+    assert session.id.startswith(session.short_id)
+    assert session.short_id == "deadbeef"
+
+
+# Tests for find_by_short_id
+
+
+def test_find_by_short_id_exact():
+    """find_by_short_id matches full ID."""
+    sessions = [
+        Session(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
+        Session(id="bbbb2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+    ]
+    result = find_by_short_id(sessions, "aaaa1111-0000-0000-0000-000000000000")
+    assert result is sessions[0]
+
+
+def test_find_by_short_id_prefix():
+    """find_by_short_id matches unique prefix."""
+    sessions = [
+        Session(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
+        Session(id="bbbb2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+    ]
+    result = find_by_short_id(sessions, "aaaa")
+    assert result is sessions[0]
+
+
+def test_find_by_short_id_short_id():
+    """find_by_short_id matches 8-char short_id."""
+    sessions = [
+        Session(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
+        Session(id="bbbb2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+    ]
+    result = find_by_short_id(sessions, "bbbb2222")
+    assert result is sessions[1]
+
+
+def test_find_by_short_id_ambiguous():
+    """find_by_short_id returns None for ambiguous prefix."""
+    sessions = [
+        Session(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
+        Session(id="aaaa2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+    ]
+    result = find_by_short_id(sessions, "aaaa")
+    assert result is None
+
+
+def test_find_by_short_id_not_found():
+    """find_by_short_id returns None when no match."""
+    sessions = [
+        Session(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
+    ]
+    result = find_by_short_id(sessions, "xxxx")
+    assert result is None
+
+
+def test_find_by_short_id_empty():
+    """find_by_short_id returns None for empty list."""
+    result = find_by_short_id([], "aaaa")
+    assert result is None

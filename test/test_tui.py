@@ -8,61 +8,30 @@ from hopper.tui import (
     TUIState,
     render,
     session_label,
-    truncate_id,
 )
-
-# Tests for truncate_id
-
-
-def test_truncate_id_single():
-    """Single ID returns minimum length prefix."""
-    result = truncate_id("abcd1234-5678-uuid", ["abcd1234-5678-uuid"])
-    assert result == "abcd"
-
-
-def test_truncate_id_unique_prefix():
-    """Returns shortest unique prefix among all IDs."""
-    all_ids = ["abcd1234-uuid", "abce5678-uuid", "xxxx0000-uuid"]
-    result = truncate_id("abcd1234-uuid", all_ids)
-    assert result == "abcd"
-
-
-def test_truncate_id_needs_longer_prefix():
-    """Extends prefix when shorter one is ambiguous."""
-    all_ids = ["abcd1234-uuid", "abcd5678-uuid"]
-    result = truncate_id("abcd1234-uuid", all_ids)
-    assert result == "abcd1"
-
-
-def test_truncate_id_full_segment():
-    """Returns full segment when all prefixes conflict."""
-    all_ids = ["abcdefgh-uuid", "abcdefgi-uuid"]
-    result = truncate_id("abcdefgh-uuid", all_ids)
-    assert result == "abcdefgh"
-
 
 # Tests for session_label
 
 
 def test_session_label_idle():
-    """Idle session shows just the short ID."""
+    """Idle session shows just the 8-char short ID."""
     session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="idle")
-    result = session_label(session, [session])
-    assert result == "abcd"
+    result = session_label(session)
+    assert result == "abcd1234"
 
 
 def test_session_label_running():
     """Running session shows (running) suffix."""
     session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="running")
-    result = session_label(session, [session])
-    assert result == "abcd (running)"
+    result = session_label(session)
+    assert result == "abcd1234 (running)"
 
 
 def test_session_label_error():
     """Error session shows (error) suffix."""
     session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="error")
-    result = session_label(session, [session])
-    assert result == "abcd (error)"
+    result = session_label(session)
+    assert result == "abcd1234 (error)"
 
 
 # Tests for TUIState
@@ -215,8 +184,8 @@ def test_render_with_sessions(capsys):
     captured = capsys.readouterr()
     # Cursor on "new shovel" (first row)
     assert "[REV]> new shovel[/REV]" in captured.out
-    assert "  aaaa" in captured.out
-    assert "  bbbb" in captured.out
+    assert "  aaaa1111" in captured.out
+    assert "  bbbb2222" in captured.out
 
 
 def test_render_cursor_on_session(capsys):
@@ -230,7 +199,7 @@ def test_render_cursor_on_session(capsys):
 
     captured = capsys.readouterr()
     assert "  new shovel" in captured.out  # Not selected
-    assert "[REV]> aaaa[/REV]" in captured.out  # Selected
+    assert "[REV]> aaaa1111[/REV]" in captured.out  # Selected
 
 
 def test_render_cursor_on_processing(capsys):
@@ -243,4 +212,4 @@ def test_render_cursor_on_processing(capsys):
     render(term, state)
 
     captured = capsys.readouterr()
-    assert "[REV]> bbbb[/REV]" in captured.out
+    assert "[REV]> bbbb2222[/REV]" in captured.out

@@ -14,6 +14,9 @@ Stage = Literal["ore", "processing"]
 State = Literal["idle", "running", "error"]
 
 
+SHORT_ID_LEN = 8  # Standard short ID length (first segment of UUID)
+
+
 @dataclass
 class Session:
     """A hopper session."""
@@ -23,6 +26,11 @@ class Session:
     created_at: int  # milliseconds since epoch
     state: State = "idle"
     tmux_window: str | None = None  # tmux window ID (e.g., "@1")
+
+    @property
+    def short_id(self) -> str:
+        """Return the 8-character short ID (first segment of UUID)."""
+        return self.id[:SHORT_ID_LEN]
 
     def to_dict(self) -> dict:
         return {
@@ -116,4 +124,20 @@ def archive_session(sessions: list[Session], session_id: str) -> Session | None:
 
             save_sessions(sessions)
             return archived
+    return None
+
+
+def find_by_short_id(sessions: list[Session], prefix: str) -> Session | None:
+    """Find a session by ID prefix.
+
+    Args:
+        sessions: List of sessions to search
+        prefix: ID prefix to match (can be full ID or short ID)
+
+    Returns:
+        The matching session, or None if not found or ambiguous (multiple matches)
+    """
+    matches = [s for s in sessions if s.id.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
     return None
