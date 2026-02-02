@@ -131,6 +131,55 @@ def cmd_ore(args: list[str]) -> int:
     return run_ore(session_id, SOCKET_PATH)
 
 
+@command("status", "Show or update session status message")
+def cmd_status(args: list[str]) -> int:
+    """Show or update the current session's status message."""
+    from hopper.client import get_session, set_session_message
+
+    if err := require_server():
+        return err
+
+    session_id = get_hopper_sid()
+    if not session_id:
+        print("HOPPER_SID not set. Run this from within a hopper session.")
+        return 1
+
+    if err := validate_hopper_sid():
+        return err
+
+    if not args:
+        # Show current status
+        session = get_session(SOCKET_PATH, session_id)
+        if not session:
+            print(f"Session {session_id} not found.")
+            return 1
+        message = session.get("message", "")
+        if message:
+            print(message)
+        else:
+            print("(no status message)")
+        return 0
+
+    # Update status - join all args as the message
+    new_message = " ".join(args)
+    if not new_message.strip():
+        print("Status message required.")
+        return 1
+
+    # Get current message for friendly output
+    session = get_session(SOCKET_PATH, session_id)
+    old_message = session.get("message", "") if session else ""
+
+    set_session_message(SOCKET_PATH, session_id, new_message)
+
+    if old_message:
+        print(f"Updated from '{old_message}' to '{new_message}'")
+    else:
+        print(f"Updated to '{new_message}'")
+
+    return 0
+
+
 @command("ping", "Check if server is running")
 def cmd_ping(args: list[str]) -> int:
     """Ping the server."""

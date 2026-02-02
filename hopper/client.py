@@ -109,6 +109,28 @@ def get_session_state(socket_path: Path, session_id: str, timeout: float = 2.0) 
     return None
 
 
+def get_session(socket_path: Path, session_id: str, timeout: float = 2.0) -> dict | None:
+    """Get a session's full data.
+
+    Args:
+        socket_path: Path to the Unix socket
+        session_id: The session ID to query
+        timeout: Timeout in seconds
+
+    Returns:
+        The full session dict or None if not found
+    """
+    message = {"type": "session_list", "ts": int(time.time() * 1000)}
+    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
+    if response is None or response.get("type") != "session_list":
+        return None
+    sessions = response.get("sessions", [])
+    for s in sessions:
+        if s.get("id") == session_id:
+            return s
+    return None
+
+
 def set_session_state(
     socket_path: Path, session_id: str, state: str, message: str, timeout: float = 2.0
 ) -> bool:
@@ -128,6 +150,34 @@ def set_session_state(
         "type": "session_set_state",
         "session_id": session_id,
         "state": state,
+        "message": message,
+        "ts": int(time.time() * 1000),
+    }
+    # Fire-and-forget: don't wait for response
+    try:
+        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
+        return True
+    except Exception:
+        return False
+
+
+def set_session_message(
+    socket_path: Path, session_id: str, message: str, timeout: float = 2.0
+) -> bool:
+    """Set a session's message only (fire-and-forget).
+
+    Args:
+        socket_path: Path to the Unix socket
+        session_id: The session ID to update
+        message: Human-readable status message
+        timeout: Connection timeout in seconds
+
+    Returns:
+        True if message was sent successfully, False otherwise
+    """
+    msg = {
+        "type": "session_set_message",
+        "session_id": session_id,
         "message": message,
         "ts": int(time.time() * 1000),
     }

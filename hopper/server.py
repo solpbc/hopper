@@ -15,6 +15,7 @@ from hopper.sessions import (
     archive_session,
     create_session,
     load_sessions,
+    update_session_message,
     update_session_stage,
     update_session_state,
 )
@@ -153,6 +154,16 @@ class Server:
                 session = update_session_state(self.sessions, session_id, state, msg)
                 if session:
                     self.broadcast({"type": "session_state_changed", "session": session.to_dict()})
+
+        elif msg_type == "session_set_message":
+            session_id = message.get("session_id")
+            msg = message.get("message", "")
+            if session_id:
+                session = update_session_message(self.sessions, session_id, msg)
+                if session:
+                    self.broadcast(
+                        {"type": "session_message_changed", "session": session.to_dict()}
+                    )
 
         else:
             # Broadcast other messages

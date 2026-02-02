@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from hopper import __version__
 from hopper.cli import (
+    cmd_status,
     get_hopper_sid,
     main,
     require_no_server,
@@ -243,3 +244,105 @@ def test_validate_hopper_sid_invalid(capsys):
     assert "invalid-session" in captured.out
     assert "not found or archived" in captured.out
     assert "unset HOPPER_SID" in captured.out
+
+
+# Tests for status command
+
+
+def test_status_no_server(capsys):
+    """status command returns 1 when server not running."""
+    with patch("hopper.client.ping", return_value=False):
+        result = cmd_status([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Server not running" in captured.out
+
+
+def test_status_no_hopper_sid(capsys):
+    """status command returns 1 when HOPPER_SID not set."""
+    env = os.environ.copy()
+    env.pop("HOPPER_SID", None)
+    with patch.dict(os.environ, env, clear=True):
+        with patch("hopper.client.ping", return_value=True):
+            result = cmd_status([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "HOPPER_SID not set" in captured.out
+
+
+def test_status_invalid_session(capsys):
+    """status command returns 1 when session doesn't exist."""
+    with patch.dict(os.environ, {"HOPPER_SID": "bad-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=False):
+                result = cmd_status([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "bad-session" in captured.out
+    assert "not found or archived" in captured.out
+
+
+def test_status_show(capsys):
+    """status command shows current message when no args."""
+    session_data = {"id": "test-session", "message": "Working on feature X"}
+    with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=True):
+                with patch("hopper.client.get_session", return_value=session_data):
+                    result = cmd_status([])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Working on feature X" in captured.out
+
+
+def test_status_show_empty(capsys):
+    """status command shows placeholder when no message set."""
+    session_data = {"id": "test-session", "message": ""}
+    with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=True):
+                with patch("hopper.client.get_session", return_value=session_data):
+                    result = cmd_status([])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "(no status message)" in captured.out
+
+
+def test_status_update(capsys):
+    """status command updates message when args provided."""
+    session_data = {"id": "test-session", "message": "Old status"}
+    with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=True):
+                with patch("hopper.client.get_session", return_value=session_data):
+                    with patch("hopper.client.set_session_message", return_value=True):
+                        result = cmd_status(["New", "status", "message"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Updated from 'Old status' to 'New status message'" in captured.out
+
+
+def test_status_update_from_empty(capsys):
+    """status command shows simpler message when updating from empty."""
+    session_data = {"id": "test-session", "message": ""}
+    with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=True):
+                with patch("hopper.client.get_session", return_value=session_data):
+                    with patch("hopper.client.set_session_message", return_value=True):
+                        result = cmd_status(["New status"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Updated to 'New status'" in captured.out
+    assert "from" not in captured.out
+
+
+def test_status_empty_message_error(capsys):
+    """status command returns 1 when given empty message."""
+    with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=True):
+                result = cmd_status(["", "  "])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Status message required" in captured.out

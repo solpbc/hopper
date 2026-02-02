@@ -226,6 +226,19 @@ def update_session_state(
     return None
 
 
+def update_session_message(
+    sessions: list[Session], session_id: str, message: str
+) -> Session | None:
+    """Update a session's message only. Returns the updated session or None if not found."""
+    for session in sessions:
+        if session.id == session_id:
+            session.message = message
+            session.touch()
+            save_sessions(sessions)
+            return session
+    return None
+
+
 def find_by_short_id(sessions: list[Session], prefix: str) -> Session | None:
     """Find a session by ID prefix.
 
