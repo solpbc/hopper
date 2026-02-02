@@ -1,8 +1,10 @@
 """Unix socket JSONL server for hopper."""
 
+import atexit
 import json
 import logging
 import queue
+import signal
 import socket
 import threading
 import time
@@ -209,11 +211,46 @@ class Server:
             return False
 
     def stop(self) -> None:
-        """Stop the server."""
+        """Stop the server gracefully.
+
+        Sends shutdown message to clients, closes all connections, then stops threads.
+        """
+        logger.info("Server stopping")
+
+        # Send shutdown message to all clients (bypass queue for immediate delivery)
+        self._send_to_clients({"type": "shutdown"})
+
+        # Close all client connections
+        with self.lock:
+            for client in self.clients:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            self.clients.clear()
+
+        # Signal threads to stop
         self.stop_event.set()
 
+        # Close server socket to unblock accept()
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+
+        # Wait for writer thread
         if self.writer_thread and self.writer_thread.is_alive():
             self.writer_thread.join(timeout=1.0)
+
+        # Clean up socket file
+        if self.socket_path.exists():
+            try:
+                self.socket_path.unlink()
+            except Exception:
+                pass
+
+        logger.info("Server stopped")
 
 
 def start_server_with_tui(socket_path: Path) -> int:
@@ -223,6 +260,27 @@ def start_server_with_tui(socket_path: Path) -> int:
     from hopper.tui import run_tui
 
     server = Server(socket_path)
+    shutdown_initiated = threading.Event()
+
+    def handle_shutdown_signal(signum, frame):
+        """Handle SIGTERM/SIGINT for graceful shutdown."""
+        if not shutdown_initiated.is_set():
+            shutdown_initiated.set()
+            raise KeyboardInterrupt
+
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+
+    # Register atexit handler for socket cleanup (backup for abnormal exit)
+    def cleanup_socket():
+        if socket_path.exists():
+            try:
+                socket_path.unlink()
+            except Exception:
+                pass
+
+    atexit.register(cleanup_socket)
 
     # Start server in background thread
     server_thread = threading.Thread(target=server.start, name="server", daemon=True)
@@ -248,3 +306,4 @@ def start_server_with_tui(socket_path: Path) -> int:
         logger.info("Shutting down server")
         server.stop()
         server_thread.join(timeout=2.0)
+        atexit.unregister(cleanup_socket)
