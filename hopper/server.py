@@ -148,7 +148,7 @@ class Server:
         elif msg_type == "session_set_state":
             session_id = message.get("session_id")
             state = message.get("state")
-            if session_id and state in ("idle", "running", "error"):
+            if session_id and state in ("new", "idle", "running", "error"):
                 session = update_session_state(self.sessions, session_id, state)
                 if session:
                     self.broadcast({"type": "session_state_changed", "session": session.to_dict()})

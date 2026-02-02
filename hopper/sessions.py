@@ -11,7 +11,7 @@ from typing import Literal
 from hopper.config import ARCHIVED_FILE, SESSIONS_DIR, SESSIONS_FILE
 
 Stage = Literal["ore", "processing"]
-State = Literal["idle", "running", "error"]
+State = Literal["new", "idle", "running", "error"]
 
 
 SHORT_ID_LEN = 8  # Standard short ID length (first segment of UUID)
@@ -141,6 +141,7 @@ def create_session(sessions: list[Session]) -> Session:
         stage="ore",
         created_at=now,
         updated_at=now,
+        state="new",
     )
     sessions.append(session)
     get_session_dir(session.id).mkdir(parents=True, exist_ok=True)

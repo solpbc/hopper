@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-from hopper.client import ping, set_session_state
+from hopper.client import get_session_state, ping, set_session_state
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ class OreRunner:
         self.stop_event = threading.Event()
         self.server_connected = False
         self.background_thread: threading.Thread | None = None
+        self.is_new_session = False  # Set during run() based on server state
 
     def run(self) -> int:
         """Run Claude for this session. Returns exit code."""
@@ -32,16 +33,18 @@ class OreRunner:
         original_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
 
         try:
+            # Query server for session state to determine if this is a new session
+            state = get_session_state(self.socket_path, self.session_id)
+            self.is_new_session = state == "new"
+            self.server_connected = state is not None
+
             # Start background thread for server connection management
             self.background_thread = threading.Thread(
                 target=self._background_loop, name="ore-background", daemon=True
             )
             self.background_thread.start()
 
-            # Notify server we're active
-            self._notify_active()
-
-            # Run Claude (blocking)
+            # Run Claude (blocking) - notifies "running" after successful start
             exit_code = self._run_claude()
 
             # Determine final state based on exit code
@@ -106,14 +109,24 @@ class OreRunner:
         env = os.environ.copy()
         env["HOPPER_SID"] = self.session_id
 
-        # Build command - always use resume (Claude handles new sessions gracefully)
-        cmd = ["claude", "--resume", self.session_id]
+        # Build command - use --resume for existing sessions
+        if self.is_new_session:
+            cmd = ["claude"]
+        else:
+            cmd = ["claude", "--resume", self.session_id]
 
         logger.debug(f"Running: {' '.join(cmd)}")
 
         try:
-            result = subprocess.run(cmd, env=env)
-            return result.returncode
+            # Start Claude process
+            proc = subprocess.Popen(cmd, env=env)
+
+            # Notify server we're running (after successful process start)
+            self._notify_active()
+
+            # Wait for Claude to complete
+            proc.wait()
+            return proc.returncode
         except FileNotFoundError:
             logger.error("claude command not found")
             return 127

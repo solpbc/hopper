@@ -87,6 +87,28 @@ def session_exists(socket_path: Path, session_id: str, timeout: float = 2.0) -> 
     return any(s.get("id") == session_id for s in sessions)
 
 
+def get_session_state(socket_path: Path, session_id: str, timeout: float = 2.0) -> str | None:
+    """Get a session's current state.
+
+    Args:
+        socket_path: Path to the Unix socket
+        session_id: The session ID to query
+        timeout: Timeout in seconds
+
+    Returns:
+        The session state ("new", "idle", "running", "error") or None if not found
+    """
+    message = {"type": "session_list", "ts": int(time.time() * 1000)}
+    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
+    if response is None or response.get("type") != "session_list":
+        return None
+    sessions = response.get("sessions", [])
+    for s in sessions:
+        if s.get("id") == session_id:
+            return s.get("state")
+    return None
+
+
 def set_session_state(socket_path: Path, session_id: str, state: str, timeout: float = 2.0) -> bool:
     """Set a session's state (fire-and-forget).
 
