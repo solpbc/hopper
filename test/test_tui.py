@@ -190,9 +190,10 @@ def test_render_empty_processing(capsys):
     assert "[BOLD]ORE[/BOLD]" in captured.out
     assert "[BOLD]PROCESSING[/BOLD]" in captured.out
     assert "(empty)" in captured.out
-    # Footer
+    # Footer (cursor on action row, so no Archive hint)
     assert "Navigate" in captured.out
-    assert "Archive" in captured.out
+    assert "New" in captured.out
+    assert "Archive" not in captured.out
     assert "Quit" in captured.out
 
 
@@ -343,3 +344,61 @@ def test_handle_archive_ignores_action_row():
 
     # Session should still be there
     assert len(new_state.sessions) == 1
+
+
+# Tests for context-sensitive footer hints
+
+
+def test_footer_shows_new_on_action_row(capsys):
+    """Footer shows 'New' when cursor is on action row."""
+    term = _mock_terminal()
+    state = TUIState(cursor_index=0)
+    state = state.rebuild_rows()
+
+    render(term, state)
+
+    captured = capsys.readouterr()
+    assert "New" in captured.out
+    assert "Archive" not in captured.out
+
+
+def test_footer_shows_switch_on_running_session(capsys):
+    """Footer shows 'Switch' when cursor is on running session."""
+    term = _mock_terminal()
+    sessions = [Session(id="aaaa1111-uuid", stage="ore", created_at=1000, state="running")]
+    state = TUIState(sessions=sessions, cursor_index=1)  # cursor on session (after new)
+    state = state.rebuild_rows()
+
+    render(term, state)
+
+    captured = capsys.readouterr()
+    assert "Switch" in captured.out
+    assert "Archive" in captured.out
+
+
+def test_footer_shows_resume_on_idle_session(capsys):
+    """Footer shows 'Resume' when cursor is on idle session."""
+    term = _mock_terminal()
+    sessions = [Session(id="aaaa1111-uuid", stage="ore", created_at=1000, state="idle")]
+    state = TUIState(sessions=sessions, cursor_index=1)
+    state = state.rebuild_rows()
+
+    render(term, state)
+
+    captured = capsys.readouterr()
+    assert "Resume" in captured.out
+    assert "Archive" in captured.out
+
+
+def test_footer_shows_resume_on_error_session(capsys):
+    """Footer shows 'Resume' when cursor is on error session."""
+    term = _mock_terminal()
+    sessions = [Session(id="aaaa1111-uuid", stage="ore", created_at=1000, state="error")]
+    state = TUIState(sessions=sessions, cursor_index=1)
+    state = state.rebuild_rows()
+
+    render(term, state)
+
+    captured = capsys.readouterr()
+    assert "Resume" in captured.out
+    assert "Archive" in captured.out

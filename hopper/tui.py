@@ -25,7 +25,6 @@ STATUS_ERROR = "✗"  # x mark
 STATUS_ACTION = "+"  # plus for action rows
 
 # Column widths for table formatting
-COL_STATUS = 1  # status indicator
 COL_ID = 8  # short_id length
 COL_AGE = 3  # "now", "3m", "4h", "2d", "1w"
 
@@ -192,11 +191,28 @@ def render_table_header(term: Terminal, title: str, width: int) -> None:
     print(term.dim + header + term.normal)
 
 
-def render_footer(term: Terminal, width: int) -> None:
+def render_footer(term: Terminal, width: int, state: "TUIState") -> None:
     """Render the footer with keybindings."""
     print()
     print(render_line(term, width))
-    hints = " ↑↓/jk Navigate  ⏎ Select  a Archive  q Quit"
+
+    # Determine context-sensitive Enter action
+    row = state.get_selected_row()
+    if row and row.is_action:
+        enter_hint = "⏎ New"
+        archive_hint = ""
+    elif row:
+        session = state.get_session(row.id)
+        if session and session.state == "running":
+            enter_hint = "⏎ Switch"
+        else:
+            enter_hint = "⏎ Resume"
+        archive_hint = "  a Archive"
+    else:
+        enter_hint = "⏎ Select"
+        archive_hint = ""
+
+    hints = f" ↑↓/jk Navigate  {enter_hint}{archive_hint}  q Quit"
     print(term.dim + hints + term.normal)
 
 
@@ -238,7 +254,7 @@ def render(term: Terminal, state: TUIState) -> None:
         print(term.dim + "    (empty)" + term.normal)
 
     # Footer
-    render_footer(term, width)
+    render_footer(term, width, state)
 
 
 def handle_enter(state: TUIState) -> TUIState:
