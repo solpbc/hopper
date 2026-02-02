@@ -45,16 +45,17 @@ class OreRunner:
             self.background_thread.start()
 
             # Run Claude (blocking) - notifies "running" after successful start
-            exit_code = self._run_claude()
+            exit_code, error_msg = self._run_claude()
 
-            # Determine final state based on exit code
+            # Notify server we're done with appropriate message
             if exit_code == 0:
-                final_state = "idle"
+                self._notify_state("idle", "Completed successfully")
+            elif exit_code == 127:
+                self._notify_state("error", error_msg or "Command not found")
+            elif exit_code == 130:
+                self._notify_state("idle", "Interrupted")
             else:
-                final_state = "error"
-
-            # Notify server we're done
-            self._notify_state(final_state)
+                self._notify_state("error", f"Exited with code {exit_code}")
 
             return exit_code
 
@@ -72,7 +73,7 @@ class OreRunner:
         """Handle shutdown signals gracefully."""
         logger.debug(f"Received signal {signum}")
         # Notify server we're going idle before exiting
-        self._notify_state("idle")
+        self._notify_state("idle", "Interrupted")
         self.stop_event.set()
         # Re-raise as KeyboardInterrupt so subprocess handling works correctly
         if signum == signal.SIGINT:
@@ -92,19 +93,19 @@ class OreRunner:
 
     def _notify_active(self) -> None:
         """Notify server that session is now running."""
-        self._notify_state("running")
+        self._notify_state("running", "Claude running")
 
-    def _notify_state(self, state: str) -> None:
-        """Notify server of state change."""
-        if set_session_state(self.socket_path, self.session_id, state):
+    def _notify_state(self, state: str, message: str) -> None:
+        """Notify server of state change with message."""
+        if set_session_state(self.socket_path, self.session_id, state, message):
             self.server_connected = True
-            logger.debug(f"Notified server: state={state}")
+            logger.debug(f"Notified server: state={state}, message={message}")
         else:
             self.server_connected = False
             logger.debug(f"Failed to notify server: state={state}")
 
-    def _run_claude(self) -> int:
-        """Run Claude with the session ID. Returns exit code."""
+    def _run_claude(self) -> tuple[int, str | None]:
+        """Run Claude with the session ID. Returns (exit_code, error_message)."""
         # Set environment
         env = os.environ.copy()
         env["HOPPER_SID"] = self.session_id
@@ -126,12 +127,12 @@ class OreRunner:
 
             # Wait for Claude to complete
             proc.wait()
-            return proc.returncode
+            return proc.returncode, None
         except FileNotFoundError:
             logger.error("claude command not found")
-            return 127
+            return 127, "claude command not found"
         except KeyboardInterrupt:
-            return 130  # Standard exit code for SIGINT
+            return 130, None  # Standard exit code for SIGINT
 
 
 def run_ore(session_id: str, socket_path: Path) -> int:

@@ -38,6 +38,7 @@ class Row:
     age: str  # formatted age string
     updated: str  # formatted updated string
     status: str  # STATUS_RUNNING, STATUS_IDLE, STATUS_ERROR, or STATUS_ACTION
+    message: str = ""  # Human-readable status message
     is_action: bool = False  # True for action rows like "new session"
 
 
@@ -56,6 +57,7 @@ def session_to_row(session: Session) -> Row:
         age=format_age(session.created_at),
         updated=format_age(session.effective_updated_at),
         status=status,
+        message=session.message,
     )
 
 
@@ -148,7 +150,7 @@ def format_row(term: Terminal, row: Row, width: int) -> str:
         width: Available width for the row content (excluding cursor prefix)
 
     Returns a string like:
-      "● abcd1234   now   now"
+      "● abcd1234   now   now  Claude running"
       "+ new session"
     """
     status_str = format_status(term, row.status)
@@ -156,13 +158,19 @@ def format_row(term: Terminal, row: Row, width: int) -> str:
     if row.is_action:
         return f"{status_str} {row.short_id}"
 
-    # Build columns: status, id, age, updated
-    # Format: "● abcd1234   now   now"
+    # Build columns: status, id, age, updated, message
+    # Format: "● abcd1234   now   now  message"
     id_part = row.short_id.ljust(COL_ID)
     age_part = row.age.rjust(COL_AGE) if row.age else "".rjust(COL_AGE)
     updated_part = row.updated.rjust(COL_AGE) if row.updated else "".rjust(COL_AGE)
 
-    return f"{status_str} {id_part}  {age_part}  {updated_part}"
+    # Calculate space for message (width minus fixed columns and spacing)
+    # Fixed: "● " (2) + id (8) + "  " (2) + age (3) + "  " (2) + upd (3) + "  " (2) = 22
+    fixed_width = 2 + COL_ID + 2 + COL_AGE + 2 + COL_AGE + 2
+    msg_width = max(0, width - fixed_width)
+    msg_part = row.message[:msg_width] if row.message else ""
+
+    return f"{status_str} {id_part}  {age_part}  {updated_part}  {msg_part}"
 
 
 def render_line(term: Terminal, width: int, char: str = BOX_H) -> str:
@@ -186,8 +194,8 @@ def render_table_header(term: Terminal, title: str, width: int) -> None:
     # Table title
     print(term.bold(title))
     # Column headers: aligned with data columns
-    # "  ● ID        AGE   UPD"
-    header = f"    {'ID'.ljust(COL_ID)}  {'AGE'.rjust(COL_AGE)}  {'UPD'.rjust(COL_AGE)}"
+    # "  ● ID        AGE   UPD  MESSAGE"
+    header = f"    {'ID'.ljust(COL_ID)}  {'AGE'.rjust(COL_AGE)}  {'UPD'.rjust(COL_AGE)}  MESSAGE"
     print(term.dim + header + term.normal)
 
 

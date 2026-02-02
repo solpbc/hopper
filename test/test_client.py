@@ -96,7 +96,7 @@ def test_session_exists_found(server, socket_path):
 
 def test_set_session_state_no_server(socket_path):
     """set_session_state returns False when server not running."""
-    result = set_session_state(socket_path, "any-session", "running", timeout=0.5)
+    result = set_session_state(socket_path, "any-session", "running", "Test message", timeout=0.5)
     # Fire-and-forget still returns True if send attempt was made
     # but the underlying send_message will fail silently
     assert result is True  # The try succeeds, send_message handles the error
@@ -110,7 +110,7 @@ def test_set_session_state_sends_message(server, socket_path):
     session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
     server.sessions = [session]
 
-    result = set_session_state(socket_path, "test-id", "running")
+    result = set_session_state(socket_path, "test-id", "running", "Claude running")
     assert result is True
 
     # Give server time to process
@@ -118,3 +118,4 @@ def test_set_session_state_sends_message(server, socket_path):
 
     # Session should be updated
     assert server.sessions[0].state == "running"
+    assert server.sessions[0].message == "Claude running"

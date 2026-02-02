@@ -63,6 +63,7 @@ class Session:
     created_at: int  # milliseconds since epoch
     updated_at: int = field(default=0)  # milliseconds since epoch, 0 means use created_at
     state: State = "idle"
+    message: str = ""  # Human-readable status message
     tmux_window: str | None = None  # tmux window ID (e.g., "@1")
 
     @property
@@ -86,6 +87,7 @@ class Session:
             "created_at": self.created_at,
             "updated_at": self.effective_updated_at,
             "state": self.state,
+            "message": self.message,
             "tmux_window": self.tmux_window,
         }
 
@@ -97,7 +99,8 @@ class Session:
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             state=data["state"],
-            tmux_window=data["tmux_window"],
+            message=data.get("message", ""),  # Backwards compat
+            tmux_window=data.get("tmux_window"),  # Backwards compat
         )
 
 
@@ -142,6 +145,7 @@ def create_session(sessions: list[Session]) -> Session:
         created_at=now,
         updated_at=now,
         state="new",
+        message="Ready to start",
     )
     sessions.append(session)
     get_session_dir(session.id).mkdir(parents=True, exist_ok=True)
@@ -180,11 +184,14 @@ def archive_session(sessions: list[Session], session_id: str) -> Session | None:
     return None
 
 
-def update_session_state(sessions: list[Session], session_id: str, state: State) -> Session | None:
-    """Update a session's state. Returns the updated session or None if not found."""
+def update_session_state(
+    sessions: list[Session], session_id: str, state: State, message: str
+) -> Session | None:
+    """Update a session's state and message. Returns the updated session or None if not found."""
     for session in sessions:
         if session.id == session_id:
             session.state = state
+            session.message = message
             session.touch()
             save_sessions(sessions)
             return session

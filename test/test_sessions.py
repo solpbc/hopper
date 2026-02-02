@@ -356,27 +356,29 @@ def test_update_session_stage_touches(temp_config):
 
 
 def test_update_session_state(temp_config):
-    """update_session_state changes state and touches timestamp."""
+    """update_session_state changes state and message, touches timestamp."""
     sessions_list = [
         Session(id="test-id", stage="ore", created_at=1000, updated_at=1000, state="idle")
     ]
     save_sessions(sessions_list)
 
-    updated = update_session_state(sessions_list, "test-id", "running")
+    updated = update_session_state(sessions_list, "test-id", "running", "Claude running")
 
     assert updated is not None
     assert updated.state == "running"
+    assert updated.message == "Claude running"
     assert updated.updated_at > 1000
 
     # Verify persistence
     loaded = load_sessions()
     assert loaded[0].state == "running"
+    assert loaded[0].message == "Claude running"
 
 
 def test_update_session_state_not_found(temp_config):
     """update_session_state returns None for unknown session."""
     sessions_list = []
 
-    result = update_session_state(sessions_list, "nonexistent", "running")
+    result = update_session_state(sessions_list, "nonexistent", "running", "Test")
 
     assert result is None

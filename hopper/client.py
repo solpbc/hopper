@@ -109,27 +109,31 @@ def get_session_state(socket_path: Path, session_id: str, timeout: float = 2.0) 
     return None
 
 
-def set_session_state(socket_path: Path, session_id: str, state: str, timeout: float = 2.0) -> bool:
-    """Set a session's state (fire-and-forget).
+def set_session_state(
+    socket_path: Path, session_id: str, state: str, message: str, timeout: float = 2.0
+) -> bool:
+    """Set a session's state and message (fire-and-forget).
 
     Args:
         socket_path: Path to the Unix socket
         session_id: The session ID to update
-        state: New state ("idle", "running", or "error")
+        state: New state ("new", "idle", "running", or "error")
+        message: Human-readable status message
         timeout: Connection timeout in seconds
 
     Returns:
         True if message was sent successfully, False otherwise
     """
-    message = {
+    msg = {
         "type": "session_set_state",
         "session_id": session_id,
         "state": state,
+        "message": message,
         "ts": int(time.time() * 1000),
     }
     # Fire-and-forget: don't wait for response
     try:
-        send_message(socket_path, message, timeout=timeout, wait_for_response=False)
+        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
         return True
     except Exception:
         return False
