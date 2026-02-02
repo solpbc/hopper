@@ -185,11 +185,12 @@ def test_ping_command_no_server(capsys):
 
 def test_ping_command_validates_hopper_sid(capsys):
     """Ping command validates HOPPER_SID if set."""
+    # connect returns session_found=False for invalid session
+    mock_response = {"type": "connected", "tmux": None, "session": None, "session_found": False}
     with patch.object(sys, "argv", ["hopper", "ping"]):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.connect", return_value=mock_response):
             with patch.dict(os.environ, {"HOPPER_SID": "bad-session"}):
-                with patch("hopper.client.session_exists", return_value=False):
-                    result = main()
+                result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "bad-session" in captured.out
@@ -198,8 +199,9 @@ def test_ping_command_validates_hopper_sid(capsys):
 
 def test_ping_command_success(capsys):
     """Ping command returns 0 when server running and no HOPPER_SID."""
+    mock_response = {"type": "connected", "tmux": None}
     with patch.object(sys, "argv", ["hopper", "ping"]):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.connect", return_value=mock_response):
             env = os.environ.copy()
             env.pop("HOPPER_SID", None)
             with patch.dict(os.environ, env, clear=True):

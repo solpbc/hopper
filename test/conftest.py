@@ -23,6 +23,7 @@ def isolate_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SESSIONS_FILE", tmp_path / "sessions.jsonl")
     monkeypatch.setattr(config, "ARCHIVED_FILE", tmp_path / "archived.jsonl")
     monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
 
     monkeypatch.setattr(sessions, "SESSIONS_FILE", tmp_path / "sessions.jsonl")
     monkeypatch.setattr(sessions, "ARCHIVED_FILE", tmp_path / "archived.jsonl")

@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 from hopper import prompt
-from hopper.client import get_session, get_session_state, ping, set_session_state
+from hopper.client import connect, set_session_state
 from hopper.projects import find_project
 
 logger = logging.getLogger(__name__)
@@ -61,23 +61,21 @@ class OreRunner:
 
         try:
             # Query server for session to get state and project info
-            session_data = get_session(self.socket_path, self.session_id)
-            if session_data:
-                state = session_data.get("state")
-                self.is_new_session = state == "new"
+            response = connect(self.socket_path, session_id=self.session_id)
+            if response:
                 self.server_connected = True
+                session_data = response.get("session")
+                if session_data:
+                    state = session_data.get("state")
+                    self.is_new_session = state == "new"
 
-                # Get project info for prompt context
-                project_name = session_data.get("project", "")
-                if project_name:
-                    self.project_name = project_name
-                    project = find_project(project_name)
-                    if project:
-                        self.project_dir = project.path
-            else:
-                state = get_session_state(self.socket_path, self.session_id)
-                self.is_new_session = state == "new"
-                self.server_connected = state is not None
+                    # Get project info for prompt context
+                    project_name = session_data.get("project", "")
+                    if project_name:
+                        self.project_name = project_name
+                        project = find_project(project_name)
+                        if project:
+                            self.project_dir = project.path
 
             # Start background thread for server connection management
             self.background_thread = threading.Thread(
@@ -128,7 +126,7 @@ class OreRunner:
         while not self.stop_event.wait(timeout=RECONNECT_INTERVAL):
             if not self.server_connected:
                 # Try to reconnect
-                if ping(self.socket_path, timeout=1.0):
+                if connect(self.socket_path, timeout=1.0) is not None:
                     logger.debug("Reconnected to server")
                     self.server_connected = True
                     # Re-notify our state

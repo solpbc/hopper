@@ -30,8 +30,9 @@ class Server:
     race conditions when multiple client handler threads send concurrently.
     """
 
-    def __init__(self, socket_path: Path):
+    def __init__(self, socket_path: Path, tmux_location: dict | None = None):
         self.socket_path = socket_path
+        self.tmux_location = tmux_location
         self.clients: list[socket.socket] = []
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -120,7 +121,20 @@ class Server:
         """Handle an incoming message, responding directly if needed."""
         msg_type = message.get("type")
 
-        if msg_type == "ping":
+        if msg_type == "connect":
+            # Unified connect/connected handshake
+            session_id = message.get("session_id")
+            response: dict = {
+                "type": "connected",
+                "tmux": self.tmux_location,
+            }
+            if session_id:
+                session = next((s for s in self.sessions if s.id == session_id), None)
+                response["session"] = session.to_dict() if session else None
+                response["session_found"] = session is not None
+            self._send_response(conn, response)
+
+        elif msg_type == "ping":
             self._send_response(conn, {"type": "pong"})
 
         elif msg_type == "session_list":
@@ -275,11 +289,11 @@ class Server:
         logger.info("Server stopped")
 
 
-def start_server_with_tui(socket_path: Path) -> int:
+def start_server_with_tui(socket_path: Path, tmux_location: dict | None = None) -> int:
     """Start the server in a background thread and run the TUI."""
     from hopper.tui import run_tui
 
-    server = Server(socket_path)
+    server = Server(socket_path, tmux_location=tmux_location)
     shutdown_initiated = threading.Event()
 
     def handle_shutdown_signal(signum, frame):

@@ -2,7 +2,12 @@
 
 from unittest.mock import patch
 
-from hopper.tmux import get_tmux_sessions, is_inside_tmux, is_tmux_server_running
+from hopper.tmux import (
+    get_current_tmux_location,
+    get_tmux_sessions,
+    is_inside_tmux,
+    is_tmux_server_running,
+)
 
 
 class TestIsInsideTmux:
@@ -47,3 +52,45 @@ class TestGetTmuxSessions:
     def test_returns_empty_list_when_tmux_not_installed(self):
         with patch("subprocess.run", side_effect=FileNotFoundError):
             assert get_tmux_sessions() == []
+
+
+class TestGetCurrentTmuxLocation:
+    def test_returns_location_when_inside_tmux(self):
+        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,12345,0"}):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stdout = "main\n@0\n"
+                result = get_current_tmux_location()
+                assert result == {"session": "main", "window": "@0"}
+                mock_run.assert_called_once_with(
+                    ["tmux", "display-message", "-p", "#{session_name}\n#{window_id}"],
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_returns_none_when_not_inside_tmux(self):
+        with patch.dict("os.environ", {}, clear=True):
+            result = get_current_tmux_location()
+            assert result is None
+
+    def test_returns_none_when_command_fails(self):
+        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,12345,0"}):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 1
+                mock_run.return_value.stdout = ""
+                result = get_current_tmux_location()
+                assert result is None
+
+    def test_returns_none_when_tmux_not_installed(self):
+        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,12345,0"}):
+            with patch("subprocess.run", side_effect=FileNotFoundError):
+                result = get_current_tmux_location()
+                assert result is None
+
+    def test_returns_none_when_output_malformed(self):
+        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,12345,0"}):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stdout = "only-one-line\n"
+                result = get_current_tmux_location()
+                assert result is None

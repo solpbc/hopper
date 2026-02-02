@@ -142,7 +142,7 @@ def get_hopper_sid() -> str | None:
 def cmd_up(args: list[str]) -> int:
     """Start the server and TUI."""
     from hopper.server import start_server_with_tui
-    from hopper.tmux import get_tmux_sessions, is_inside_tmux
+    from hopper.tmux import get_current_tmux_location, get_tmux_sessions, is_inside_tmux
 
     parser = make_parser("up", "Start the hopper server and TUI (must run inside tmux).")
     try:
@@ -181,7 +181,8 @@ def cmd_up(args: list[str]) -> int:
         return 1
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return start_server_with_tui(SOCKET_PATH)
+    tmux_location = get_current_tmux_location()
+    return start_server_with_tui(SOCKET_PATH, tmux_location=tmux_location)
 
 
 @command("ore", "Run Claude for a session")
@@ -396,7 +397,7 @@ def cmd_config(args: list[str]) -> int:
 @command("ping", "Check if server is running")
 def cmd_ping(args: list[str]) -> int:
     """Ping the server."""
-    from hopper.client import ping
+    from hopper.client import connect
 
     parser = make_parser("ping", "Check if the hopper server is running.")
     try:
@@ -408,18 +409,26 @@ def cmd_ping(args: list[str]) -> int:
         parser.print_usage()
         return 1
 
-    if not ping(SOCKET_PATH):
+    session_id = get_hopper_sid()
+    response = connect(SOCKET_PATH, session_id=session_id)
+    if not response:
         require_server()
         return 1
 
-    if err := validate_hopper_sid():
-        return err
+    # Check session validity if HOPPER_SID was set
+    if session_id and not response.get("session_found", False):
+        print(f"Session {session_id} not found or archived.")
+        print("Unset HOPPER_SID to continue: unset HOPPER_SID")
+        return 1
 
-    session_id = get_hopper_sid()
+    # Build output
+    parts = ["pong"]
+    tmux = response.get("tmux")
+    if tmux:
+        parts.append(f"tmux:{tmux['session']}:{tmux['window']}")
     if session_id:
-        print(f"pong (session: {session_id})")
-    else:
-        print("pong")
+        parts.append(f"session:{session_id}")
+    print(" ".join(parts))
     return 0
 
 

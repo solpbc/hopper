@@ -70,3 +70,30 @@ def select_window(window_id: str) -> bool:
         return result.returncode == 0
     except FileNotFoundError:
         return False
+
+
+def get_current_tmux_location() -> dict | None:
+    """Get the current tmux session name and window ID.
+
+    Returns:
+        Dict with 'session' and 'window' keys, or None if not in tmux or on error.
+    """
+    if not is_inside_tmux():
+        return None
+
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{session_name}\n#{window_id}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+
+        lines = result.stdout.strip().split("\n")
+        if len(lines) != 2:
+            return None
+
+        return {"session": lines[0], "window": lines[1]}
+    except FileNotFoundError:
+        return None

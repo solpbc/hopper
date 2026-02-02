@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hopper.client import ping, send_message, session_exists, set_session_state
+from hopper.client import connect, ping, send_message, session_exists, set_session_state
 from hopper.server import Server
 
 
@@ -34,6 +34,70 @@ def server(socket_path):
 
     srv.stop()
     thread.join(timeout=2)
+
+
+@pytest.fixture
+def server_with_tmux(socket_path):
+    """Start a server with tmux location set."""
+    tmux_location = {"session": "main", "window": "@0"}
+    srv = Server(socket_path, tmux_location=tmux_location)
+    thread = threading.Thread(target=srv.start, daemon=True)
+    thread.start()
+
+    for _ in range(50):
+        if socket_path.exists():
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError("Server did not start")
+
+    yield srv
+
+    srv.stop()
+    thread.join(timeout=2)
+
+
+def test_connect_success(server, socket_path):
+    """Connect returns response dict when server responds."""
+    result = connect(socket_path)
+    assert result is not None
+    assert result["type"] == "connected"
+    assert "tmux" in result
+
+
+def test_connect_failure_no_server(socket_path):
+    """Connect returns None when server not running."""
+    result = connect(socket_path, timeout=0.5)
+    assert result is None
+
+
+def test_connect_with_tmux_location(server_with_tmux, socket_path):
+    """Connect returns tmux location when server has it."""
+    result = connect(socket_path)
+    assert result is not None
+    assert result["tmux"] == {"session": "main", "window": "@0"}
+
+
+def test_connect_with_session_id_found(server, socket_path):
+    """Connect returns session data when session exists."""
+    from hopper.sessions import Session
+
+    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    server.sessions = [session]
+
+    result = connect(socket_path, session_id="test-id")
+    assert result is not None
+    assert result["session_found"] is True
+    assert result["session"]["id"] == "test-id"
+    assert result["session"]["state"] == "idle"
+
+
+def test_connect_with_session_id_not_found(server, socket_path):
+    """Connect returns session_found=False when session doesn't exist."""
+    result = connect(socket_path, session_id="nonexistent")
+    assert result is not None
+    assert result["session_found"] is False
+    assert result["session"] is None
 
 
 def test_ping_success(server, socket_path):
@@ -78,19 +142,12 @@ def test_session_exists_not_found(server, socket_path):
 
 def test_session_exists_found(server, socket_path):
     """session_exists returns True when session exists."""
-    # Create a session first
-    response = send_message(socket_path, {"type": "session_create"}, wait_for_response=False)
-    # Give server time to process
-    time.sleep(0.1)
+    from hopper.sessions import Session
 
-    # Get the session list to find the created session
-    response = send_message(socket_path, {"type": "session_list"}, wait_for_response=True)
-    assert response is not None
-    sessions = response.get("sessions", [])
-    assert len(sessions) > 0
+    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    server.sessions = [session]
 
-    session_id = sessions[0]["id"]
-    result = session_exists(socket_path, session_id)
+    result = session_exists(socket_path, "test-id")
     assert result is True
 
 

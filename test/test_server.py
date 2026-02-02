@@ -120,6 +120,117 @@ def test_server_sends_shutdown_to_clients(socket_path):
     thread.join(timeout=2)
 
 
+def test_server_handles_connect(socket_path, server):
+    """Server handles connect message and returns connected response."""
+    # Connect client
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    # Send connect message
+    msg = {"type": "connect"}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    # Should receive connected response
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "connected"
+    assert "tmux" in response
+    assert response["tmux"] is None  # No tmux location set
+
+    client.close()
+
+
+def test_server_handles_connect_with_tmux_location(socket_path, temp_config):
+    """Server includes tmux location in connect response."""
+    tmux_location = {"session": "main", "window": "@0"}
+    srv = Server(socket_path, tmux_location=tmux_location)
+    thread = threading.Thread(target=srv.start, daemon=True)
+    thread.start()
+
+    for _ in range(50):
+        if socket_path.exists():
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError("Server did not start")
+
+    try:
+        # Connect client
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(socket_path))
+        client.settimeout(2.0)
+
+        # Send connect message
+        msg = {"type": "connect"}
+        client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+        # Should receive connected response with tmux location
+        data = client.recv(4096).decode("utf-8")
+        response = json.loads(data.strip().split("\n")[0])
+
+        assert response["type"] == "connected"
+        assert response["tmux"] == {"session": "main", "window": "@0"}
+
+        client.close()
+    finally:
+        srv.stop()
+        thread.join(timeout=2)
+
+
+def test_server_handles_connect_with_session_id(socket_path, server, temp_config):
+    """Server returns session data when session_id is provided."""
+    from hopper.sessions import Session, save_sessions
+
+    # Create a test session
+    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    server.sessions = [session]
+    save_sessions(server.sessions)
+
+    # Connect client
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    # Send connect message with session_id
+    msg = {"type": "connect", "session_id": "test-id"}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    # Should receive connected response with session data
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "connected"
+    assert response["session_found"] is True
+    assert response["session"]["id"] == "test-id"
+    assert response["session"]["state"] == "idle"
+
+    client.close()
+
+
+def test_server_handles_connect_with_missing_session_id(socket_path, server):
+    """Server returns session_found=False for unknown session."""
+    # Connect client
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    # Send connect message with unknown session_id
+    msg = {"type": "connect", "session_id": "nonexistent"}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    # Should receive connected response with session not found
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "connected"
+    assert response["session_found"] is False
+    assert response["session"] is None
+
+    client.close()
+
+
 def test_server_handles_session_set_state(socket_path, server, temp_config):
     """Server handles session_set_state message."""
     from hopper.sessions import Session, save_sessions

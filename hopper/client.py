@@ -53,19 +53,44 @@ def send_message(
         return None
 
 
+def connect(socket_path: Path, session_id: str | None = None, timeout: float = 2.0) -> dict | None:
+    """Connect to the server and get status information.
+
+    This is the primary handshake for all client commands. It returns server
+    status including tmux location, and optionally validates/retrieves a session.
+
+    Args:
+        socket_path: Path to the Unix socket
+        session_id: Optional session ID to look up
+        timeout: Timeout in seconds
+
+    Returns:
+        Connected response dict with keys:
+        - tmux: {"session": str, "window": str} or None
+        - session: Session dict if session_id provided and found, else None
+        - session_found: bool if session_id was provided
+        Returns None if server is unreachable.
+    """
+    message: dict = {"type": "connect", "ts": int(time.time() * 1000)}
+    if session_id:
+        message["session_id"] = session_id
+    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
+    if response is None or response.get("type") != "connected":
+        return None
+    return response
+
+
 def ping(socket_path: Path, timeout: float = 2.0) -> bool:
-    """Send a ping to the server and wait for pong.
+    """Check if server is running.
 
     Args:
         socket_path: Path to the Unix socket
         timeout: Timeout in seconds
 
     Returns:
-        True if pong received, False otherwise
+        True if server responds, False otherwise
     """
-    message = {"type": "ping", "ts": int(time.time() * 1000)}
-    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
-    return response is not None and response.get("type") == "pong"
+    return connect(socket_path, timeout=timeout) is not None
 
 
 def session_exists(socket_path: Path, session_id: str, timeout: float = 2.0) -> bool:
@@ -79,12 +104,10 @@ def session_exists(socket_path: Path, session_id: str, timeout: float = 2.0) -> 
     Returns:
         True if session exists and is active, False otherwise
     """
-    message = {"type": "session_list", "ts": int(time.time() * 1000)}
-    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
-    if response is None or response.get("type") != "session_list":
+    response = connect(socket_path, session_id=session_id, timeout=timeout)
+    if response is None:
         return False
-    sessions = response.get("sessions", [])
-    return any(s.get("id") == session_id for s in sessions)
+    return response.get("session_found", False)
 
 
 def get_session_state(socket_path: Path, session_id: str, timeout: float = 2.0) -> str | None:
@@ -98,15 +121,13 @@ def get_session_state(socket_path: Path, session_id: str, timeout: float = 2.0) 
     Returns:
         The session state ("new", "idle", "running", "error") or None if not found
     """
-    message = {"type": "session_list", "ts": int(time.time() * 1000)}
-    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
-    if response is None or response.get("type") != "session_list":
+    response = connect(socket_path, session_id=session_id, timeout=timeout)
+    if response is None:
         return None
-    sessions = response.get("sessions", [])
-    for s in sessions:
-        if s.get("id") == session_id:
-            return s.get("state")
-    return None
+    session = response.get("session")
+    if session is None:
+        return None
+    return session.get("state")
 
 
 def get_session(socket_path: Path, session_id: str, timeout: float = 2.0) -> dict | None:
@@ -120,15 +141,10 @@ def get_session(socket_path: Path, session_id: str, timeout: float = 2.0) -> dic
     Returns:
         The full session dict or None if not found
     """
-    message = {"type": "session_list", "ts": int(time.time() * 1000)}
-    response = send_message(socket_path, message, timeout=timeout, wait_for_response=True)
-    if response is None or response.get("type") != "session_list":
+    response = connect(socket_path, session_id=session_id, timeout=timeout)
+    if response is None:
         return None
-    sessions = response.get("sessions", [])
-    for s in sessions:
-        if s.get("id") == session_id:
-            return s
-    return None
+    return response.get("session")
 
 
 def set_session_state(

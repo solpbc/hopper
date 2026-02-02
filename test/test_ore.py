@@ -63,10 +63,16 @@ class TestOreRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             exit_code = runner.run()
@@ -90,10 +96,16 @@ class TestOreRunner:
         mock_proc.returncode = 1
         mock_proc.stderr = io.BytesIO(b"")  # Empty stderr
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             exit_code = runner.run()
@@ -116,10 +128,16 @@ class TestOreRunner:
         mock_proc.returncode = 1
         mock_proc.stderr = io.BytesIO(b"Error: something went wrong\nDetails here\n")
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             exit_code = runner.run()
@@ -140,10 +158,16 @@ class TestOreRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", return_value=True),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             runner.run()
@@ -165,10 +189,16 @@ class TestOreRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "new"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="new"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", return_value=True),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             runner.run()
@@ -186,8 +216,15 @@ class TestOreRunner:
         """Runner raises FileNotFoundError if shovel prompt is missing for new session."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "new"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="new"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch(
                 "hopper.ore.prompt.load",
                 side_effect=FileNotFoundError("Prompt not found: shovel.md"),
@@ -208,10 +245,16 @@ class TestOreRunner:
             notifications.append((session_id, state, message))
             return True
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", side_effect=FileNotFoundError),
         ):
             exit_code = runner.run()
@@ -235,10 +278,10 @@ class TestOreRunner:
             # First call (running) fails, subsequent calls succeed
             return call_count[0] > 1
 
+        # Server initially unreachable (connect returns None)
         with (
-            patch("hopper.ore.get_session_state", return_value=None),
+            patch("hopper.ore.connect", return_value=None),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=False),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             runner.run()
@@ -261,10 +304,16 @@ class TestOreRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc),
             patch("hopper.ore.RECONNECT_INTERVAL", 0.01),  # Speed up test
         ):
@@ -292,10 +341,16 @@ class TestOreRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc),
             patch("hopper.ore.RECONNECT_INTERVAL", 0.01),
         ):
@@ -312,10 +367,16 @@ class TestRunOre:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "idle"},
+            "session_found": True,
+        }
+
         with (
-            patch("hopper.ore.get_session_state", return_value="idle"),
+            patch("hopper.ore.connect", return_value=mock_response),
             patch("hopper.ore.set_session_state", return_value=True),
-            patch("hopper.ore.ping", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             exit_code = run_ore("test-id", Path("/tmp/test.sock"))
