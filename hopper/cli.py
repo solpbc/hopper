@@ -24,9 +24,9 @@ def command(name: str, description: str):
 
 def print_help() -> None:
     """Print help text."""
-    print(f"hopper v{__version__} - TUI for managing coding agents")
+    print(f"hop v{__version__} - TUI for managing coding agents")
     print()
-    print("Usage: hopper <command> [options]")
+    print("Usage: hop <command> [options]")
     print()
     print("Commands:")
     for name, (_, desc) in COMMANDS.items():
@@ -42,7 +42,7 @@ def require_server() -> int | None:
     from hopper.client import ping
 
     if not ping(SOCKET_PATH):
-        print("Server not running. Start it with: hopper up")
+        print("Server not running. Start it with: hop up")
         return 1
     return None
 
@@ -87,11 +87,11 @@ def cmd_up(args: list[str]) -> int:
         return err
 
     if not is_inside_tmux():
-        print("hopper up must run inside tmux.")
+        print("hop up must run inside tmux.")
         print()
         sessions = get_tmux_sessions()
         if sessions:
-            print("You have active tmux sessions. Attach to one and run hopper:")
+            print("You have active tmux sessions. Attach to one and run hop:")
             print()
             for session in sessions:
                 print(f"    tmux attach -t {session}")
@@ -100,7 +100,7 @@ def cmd_up(args: list[str]) -> int:
         else:
             print("Start a new tmux session:")
         print()
-        print("    tmux new 'hopper up'")
+        print("    tmux new 'hop up'")
         return 1
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,7 +114,7 @@ def cmd_ore(args: list[str]) -> int:
     from hopper.ore import run_ore
 
     if not args:
-        print("Usage: hopper ore <session-id>")
+        print("Usage: hop ore <session-id>")
         return 1
 
     session_id = args[0]
@@ -162,7 +162,7 @@ def main() -> int:
 
     # Version flag
     if args[0] == "--version":
-        print(f"hopper {__version__}")
+        print(f"hop {__version__}")
         return 0
 
     cmd = args[0]

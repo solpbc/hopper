@@ -12,8 +12,8 @@ def spawn_claude(session_id: str) -> str | None:
     Returns:
         The tmux window ID on success, None on failure.
     """
-    # Use hopper ore to manage session lifecycle
-    command = f"hopper ore {session_id}"
+    # Use hop ore to manage session lifecycle
+    command = f"hop ore {session_id}"
     return new_window(command)
 
 

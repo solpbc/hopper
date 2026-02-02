@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-hopper = "hopper.cli:main"
+hop = "hopper.cli:main"
 
 [tool.ruff]
 line-length = 100

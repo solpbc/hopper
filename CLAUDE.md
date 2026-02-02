@@ -16,7 +16,7 @@ Hopper manages multiple Claude Code sessions through a terminal interface. It ru
 ## Architecture
 
 ```
-CLI (hopper up)
+CLI (hop up)
     │
     ├── Server (background thread)
     │   ├── Unix socket listener

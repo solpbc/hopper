@@ -128,8 +128,8 @@ def test_up_command_requires_tmux(capsys):
                     result = main()
     assert result == 1
     captured = capsys.readouterr()
-    assert "hopper up must run inside tmux" in captured.out
-    assert "tmux new 'hopper up'" in captured.out
+    assert "hop up must run inside tmux" in captured.out
+    assert "tmux new 'hop up'" in captured.out
 
 
 def test_up_command_shows_existing_sessions(capsys):
@@ -172,7 +172,7 @@ def test_require_server_failure(capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "Server not running" in captured.out
-    assert "hopper up" in captured.out
+    assert "hop up" in captured.out
 
 
 # Tests for require_no_server
