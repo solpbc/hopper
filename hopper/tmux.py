@@ -70,6 +70,27 @@ def new_window(
         return None
 
 
+def rename_window(target: str, name: str) -> bool:
+    """Rename the tmux window containing the given pane.
+
+    This disables automatic-rename for the window, so the name persists
+    even when subprocesses change their process title.
+
+    Args:
+        target: The tmux target (pane ID like "%1" or window ID like "@1").
+        name: The new window name.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "rename-window", "-t", target, name],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def select_window(target: str) -> bool:
     """Switch to the tmux window containing the given pane.
 

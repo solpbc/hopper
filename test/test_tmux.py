@@ -9,6 +9,7 @@ from hopper.tmux import (
     get_tmux_sessions,
     is_inside_tmux,
     is_tmux_server_running,
+    rename_window,
     send_keys,
 )
 
@@ -143,6 +144,30 @@ class TestCapturePane:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = capture_pane("@0")
             assert result is None
+
+
+class TestRenameWindow:
+    def test_renames_successfully(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            result = rename_window("%0", "hop:ore")
+            assert result is True
+            mock_run.assert_called_once_with(
+                ["tmux", "rename-window", "-t", "%0", "hop:ore"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_returns_false_when_command_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            result = rename_window("%99", "test")
+            assert result is False
+
+    def test_returns_false_when_tmux_not_installed(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = rename_window("%0", "test")
+            assert result is False
 
 
 class TestSendKeys:

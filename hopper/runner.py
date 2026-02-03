@@ -11,7 +11,7 @@ from pathlib import Path
 from hopper.client import HopperConnection, connect
 from hopper.projects import find_project
 from hopper.sessions import SHORT_ID_LEN, current_time_ms
-from hopper.tmux import capture_pane, get_current_pane_id, send_keys
+from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +272,7 @@ class BaseRunner:
             logger.debug("Not in tmux, skipping activity monitor")
             return
 
+        rename_window(self._pane_id, self.session_id[:SHORT_ID_LEN])
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop, name="activity-monitor", daemon=True
