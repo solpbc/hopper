@@ -6,7 +6,7 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 
-def run_codex(prompt: str, cwd: str, output_file: str) -> int:
+def run_codex(prompt: str, cwd: str, output_file: str) -> tuple[int, list[str]]:
     """Run Codex in one-shot mode with full permissions.
 
     Args:
@@ -15,7 +15,8 @@ def run_codex(prompt: str, cwd: str, output_file: str) -> int:
         output_file: Path to write the final agent message.
 
     Returns:
-        Exit code from Codex (127 if codex not found).
+        (exit_code, cmd) tuple. Exit code is 127 if codex not found,
+        130 on KeyboardInterrupt.
     """
     cmd = [
         "codex",
@@ -30,9 +31,9 @@ def run_codex(prompt: str, cwd: str, output_file: str) -> int:
 
     try:
         result = subprocess.run(cmd, cwd=cwd)
-        return result.returncode
+        return result.returncode, cmd
     except FileNotFoundError:
         logger.error("codex command not found")
-        return 127
+        return 127, cmd
     except KeyboardInterrupt:
-        return 130
+        return 130, cmd

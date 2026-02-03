@@ -1,13 +1,15 @@
 """Task runner - runs a prompt via Codex in one-shot mode."""
 
+import json
 import logging
+import os
 from pathlib import Path
 
 from hopper import prompt
 from hopper.client import connect, set_session_state
 from hopper.codex import run_codex
 from hopper.projects import find_project
-from hopper.sessions import get_session_dir
+from hopper.sessions import current_time_ms, get_session_dir
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +18,9 @@ def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
     """Run a task prompt via Codex for a processing-stage session.
 
     Validates the prompt exists, session is in processing stage, and cwd
-    matches the session worktree. Runs Codex one-shot, saves output to
-    the session directory, and prints it to stdout.
+    matches the session worktree. Runs Codex one-shot, saves artifacts
+    (<task>.in.md, <task>.out.md, <task>.json) to the session directory,
+    and prints the output to stdout.
 
     Args:
         session_id: The hopper session ID.
@@ -73,12 +76,32 @@ def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
         print(f"Task prompt not found: prompts/{task_name}.md")
         return 1
 
+    # Save input prompt
+    session_dir = get_session_dir(session_id)
+    input_path = session_dir / f"{task_name}.in.md"
+    _atomic_write(input_path, prompt_text)
+
     # Set state to task name while running
     set_session_state(socket_path, session_id, task_name, f"Running {task_name}")
 
     # Run codex
-    output_path = get_session_dir(session_id) / f"{task_name}.md"
-    exit_code = run_codex(prompt_text, str(cwd), str(output_path))
+    output_path = session_dir / f"{task_name}.out.md"
+    started_at = current_time_ms()
+    exit_code, cmd = run_codex(prompt_text, str(cwd), str(output_path))
+    finished_at = current_time_ms()
+
+    # Save run metadata
+    metadata = {
+        "task": task_name,
+        "session_id": session_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": finished_at - started_at,
+        "exit_code": exit_code,
+        "cmd": cmd,
+    }
+    meta_path = session_dir / f"{task_name}.json"
+    _atomic_write(meta_path, json.dumps(metadata, indent=2) + "\n")
 
     # Restore state to running/processing regardless of outcome
     set_session_state(socket_path, session_id, "running", "Processing")
@@ -90,3 +113,11 @@ def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
             print(content)
 
     return exit_code
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content to a file atomically via tmp + rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    os.replace(tmp, path)

@@ -7,17 +7,11 @@ from hopper.codex import run_codex
 
 class TestRunCodex:
     def test_correct_command(self):
-        """Builds correct codex exec command."""
+        """Builds correct codex exec command and returns it."""
         mock_result = MagicMock()
         mock_result.returncode = 0
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            exit_code = run_codex("do the thing", "/tmp/work", "/tmp/out.md")
-
-        assert exit_code == 0
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        assert cmd == [
+        expected_cmd = [
             "codex",
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -25,6 +19,14 @@ class TestRunCodex:
             "/tmp/out.md",
             "do the thing",
         ]
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            exit_code, cmd = run_codex("do the thing", "/tmp/work", "/tmp/out.md")
+
+        assert exit_code == 0
+        assert cmd == expected_cmd
+        mock_run.assert_called_once()
+        assert mock_run.call_args[0][0] == expected_cmd
         assert mock_run.call_args[1]["cwd"] == "/tmp/work"
 
     def test_passthrough_no_capture(self):
@@ -45,14 +47,20 @@ class TestRunCodex:
         mock_result.returncode = 42
 
         with patch("subprocess.run", return_value=mock_result):
-            assert run_codex("prompt", "/tmp", "/tmp/out.md") == 42
+            exit_code, cmd = run_codex("prompt", "/tmp", "/tmp/out.md")
+            assert exit_code == 42
+            assert cmd[0] == "codex"
 
     def test_codex_not_found(self):
-        """Returns 127 when codex command not found."""
+        """Returns 127 and cmd when codex command not found."""
         with patch("subprocess.run", side_effect=FileNotFoundError):
-            assert run_codex("prompt", "/tmp", "/tmp/out.md") == 127
+            exit_code, cmd = run_codex("prompt", "/tmp", "/tmp/out.md")
+            assert exit_code == 127
+            assert cmd[0] == "codex"
 
     def test_keyboard_interrupt(self):
-        """Returns 130 on KeyboardInterrupt."""
+        """Returns 130 and cmd on KeyboardInterrupt."""
         with patch("subprocess.run", side_effect=KeyboardInterrupt):
-            assert run_codex("prompt", "/tmp", "/tmp/out.md") == 130
+            exit_code, cmd = run_codex("prompt", "/tmp", "/tmp/out.md")
+            assert exit_code == 130
+            assert cmd[0] == "codex"
