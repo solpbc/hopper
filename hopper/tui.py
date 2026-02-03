@@ -152,7 +152,7 @@ class ProjectPickerScreen(ModalScreen[Project | None]):
     }
 
     #picker-container {
-        width: 50;
+        width: 70;
         height: auto;
         max-height: 80%;
         background: $surface;
@@ -487,7 +487,8 @@ class HopperApp(App):
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("escape", "quit", "Quit", show=False),
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
+        Binding("ctrl+d", "quit", "Quit", show=False, priority=True),
         Binding("tab", "switch_table", "Switch", priority=True),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
