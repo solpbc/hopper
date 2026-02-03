@@ -110,6 +110,28 @@ def get_current_tmux_location() -> dict | None:
         return None
 
 
+def get_current_window_id() -> str | None:
+    """Get the current tmux window ID.
+
+    Returns:
+        The window ID (e.g., "@1"), or None if not in tmux or on error.
+    """
+    if not is_inside_tmux():
+        return None
+
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{window_id}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except FileNotFoundError:
+        return None
+
+
 def capture_pane(window_id: str) -> str | None:
     """Capture the contents of a tmux pane with ANSI escape sequences.
 

@@ -5,15 +5,19 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from hopper import prompt
 from hopper.client import HopperConnection, connect
 from hopper.projects import find_project
+from hopper.sessions import current_time_ms
+from hopper.tmux import capture_pane, get_current_window_id
 
 logger = logging.getLogger(__name__)
 
 ERROR_LINES = 5  # Number of stderr lines to capture on error
+MONITOR_INTERVAL = 5.0  # Seconds between activity checks
 
 
 def _extract_error_message(stderr_bytes: bytes) -> str | None:
@@ -49,6 +53,12 @@ class OreRunner:
         self.project_name: str = ""  # Project name for prompt context
         self.project_dir: str = ""  # Project directory for prompt context
         self.scope: str = ""  # User's task scope description
+        # Activity monitor state
+        self._monitor_thread: threading.Thread | None = None
+        self._monitor_stop = threading.Event()
+        self._last_snapshot: str | None = None
+        self._stuck_since: int | None = None
+        self._window_id: str | None = None
 
     def run(self) -> int:
         """Run Claude for this session. Returns exit code."""
@@ -95,6 +105,9 @@ class OreRunner:
             return exit_code
 
         finally:
+            # Stop activity monitor first
+            self._stop_monitor()
+
             # Restore original signal handlers
             signal.signal(signal.SIGINT, original_sigint)
             signal.signal(signal.SIGTERM, original_sigterm)
@@ -122,6 +135,59 @@ class OreRunner:
                 status=status,
             )
             logger.debug(f"Emitted state: {state}, status: {status}")
+
+    def _start_monitor(self) -> None:
+        """Start the activity monitor thread."""
+        self._window_id = get_current_window_id()
+        if not self._window_id:
+            logger.debug("Not in tmux, skipping activity monitor")
+            return
+
+        self._monitor_stop.clear()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, name="activity-monitor", daemon=True
+        )
+        self._monitor_thread.start()
+        logger.debug(f"Started activity monitor for window {self._window_id}")
+
+    def _stop_monitor(self) -> None:
+        """Stop the activity monitor thread."""
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_stop.set()
+            self._monitor_thread.join(timeout=1.0)
+            logger.debug("Stopped activity monitor")
+
+    def _monitor_loop(self) -> None:
+        """Monitor loop that checks for activity every MONITOR_INTERVAL seconds."""
+        while not self._monitor_stop.wait(MONITOR_INTERVAL):
+            self._check_activity()
+
+    def _check_activity(self) -> None:
+        """Check tmux pane for activity and update state accordingly."""
+        if not self._window_id:
+            return
+
+        snapshot = capture_pane(self._window_id)
+        if snapshot is None:
+            # Window gone or capture failed - stop monitoring
+            logger.debug("Failed to capture pane, stopping monitor")
+            self._monitor_stop.set()
+            return
+
+        if snapshot == self._last_snapshot:
+            # No change - mark as stuck
+            now = current_time_ms()
+            if self._stuck_since is None:
+                self._stuck_since = now
+            duration_sec = (now - self._stuck_since) // 1000
+            self._emit_state("stuck", f"No output for {duration_sec}s")
+        else:
+            # Activity detected
+            if self._stuck_since is not None:
+                # Was stuck, now active again
+                self._emit_state("running", "Claude running")
+            self._stuck_since = None
+            self._last_snapshot = snapshot
 
     def _run_claude(self) -> tuple[int, str | None]:
         """Run Claude with the session ID. Returns (exit_code, error_message)."""
@@ -159,6 +225,9 @@ class OreRunner:
 
             # Notify server we're running (after successful process start)
             self._emit_state("running", "Claude running")
+
+            # Start activity monitor
+            self._start_monitor()
 
             # Wait for Claude to complete
             proc.wait()
