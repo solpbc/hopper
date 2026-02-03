@@ -438,7 +438,13 @@ class LegendScreen(ModalScreen):
 
 
 class SessionTable(DataTable):
-    """Table displaying all sessions."""
+    """Table displaying all sessions.
+
+    IMPORTANT: Never use table.clear() to refresh data -- it resets cursor
+    position. Use update_cell() for existing rows, add_row()/remove_row()
+    only when rows actually change. Define column keys explicitly with
+    add_column("Label", key="col_key") to enable update_cell().
+    """
 
     # Column keys for update_cell operations
     COL_STATUS = "status"
