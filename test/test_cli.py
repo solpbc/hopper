@@ -9,6 +9,7 @@ from hopper.cli import (
     cmd_config,
     cmd_ore,
     cmd_ping,
+    cmd_screenshot,
     cmd_status,
     cmd_up,
     get_hopper_sid,
@@ -672,3 +673,59 @@ def test_project_remove_not_found(tmp_path, monkeypatch, capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "not found" in captured.out
+
+
+# Tests for screenshot command
+
+
+def test_screenshot_help(capsys):
+    """screenshot --help shows help and returns 0."""
+    result = cmd_screenshot(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop screenshot" in captured.out
+
+
+def test_screenshot_no_server(capsys):
+    """screenshot returns 1 when server not running."""
+    with patch("hopper.client.ping", return_value=False):
+        result = cmd_screenshot([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Server not running" in captured.out
+
+
+def test_screenshot_no_tmux_location(capsys):
+    """screenshot returns 1 when server has no tmux location."""
+    mock_response = {"type": "connected", "tmux": None}
+    with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.connect", return_value=mock_response):
+            result = cmd_screenshot([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "not started inside tmux" in captured.out
+
+
+def test_screenshot_capture_fails(capsys):
+    """screenshot returns 1 when capture_pane fails."""
+    mock_response = {"type": "connected", "tmux": {"session": "main", "window": "@0"}}
+    with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.connect", return_value=mock_response):
+            with patch("hopper.tmux.capture_pane", return_value=None):
+                result = cmd_screenshot([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Failed to capture" in captured.out
+
+
+def test_screenshot_success(capsys):
+    """screenshot prints captured content on success."""
+    mock_response = {"type": "connected", "tmux": {"session": "main", "window": "@0"}}
+    ansi_content = "\x1b[32mGreen text\x1b[0m\nMore lines\n"
+    with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.connect", return_value=mock_response):
+            with patch("hopper.tmux.capture_pane", return_value=ansi_content):
+                result = cmd_screenshot([])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.out == ansi_content

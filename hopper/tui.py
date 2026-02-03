@@ -14,6 +14,7 @@ from hopper.sessions import (
     archive_session,
     create_session,
     format_age,
+    format_uptime,
     save_sessions,
 )
 
@@ -149,6 +150,9 @@ class HopperApp(App):
         self._projects: list[Project] = []
         self._selected_project_index: int = 0
         self._active_table: str = "ore"  # "ore" or "processing"
+        self._git_hash: str = server.git_hash if server and server.git_hash else ""
+        self._started_at: int | None = server.started_at if server else None
+        self._update_sub_title()
 
     @property
     def selected_project(self) -> Project | None:
@@ -183,7 +187,17 @@ class HopperApp(App):
 
     def check_server_updates(self) -> None:
         """Poll server's session list and refresh if needed."""
+        self._update_sub_title()
         self.refresh_tables()
+
+    def _update_sub_title(self) -> None:
+        """Update sub_title with git hash and uptime."""
+        parts = []
+        if self._git_hash:
+            parts.append(self._git_hash)
+        if self._started_at:
+            parts.append(format_uptime(self._started_at))
+        self.sub_title = " · ".join(parts)
 
     def refresh_tables(self) -> None:
         """Refresh both tables from session data."""

@@ -11,6 +11,7 @@ from hopper.sessions import (
     current_time_ms,
     find_by_short_id,
     format_age,
+    format_uptime,
     get_session_dir,
     load_sessions,
     save_sessions,
@@ -303,6 +304,39 @@ def test_format_age_future():
     """Future timestamps return 'now'."""
     now = current_time_ms()
     assert format_age(now + 60_000) == "now"  # 1 minute in future
+
+
+# Tests for format_uptime
+
+
+def test_format_uptime_zero():
+    """Very recent start returns '0m'."""
+    now = current_time_ms()
+    assert format_uptime(now) == "0m"
+    assert format_uptime(now - 30_000) == "0m"  # 30 seconds
+
+
+def test_format_uptime_minutes():
+    """Minutes-old uptime shows minutes."""
+    now = current_time_ms()
+    assert format_uptime(now - 5 * 60_000) == "5m"
+    assert format_uptime(now - 45 * 60_000) == "45m"
+
+
+def test_format_uptime_hours():
+    """Hours-old uptime shows hours and minutes."""
+    now = current_time_ms()
+    assert format_uptime(now - 2 * 60 * 60_000) == "2h"
+    assert format_uptime(now - (2 * 60 + 15) * 60_000) == "2h 15m"
+
+
+def test_format_uptime_days():
+    """Days-old uptime shows days and hours, not minutes."""
+    now = current_time_ms()
+    assert format_uptime(now - 3 * 24 * 60 * 60_000) == "3d"
+    assert format_uptime(now - (3 * 24 + 4) * 60 * 60_000) == "3d 4h"
+    # Minutes not shown when days > 0
+    assert format_uptime(now - (1 * 24 * 60 + 30) * 60_000) == "1d"
 
 
 # Tests for updated_at

@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from hopper.tmux import (
+    capture_pane,
     get_current_tmux_location,
     get_tmux_sessions,
     is_inside_tmux,
@@ -94,3 +95,29 @@ class TestGetCurrentTmuxLocation:
                 mock_run.return_value.stdout = "only-one-line\n"
                 result = get_current_tmux_location()
                 assert result is None
+
+
+class TestCapturePane:
+    def test_returns_content_on_success(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "\x1b[32mGreen text\x1b[0m\n"
+            result = capture_pane("@0")
+            assert result == "\x1b[32mGreen text\x1b[0m\n"
+            mock_run.assert_called_once_with(
+                ["tmux", "capture-pane", "-e", "-p", "-t", "@0"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_returns_none_when_command_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stdout = ""
+            result = capture_pane("@99")
+            assert result is None
+
+    def test_returns_none_when_tmux_not_installed(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = capture_pane("@0")
+            assert result is None

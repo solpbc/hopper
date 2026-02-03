@@ -4,10 +4,44 @@ import json
 import socket
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
-from hopper.server import Server
+from hopper.server import Server, get_git_hash
+
+
+class TestGetGitHash:
+    def test_returns_short_hash(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "abc1234\n"
+            result = get_git_hash()
+            assert result == "abc1234"
+            mock_run.assert_called_once_with(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_returns_none_when_git_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 128
+            mock_run.return_value.stdout = ""
+            result = get_git_hash()
+            assert result is None
+
+    def test_returns_none_when_git_not_installed(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = get_git_hash()
+            assert result is None
+
+
+def test_server_stores_git_hash():
+    """Server captures git hash at initialization."""
+    with patch("hopper.server.get_git_hash", return_value="abc1234"):
+        srv = Server(socket_path="/tmp/unused.sock")
+        assert srv.git_hash == "abc1234"
 
 
 @pytest.fixture

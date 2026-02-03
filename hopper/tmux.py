@@ -97,3 +97,25 @@ def get_current_tmux_location() -> dict | None:
         return {"session": lines[0], "window": lines[1]}
     except FileNotFoundError:
         return None
+
+
+def capture_pane(window_id: str) -> str | None:
+    """Capture the contents of a tmux pane with ANSI escape sequences.
+
+    Args:
+        window_id: The tmux window ID to capture (e.g., "@1").
+
+    Returns:
+        The pane contents with ANSI styling, or None on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-e", "-p", "-t", window_id],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except FileNotFoundError:
+        return None

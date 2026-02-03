@@ -126,8 +126,15 @@ def test_row_dataclass():
 class MockServer:
     """Mock server for testing."""
 
-    def __init__(self, sessions: list[Session] | None = None):
+    def __init__(
+        self,
+        sessions: list[Session] | None = None,
+        git_hash: str | None = None,
+        started_at: int | None = None,
+    ):
         self.sessions = sessions if sessions is not None else []
+        self.git_hash = git_hash
+        self.started_at = started_at
 
 
 @pytest.mark.asyncio
@@ -153,6 +160,39 @@ async def test_app_with_empty_sessions():
         ore_table = app.query_one("#ore-table")
         # Should have exactly one row (the "new" action row)
         assert ore_table.row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_app_shows_git_hash_and_uptime_in_subtitle():
+    """App should show git hash and uptime in sub_title."""
+    from hopper.sessions import current_time_ms
+
+    started_at = current_time_ms() - 2 * 60 * 60_000  # 2 hours ago
+    server = MockServer([], git_hash="abc1234", started_at=started_at)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        assert app.sub_title == "abc1234 · 2h"
+
+
+@pytest.mark.asyncio
+async def test_app_shows_uptime_only_when_no_git_hash():
+    """App should show just uptime when no git hash."""
+    from hopper.sessions import current_time_ms
+
+    started_at = current_time_ms() - 15 * 60_000  # 15 minutes ago
+    server = MockServer([], git_hash=None, started_at=started_at)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        assert app.sub_title == "15m"
+
+
+@pytest.mark.asyncio
+async def test_app_handles_no_git_hash_or_uptime():
+    """App should handle missing git hash and uptime gracefully."""
+    server = MockServer([], git_hash=None, started_at=None)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        assert app.sub_title == ""
 
 
 @pytest.mark.asyncio

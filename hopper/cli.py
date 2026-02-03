@@ -394,6 +394,44 @@ def cmd_config(args: list[str]) -> int:
     return 0
 
 
+@command("screenshot", "Capture TUI window as ANSI text")
+def cmd_screenshot(args: list[str]) -> int:
+    """Capture the TUI window content with ANSI styling."""
+    from hopper.client import connect
+    from hopper.tmux import capture_pane
+
+    parser = make_parser("screenshot", "Capture the TUI window as ANSI text.")
+    try:
+        parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+
+    response = connect(SOCKET_PATH)
+    if not response:
+        print("Failed to connect to server.")
+        return 1
+
+    tmux = response.get("tmux")
+    if not tmux:
+        print("Server was not started inside tmux.")
+        return 1
+
+    content = capture_pane(tmux["window"])
+    if content is None:
+        print(f"Failed to capture tmux window {tmux['window']}.")
+        return 1
+
+    print(content, end="")
+    return 0
+
+
 @command("ping", "Check if server is running")
 def cmd_ping(args: list[str]) -> int:
     """Ping the server."""

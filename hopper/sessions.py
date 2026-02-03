@@ -80,6 +80,39 @@ def format_age(timestamp_ms: int) -> str:
     return f"{weeks}w"
 
 
+def format_uptime(started_at_ms: int) -> str:
+    """Format uptime as a friendly duration string.
+
+    Args:
+        started_at_ms: Start timestamp in milliseconds since epoch
+
+    Returns:
+        Friendly string like "5m", "2h 15m", "3d 4h"
+    """
+    now = current_time_ms()
+    diff_ms = now - started_at_ms
+
+    if diff_ms < 60_000:  # < 1 minute
+        return "0m"
+
+    minutes = diff_ms // 60_000
+    hours = minutes // 60
+    days = hours // 24
+
+    minutes = minutes % 60
+    hours = hours % 24
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 and days == 0:  # Only show minutes if less than a day
+        parts.append(f"{minutes}m")
+
+    return " ".join(parts) if parts else "0m"
+
+
 @dataclass
 class Session:
     """A hopper session."""

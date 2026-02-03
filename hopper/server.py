@@ -6,6 +6,7 @@ import logging
 import queue
 import signal
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from hopper.sessions import (
     Session,
     archive_session,
     create_session,
+    current_time_ms,
     load_sessions,
     update_session_message,
     update_session_stage,
@@ -21,6 +23,21 @@ from hopper.sessions import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def get_git_hash() -> str | None:
+    """Get the short git hash of the current HEAD."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return None
 
 
 class Server:
@@ -33,6 +50,8 @@ class Server:
     def __init__(self, socket_path: Path, tmux_location: dict | None = None):
         self.socket_path = socket_path
         self.tmux_location = tmux_location
+        self.git_hash = get_git_hash()
+        self.started_at = current_time_ms()
         self.clients: list[socket.socket] = []
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
