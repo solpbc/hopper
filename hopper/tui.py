@@ -1,6 +1,7 @@
 """TUI for managing coding agents using Textual."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -187,13 +188,26 @@ class ProjectPickerScreen(ModalScreen[Project | None]):
 class SessionTable(DataTable):
     """Table displaying all sessions."""
 
+    # Column keys for update_cell operations
+    COL_STATUS = "status"
+    COL_STAGE = "stage"
+    COL_ID = "id"
+    COL_PROJECT = "project"
+    COL_AGE = "age"
+    COL_MESSAGE = "message"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cursor_type = "row"
 
     def on_mount(self) -> None:
-        """Set up columns when mounted."""
-        self.add_columns("", "S", "ID", "PROJECT", "AGE", "MESSAGE")
+        """Set up columns when mounted with explicit keys."""
+        self.add_column("", key=self.COL_STATUS)
+        self.add_column("S", key=self.COL_STAGE)
+        self.add_column("ID", key=self.COL_ID)
+        self.add_column("PROJECT", key=self.COL_PROJECT)
+        self.add_column("AGE", key=self.COL_AGE)
+        self.add_column("MESSAGE", key=self.COL_MESSAGE)
 
 
 class HopperApp(App):
@@ -246,7 +260,7 @@ class HopperApp(App):
         Binding("down", "cursor_down", show=False),
         Binding("up", "cursor_up", show=False),
         Binding("enter", "select_row", "Select"),
-        Binding("n", "new_session", "New"),
+        Binding("c", "new_session", "Create"),
         Binding("a", "archive", "Archive"),
     ]
 
@@ -263,7 +277,7 @@ class HopperApp(App):
         """Create the UI layout."""
         yield Header()
         yield SessionTable(id="session-table")
-        yield Static("No sessions yet. Press 'n' to create one.", id="empty-message")
+        yield Static("No sessions yet. Press 'c' to create one.", id="empty-message")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -294,7 +308,11 @@ class HopperApp(App):
         self.sub_title = " · ".join(parts)
 
     def refresh_table(self) -> None:
-        """Refresh the unified table from session data."""
+        """Refresh the table using incremental updates to preserve cursor position.
+
+        Uses Textual's update_cell() for existing rows instead of clear()+add_row()
+        which would reset cursor position on every refresh.
+        """
         table = self.query_one("#session-table", SessionTable)
         empty_msg = self.query_one("#empty-message", Static)
 
@@ -308,12 +326,32 @@ class HopperApp(App):
         for session in processing_sessions:
             rows.append(session_to_row(session))
 
-        # Update table
-        table.clear()
-        if rows:
-            empty_msg.display = False
-            table.display = True
-            for row in rows:
+        # Get current row keys in table
+        existing_keys: set[str] = set()
+        for row_key in table.rows:
+            existing_keys.add(str(row_key.value))
+
+        # Get desired row keys
+        desired_keys = {row.id for row in rows}
+
+        # Remove rows that no longer exist
+        for key in existing_keys - desired_keys:
+            table.remove_row(key)
+
+        # Add or update rows
+        for row in rows:
+            if row.id in existing_keys:
+                # Update existing row cells
+                table.update_cell(row.id, SessionTable.COL_STATUS, format_status_text(row.status))
+                table.update_cell(row.id, SessionTable.COL_STAGE, format_stage_text(row.stage))
+                table.update_cell(row.id, SessionTable.COL_ID, row.short_id)
+                table.update_cell(row.id, SessionTable.COL_PROJECT, row.project)
+                table.update_cell(row.id, SessionTable.COL_AGE, row.age)
+                table.update_cell(
+                    row.id, SessionTable.COL_MESSAGE, self._truncate_message(row.message)
+                )
+            else:
+                # Add new row
                 table.add_row(
                     format_status_text(row.status),
                     format_stage_text(row.stage),
@@ -323,6 +361,11 @@ class HopperApp(App):
                     self._truncate_message(row.message),
                     key=row.id,
                 )
+
+        # Toggle empty message visibility
+        if rows:
+            empty_msg.display = False
+            table.display = True
         else:
             empty_msg.display = True
             table.display = False
@@ -381,24 +424,33 @@ class HopperApp(App):
         """Handle Enter key on selected row."""
         session_id = self._get_selected_session_id()
         if not session_id:
+            self.notify("No session selected", severity="warning")
             return
 
         session = self._get_session(session_id)
         if not session:
+            self.notify(f"Session {session_id[:8]} not found", severity="error")
             return
 
         project = find_project(session.project) if session.project else None
         project_path = project.path if project else None
 
+        # Check if project directory still exists
+        if project_path and not Path(project_path).is_dir():
+            self.notify(f"Project dir missing: {project_path}", severity="error")
+            return
+
         if session.tmux_window and switch_to_window(session.tmux_window):
-            # Successfully switched
+            # Successfully switched to existing window
             pass
         else:
-            # Respawn
+            # Respawn in new window
             window_id = spawn_claude(session.id, project_path)
             if window_id:
                 session.tmux_window = window_id
                 save_sessions(self._sessions)
+            else:
+                self.notify("Failed to spawn tmux window", severity="error")
 
         self.refresh_table()
 
