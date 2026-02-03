@@ -1,5 +1,11 @@
 # Coding Agent Operating Manual
 
+This is your shovel-ready prompt:
+
+$shovel
+
+---
+
 This document defines the behavioral and operational spec for coding agents executing the:
 
 **/prep → /design → /implement → /audit → /commit** workflow.
@@ -305,10 +311,22 @@ Avoid:
 - Update all callers
 - Use consistent naming
 
-### Don’t
+### Don't
 - Build frameworks unnecessarily
-- Add “just in case” flags
+- Add "just in case" flags
 - Keep legacy fallbacks
 - Trust fixtures blindly
 - Duplicate truth sources
 - Leave dead code
+
+---
+
+## 7) Completion
+
+When you have finished the full /prep → /design → /implement → /audit → /commit workflow, signal completion by running:
+
+```
+hop refined
+```
+
+This tells the session manager that your work is done.
