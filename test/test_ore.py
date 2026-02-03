@@ -49,15 +49,14 @@ class TestExtractErrorMessage:
 
 
 class TestOreRunner:
-    def test_run_notifies_active_then_inactive(self):
-        """Runner notifies server of state changes with messages."""
+    def test_run_emits_state_changes(self):
+        """Runner emits state changes via HopperConnection."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
-        notifications = []
+        emitted = []
 
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            notifications.append((session_id, state, message))
-            return True
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
@@ -72,25 +71,29 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             exit_code = runner.run()
 
         assert exit_code == 0
-        # Should notify running, then idle (exit code 0)
-        assert ("test-session", "running", "Claude running") in notifications
-        assert ("test-session", "idle", "Completed successfully") in notifications
+        # Should emit running, then idle (exit code 0)
+        assert any(e[0] == "session_set_state" and e[1]["state"] == "running" for e in emitted)
+        assert any(
+            e[0] == "session_set_state"
+            and e[1]["state"] == "idle"
+            and e[1]["message"] == "Completed successfully"
+            for e in emitted
+        )
 
-    def test_run_sets_error_state_on_nonzero_exit(self):
-        """Runner sets error state when Claude exits with non-zero, no stderr."""
+    def test_run_emits_error_state_on_nonzero_exit(self):
+        """Runner emits error state when Claude exits with non-zero."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
-        notifications = []
+        emitted = []
 
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            notifications.append((session_id, state, message))
-            return True
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
 
         mock_proc = MagicMock()
         mock_proc.returncode = 1
@@ -105,24 +108,27 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             exit_code = runner.run()
 
         assert exit_code == 1
-        assert ("test-session", "running", "Claude running") in notifications
-        assert ("test-session", "error", "Exited with code 1") in notifications
+        assert any(
+            e[0] == "session_set_state"
+            and e[1]["state"] == "error"
+            and e[1]["message"] == "Exited with code 1"
+            for e in emitted
+        )
 
     def test_run_captures_stderr_on_error(self):
         """Runner captures stderr and uses last 5 lines as error message."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
-        notifications = []
+        emitted = []
 
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            notifications.append((session_id, state, message))
-            return True
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
 
         mock_proc = MagicMock()
         mock_proc.returncode = 1
@@ -137,22 +143,26 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc),
         ):
             exit_code = runner.run()
 
         assert exit_code == 1
-        # Should use stderr content, not generic message
-        error_notification = [n for n in notifications if n[1] == "error"][0]
-        assert "something went wrong" in error_notification[2]
-        assert "Details here" in error_notification[2]
-        # Newlines preserved in stored message
-        assert "\n" in error_notification[2]
+        # Find error emission
+        error_emissions = [
+            e for e in emitted if e[0] == "session_set_state" and e[1]["state"] == "error"
+        ]
+        assert len(error_emissions) == 1
+        assert "something went wrong" in error_emissions[0][1]["message"]
+        assert "Details here" in error_emissions[0][1]["message"]
 
     def test_run_claude_with_resume_for_existing_session(self):
         """Runner invokes claude with --resume for existing (non-new) sessions."""
         runner = OreRunner("my-session-id", Path("/tmp/test.sock"))
+
+        mock_conn = MagicMock()
+        mock_conn.emit = MagicMock(return_value=True)
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
@@ -167,7 +177,7 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", return_value=True),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             runner.run()
@@ -185,6 +195,9 @@ class TestOreRunner:
         """Runner invokes claude with --session-id and prompt for new sessions."""
         runner = OreRunner("my-session-id", Path("/tmp/test.sock"))
 
+        mock_conn = MagicMock()
+        mock_conn.emit = MagicMock(return_value=True)
+
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stderr = None
@@ -198,7 +211,7 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", return_value=True),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             runner.run()
@@ -216,6 +229,9 @@ class TestOreRunner:
         """Runner raises FileNotFoundError if shovel prompt is missing for new session."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
+        mock_conn = MagicMock()
+        mock_conn.emit = MagicMock(return_value=True)
+
         mock_response = {
             "type": "connected",
             "tmux": None,
@@ -225,6 +241,7 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch(
                 "hopper.ore.prompt.load",
                 side_effect=FileNotFoundError("Prompt not found: shovel.md"),
@@ -239,11 +256,10 @@ class TestOreRunner:
         """Runner returns 127 if claude command not found."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
-        notifications = []
+        emitted = []
 
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            notifications.append((session_id, state, message))
-            return True
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
 
         mock_response = {
             "type": "connected",
@@ -254,51 +270,25 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", side_effect=FileNotFoundError),
         ):
             exit_code = runner.run()
 
         assert exit_code == 127
-        assert ("test-session", "error", "claude command not found") in notifications
+        assert any(
+            e[0] == "session_set_state"
+            and e[1]["state"] == "error"
+            and e[1]["message"] == "claude command not found"
+            for e in emitted
+        )
 
-    def test_server_disconnect_tracked(self):
-        """Runner tracks server connection state."""
+    def test_connection_stopped_on_exit(self):
+        """Runner stops HopperConnection on exit."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
 
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = None
-
-        # Simulate: first call fails (during _run_claude), second succeeds (blocking retry)
-        call_count = [0]
-
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            call_count[0] += 1
-            # First call (running) fails, subsequent calls succeed
-            return call_count[0] > 1
-
-        # Server initially unreachable (connect returns None)
-        with (
-            patch("hopper.ore.connect", return_value=None),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("subprocess.Popen", return_value=mock_proc),
-        ):
-            runner.run()
-
-        # Should have reconnected via blocking retry
-        assert runner.server_connected is True
-
-    def test_blocking_notify_retries_until_success(self):
-        """_notify_state_blocking retries until server responds."""
-        runner = OreRunner("test-session", Path("/tmp/test.sock"))
-
-        call_count = [0]
-
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            call_count[0] += 1
-            # Fail first 2 attempts, succeed on third
-            return call_count[0] >= 3
+        mock_conn = MagicMock()
+        mock_conn.emit = MagicMock(return_value=True)
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
@@ -313,56 +303,22 @@ class TestOreRunner:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc),
-            patch("hopper.ore.RECONNECT_INTERVAL", 0.01),  # Speed up test
-        ):
-            exit_code = runner.run()
-
-        assert exit_code == 0
-        # running (call 1 fails), idle (call 2 fails), idle retry (call 3 succeeds)
-        assert call_count[0] >= 3
-        assert runner.server_connected is True
-
-    def test_blocking_notify_respects_stop_event(self):
-        """_notify_state_blocking stops when stop_event is set."""
-        runner = OreRunner("test-session", Path("/tmp/test.sock"))
-
-        call_count = [0]
-
-        def mock_set_state(socket_path, session_id, state, message, timeout=2.0):
-            call_count[0] += 1
-            # Always fail, but set stop event after first call
-            if call_count[0] == 1:
-                runner.stop_event.set()
-            return False
-
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = None
-
-        mock_response = {
-            "type": "connected",
-            "tmux": None,
-            "session": {"state": "idle"},
-            "session_found": True,
-        }
-
-        with (
-            patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", side_effect=mock_set_state),
-            patch("subprocess.Popen", return_value=mock_proc),
-            patch("hopper.ore.RECONNECT_INTERVAL", 0.01),
         ):
             runner.run()
 
-        # Should have stopped after stop_event was set (1-2 calls max)
-        assert call_count[0] <= 2
+        # Verify start() and stop() were called
+        mock_conn.start.assert_called_once()
+        mock_conn.stop.assert_called_once()
 
 
 class TestRunOre:
     def test_run_ore_creates_runner(self):
         """run_ore entry point creates and runs OreRunner."""
+        mock_conn = MagicMock()
+        mock_conn.emit = MagicMock(return_value=True)
+
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stderr = None
@@ -376,7 +332,7 @@ class TestRunOre:
 
         with (
             patch("hopper.ore.connect", return_value=mock_response),
-            patch("hopper.ore.set_session_state", return_value=True),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             exit_code = run_ore("test-id", Path("/tmp/test.sock"))
