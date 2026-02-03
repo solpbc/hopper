@@ -27,11 +27,12 @@ def _build_template_vars(context: dict[str, str] | None = None) -> dict[str, str
     if context:
         config.update(context)
 
-    # Build final vars with uppercase-first versions
+    # Build final vars with uppercase-first versions (strings only)
     template_vars: dict[str, str] = {}
     for key, value in config.items():
-        template_vars[key] = value
-        template_vars[key.capitalize()] = value.capitalize()
+        if isinstance(value, str):
+            template_vars[key] = value
+            template_vars[key.capitalize()] = value.capitalize()
 
     return template_vars
 

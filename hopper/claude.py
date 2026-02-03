@@ -15,7 +15,7 @@ def spawn_claude(session_id: str, project_path: str | None = None) -> str | None
     """
     # Use hop ore to manage session lifecycle
     # On failure, pause so user can see the error before window closes
-    command = f"hop ore {session_id} || read -rp 'Failed. Press Enter to close.'"
+    command = f"hop ore {session_id} || {{ echo 'Failed. Press Enter to close.'; read; }}"
     return new_window(command, cwd=project_path)
 
 

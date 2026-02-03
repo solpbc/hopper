@@ -91,3 +91,15 @@ def test_load_context_overrides_config(tmp_path, monkeypatch, mock_config):
 
     content = prompt.load("greet", context={"name": "context-name"})
     assert content == "Hello, context-name!"
+
+
+def test_load_skips_non_string_config_values(tmp_path, monkeypatch, mock_config):
+    """Non-string config values (lists, dicts) are skipped without error."""
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "greet.md").write_text("Hello, $name! Projects: $projects")
+    mock_config.write_text('{"name": "jer", "projects": [{"path": "/foo"}]}')
+    monkeypatch.setattr(prompt, "PROMPTS_DIR", prompts_dir)
+
+    content = prompt.load("greet")
+    assert content == "Hello, jer! Projects: $projects"
