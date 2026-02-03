@@ -65,7 +65,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -80,8 +80,6 @@ class TestOreRunner:
         assert exit_code == 0
         # Should emit running state
         assert any(e[0] == "session_set_state" and e[1]["state"] == "running" for e in emitted)
-        # Should NOT emit idle - server handles active flag on disconnect
-        assert not any(e[0] == "session_set_state" and e[1]["state"] == "idle" for e in emitted)
 
     def test_run_bails_if_session_already_active(self):
         """Runner exits with code 1 if session is already active."""
@@ -115,7 +113,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -151,7 +149,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -186,7 +184,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -281,7 +279,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -315,7 +313,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -349,7 +347,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle", "project": "my-project"},
+            "session": {"state": "running", "project": "my-project"},
             "session_found": True,
         }
 
@@ -382,7 +380,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle", "project": "my-project"},
+            "session": {"state": "running", "project": "my-project"},
             "session_found": True,
         }
 
@@ -422,7 +420,7 @@ class TestOreRunner:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},  # No project
+            "session": {"state": "running"},  # No project
             "session_found": True,
         }
 
@@ -453,7 +451,7 @@ class TestRunOre:
         mock_response = {
             "type": "connected",
             "tmux": None,
-            "session": {"state": "idle"},
+            "session": {"state": "running"},
             "session_found": True,
         }
 
@@ -569,3 +567,197 @@ class TestActivityMonitor:
         """Stop monitor handles case where thread was never started."""
         runner = OreRunner("test-session", Path("/tmp/test.sock"))
         runner._stop_monitor()  # Should not raise
+
+    def test_check_activity_skips_when_shovel_done(self):
+        """Monitor skips stuck detection once shovel is complete."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+        runner._window_id = "@1"
+        runner._last_snapshot = "Hello World"
+        runner._shovel_done.set()
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with patch("hopper.ore.capture_pane", return_value="Hello World"):
+            runner._check_activity()
+
+        # Should not emit stuck since shovel is done
+        assert not any(e[0] == "session_set_state" and e[1]["state"] == "stuck" for e in emitted)
+
+
+class TestShovelWorkflow:
+    """Tests for the shovel completion and auto-dismiss workflow."""
+
+    def test_on_server_message_sets_shovel_done(self):
+        """Callback sets _shovel_done when completed state received."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        msg = {
+            "type": "session_state_changed",
+            "session": {"id": "test-session", "state": "completed"},
+        }
+        runner._on_server_message(msg)
+
+        assert runner._shovel_done.is_set()
+
+    def test_on_server_message_ignores_other_sessions(self):
+        """Callback ignores messages for other sessions."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        msg = {
+            "type": "session_state_changed",
+            "session": {"id": "other-session", "state": "completed"},
+        }
+        runner._on_server_message(msg)
+
+        assert not runner._shovel_done.is_set()
+
+    def test_on_server_message_ignores_other_states(self):
+        """Callback ignores non-completed states."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        msg = {
+            "type": "session_state_changed",
+            "session": {"id": "test-session", "state": "running"},
+        }
+        runner._on_server_message(msg)
+
+        assert not runner._shovel_done.is_set()
+
+    def test_on_server_message_ignores_other_message_types(self):
+        """Callback ignores non-state-changed messages."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        msg = {
+            "type": "session_updated",
+            "session": {"id": "test-session", "state": "completed"},
+        }
+        runner._on_server_message(msg)
+
+        assert not runner._shovel_done.is_set()
+
+    def test_wait_and_dismiss_sends_ctrl_d(self):
+        """Dismiss thread sends two Ctrl-D after screen stabilizes."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+        runner._window_id = "@1"
+        runner._shovel_done.set()  # Already done
+
+        send_keys_calls = []
+
+        # Return same content twice to indicate stable screen
+        snapshots = iter(["content A", "content A"])
+        with (
+            patch("hopper.ore.capture_pane", side_effect=lambda _: next(snapshots)),
+            patch(
+                "hopper.ore.send_keys",
+                side_effect=lambda w, k: send_keys_calls.append((w, k)) or True,
+            ),
+            patch("hopper.ore.MONITOR_INTERVAL", 0.01),
+        ):
+            runner._wait_and_dismiss_claude()
+
+        assert send_keys_calls == [("@1", "C-d"), ("@1", "C-d")]
+
+    def test_wait_and_dismiss_aborts_when_monitor_stops(self):
+        """Dismiss thread aborts if monitor stop is set."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+        runner._window_id = "@1"
+        runner._monitor_stop.set()  # Already stopped
+
+        send_keys_calls = []
+        with patch("hopper.ore.send_keys", side_effect=lambda w, k: send_keys_calls.append((w, k))):
+            runner._wait_and_dismiss_claude()
+
+        assert send_keys_calls == []
+
+    def test_wait_and_dismiss_aborts_without_window(self):
+        """Dismiss thread aborts if no window ID."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+        runner._window_id = None
+        runner._shovel_done.set()
+
+        send_keys_calls = []
+        with patch("hopper.ore.send_keys", side_effect=lambda w, k: send_keys_calls.append((w, k))):
+            runner._wait_and_dismiss_claude()
+
+        assert send_keys_calls == []
+
+    def test_clean_exit_after_shovel_emits_ready(self):
+        """Runner emits state=ready then stage=processing after clean shovel exit."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        emitted = []
+
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = None
+
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "new"},
+            "session_found": True,
+        }
+
+        with (
+            patch("hopper.ore.connect", return_value=mock_response),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
+            patch("subprocess.Popen", return_value=mock_proc),
+            patch("hopper.ore.get_current_window_id", return_value=None),
+        ):
+            # Simulate shovel completing before proc.wait returns
+            runner._shovel_done.set()
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        # Should emit ready state before stage transition
+        state_idx = next(
+            i
+            for i, e in enumerate(emitted)
+            if e[0] == "session_set_state" and e[1]["state"] == "ready"
+        )
+        stage_idx = next(
+            i
+            for i, e in enumerate(emitted)
+            if e[0] == "session_update" and e[1]["stage"] == "processing"
+        )
+        assert state_idx < stage_idx
+        assert "Shovel-ready" in emitted[state_idx][1]["status"]
+
+    def test_clean_exit_without_shovel_does_not_emit_ready(self):
+        """Runner does NOT emit ready if shovel was never completed."""
+        runner = OreRunner("test-session", Path("/tmp/test.sock"))
+
+        emitted = []
+
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = None
+
+        mock_response = {
+            "type": "connected",
+            "tmux": None,
+            "session": {"state": "running"},
+            "session_found": True,
+        }
+
+        with (
+            patch("hopper.ore.connect", return_value=mock_response),
+            patch("hopper.ore.HopperConnection", return_value=mock_conn),
+            patch("subprocess.Popen", return_value=mock_proc),
+            patch("hopper.ore.get_current_window_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        # Should NOT emit stage transition or ready state
+        assert not any(e[0] == "session_update" for e in emitted)
+        assert not any(e[0] == "session_set_state" and e[1]["state"] == "ready" for e in emitted)

@@ -37,7 +37,7 @@ def _check_test_isolation() -> None:
 
 
 Stage = Literal["ore", "processing"]
-State = Literal["new", "idle", "running", "stuck", "error"]
+State = Literal["new", "running", "stuck", "error", "completed", "ready"]
 
 
 SHORT_ID_LEN = 8  # Standard short ID length (first segment of UUID)
@@ -123,7 +123,7 @@ class Session:
     project: str = ""  # Project name this session belongs to
     scope: str = ""  # User's task scope description
     updated_at: int = field(default=0)  # milliseconds since epoch, 0 means use created_at
-    state: State = "idle"
+    state: State = "new"
     status: str = ""  # Human-readable status text
     active: bool = False  # Whether a hop ore client is connected
     tmux_window: str | None = None  # tmux window ID (e.g., "@1")

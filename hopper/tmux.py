@@ -132,6 +132,27 @@ def get_current_window_id() -> str | None:
         return None
 
 
+def send_keys(window_id: str, keys: str) -> bool:
+    """Send keys to a tmux pane.
+
+    Args:
+        window_id: The tmux window ID to target (e.g., "@1").
+        keys: The keys to send (e.g., "C-d" for Ctrl-D).
+
+    Returns:
+        True if the command succeeded, False otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", window_id, keys],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def capture_pane(window_id: str) -> str | None:
     """Capture the contents of a tmux pane with ANSI escape sequences.
 

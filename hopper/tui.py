@@ -12,6 +12,7 @@ from textual.theme import Theme
 from textual.widgets import Button, DataTable, Footer, Header, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+from hopper.backlog import BacklogItem, remove_backlog_item
 from hopper.claude import spawn_claude, switch_to_window
 from hopper.projects import Project, find_project, get_active_projects
 from hopper.sessions import (
@@ -47,8 +48,9 @@ CLAUDE_THEME = Theme(
 # Status indicators (Unicode symbols, no emoji)
 STATUS_RUNNING = "●"  # filled circle
 STATUS_STUCK = "◐"  # half-filled circle
-STATUS_IDLE = "○"  # empty circle
+STATUS_NEW = "○"  # empty circle
 STATUS_ERROR = "✗"  # x mark
+STATUS_READY = "◆"  # filled diamond
 STATUS_ACTION = "+"  # plus for action rows
 
 # Stage indicators
@@ -64,7 +66,7 @@ class Row:
     short_id: str
     stage: str  # STAGE_ORE or STAGE_PROCESSING
     age: str  # formatted age string
-    status: str  # STATUS_RUNNING, STATUS_STUCK, STATUS_IDLE, STATUS_ERROR
+    status: str  # STATUS_RUNNING, STATUS_STUCK, STATUS_IDLE, STATUS_ERROR, STATUS_READY
     active: bool = False  # Whether hop ore is connected
     project: str = ""  # Project name
     status_text: str = ""  # Human-readable status text
@@ -76,10 +78,12 @@ def session_to_row(session: Session) -> Row:
         status = STATUS_ERROR
     elif session.state == "stuck":
         status = STATUS_STUCK
-    elif session.state == "running":
+    elif session.state == "running" or session.state == "completed":
         status = STATUS_RUNNING
+    elif session.state == "ready":
+        status = STATUS_READY
     else:
-        status = STATUS_IDLE
+        status = STATUS_NEW
 
     stage = STAGE_ORE if session.stage == "ore" else STAGE_PROCESSING
 
@@ -103,9 +107,11 @@ def format_status_text(status: str) -> Text:
         return Text(status, style="bright_yellow")
     elif status == STATUS_ERROR:
         return Text(status, style="bright_red")
+    elif status == STATUS_READY:
+        return Text(status, style="bright_cyan")
     elif status == STATUS_ACTION:
         return Text(status, style="bright_magenta")
-    else:  # STATUS_IDLE
+    else:  # STATUS_NEW
         return Text(status, style="bright_black")
 
 
@@ -299,6 +305,24 @@ class SessionTable(DataTable):
         self.add_column("status", key=self.COL_STATUS_TEXT)
 
 
+class BacklogTable(DataTable):
+    """Table displaying backlog items."""
+
+    COL_PROJECT = "project"
+    COL_DESCRIPTION = "description"
+    COL_AGE = "age"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cursor_type = "row"
+
+    def on_mount(self) -> None:
+        """Set up columns when mounted with explicit keys."""
+        self.add_column("project", key=self.COL_PROJECT)
+        self.add_column("description", key=self.COL_DESCRIPTION)
+        self.add_column("added", key=self.COL_AGE)
+
+
 class HopperApp(App):
     """Hopper TUI application."""
 
@@ -324,6 +348,20 @@ class HopperApp(App):
         background: $background;
     }
 
+    #backlog-label {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        text-style: bold;
+        background: $surface;
+    }
+
+    #backlog-table {
+        height: auto;
+        max-height: 40%;
+        background: $background;
+    }
+
     #empty-message {
         height: 3;
         content-align: center middle;
@@ -339,11 +377,20 @@ class HopperApp(App):
         color: $text-muted;
         text-style: bold;
     }
+
+    DataTable:focus > .datatable--header {
+        color: $text;
+    }
+
+    DataTable:blur > .datatable--cursor {
+        background: $surface;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit", show=False),
+        Binding("tab", "switch_table", "Switch", priority=True),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
         Binding("down", "cursor_down", show=False),
@@ -351,12 +398,14 @@ class HopperApp(App):
         Binding("enter", "select_row", "Select"),
         Binding("c", "new_session", "Create"),
         Binding("a", "archive", "Archive"),
+        Binding("d", "delete_backlog", "Delete", show=False),
     ]
 
     def __init__(self, server=None):
         super().__init__()
         self.server = server
         self._sessions: list[Session] = server.sessions if server else []
+        self._backlog: list[BacklogItem] = server.backlog if server else []
         self._projects: list[Project] = []
         self._git_hash: str = server.git_hash if server and server.git_hash else ""
         self._started_at: int | None = server.started_at if server else None
@@ -367,6 +416,8 @@ class HopperApp(App):
         yield Header()
         yield SessionTable(id="session-table")
         yield Static("No sessions yet. Press 'c' to create one.", id="empty-message")
+        yield Static("BACKLOG", id="backlog-label")
+        yield BacklogTable(id="backlog-table")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -377,15 +428,17 @@ class HopperApp(App):
 
         self._projects = get_active_projects()
         self.refresh_table()
+        self.refresh_backlog()
         # Start polling for server updates
         self.set_interval(1.0, self.check_server_updates)
-        # Focus the table
+        # Focus the session table
         self.query_one("#session-table", SessionTable).focus()
 
     def check_server_updates(self) -> None:
         """Poll server's session list and refresh if needed."""
         self._update_sub_title()
         self.refresh_table()
+        self.refresh_backlog()
 
     def _update_sub_title(self) -> None:
         """Update sub_title with git hash and uptime."""
@@ -461,6 +514,35 @@ class HopperApp(App):
             empty_msg.display = True
             table.display = False
 
+    def refresh_backlog(self) -> None:
+        """Refresh the backlog table using incremental updates."""
+        table = self.query_one("#backlog-table", BacklogTable)
+        label = self.query_one("#backlog-label", Static)
+
+        items = self._backlog
+
+        existing_keys: set[str] = set()
+        for row_key in table.rows:
+            existing_keys.add(str(row_key.value))
+
+        desired_keys = {item.id for item in items}
+
+        for key in existing_keys - desired_keys:
+            table.remove_row(key)
+
+        for item in items:
+            age = format_age(item.created_at)
+            if item.id in existing_keys:
+                table.update_cell(item.id, BacklogTable.COL_PROJECT, item.project)
+                table.update_cell(item.id, BacklogTable.COL_DESCRIPTION, item.description)
+                table.update_cell(item.id, BacklogTable.COL_AGE, age)
+            else:
+                table.add_row(item.project, item.description, age, key=item.id)
+
+        has_items = len(items) > 0
+        label.display = has_items
+        table.display = has_items
+
     def _format_status(self, status: str) -> str:
         """Format status text for display, replacing newlines with spaces."""
         return status.replace("\n", " ") if status else ""
@@ -473,6 +555,14 @@ class HopperApp(App):
             return str(cell_key.row_key.value) if cell_key.row_key else None
         return None
 
+    def _get_selected_backlog_id(self) -> str | None:
+        """Get the backlog item ID of the selected row."""
+        table = self.query_one("#backlog-table", BacklogTable)
+        if table.cursor_row is not None and table.row_count > 0:
+            cell_key = table.coordinate_to_cell_key((table.cursor_row, 0))
+            return str(cell_key.row_key.value) if cell_key.row_key else None
+        return None
+
     def _get_session(self, session_id: str) -> Session | None:
         """Get a session by ID."""
         for session in self._sessions:
@@ -480,15 +570,30 @@ class HopperApp(App):
                 return session
         return None
 
+    def _focused_table(self) -> DataTable:
+        """Return whichever table currently has focus."""
+        focused = self.focused
+        if isinstance(focused, (SessionTable, BacklogTable)):
+            return focused
+        return self.query_one("#session-table", SessionTable)
+
+    def action_switch_table(self) -> None:
+        """Switch focus between session and backlog tables."""
+        focused = self.focused
+        if isinstance(focused, SessionTable):
+            backlog_table = self.query_one("#backlog-table", BacklogTable)
+            if backlog_table.display:
+                backlog_table.focus()
+        else:
+            self.query_one("#session-table", SessionTable).focus()
+
     def action_cursor_down(self) -> None:
-        """Move cursor down."""
-        table = self.query_one("#session-table", SessionTable)
-        table.action_cursor_down()
+        """Move cursor down in the focused table."""
+        self._focused_table().action_cursor_down()
 
     def action_cursor_up(self) -> None:
-        """Move cursor up."""
-        table = self.query_one("#session-table", SessionTable)
-        table.action_cursor_up()
+        """Move cursor up in the focused table."""
+        self._focused_table().action_cursor_up()
 
     def action_new_session(self) -> None:
         """Open project picker, then scope input, to create a new session."""
@@ -516,7 +621,10 @@ class HopperApp(App):
         self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
 
     def action_select_row(self) -> None:
-        """Handle Enter key on selected row."""
+        """Handle Enter key on selected row (session table only)."""
+        if not isinstance(self.focused, SessionTable):
+            return
+
         session_id = self._get_selected_session_id()
         if not session_id:
             self.notify("No session selected", severity="warning")
@@ -551,13 +659,29 @@ class HopperApp(App):
         self.refresh_table()
 
     def action_archive(self) -> None:
-        """Archive the selected session."""
+        """Archive the selected session (session table only)."""
+        if not isinstance(self.focused, SessionTable):
+            return
+
         session_id = self._get_selected_session_id()
         if not session_id:
             return
 
         archive_session(self._sessions, session_id)
         self.refresh_table()
+
+    def action_delete_backlog(self) -> None:
+        """Delete the selected backlog item."""
+        if not isinstance(self.focused, BacklogTable):
+            return
+
+        item_id = self._get_selected_backlog_id()
+        if not item_id:
+            return
+
+        removed = remove_backlog_item(self._backlog, item_id)
+        if removed:
+            self.refresh_backlog()
 
 
 def run_tui(server=None) -> int:

@@ -218,7 +218,7 @@ def test_server_handles_connect_with_session_id(socket_path, server, temp_config
     from hopper.sessions import Session, save_sessions
 
     # Create a test session
-    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    session = Session(id="test-id", stage="ore", created_at=1000, state="new")
     server.sessions = [session]
     save_sessions(server.sessions)
 
@@ -238,7 +238,7 @@ def test_server_handles_connect_with_session_id(socket_path, server, temp_config
     assert response["type"] == "connected"
     assert response["session_found"] is True
     assert response["session"]["id"] == "test-id"
-    assert response["session"]["state"] == "idle"
+    assert response["session"]["state"] == "new"
 
     client.close()
 
@@ -270,7 +270,7 @@ def test_server_handles_session_set_state(socket_path, server, temp_config):
     from hopper.sessions import Session, save_sessions
 
     # Create a test session
-    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    session = Session(id="test-id", stage="ore", created_at=1000, state="new")
     server.sessions = [session]
     save_sessions(server.sessions)
 
@@ -307,7 +307,7 @@ def test_server_connect_does_not_register_ownership(socket_path, server, temp_co
     """Connect message returns session data but does not register ownership."""
     from hopper.sessions import Session, save_sessions
 
-    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    session = Session(id="test-id", stage="ore", created_at=1000, state="new")
     server.sessions = [session]
     save_sessions(server.sessions)
 
@@ -333,7 +333,7 @@ def test_server_registers_on_session_register(socket_path, server, temp_config):
     """session_register message claims ownership and sets active=True."""
     from hopper.sessions import Session, save_sessions
 
-    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    session = Session(id="test-id", stage="ore", created_at=1000, state="new")
     server.sessions = [session]
     save_sessions(server.sessions)
 
@@ -443,12 +443,47 @@ def test_server_preserves_state_on_disconnect(socket_path, server, temp_config):
     assert server.sessions[0].tmux_window is None
 
 
+def test_server_handles_ready_state(socket_path, server, temp_config):
+    """Server accepts 'ready' as a valid state."""
+    from hopper.sessions import Session, save_sessions
+
+    session = Session(id="test-id", stage="processing", created_at=1000, state="completed")
+    server.sessions = [session]
+    save_sessions(server.sessions)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    msg = {
+        "type": "session_set_state",
+        "session_id": "test-id",
+        "state": "ready",
+        "status": "Shovel-ready prompt saved",
+    }
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "session_state_changed"
+    assert response["session"]["state"] == "ready"
+    assert response["session"]["status"] == "Shovel-ready prompt saved"
+
+    client.close()
+
+
 def test_server_disconnects_stale_client_on_reconnect(socket_path, server, temp_config):
     """Server disconnects old client when new client registers for same session."""
     from hopper.sessions import Session, save_sessions
 
     # Create a test session
-    session = Session(id="test-id", stage="ore", created_at=1000, state="idle")
+    session = Session(id="test-id", stage="ore", created_at=1000, state="new")
     server.sessions = [session]
     save_sessions(server.sessions)
 

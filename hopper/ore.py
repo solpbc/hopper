@@ -12,7 +12,7 @@ from hopper import prompt
 from hopper.client import HopperConnection, connect
 from hopper.projects import find_project
 from hopper.sessions import current_time_ms
-from hopper.tmux import capture_pane, get_current_window_id
+from hopper.tmux import capture_pane, get_current_window_id, send_keys
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,8 @@ class OreRunner:
         self._last_snapshot: str | None = None
         self._stuck_since: int | None = None
         self._window_id: str | None = None
+        # Shovel completion tracking
+        self._shovel_done = threading.Event()
 
     def run(self) -> int:
         """Run Claude for this session. Returns exit code."""
@@ -97,7 +99,7 @@ class OreRunner:
 
             # Start persistent connection and register ownership (sets active=True)
             self.connection = HopperConnection(self.socket_path)
-            self.connection.start()
+            self.connection.start(callback=self._on_server_message)
             self.connection.emit("session_register", session_id=self.session_id)
 
             # Run Claude (blocking) - notifies "running" after successful start
@@ -110,7 +112,10 @@ class OreRunner:
                 # Non-zero exit (except interrupt) - set error state
                 msg = error_msg or f"Exited with code {exit_code}"
                 self._emit_state("error", msg)
-            # For success (0) or interrupt (130), server clears active on disconnect
+            elif exit_code == 0 and self._shovel_done.is_set():
+                # Shovel workflow completed cleanly - transition to processing
+                self._emit_state("ready", "Shovel-ready prompt saved")
+                self._emit_stage("processing")
 
             return exit_code
 
@@ -145,6 +150,58 @@ class OreRunner:
             )
             logger.debug(f"Emitted state: {state}, status: {status}")
 
+    def _emit_stage(self, stage: str) -> None:
+        """Emit stage change to server via persistent connection."""
+        if self.connection:
+            self.connection.emit(
+                "session_update",
+                session_id=self.session_id,
+                stage=stage,
+            )
+            logger.debug(f"Emitted stage: {stage}")
+
+    def _on_server_message(self, message: dict) -> None:
+        """Handle incoming server broadcast messages."""
+        if message.get("type") != "session_state_changed":
+            return
+        session = message.get("session", {})
+        if session.get("id") != self.session_id:
+            return
+        if session.get("state") == "completed":
+            self._shovel_done.set()
+            logger.debug("Shovel done signal received")
+
+    def _wait_and_dismiss_claude(self) -> None:
+        """Wait for shovel completion, screen stability, then send Ctrl-D to exit Claude."""
+        # Wait for shovel to complete (blocks until set or monitor stop signals exit)
+        while not self._shovel_done.wait(timeout=1.0):
+            if self._monitor_stop.is_set():
+                return
+
+        if not self._window_id:
+            return
+
+        logger.debug("Shovel done, waiting for screen to stabilize")
+
+        # Wait for screen to stabilize using the same interval as the activity monitor
+        last_snapshot = None
+        while not self._monitor_stop.is_set():
+            self._monitor_stop.wait(MONITOR_INTERVAL)
+            snapshot = capture_pane(self._window_id)
+            if snapshot is None:
+                return
+            if snapshot == last_snapshot:
+                break
+            last_snapshot = snapshot
+
+        if self._monitor_stop.is_set():
+            return
+
+        # Send two Ctrl-D to exit Claude cleanly
+        logger.debug("Screen stable, sending Ctrl-D")
+        send_keys(self._window_id, "C-d")
+        send_keys(self._window_id, "C-d")
+
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""
         self._window_id = get_current_window_id()
@@ -174,6 +231,10 @@ class OreRunner:
     def _check_activity(self) -> None:
         """Check tmux pane for activity and update state accordingly."""
         if not self._window_id:
+            return
+
+        # Skip stuck detection once shovel is done — dismiss thread handles exit
+        if self._shovel_done.is_set():
             return
 
         snapshot = capture_pane(self._window_id)
@@ -237,6 +298,14 @@ class OreRunner:
 
             # Start activity monitor
             self._start_monitor()
+
+            # For new sessions, start dismiss thread to auto-exit after shovel
+            if self.is_new_session and self._window_id:
+                threading.Thread(
+                    target=self._wait_and_dismiss_claude,
+                    name="shovel-dismiss",
+                    daemon=True,
+                ).start()
 
             # Wait for Claude to complete
             proc.wait()

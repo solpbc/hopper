@@ -8,6 +8,7 @@ from hopper.tmux import (
     get_tmux_sessions,
     is_inside_tmux,
     is_tmux_server_running,
+    send_keys,
 )
 
 
@@ -121,3 +122,27 @@ class TestCapturePane:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = capture_pane("@0")
             assert result is None
+
+
+class TestSendKeys:
+    def test_sends_keys_successfully(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            result = send_keys("@0", "C-d")
+            assert result is True
+            mock_run.assert_called_once_with(
+                ["tmux", "send-keys", "-t", "@0", "C-d"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_returns_false_when_command_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            result = send_keys("@99", "C-d")
+            assert result is False
+
+    def test_returns_false_when_tmux_not_installed(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = send_keys("@0", "C-d")
+            assert result is False

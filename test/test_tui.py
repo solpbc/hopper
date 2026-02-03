@@ -9,7 +9,8 @@ from hopper.tui import (
     STAGE_ORE,
     STAGE_PROCESSING,
     STATUS_ERROR,
-    STATUS_IDLE,
+    STATUS_NEW,
+    STATUS_READY,
     STATUS_RUNNING,
     STATUS_STUCK,
     HopperApp,
@@ -25,12 +26,12 @@ from hopper.tui import (
 # Tests for session_to_row
 
 
-def test_session_to_row_idle():
-    """Idle session has idle status indicator."""
-    session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="idle")
+def test_session_to_row_new():
+    """New session has new status indicator."""
+    session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="new")
     row = session_to_row(session)
     assert row.short_id == "abcd1234"
-    assert row.status == STATUS_IDLE
+    assert row.status == STATUS_NEW
     assert row.stage == STAGE_ORE
 
 
@@ -72,16 +73,30 @@ def test_session_to_row_active():
 
 def test_session_to_row_inactive():
     """Inactive session has active=False in row."""
-    session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="idle")
+    session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="new")
     row = session_to_row(session)
     assert row.active is False
 
 
 def test_session_to_row_processing_stage():
     """Processing session has gear stage indicator."""
-    session = Session(id="abcd1234-5678-uuid", stage="processing", created_at=1000, state="idle")
+    session = Session(id="abcd1234-5678-uuid", stage="processing", created_at=1000, state="new")
     row = session_to_row(session)
     assert row.stage == STAGE_PROCESSING
+
+
+def test_session_to_row_completed():
+    """Completed session shows running indicator (transient state)."""
+    session = Session(id="abcd1234-5678-uuid", stage="ore", created_at=1000, state="completed")
+    row = session_to_row(session)
+    assert row.status == STATUS_RUNNING
+
+
+def test_session_to_row_ready():
+    """Ready session shows ready indicator."""
+    session = Session(id="abcd1234-5678-uuid", stage="processing", created_at=1000, state="ready")
+    row = session_to_row(session)
+    assert row.status == STATUS_READY
 
 
 # Tests for format_status_text
@@ -108,10 +123,17 @@ def test_format_status_text_error():
     assert text.style == "bright_red"
 
 
-def test_format_status_text_idle():
-    """format_status_text returns bright_black for idle."""
-    text = format_status_text(STATUS_IDLE)
-    assert str(text) == STATUS_IDLE
+def test_format_status_text_ready():
+    """format_status_text returns bright_cyan for ready."""
+    text = format_status_text(STATUS_READY)
+    assert str(text) == STATUS_READY
+    assert text.style == "bright_cyan"
+
+
+def test_format_status_text_new():
+    """format_status_text returns bright_black for new."""
+    text = format_status_text(STATUS_NEW)
+    assert str(text) == STATUS_NEW
     assert text.style == "bright_black"
 
 
@@ -181,10 +203,12 @@ class MockServer:
     def __init__(
         self,
         sessions: list[Session] | None = None,
+        backlog: list | None = None,
         git_hash: str | None = None,
         started_at: int | None = None,
     ):
         self.sessions = sessions if sessions is not None else []
+        self.backlog = backlog if backlog is not None else []
         self.git_hash = git_hash
         self.started_at = started_at
 
@@ -521,3 +545,151 @@ async def test_scope_input_empty_validation():
         await pilot.press("enter")
         # Should not have dismissed - still sentinel
         assert app.scope_result == "not_set"
+
+
+# Tests for BacklogTable
+
+
+@pytest.mark.asyncio
+async def test_backlog_hidden_when_empty():
+    """Backlog label and table should be hidden when no items."""
+    server = MockServer([])
+    app = HopperApp(server=server)
+    async with app.run_test():
+        label = app.query_one("#backlog-label")
+        table = app.query_one("#backlog-table")
+        assert label.display is False
+        assert table.display is False
+
+
+@pytest.mark.asyncio
+async def test_backlog_shown_with_items():
+    """Backlog table should display when items exist."""
+    from hopper.backlog import BacklogItem
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj-a", description="Fix bug", created_at=1000),
+        BacklogItem(
+            id="bl-2222-uuid", project="proj-b", description="Add feature", created_at=2000
+        ),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        label = app.query_one("#backlog-label")
+        table = app.query_one("#backlog-table")
+        assert label.display is True
+        assert table.display is True
+        assert table.row_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tab_switches_focus_to_backlog():
+    """Tab should switch focus from session table to backlog table."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogTable, SessionTable
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj", description="Item", created_at=1000),
+    ]
+    sessions = [
+        Session(id="aaaa1111-uuid", stage="ore", created_at=1000),
+    ]
+    server = MockServer(sessions, backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        # Should start focused on session table
+        assert isinstance(app.focused, SessionTable)
+        # Tab to switch
+        await pilot.press("tab")
+        assert isinstance(app.focused, BacklogTable)
+        # Tab back
+        await pilot.press("tab")
+        assert isinstance(app.focused, SessionTable)
+
+
+@pytest.mark.asyncio
+async def test_tab_stays_on_sessions_when_backlog_empty():
+    """Tab should stay on session table when backlog is empty."""
+    from hopper.tui import SessionTable
+
+    sessions = [
+        Session(id="aaaa1111-uuid", stage="ore", created_at=1000),
+    ]
+    server = MockServer(sessions)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        assert isinstance(app.focused, SessionTable)
+        await pilot.press("tab")
+        # Should stay on session table since backlog is hidden
+        assert isinstance(app.focused, SessionTable)
+
+
+@pytest.mark.asyncio
+async def test_jk_navigation_in_backlog():
+    """j/k should navigate within the backlog table when focused."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogTable
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj", description="First", created_at=1000),
+        BacklogItem(id="bl-2222-uuid", project="proj", description="Second", created_at=2000),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        # Switch to backlog table
+        await pilot.press("tab")
+        table = app.query_one("#backlog-table", BacklogTable)
+        assert table.cursor_row == 0
+        await pilot.press("j")
+        assert table.cursor_row == 1
+        await pilot.press("k")
+        assert table.cursor_row == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_backlog_item(temp_config):
+    """d should delete selected backlog item when backlog is focused."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogTable
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj", description="To delete", created_at=1000),
+        BacklogItem(id="bl-2222-uuid", project="proj", description="To keep", created_at=2000),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        # Switch to backlog table
+        await pilot.press("tab")
+        table = app.query_one("#backlog-table", BacklogTable)
+        assert table.row_count == 2
+        # Delete first item
+        await pilot.press("d")
+        assert table.row_count == 1
+        assert len(app._backlog) == 1
+        assert app._backlog[0].id == "bl-2222-uuid"
+
+
+@pytest.mark.asyncio
+async def test_delete_noop_on_session_table():
+    """d should do nothing when session table is focused."""
+    from hopper.backlog import BacklogItem
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj", description="Item", created_at=1000),
+    ]
+    sessions = [
+        Session(id="aaaa1111-uuid", stage="ore", created_at=1000),
+    ]
+    server = MockServer(sessions, backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        # Focus is on session table by default
+        session_table = app.query_one("#session-table")
+        assert session_table.row_count == 1
+        # Press d - should not delete session or backlog item
+        await pilot.press("d")
+        assert session_table.row_count == 1
+        assert len(app._backlog) == 1

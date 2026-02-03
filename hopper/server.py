@@ -11,6 +11,15 @@ import threading
 import time
 from pathlib import Path
 
+from hopper.backlog import (
+    BacklogItem,
+    add_backlog_item,
+    load_backlog,
+    remove_backlog_item,
+)
+from hopper.backlog import (
+    find_by_short_id as find_backlog_by_short_id,
+)
 from hopper.sessions import (
     Session,
     archive_session,
@@ -63,6 +72,7 @@ class Server:
         self.broadcast_queue: queue.Queue = queue.Queue(maxsize=10000)
         self.writer_thread: threading.Thread | None = None
         self.sessions: list[Session] = []
+        self.backlog: list[BacklogItem] = []
         # Session ownership tracking: session_id -> socket, socket -> session_id
         self.session_clients: dict[str, socket.socket] = {}
         self.client_sessions: dict[socket.socket, str] = {}
@@ -71,6 +81,7 @@ class Server:
         """Start the server (blocking)."""
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.sessions = load_sessions()
+        self.backlog = load_backlog()
 
         # Clear stale active flags from previous run (no clients connected yet)
         stale = False
@@ -266,7 +277,14 @@ class Server:
             session_id = message.get("session_id")
             state = message.get("state")
             status = message.get("status", "")
-            if session_id and state in ("new", "idle", "running", "stuck", "error"):
+            if session_id and state in (
+                "new",
+                "running",
+                "stuck",
+                "error",
+                "completed",
+                "ready",
+            ):
                 session = update_session_state(self.sessions, session_id, state, status)
                 if session:
                     self.broadcast({"type": "session_state_changed", "session": session.to_dict()})
@@ -278,6 +296,25 @@ class Server:
                 session = update_session_status(self.sessions, session_id, status)
                 if session:
                     self.broadcast({"type": "session_status_changed", "session": session.to_dict()})
+
+        elif msg_type == "backlog_list":
+            items_data = [item.to_dict() for item in self.backlog]
+            self._send_response(conn, {"type": "backlog_list", "items": items_data})
+
+        elif msg_type == "backlog_add":
+            project = message.get("project", "")
+            description = message.get("description", "")
+            session_id = message.get("session_id")
+            if project and description:
+                item = add_backlog_item(self.backlog, project, description, session_id)
+                self.broadcast({"type": "backlog_added", "item": item.to_dict()})
+
+        elif msg_type == "backlog_remove":
+            item_id = message.get("item_id", "")
+            item = find_backlog_by_short_id(self.backlog, item_id)
+            if item:
+                remove_backlog_item(self.backlog, item.id)
+                self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
 
         else:
             # Broadcast other messages
