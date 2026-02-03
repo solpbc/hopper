@@ -362,6 +362,81 @@ class BacklogInputScreen(TextInputScreen):
         self.dismiss(text)
 
 
+class LegendScreen(ModalScreen):
+    """Modal screen showing the symbol legend."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+    ]
+
+    CSS = """
+    LegendScreen {
+        align: center middle;
+    }
+
+    #legend-container {
+        width: 70;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+
+    #legend-title {
+        text-align: center;
+        text-style: bold;
+        color: $text;
+        padding-bottom: 1;
+    }
+
+    #legend-body {
+        padding: 0 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="legend-container"):
+            yield Static("Legend", id="legend-title")
+            yield Static(self._build_legend(), id="legend-body")
+
+    def _build_legend(self) -> Text:
+        t = Text()
+
+        t.append("Status\n", style="bold")
+        t.append(f"  {STATUS_RUNNING}", style="bright_green")
+        t.append("  running\n", style="bright_black")
+        t.append(f"  {STATUS_STUCK}", style="bright_yellow")
+        t.append("  stuck\n", style="bright_black")
+        t.append(f"  {STATUS_ERROR}", style="bright_red")
+        t.append("  error\n", style="bright_black")
+        t.append(f"  {STATUS_NEW}", style="bright_black")
+        t.append("  new\n", style="bright_black")
+
+        t.append("\n")
+
+        t.append("Stage\n", style="bold")
+        t.append(f"  {STAGE_ORE}", style="bright_blue")
+        t.append("  ore\n", style="bright_black")
+        t.append(f"  {STAGE_PROCESSING}", style="bright_yellow")
+        t.append("  processing\n", style="bright_black")
+        t.append(f"  {STAGE_SHIP}", style="bright_green")
+        t.append("  ship\n", style="bright_black")
+
+        t.append("\n")
+
+        t.append("Connection\n", style="bold")
+        t.append("  ▸", style="bright_cyan")
+        t.append("  connected\n", style="bright_black")
+        t.append("  ▹", style="bright_black")
+        t.append("  disconnected", style="bright_black")
+
+        return t
+
+    def action_cancel(self) -> None:
+        self.dismiss()
+
+
 class SessionTable(DataTable):
     """Table displaying all sessions."""
 
@@ -498,6 +573,7 @@ class HopperApp(App):
         Binding("b", "new_backlog", "Backlog"),
         Binding("a", "archive", "Archive"),
         Binding("d", "delete_backlog", "Delete", show=False),
+        Binding("l", "legend", "Legend"),
     ]
 
     def __init__(self, server=None):
@@ -814,6 +890,10 @@ class HopperApp(App):
 
         archive_session(self._sessions, session_id)
         self.refresh_table()
+
+    def action_legend(self) -> None:
+        """Show the symbol legend modal."""
+        self.push_screen(LegendScreen())
 
     def action_delete_backlog(self) -> None:
         """Delete the selected backlog item."""

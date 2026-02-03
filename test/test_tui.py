@@ -14,6 +14,7 @@ from hopper.tui import (
     STATUS_STUCK,
     BacklogInputScreen,
     HopperApp,
+    LegendScreen,
     ProjectPickerScreen,
     Row,
     ScopeInputScreen,
@@ -903,3 +904,46 @@ async def test_delete_noop_on_session_table():
         await pilot.press("d")
         assert session_table.row_count == 2  # unchanged
         assert len(app._backlog) == 1
+
+
+# Tests for LegendScreen
+
+
+@pytest.mark.asyncio
+async def test_legend_opens_with_l_key():
+    """Pressing l should open the legend modal."""
+    app = HopperApp()
+    async with app.run_test() as pilot:
+        await pilot.press("l")
+        assert isinstance(app.screen, LegendScreen)
+
+
+@pytest.mark.asyncio
+async def test_legend_dismiss_with_escape():
+    """Escape should dismiss the legend modal."""
+    app = HopperApp()
+    async with app.run_test() as pilot:
+        await pilot.press("l")
+        assert isinstance(app.screen, LegendScreen)
+        await pilot.press("escape")
+        assert not isinstance(app.screen, LegendScreen)
+
+
+@pytest.mark.asyncio
+async def test_legend_contains_all_symbols():
+    """Legend should contain all status, stage, and connection symbols."""
+    from textual.widgets import Static
+
+    app = HopperApp()
+    async with app.run_test() as pilot:
+        await pilot.press("l")
+        body = app.screen.query_one("#legend-body", Static)
+        text = str(body.render())
+        assert STATUS_RUNNING in text
+        assert STATUS_STUCK in text
+        assert STATUS_ERROR in text
+        assert STATUS_NEW in text
+        assert STAGE_ORE in text
+        assert STAGE_PROCESSING in text
+        assert "▸" in text
+        assert "▹" in text
