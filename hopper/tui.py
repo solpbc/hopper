@@ -1,5 +1,6 @@
 """TUI for managing coding agents using Textual."""
 
+import traceback
 from dataclasses import dataclass
 
 from rich.text import Text
@@ -349,6 +350,11 @@ class HopperApp(App):
                 return session
         return None
 
+    def _exit_on_error(self, exc: Exception) -> None:
+        """Exit the app with a traceback message for debugging."""
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self.exit(return_code=1, message=f"Error in TUI:\n{tb}")
+
     def action_cursor_down(self) -> None:
         """Move cursor down."""
         table = self.query_one("#session-table", SessionTable)
@@ -368,48 +374,57 @@ class HopperApp(App):
         def on_project_selected(project: Project | None) -> None:
             if project is None:
                 return  # Cancelled
-            session = create_session(self._sessions, project.name)
-            window_id = spawn_claude(session.id, project.path)
-            if window_id:
-                session.tmux_window = window_id
-                save_sessions(self._sessions)
-            self.refresh_table()
+            try:
+                session = create_session(self._sessions, project.name)
+                window_id = spawn_claude(session.id, project.path)
+                if window_id:
+                    session.tmux_window = window_id
+                    save_sessions(self._sessions)
+                self.refresh_table()
+            except Exception as e:
+                self._exit_on_error(e)
 
         self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
 
     def action_select_row(self) -> None:
         """Handle Enter key on selected row."""
-        session_id = self._get_selected_session_id()
-        if not session_id:
-            return
+        try:
+            session_id = self._get_selected_session_id()
+            if not session_id:
+                return
 
-        session = self._get_session(session_id)
-        if not session:
-            return
+            session = self._get_session(session_id)
+            if not session:
+                return
 
-        project = find_project(session.project) if session.project else None
-        project_path = project.path if project else None
+            project = find_project(session.project) if session.project else None
+            project_path = project.path if project else None
 
-        if session.tmux_window and switch_to_window(session.tmux_window):
-            # Successfully switched
-            pass
-        else:
-            # Respawn
-            window_id = spawn_claude(session.id, project_path)
-            if window_id:
-                session.tmux_window = window_id
-                save_sessions(self._sessions)
+            if session.tmux_window and switch_to_window(session.tmux_window):
+                # Successfully switched
+                pass
+            else:
+                # Respawn
+                window_id = spawn_claude(session.id, project_path)
+                if window_id:
+                    session.tmux_window = window_id
+                    save_sessions(self._sessions)
 
-        self.refresh_table()
+            self.refresh_table()
+        except Exception as e:
+            self._exit_on_error(e)
 
     def action_archive(self) -> None:
         """Archive the selected session."""
-        session_id = self._get_selected_session_id()
-        if not session_id:
-            return
+        try:
+            session_id = self._get_selected_session_id()
+            if not session_id:
+                return
 
-        archive_session(self._sessions, session_id)
-        self.refresh_table()
+            archive_session(self._sessions, session_id)
+            self.refresh_table()
+        except Exception as e:
+            self._exit_on_error(e)
 
 
 def run_tui(server=None) -> int:
