@@ -404,13 +404,13 @@ def test_update_session_state(temp_config):
 
     assert updated is not None
     assert updated.state == "running"
-    assert updated.message == "Claude running"
+    assert updated.status == "Claude running"
     assert updated.updated_at > 1000
 
     # Verify persistence
     loaded = load_sessions()
     assert loaded[0].state == "running"
-    assert loaded[0].message == "Claude running"
+    assert loaded[0].status == "Claude running"
 
 
 def test_update_session_state_not_found(temp_config):

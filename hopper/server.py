@@ -18,9 +18,9 @@ from hopper.sessions import (
     current_time_ms,
     load_sessions,
     save_sessions,
-    update_session_message,
     update_session_stage,
     update_session_state,
+    update_session_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,9 +160,9 @@ class Server:
             return
 
         # Only transition to idle if currently running (preserve error state)
-        if session.state == "running":
+        if session.state in ("running", "stuck"):
             session.state = "idle"
-            session.message = "Disconnected"
+            session.status = "Disconnected"
             session.touch()
 
         # Clear tmux_window since hop ore closing means window is gone
@@ -249,21 +249,19 @@ class Server:
         elif msg_type == "session_set_state":
             session_id = message.get("session_id")
             state = message.get("state")
-            msg = message.get("message", "")
-            if session_id and state in ("new", "idle", "running", "error"):
-                session = update_session_state(self.sessions, session_id, state, msg)
+            status = message.get("status") or message.get("message", "")  # Backwards compat
+            if session_id and state in ("new", "idle", "running", "stuck", "error"):
+                session = update_session_state(self.sessions, session_id, state, status)
                 if session:
                     self.broadcast({"type": "session_state_changed", "session": session.to_dict()})
 
-        elif msg_type == "session_set_message":
+        elif msg_type == "session_set_status":
             session_id = message.get("session_id")
-            msg = message.get("message", "")
+            status = message.get("status") or message.get("message", "")  # Backwards compat
             if session_id:
-                session = update_session_message(self.sessions, session_id, msg)
+                session = update_session_status(self.sessions, session_id, status)
                 if session:
-                    self.broadcast(
-                        {"type": "session_message_changed", "session": session.to_dict()}
-                    )
+                    self.broadcast({"type": "session_status_changed", "session": session.to_dict()})
 
         else:
             # Broadcast other messages

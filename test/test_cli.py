@@ -120,7 +120,7 @@ def test_status_help(capsys):
     assert result == 0
     captured = capsys.readouterr()
     assert "usage: hop status" in captured.out
-    assert "message" in captured.out
+    assert "status" in captured.out
 
 
 # Tests for subcommand unknown args
@@ -463,8 +463,8 @@ def test_status_invalid_session(capsys):
 
 
 def test_status_show(capsys):
-    """status command shows current message when no args."""
-    session_data = {"id": "test-session", "message": "Working on feature X"}
+    """status command shows current status when no args."""
+    session_data = {"id": "test-session", "status": "Working on feature X"}
     with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.session_exists", return_value=True):
@@ -476,8 +476,8 @@ def test_status_show(capsys):
 
 
 def test_status_show_empty(capsys):
-    """status command shows placeholder when no message set."""
-    session_data = {"id": "test-session", "message": ""}
+    """status command shows placeholder when no status set."""
+    session_data = {"id": "test-session", "status": ""}
     with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.session_exists", return_value=True):
@@ -485,31 +485,31 @@ def test_status_show_empty(capsys):
                     result = cmd_status([])
     assert result == 0
     captured = capsys.readouterr()
-    assert "(no status message)" in captured.out
+    assert "(no status)" in captured.out
 
 
 def test_status_update(capsys):
-    """status command updates message when args provided."""
-    session_data = {"id": "test-session", "message": "Old status"}
+    """status command updates status when args provided."""
+    session_data = {"id": "test-session", "status": "Old status"}
     with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.session_exists", return_value=True):
                 with patch("hopper.client.get_session", return_value=session_data):
-                    with patch("hopper.client.set_session_message", return_value=True):
-                        result = cmd_status(["New", "status", "message"])
+                    with patch("hopper.client.set_session_status", return_value=True):
+                        result = cmd_status(["New", "status", "text"])
     assert result == 0
     captured = capsys.readouterr()
-    assert "Updated from 'Old status' to 'New status message'" in captured.out
+    assert "Updated from 'Old status' to 'New status text'" in captured.out
 
 
 def test_status_update_from_empty(capsys):
     """status command shows simpler message when updating from empty."""
-    session_data = {"id": "test-session", "message": ""}
+    session_data = {"id": "test-session", "status": ""}
     with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.session_exists", return_value=True):
                 with patch("hopper.client.get_session", return_value=session_data):
-                    with patch("hopper.client.set_session_message", return_value=True):
+                    with patch("hopper.client.set_session_status", return_value=True):
                         result = cmd_status(["New status"])
     assert result == 0
     captured = capsys.readouterr()
@@ -517,15 +517,15 @@ def test_status_update_from_empty(capsys):
     assert "from" not in captured.out
 
 
-def test_status_empty_message_error(capsys):
-    """status command returns 1 when given empty message."""
+def test_status_empty_text_error(capsys):
+    """status command returns 1 when given empty text."""
     with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.session_exists", return_value=True):
                 result = cmd_status(["", "  "])
     assert result == 1
     captured = capsys.readouterr()
-    assert "Status message required" in captured.out
+    assert "Status text required" in captured.out
 
 
 # Tests for config command

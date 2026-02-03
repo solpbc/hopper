@@ -37,7 +37,7 @@ def _check_test_isolation() -> None:
 
 
 Stage = Literal["ore", "processing"]
-State = Literal["new", "idle", "running", "error"]
+State = Literal["new", "idle", "running", "stuck", "error"]
 
 
 SHORT_ID_LEN = 8  # Standard short ID length (first segment of UUID)
@@ -124,7 +124,7 @@ class Session:
     scope: str = ""  # User's task scope description
     updated_at: int = field(default=0)  # milliseconds since epoch, 0 means use created_at
     state: State = "idle"
-    message: str = ""  # Human-readable status message
+    status: str = ""  # Human-readable status text
     tmux_window: str | None = None  # tmux window ID (e.g., "@1")
 
     @property
@@ -150,7 +150,7 @@ class Session:
             "scope": self.scope,
             "updated_at": self.effective_updated_at,
             "state": self.state,
-            "message": self.message,
+            "status": self.status,
             "tmux_window": self.tmux_window,
         }
 
@@ -164,7 +164,7 @@ class Session:
             scope=data.get("scope", ""),  # Backwards compat
             updated_at=data["updated_at"],
             state=data["state"],
-            message=data.get("message", ""),  # Backwards compat
+            status=data.get("status") or data.get("message", ""),  # Backwards compat
             tmux_window=data.get("tmux_window"),  # Backwards compat
         )
 
@@ -222,7 +222,7 @@ def create_session(sessions: list[Session], project: str, scope: str = "") -> Se
         scope=scope,
         updated_at=now,
         state="new",
-        message="Ready to start",
+        status="Ready to start",
     )
     sessions.append(session)
     get_session_dir(session.id).mkdir(parents=True, exist_ok=True)
@@ -263,26 +263,24 @@ def archive_session(sessions: list[Session], session_id: str) -> Session | None:
 
 
 def update_session_state(
-    sessions: list[Session], session_id: str, state: State, message: str
+    sessions: list[Session], session_id: str, state: State, status: str
 ) -> Session | None:
-    """Update a session's state and message. Returns the updated session or None if not found."""
+    """Update a session's state and status. Returns the updated session or None if not found."""
     for session in sessions:
         if session.id == session_id:
             session.state = state
-            session.message = message
+            session.status = status
             session.touch()
             save_sessions(sessions)
             return session
     return None
 
 
-def update_session_message(
-    sessions: list[Session], session_id: str, message: str
-) -> Session | None:
-    """Update a session's message only. Returns the updated session or None if not found."""
+def update_session_status(sessions: list[Session], session_id: str, status: str) -> Session | None:
+    """Update a session's status text only. Returns the updated session or None if not found."""
     for session in sessions:
         if session.id == session_id:
-            session.message = message
+            session.status = status
             session.touch()
             save_sessions(sessions)
             return session

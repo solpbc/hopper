@@ -112,16 +112,16 @@ class OreRunner:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
 
-    def _emit_state(self, state: str, message: str) -> None:
+    def _emit_state(self, state: str, status: str) -> None:
         """Emit state change to server via persistent connection."""
         if self.connection:
             self.connection.emit(
                 "session_set_state",
                 session_id=self.session_id,
                 state=state,
-                message=message,
+                status=status,
             )
-            logger.debug(f"Emitted state: {state}, message: {message}")
+            logger.debug(f"Emitted state: {state}, status: {status}")
 
     def _run_claude(self) -> tuple[int, str | None]:
         """Run Claude with the session ID. Returns (exit_code, error_message)."""

@@ -295,15 +295,15 @@ def get_session(socket_path: Path, session_id: str, timeout: float = 2.0) -> dic
 
 
 def set_session_state(
-    socket_path: Path, session_id: str, state: str, message: str, timeout: float = 2.0
+    socket_path: Path, session_id: str, state: str, status: str, timeout: float = 2.0
 ) -> bool:
-    """Set a session's state and message (fire-and-forget).
+    """Set a session's state and status (fire-and-forget).
 
     Args:
         socket_path: Path to the Unix socket
         session_id: The session ID to update
-        state: New state ("new", "idle", "running", or "error")
-        message: Human-readable status message
+        state: New state ("new", "idle", "running", "stuck", or "error")
+        status: Human-readable status text
         timeout: Connection timeout in seconds
 
     Returns:
@@ -313,7 +313,7 @@ def set_session_state(
         "type": "session_set_state",
         "session_id": session_id,
         "state": state,
-        "message": message,
+        "status": status,
         "ts": int(time.time() * 1000),
     }
     # Fire-and-forget: don't wait for response
@@ -324,24 +324,24 @@ def set_session_state(
         return False
 
 
-def set_session_message(
-    socket_path: Path, session_id: str, message: str, timeout: float = 2.0
+def set_session_status(
+    socket_path: Path, session_id: str, status: str, timeout: float = 2.0
 ) -> bool:
-    """Set a session's message only (fire-and-forget).
+    """Set a session's status text only (fire-and-forget).
 
     Args:
         socket_path: Path to the Unix socket
         session_id: The session ID to update
-        message: Human-readable status message
+        status: Human-readable status text
         timeout: Connection timeout in seconds
 
     Returns:
         True if message was sent successfully, False otherwise
     """
     msg = {
-        "type": "session_set_message",
+        "type": "session_set_status",
         "session_id": session_id,
-        "message": message,
+        "status": status,
         "ts": int(time.time() * 1000),
     }
     # Fire-and-forget: don't wait for response

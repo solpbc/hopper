@@ -384,7 +384,7 @@ def test_server_preserves_error_state_on_disconnect(socket_path, server, temp_co
         stage="ore",
         created_at=1000,
         state="error",
-        message="Something failed",
+        status="Something failed",
         tmux_window="@1",
     )
     server.sessions = [session]
@@ -416,7 +416,7 @@ def test_server_preserves_error_state_on_disconnect(socket_path, server, temp_co
 
     # Session should still be in error state, but tmux_window cleared
     assert server.sessions[0].state == "error"
-    assert server.sessions[0].message == "Something failed"
+    assert server.sessions[0].status == "Something failed"
     assert server.sessions[0].tmux_window is None
 
 

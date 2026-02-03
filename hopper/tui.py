@@ -46,6 +46,7 @@ CLAUDE_THEME = Theme(
 
 # Status indicators (Unicode symbols, no emoji)
 STATUS_RUNNING = "●"  # filled circle
+STATUS_STUCK = "◐"  # half-filled circle
 STATUS_IDLE = "○"  # empty circle
 STATUS_ERROR = "✗"  # x mark
 STATUS_ACTION = "+"  # plus for action rows
@@ -63,15 +64,17 @@ class Row:
     short_id: str
     stage: str  # "o" for ore, "p" for processing
     age: str  # formatted age string
-    status: str  # STATUS_RUNNING, STATUS_IDLE, STATUS_ERROR
+    status: str  # STATUS_RUNNING, STATUS_STUCK, STATUS_IDLE, STATUS_ERROR
     project: str = ""  # Project name
-    message: str = ""  # Human-readable status message
+    status_text: str = ""  # Human-readable status text
 
 
 def session_to_row(session: Session) -> Row:
     """Convert a session to a display row."""
     if session.state == "error":
         status = STATUS_ERROR
+    elif session.state == "stuck":
+        status = STATUS_STUCK
     elif session.state == "running":
         status = STATUS_RUNNING
     else:
@@ -86,7 +89,7 @@ def session_to_row(session: Session) -> Row:
         age=format_age(session.created_at),
         status=status,
         project=session.project,
-        message=session.message,
+        status_text=session.status,
     )
 
 
@@ -94,6 +97,8 @@ def format_status_text(status: str) -> Text:
     """Format a status indicator with color using Rich Text."""
     if status == STATUS_RUNNING:
         return Text(status, style="bright_green")
+    elif status == STATUS_STUCK:
+        return Text(status, style="bright_yellow")
     elif status == STATUS_ERROR:
         return Text(status, style="bright_red")
     elif status == STATUS_ACTION:
@@ -420,7 +425,7 @@ class HopperApp(App):
                 table.update_cell(row.id, SessionTable.COL_PROJECT, row.project)
                 table.update_cell(row.id, SessionTable.COL_AGE, row.age)
                 table.update_cell(
-                    row.id, SessionTable.COL_MESSAGE, self._format_message(row.message)
+                    row.id, SessionTable.COL_MESSAGE, self._format_message(row.status_text)
                 )
             else:
                 # Add new row
@@ -430,7 +435,7 @@ class HopperApp(App):
                     row.short_id,
                     row.project,
                     row.age,
-                    self._format_message(row.message),
+                    self._format_message(row.status_text),
                     key=row.id,
                 )
 

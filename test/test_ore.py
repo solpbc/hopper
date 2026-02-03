@@ -113,7 +113,7 @@ class TestOreRunner:
         assert any(
             e[0] == "session_set_state"
             and e[1]["state"] == "error"
-            and e[1]["message"] == "Exited with code 1"
+            and e[1]["status"] == "Exited with code 1"
             for e in emitted
         )
 
@@ -150,8 +150,8 @@ class TestOreRunner:
             e for e in emitted if e[0] == "session_set_state" and e[1]["state"] == "error"
         ]
         assert len(error_emissions) == 1
-        assert "something went wrong" in error_emissions[0][1]["message"]
-        assert "Details here" in error_emissions[0][1]["message"]
+        assert "something went wrong" in error_emissions[0][1]["status"]
+        assert "Details here" in error_emissions[0][1]["status"]
 
     def test_run_claude_with_resume_for_existing_session(self):
         """Runner invokes claude with --resume for existing (non-new) sessions."""
@@ -275,7 +275,7 @@ class TestOreRunner:
         assert any(
             e[0] == "session_set_state"
             and e[1]["state"] == "error"
-            and e[1]["message"] == "claude command not found"
+            and e[1]["status"] == "claude command not found"
             for e in emitted
         )
 
@@ -381,7 +381,7 @@ class TestOreRunner:
             e for e in emitted if e[0] == "session_set_state" and e[1]["state"] == "error"
         ]
         assert len(error_emissions) == 1
-        assert "not found" in error_emissions[0][1]["message"]
+        assert "not found" in error_emissions[0][1]["status"]
 
     def test_run_without_project_uses_no_cwd(self):
         """Runner passes cwd=None when no project is set."""

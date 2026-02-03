@@ -110,7 +110,7 @@ def test_row_dataclass():
         age="1m",
         status=STATUS_RUNNING,
         project="proj",
-        message="Working on it",
+        status_text="Working on it",
     )
     assert row.id == "test-id"
     assert row.short_id == "test-sho"
@@ -118,7 +118,7 @@ def test_row_dataclass():
     assert row.age == "1m"
     assert row.status == STATUS_RUNNING
     assert row.project == "proj"
-    assert row.message == "Working on it"
+    assert row.status_text == "Working on it"
 
 
 # Tests for HopperApp

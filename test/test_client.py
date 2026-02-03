@@ -182,7 +182,7 @@ def test_set_session_state_sends_message(server, socket_path):
 
     # Session should be updated
     assert server.sessions[0].state == "running"
-    assert server.sessions[0].message == "Claude running"
+    assert server.sessions[0].status == "Claude running"
 
 
 class TestHopperConnection:
@@ -240,7 +240,7 @@ class TestHopperConnection:
         time.sleep(0.2)
 
         # Send state update
-        conn.emit("session_set_state", session_id="test-id", state="running", message="Test")
+        conn.emit("session_set_state", session_id="test-id", state="running", status="Test")
 
         # Give time for message to be processed
         time.sleep(0.2)
@@ -249,7 +249,7 @@ class TestHopperConnection:
 
         # Session should be updated
         assert server.sessions[0].state == "running"
-        assert server.sessions[0].message == "Test"
+        assert server.sessions[0].status == "Test"
 
     def test_callback_receives_messages(self, socket_path, server):
         """Callback is invoked when server sends messages."""

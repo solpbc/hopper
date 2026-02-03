@@ -225,18 +225,18 @@ def cmd_ore(args: list[str]) -> int:
     return run_ore(session_id, SOCKET_PATH)
 
 
-@command("status", "Show or update session status message")
+@command("status", "Show or update session status")
 def cmd_status(args: list[str]) -> int:
-    """Show or update the current session's status message."""
-    from hopper.client import get_session, set_session_message
+    """Show or update the current session's status text."""
+    from hopper.client import get_session, set_session_status
 
     parser = make_parser(
         "status",
-        "Show or update session status message. "
+        "Show or update session status. "
         "Without arguments, displays the current status. "
-        "With arguments, sets the status to the provided message.",
+        "With arguments, sets the status to the provided text.",
     )
-    parser.add_argument("message", nargs="*", help="New status message (optional)")
+    parser.add_argument("text", nargs="*", help="New status text (optional)")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -257,35 +257,35 @@ def cmd_status(args: list[str]) -> int:
     if err := validate_hopper_sid():
         return err
 
-    if not parsed.message:
+    if not parsed.text:
         # Show current status
         session = get_session(SOCKET_PATH, session_id)
         if not session:
             print(f"Session {session_id} not found.")
             return 1
-        message = session.get("message", "")
-        if message:
-            print(message)
+        status = session.get("status", "")
+        if status:
+            print(status)
         else:
-            print("(no status message)")
+            print("(no status)")
         return 0
 
-    # Update status - join all args as the message
-    new_message = " ".join(parsed.message)
-    if not new_message.strip():
-        print("Status message required.")
+    # Update status - join all args as the text
+    new_status = " ".join(parsed.text)
+    if not new_status.strip():
+        print("Status text required.")
         return 1
 
-    # Get current message for friendly output
+    # Get current status for friendly output
     session = get_session(SOCKET_PATH, session_id)
-    old_message = session.get("message", "") if session else ""
+    old_status = session.get("status", "") if session else ""
 
-    set_session_message(SOCKET_PATH, session_id, new_message)
+    set_session_status(SOCKET_PATH, session_id, new_status)
 
-    if old_message:
-        print(f"Updated from '{old_message}' to '{new_message}'")
+    if old_status:
+        print(f"Updated from '{old_status}' to '{new_status}'")
     else:
-        print(f"Updated to '{new_message}'")
+        print(f"Updated to '{new_status}'")
 
     return 0
 
