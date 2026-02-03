@@ -348,7 +348,7 @@ class HopperApp(App):
                 table.update_cell(row.id, SessionTable.COL_PROJECT, row.project)
                 table.update_cell(row.id, SessionTable.COL_AGE, row.age)
                 table.update_cell(
-                    row.id, SessionTable.COL_MESSAGE, self._truncate_message(row.message)
+                    row.id, SessionTable.COL_MESSAGE, self._format_message(row.message)
                 )
             else:
                 # Add new row
@@ -358,7 +358,7 @@ class HopperApp(App):
                     row.short_id,
                     row.project,
                     row.age,
-                    self._truncate_message(row.message),
+                    self._format_message(row.message),
                     key=row.id,
                 )
 
@@ -370,12 +370,9 @@ class HopperApp(App):
             empty_msg.display = True
             table.display = False
 
-    def _truncate_message(self, message: str, max_len: int = 60) -> str:
-        """Truncate message for display, replacing newlines."""
-        text = message.replace("\n", " ") if message else ""
-        if len(text) > max_len:
-            return text[: max_len - 3] + "..."
-        return text
+    def _format_message(self, message: str) -> str:
+        """Format message for display, replacing newlines with spaces."""
+        return message.replace("\n", " ") if message else ""
 
     def _get_selected_session_id(self) -> str | None:
         """Get the session ID of the selected row."""
