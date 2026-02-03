@@ -7,6 +7,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import DataTable, Footer, Header, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -19,6 +20,27 @@ from hopper.sessions import (
     format_age,
     format_uptime,
     save_sessions,
+)
+
+# Claude Code-inspired theme
+# Colors derived from Claude Code's terminal UI (ANSI bright colors)
+CLAUDE_THEME = Theme(
+    name="claude",
+    primary="#ff5555",  # Bright red - logo accent, primary branding
+    secondary="#5555ff",  # Bright blue - code/identifiers
+    accent="#ff55ff",  # Bright magenta - hints, prompts
+    foreground="#ffffff",  # Bright white - main text
+    background="#000000",  # Black - main background
+    surface="#1a1a1a",  # Very dark gray - widget backgrounds
+    panel="#262626",  # Dark gray - differentiated sections
+    success="#55ff55",  # Bright green - completed/running
+    warning="#ffff55",  # Bright yellow - activity/processing
+    error="#ff5555",  # Bright red - errors
+    dark=True,
+    variables={
+        "footer-key-foreground": "#ff55ff",  # Magenta for key hints
+        "footer-description-foreground": "#888888",  # Gray for descriptions
+    },
 )
 
 # Status indicators (Unicode symbols, no emoji)
@@ -70,21 +92,21 @@ def session_to_row(session: Session) -> Row:
 def format_status_text(status: str) -> Text:
     """Format a status indicator with color using Rich Text."""
     if status == STATUS_RUNNING:
-        return Text(status, style="green")
+        return Text(status, style="bright_green")
     elif status == STATUS_ERROR:
-        return Text(status, style="red")
+        return Text(status, style="bright_red")
     elif status == STATUS_ACTION:
-        return Text(status, style="cyan")
+        return Text(status, style="bright_magenta")
     else:  # STATUS_IDLE
-        return Text(status, style="dim")
+        return Text(status, style="bright_black")
 
 
 def format_stage_text(stage: str) -> Text:
     """Format a stage indicator with color using Rich Text."""
     if stage == STAGE_ORE:
-        return Text(stage, style="cyan")
+        return Text(stage, style="bright_blue")
     else:  # STAGE_PROCESSING
-        return Text(stage, style="yellow")
+        return Text(stage, style="bright_yellow")
 
 
 class ProjectPickerScreen(ModalScreen[Project | None]):
@@ -107,19 +129,25 @@ class ProjectPickerScreen(ModalScreen[Project | None]):
         height: auto;
         max-height: 80%;
         background: $surface;
-        border: thick $primary;
+        border: solid $primary;
         padding: 1 2;
     }
 
     #picker-title {
         text-align: center;
         text-style: bold;
+        color: $text;
         padding-bottom: 1;
     }
 
     #project-list {
         height: auto;
         max-height: 20;
+        background: $surface;
+    }
+
+    #project-list > .option-list--option-highlighted {
+        background: $panel;
     }
     """
 
@@ -176,10 +204,21 @@ class HopperApp(App):
     CSS = """
     Screen {
         layout: vertical;
+        background: $background;
+    }
+
+    Header {
+        background: $surface;
+        color: $text;
+    }
+
+    Footer {
+        background: $surface;
     }
 
     #session-table {
         height: 1fr;
+        background: $background;
     }
 
     #empty-message {
@@ -189,7 +228,13 @@ class HopperApp(App):
     }
 
     DataTable > .datatable--cursor {
-        background: $accent;
+        background: $panel;
+    }
+
+    DataTable > .datatable--header {
+        background: $surface;
+        color: $text-muted;
+        text-style: bold;
     }
     """
 
@@ -223,6 +268,10 @@ class HopperApp(App):
 
     def on_mount(self) -> None:
         """Initialize when app is mounted."""
+        # Register and apply Claude-inspired theme
+        self.register_theme(CLAUDE_THEME)
+        self.theme = "claude"
+
         self._projects = get_active_projects()
         self.refresh_table()
         # Start polling for server updates

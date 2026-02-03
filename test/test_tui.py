@@ -60,41 +60,41 @@ def test_session_to_row_processing_stage():
 
 
 def test_format_status_text_running():
-    """format_status_text returns green for running."""
+    """format_status_text returns bright_green for running."""
     text = format_status_text(STATUS_RUNNING)
     assert str(text) == STATUS_RUNNING
-    assert text.style == "green"
+    assert text.style == "bright_green"
 
 
 def test_format_status_text_error():
-    """format_status_text returns red for error."""
+    """format_status_text returns bright_red for error."""
     text = format_status_text(STATUS_ERROR)
     assert str(text) == STATUS_ERROR
-    assert text.style == "red"
+    assert text.style == "bright_red"
 
 
 def test_format_status_text_idle():
-    """format_status_text returns dim for idle."""
+    """format_status_text returns bright_black for idle."""
     text = format_status_text(STATUS_IDLE)
     assert str(text) == STATUS_IDLE
-    assert text.style == "dim"
+    assert text.style == "bright_black"
 
 
 # Tests for format_stage_text
 
 
 def test_format_stage_text_ore():
-    """format_stage_text returns cyan for ore."""
+    """format_stage_text returns bright_blue for ore."""
     text = format_stage_text(STAGE_ORE)
     assert str(text) == STAGE_ORE
-    assert text.style == "cyan"
+    assert text.style == "bright_blue"
 
 
 def test_format_stage_text_processing():
-    """format_stage_text returns yellow for processing."""
+    """format_stage_text returns bright_yellow for processing."""
     text = format_stage_text(STAGE_PROCESSING)
     assert str(text) == STAGE_PROCESSING
-    assert text.style == "yellow"
+    assert text.style == "bright_yellow"
 
 
 # Tests for Row dataclass
