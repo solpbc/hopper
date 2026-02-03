@@ -31,6 +31,8 @@ class OreRunner(BaseRunner):
     def _build_command(self) -> tuple[list[str], str | None]:
         cwd = self.project_dir if self.project_dir else None
 
+        skip = "--dangerously-skip-permissions"
+
         if self.is_first_run:
             context = {}
             if self.project_name:
@@ -40,9 +42,9 @@ class OreRunner(BaseRunner):
             if self.scope:
                 context["scope"] = self.scope
             initial_prompt = prompt.load("shovel", context=context if context else None)
-            cmd = ["claude", "--session-id", self.session_id, initial_prompt]
+            cmd = ["claude", skip, "--session-id", self.session_id, initial_prompt]
         else:
-            cmd = ["claude", "--resume", self.session_id]
+            cmd = ["claude", skip, "--resume", self.session_id]
 
         return cmd, cwd
 

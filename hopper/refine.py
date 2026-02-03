@@ -61,6 +61,8 @@ class RefineRunner(BaseRunner):
     def _build_command(self) -> tuple[list[str], str | None]:
         cwd = str(self.worktree_path)
 
+        skip = "--dangerously-skip-permissions"
+
         if self.is_first_run and self.shovel_content is not None:
             context: dict[str, str] = {"shovel": self.shovel_content}
             if self.project_name:
@@ -68,9 +70,9 @@ class RefineRunner(BaseRunner):
             if self.project_dir:
                 context["dir"] = self.project_dir
             initial_prompt = prompt.load("refine", context=context)
-            cmd = ["claude", "--session-id", self.session_id, initial_prompt]
+            cmd = ["claude", skip, "--session-id", self.session_id, initial_prompt]
         else:
-            cmd = ["claude", "--resume", self.session_id]
+            cmd = ["claude", skip, "--resume", self.session_id]
 
         return cmd, cwd
 

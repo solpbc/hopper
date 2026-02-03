@@ -158,7 +158,7 @@ class TestOreRunner:
         # Check the command uses --resume for existing session
         mock_popen.assert_called_once()
         call_args = mock_popen.call_args
-        assert call_args[0][0] == ["claude", "--resume", "my-session-id"]
+        assert call_args[0][0] == ["claude", "--dangerously-skip-permissions", "--resume", "my-session-id"]
 
         # Check environment includes HOPPER_SID
         env = call_args[1]["env"]
@@ -195,9 +195,10 @@ class TestOreRunner:
         call_args = mock_popen.call_args
         cmd = call_args[0][0]
         assert cmd[0] == "claude"
-        assert cmd[1:3] == ["--session-id", "my-session-id"]
+        assert cmd[1] == "--dangerously-skip-permissions"
+        assert cmd[2:4] == ["--session-id", "my-session-id"]
         assert "--resume" not in cmd
-        assert len(cmd) == 4  # ["claude", "--session-id", "<id>", "<prompt>"]
+        assert len(cmd) == 5  # ["claude", "--dangerously-skip-permissions", "--session-id", "<id>", "<prompt>"]
 
     def test_run_fails_if_prompt_missing_for_new_session(self):
         """Runner raises FileNotFoundError if shovel prompt is missing for new session."""

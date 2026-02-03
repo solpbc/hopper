@@ -77,7 +77,7 @@ class TestRefineRunner:
         # Claude invoked with --session-id and prompt, cwd=worktree
         mock_popen.assert_called_once()
         cmd = mock_popen.call_args[0][0]
-        assert cmd == ["claude", "--session-id", "test-session-id", "loaded prompt"]
+        assert cmd == ["claude", "--dangerously-skip-permissions", "--session-id", "test-session-id", "loaded prompt"]
         assert mock_popen.call_args[1]["cwd"] == str(session_dir / "worktree")
 
     def test_resume_uses_existing_worktree(self, tmp_path):
@@ -117,7 +117,7 @@ class TestRefineRunner:
 
         # Claude invoked with --resume, cwd=worktree
         cmd = mock_popen.call_args[0][0]
-        assert cmd == ["claude", "--resume", "test-session-id"]
+        assert cmd == ["claude", "--dangerously-skip-permissions", "--resume", "test-session-id"]
         assert mock_popen.call_args[1]["cwd"] == str(worktree)
 
     def test_bails_if_session_already_active(self):
