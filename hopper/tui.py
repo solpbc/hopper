@@ -13,7 +13,7 @@ from textual.theme import Theme
 from textual.widgets import Button, DataTable, Footer, Header, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
-from hopper.backlog import BacklogItem, add_backlog_item, remove_backlog_item
+from hopper.backlog import BacklogItem, add_backlog_item, remove_backlog_item, update_backlog_item
 from hopper.claude import spawn_claude, switch_to_pane
 from hopper.projects import Project, find_project, get_active_projects
 from hopper.sessions import (
@@ -22,6 +22,7 @@ from hopper.sessions import (
     create_session,
     format_age,
     format_uptime,
+    save_sessions,
 )
 
 # Claude Code-inspired theme
@@ -216,6 +217,10 @@ class TextInputScreen(ModalScreen):
     SCOPED_CSS = False
     MODAL_TITLE: str = ""
 
+    def __init__(self, initial_text: str = ""):
+        super().__init__()
+        self._initial_text = initial_text
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
     ]
@@ -273,7 +278,10 @@ class TextInputScreen(ModalScreen):
         raise NotImplementedError
 
     def on_mount(self) -> None:
-        self.query_one(TextArea).focus()
+        ta = self.query_one(TextArea)
+        if self._initial_text:
+            ta.text = self._initial_text
+        ta.focus()
 
     def on_key(self, event: events.Key) -> None:
         focused = self.focused
@@ -338,6 +346,21 @@ class BacklogInputScreen(TextInputScreen):
 
     def on_submit(self, button: Button, text: str) -> None:
         self.dismiss(text)
+
+
+class BacklogEditScreen(TextInputScreen):
+    """Modal screen for editing a backlog item with save/promote options."""
+
+    MODAL_TITLE = "Edit Backlog Item"
+
+    def compose_buttons(self) -> ComposeResult:
+        yield Button("Cancel", id="btn-cancel", variant="default")
+        yield Button("Promote", id="btn-promote", variant="default")
+        yield Button("Save", id="btn-save", variant="primary")
+
+    def on_submit(self, button: Button, text: str) -> None:
+        action = "promote" if button.id == "btn-promote" else "save"
+        self.dismiss((action, text))
 
 
 class LegendScreen(ModalScreen):
@@ -752,6 +775,13 @@ class HopperApp(App):
             return None
         return key
 
+    def _get_backlog_item(self, item_id: str) -> BacklogItem | None:
+        """Get a backlog item by ID."""
+        for item in self._backlog:
+            if item.id == item_id:
+                return item
+        return None
+
     def _get_session(self, session_id: str) -> Session | None:
         """Get a session by ID."""
         for session in self._sessions:
@@ -818,6 +848,10 @@ class HopperApp(App):
             self.action_new_backlog()
             return
 
+        if isinstance(event.data_table, BacklogTable):
+            self._edit_backlog_item(key)
+            return
+
         if not isinstance(event.data_table, SessionTable):
             return
 
@@ -860,6 +894,32 @@ class HopperApp(App):
     def action_legend(self) -> None:
         """Show the symbol legend modal."""
         self.push_screen(LegendScreen())
+
+    def _edit_backlog_item(self, item_id: str) -> None:
+        """Open the edit modal for a backlog item."""
+        item = self._get_backlog_item(item_id)
+        if not item:
+            return
+
+        def on_edit_result(result: tuple[str, str] | None) -> None:
+            if result is None:
+                return  # Cancelled
+            action, text = result
+            if action == "save":
+                update_backlog_item(self._backlog, item_id, text)
+                self.refresh_backlog()
+            elif action == "promote":
+                project = find_project(item.project)
+                project_path = project.path if project else None
+                session = create_session(self._sessions, item.project, text)
+                session.backlog = item.to_dict()
+                save_sessions(self._sessions)
+                spawn_claude(session.id, project_path, foreground=False)
+                remove_backlog_item(self._backlog, item_id)
+                self.refresh_table()
+                self.refresh_backlog()
+
+        self.push_screen(BacklogEditScreen(initial_text=item.description), on_edit_result)
 
     def action_delete_backlog(self) -> None:
         """Delete the selected backlog item."""

@@ -481,3 +481,45 @@ def test_update_session_state_not_found(temp_config):
     result = update_session_state(sessions_list, "nonexistent", "running", "Test")
 
     assert result is None
+
+
+def test_session_backlog_field_roundtrip():
+    """backlog field survives to_dict/from_dict roundtrip."""
+    backlog_data = {
+        "id": "bl-uuid",
+        "project": "proj",
+        "description": "Original task",
+        "created_at": 1000,
+        "session_id": None,
+    }
+    session = Session(
+        id="abc-123",
+        stage="ore",
+        created_at=1000,
+        updated_at=1000,
+        state="new",
+        backlog=backlog_data,
+    )
+    restored = Session.from_dict(session.to_dict())
+    assert restored.backlog == backlog_data
+    assert restored.backlog["project"] == "proj"
+
+
+def test_session_backlog_field_default_none():
+    """backlog defaults to None."""
+    session = Session(id="abc-123", stage="ore", created_at=1000)
+    assert session.backlog is None
+    assert session.to_dict()["backlog"] is None
+
+
+def test_session_from_dict_backwards_compat_backlog():
+    """Sessions without 'backlog' field default to None."""
+    data = {
+        "id": "abc-123",
+        "stage": "ore",
+        "created_at": 1000,
+        "updated_at": 1000,
+        "state": "new",
+    }
+    session = Session.from_dict(data)
+    assert session.backlog is None

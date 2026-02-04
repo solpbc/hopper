@@ -7,6 +7,7 @@ from hopper.backlog import (
     load_backlog,
     remove_backlog_item,
     save_backlog,
+    update_backlog_item,
 )
 
 
@@ -131,6 +132,31 @@ def test_remove_backlog_item_not_found(temp_config):
     result = remove_backlog_item(items, "nonexistent-id")
     assert result is None
     assert len(items) == 1
+
+
+def test_update_backlog_item(temp_config):
+    """update_backlog_item updates description and persists."""
+    items: list[BacklogItem] = []
+    item = add_backlog_item(items, "proj", "Original text")
+
+    updated = update_backlog_item(items, item.id, "Updated text")
+    assert updated is not None
+    assert updated.description == "Updated text"
+    assert items[0].description == "Updated text"
+
+    # Verify persisted
+    loaded = load_backlog()
+    assert loaded[0].description == "Updated text"
+
+
+def test_update_backlog_item_not_found(temp_config):
+    """update_backlog_item returns None for unknown ID."""
+    items: list[BacklogItem] = []
+    add_backlog_item(items, "proj", "Keep")
+
+    result = update_backlog_item(items, "nonexistent-id", "New text")
+    assert result is None
+    assert items[0].description == "Keep"
 
 
 def test_find_by_short_id():

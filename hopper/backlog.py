@@ -102,6 +102,18 @@ def remove_backlog_item(items: list[BacklogItem], item_id: str) -> BacklogItem |
     return None
 
 
+def update_backlog_item(
+    items: list[BacklogItem], item_id: str, description: str
+) -> BacklogItem | None:
+    """Update a backlog item's description. Returns the updated item or None."""
+    for item in items:
+        if item.id == item_id:
+            item.description = description
+            save_backlog(items)
+            return item
+    return None
+
+
 def find_by_short_id(items: list[BacklogItem], prefix: str) -> BacklogItem | None:
     """Find a backlog item by ID prefix. Returns None if not found or ambiguous."""
     matches = [item for item in items if item.id.startswith(prefix)]

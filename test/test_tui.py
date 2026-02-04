@@ -944,6 +944,205 @@ async def test_delete_noop_on_session_table():
         assert len(app._backlog) == 1
 
 
+# Tests for BacklogEditScreen
+
+
+class BacklogEditTestApp(App):
+    """Test app wrapper for BacklogEditScreen."""
+
+    def __init__(self, initial_text: str = ""):
+        super().__init__()
+        self.edit_result = "not_set"  # sentinel value
+        self._initial_text = initial_text
+
+    def on_mount(self) -> None:
+        from hopper.tui import BacklogEditScreen
+
+        def capture_result(r):
+            self.edit_result = r
+
+        self.push_screen(BacklogEditScreen(initial_text=self._initial_text), capture_result)
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_prefills_text():
+    """BacklogEditScreen should show pre-filled text."""
+    from textual.widgets import TextArea
+
+    app = BacklogEditTestApp(initial_text="Existing description")
+    async with app.run_test():
+        ta = app.screen.query_one(TextArea)
+        assert ta.text == "Existing description"
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_cancel_escape():
+    """Escape should dismiss the edit screen with None."""
+    app = BacklogEditTestApp(initial_text="Some text")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        assert app.edit_result is None
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_save():
+    """Save button should return ('save', text)."""
+    from textual.widgets import TextArea
+
+    app = BacklogEditTestApp(initial_text="Original")
+    async with app.run_test() as pilot:
+        ta = app.screen.query_one(TextArea)
+        ta.clear()
+        ta.insert("Updated text")
+        # Tab to Cancel, Promote, Save (3rd button)
+        await pilot.press("tab")  # Cancel
+        await pilot.press("tab")  # Promote
+        await pilot.press("tab")  # Save
+        await pilot.press("enter")
+        assert app.edit_result == ("save", "Updated text")
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_promote():
+    """Promote button should return ('promote', text)."""
+    from textual.widgets import TextArea
+
+    app = BacklogEditTestApp(initial_text="Task to promote")
+    async with app.run_test() as pilot:
+        ta = app.screen.query_one(TextArea)
+        assert ta.text == "Task to promote"
+        # Tab to Cancel, then Promote (2nd button)
+        await pilot.press("tab")  # Cancel
+        await pilot.press("tab")  # Promote
+        await pilot.press("enter")
+        assert app.edit_result == ("promote", "Task to promote")
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_empty_validation():
+    """Empty text should not submit."""
+    app = BacklogEditTestApp(initial_text="")
+    async with app.run_test() as pilot:
+        # Tab to Save button
+        await pilot.press("tab")  # Cancel
+        await pilot.press("tab")  # Promote
+        await pilot.press("tab")  # Save
+        await pilot.press("enter")
+        assert app.edit_result == "not_set"
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_arrow_navigation():
+    """Arrow keys should navigate between buttons."""
+    app = BacklogEditTestApp(initial_text="Text")
+    async with app.run_test() as pilot:
+        await pilot.press("tab")
+        assert app.screen.focused.id == "btn-cancel"
+        await pilot.press("right")
+        assert app.screen.focused.id == "btn-promote"
+        await pilot.press("right")
+        assert app.screen.focused.id == "btn-save"
+        await pilot.press("right")  # wraps
+        assert app.screen.focused.id == "btn-cancel"
+
+
+@pytest.mark.asyncio
+async def test_enter_on_backlog_item_opens_edit(temp_config):
+    """Enter on a backlog item should open BacklogEditScreen."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogEditScreen
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj", description="Edit me", created_at=1000),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("tab")  # Focus backlog table
+        await pilot.press("enter")  # Enter on first item
+        assert isinstance(app.screen, BacklogEditScreen)
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_save_updates_item(temp_config):
+    """Saving from edit modal should update the backlog item description."""
+    from textual.widgets import TextArea
+
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogEditScreen
+
+    items = [
+        BacklogItem(id="bl-1111-uuid", project="proj", description="Original", created_at=1000),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("tab")
+        await pilot.press("enter")
+        assert isinstance(app.screen, BacklogEditScreen)
+        ta = app.screen.query_one(TextArea)
+        assert ta.text == "Original"
+        ta.clear()
+        ta.insert("Updated")
+        # Tab to Save (3rd button)
+        await pilot.press("tab")  # Cancel
+        await pilot.press("tab")  # Promote
+        await pilot.press("tab")  # Save
+        await pilot.press("enter")
+        assert app._backlog[0].description == "Updated"
+
+
+@pytest.mark.asyncio
+async def test_backlog_promote_creates_session(monkeypatch, temp_config):
+    """Promote should create a session, remove backlog item, and spawn in background."""
+    from textual.widgets import TextArea
+
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogEditScreen
+
+    items = [
+        BacklogItem(
+            id="bl-1111-uuid", project="testproj", description="Promote me", created_at=1000
+        ),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+
+    spawned = []
+    monkeypatch.setattr(
+        "hopper.tui.spawn_claude",
+        lambda sid, path, foreground=True, stage="ore": spawned.append(
+            {"sid": sid, "path": path, "fg": foreground}
+        ),
+    )
+    monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
+
+    async with app.run_test() as pilot:
+        await pilot.press("tab")
+        await pilot.press("enter")
+        assert isinstance(app.screen, BacklogEditScreen)
+        ta = app.screen.query_one(TextArea)
+        assert ta.text == "Promote me"
+        # Tab to Promote (2nd button)
+        await pilot.press("tab")  # Cancel
+        await pilot.press("tab")  # Promote
+        await pilot.press("enter")
+
+        # Backlog item should be removed
+        assert len(app._backlog) == 0
+        # Session should be created
+        assert len(app._sessions) == 1
+        session = app._sessions[0]
+        assert session.project == "testproj"
+        assert session.scope == "Promote me"
+        assert session.backlog is not None
+        assert session.backlog["id"] == "bl-1111-uuid"
+        assert session.backlog["description"] == "Promote me"
+        # Should have spawned in background
+        assert len(spawned) == 1
+        assert spawned[0]["fg"] is False
+
+
 # Tests for LegendScreen
 
 
