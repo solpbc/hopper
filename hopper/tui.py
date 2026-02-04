@@ -634,11 +634,11 @@ class HopperApp(App):
         """
         table = self.query_one("#session-table", SessionTable)
 
-        # Build rows from sessions (ore first, then processing; skip ship)
-        stage_order = {"ore": 0, "processing": 1}
+        # Build rows from sessions (ore first, then processing, then ship)
+        stage_order = {"ore": 0, "processing": 1, "ship": 2}
         rows = [
             session_to_row(s)
-            for s in sorted(self._sessions, key=lambda s: stage_order.get(s.stage, 2))
+            for s in sorted(self._sessions, key=lambda s: stage_order.get(s.stage, 3))
             if s.stage in stage_order
         ]
 

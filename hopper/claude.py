@@ -15,13 +15,14 @@ def spawn_claude(
         session_id: The hopper session ID.
         project_path: Working directory for the Claude session.
         foreground: If True, switch to the new window. If False, stay in current window.
-        stage: Session stage ("ore" or "processing") to determine which runner to use.
+        stage: Session stage ("ore", "processing", or "ship") to determine which runner to use.
 
     Returns:
         The tmux pane ID on success, None on failure.
     """
     # Select runner based on stage
-    hop_cmd = "hop refine" if stage == "processing" else "hop ore"
+    stage_cmds = {"ore": "hop ore", "processing": "hop refine", "ship": "hop ship"}
+    hop_cmd = stage_cmds.get(stage, "hop ore")
     # On failure, pause so user can see the error before window closes
     command = f"{hop_cmd} {session_id} || {{ echo 'Failed. Press Enter to close.'; read; }}"
     return new_window(command, cwd=project_path, background=not foreground)

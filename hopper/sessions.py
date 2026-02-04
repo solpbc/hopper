@@ -87,7 +87,7 @@ class Session:
     """A hopper session."""
 
     id: str
-    stage: str  # "ore" or "processing"
+    stage: str  # "ore", "processing", or "ship"
     created_at: int  # milliseconds since epoch
     project: str = ""  # Project name this session belongs to
     scope: str = ""  # User's task scope description

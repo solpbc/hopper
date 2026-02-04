@@ -893,6 +893,113 @@ def test_refined_success(capsys):
     assert "Refine complete" in status
 
 
+# Tests for ship command
+
+
+def test_ship_help(capsys):
+    """ship --help shows help and returns 0."""
+    from hopper.cli import cmd_ship
+
+    result = cmd_ship(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop ship" in captured.out
+
+
+def test_ship_no_server(capsys):
+    """ship returns 1 when server not running."""
+    from hopper.cli import cmd_ship
+
+    with patch("hopper.client.ping", return_value=False):
+        result = cmd_ship(["test-session"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Server not running" in captured.out
+
+
+def test_ship_missing_session_id(capsys):
+    """ship requires session_id argument."""
+    from hopper.cli import cmd_ship
+
+    result = cmd_ship([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.out
+
+
+# Tests for shipped command
+
+
+def test_shipped_help(capsys):
+    """shipped --help shows help and returns 0."""
+    from hopper.cli import cmd_shipped
+
+    result = cmd_shipped(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop shipped" in captured.out
+
+
+def test_shipped_no_server(capsys):
+    """shipped returns 1 when server not running."""
+    from hopper.cli import cmd_shipped
+
+    with patch("hopper.client.ping", return_value=False):
+        result = cmd_shipped([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Server not running" in captured.out
+
+
+def test_shipped_no_hopper_sid(capsys):
+    """shipped returns 1 when HOPPER_SID not set."""
+    from hopper.cli import cmd_shipped
+
+    env = os.environ.copy()
+    env.pop("HOPPER_SID", None)
+    with patch.dict(os.environ, env, clear=True):
+        with patch("hopper.client.ping", return_value=True):
+            result = cmd_shipped([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "HOPPER_SID not set" in captured.out
+
+
+def test_shipped_invalid_session(capsys):
+    """shipped returns 1 when session doesn't exist."""
+    from hopper.cli import cmd_shipped
+
+    with patch.dict(os.environ, {"HOPPER_SID": "bad-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=False):
+                result = cmd_shipped([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "bad-session" in captured.out
+    assert "not found or archived" in captured.out
+
+
+def test_shipped_success(capsys):
+    """shipped sets state to completed and prints confirmation."""
+    from hopper.cli import cmd_shipped
+
+    with patch.dict(os.environ, {"HOPPER_SID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.session_exists", return_value=True):
+                with patch("hopper.client.set_session_state", return_value=True) as mock_set:
+                    result = cmd_shipped([])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Ship complete" in captured.out
+
+    mock_set.assert_called_once()
+    _, sid, state, status = mock_set.call_args[0]
+    assert sid == "test-session"
+    assert state == "completed"
+    assert "Ship complete" in status
+
+
 # Tests for task command
 
 

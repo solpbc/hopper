@@ -9,7 +9,7 @@ Hopper manages multiple Claude Code sessions through a terminal interface. It ru
 ## Key Concepts
 
 - **Session** - A Claude Code instance with a unique ID, workflow stage, freeform state, active flag, and associated tmux window
-- **Stage** - Workflow position: "ore" (new/unprocessed), "processing" (in progress), or "ship" (complete)
+- **Stage** - Workflow position: "ore" (new/unprocessed), "processing" (in progress), or "ship" (merging back to main)
 - **Backlog** - Future work items with project and description
 
 ## Architecture

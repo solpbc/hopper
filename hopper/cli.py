@@ -235,6 +235,28 @@ def cmd_refine(args: list[str]) -> int:
     return run_refine(parsed.session_id, _socket())
 
 
+@command("ship", "Run ship workflow for a session")
+def cmd_ship(args: list[str]) -> int:
+    """Run Claude to merge feature branch back to main."""
+    from hopper.ship import run_ship
+
+    parser = make_parser("ship", "Run ship workflow for a ship-stage session.")
+    parser.add_argument("session_id", help="Session ID to run")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+
+    return run_ship(parsed.session_id, _socket())
+
+
 @command("status", "Show or update session status")
 def cmd_status(args: list[str]) -> int:
     """Show or update the current session's status text."""
@@ -536,6 +558,42 @@ def cmd_refined(args: list[str]) -> int:
     set_session_state(_socket(), session_id, "completed", "Refine complete")
 
     print("Refine complete.")
+    return 0
+
+
+@command("shipped", "Signal that ship workflow is complete")
+def cmd_shipped(args: list[str]) -> int:
+    """Signal that the ship workflow is complete for this session."""
+    from hopper.client import set_session_state
+
+    parser = make_parser(
+        "shipped",
+        "Signal that the ship workflow is complete. "
+        "Called by Claude from within a ship session.",
+    )
+    try:
+        parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+
+    session_id = get_hopper_sid()
+    if not session_id:
+        print("HOPPER_SID not set. Run this from within a hopper session.")
+        return 1
+
+    if err := validate_hopper_sid():
+        return err
+
+    set_session_state(_socket(), session_id, "completed", "Ship complete")
+
+    print("Ship complete.")
     return 0
 
 

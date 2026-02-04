@@ -32,3 +32,48 @@ def create_worktree(repo_dir: str, worktree_path: Path, branch_name: str) -> boo
     except FileNotFoundError:
         logger.error("git command not found")
         return False
+
+
+def is_dirty(repo_dir: str) -> bool:
+    """Check if a git repo has uncommitted changes.
+
+    Args:
+        repo_dir: Path to the git repository.
+
+    Returns:
+        True if the repo has uncommitted changes, False if clean.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        return bool(result.stdout.strip())
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return True  # Assume dirty if we can't check
+
+
+def current_branch(repo_dir: str) -> str | None:
+    """Get the current branch name of a git repo.
+
+    Args:
+        repo_dir: Path to the git repository.
+
+    Returns:
+        Branch name, or None if detached HEAD or error.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        branch = result.stdout.strip()
+        return branch if branch != "HEAD" else None
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
