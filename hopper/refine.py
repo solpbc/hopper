@@ -3,6 +3,8 @@
 from pathlib import Path
 
 from hopper import prompt
+from hopper.client import set_codex_thread_id
+from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree
 from hopper.runner import BaseRunner
 from hopper.sessions import SHORT_ID_LEN, get_session_dir
@@ -56,6 +58,53 @@ class RefineRunner(BaseRunner):
                 return 1
             self.shovel_content = shovel_path.read_text()
 
+            # Bootstrap Codex session for tasks
+            err = self._bootstrap_codex()
+            if err is not None:
+                return err
+
+        return None
+
+    def _bootstrap_codex(self) -> int | None:
+        """Bootstrap a Codex session using task.md prompt.
+
+        Creates a new Codex session in the worktree and stores the thread_id
+        on the server for subsequent hop task calls to resume.
+
+        Returns:
+            Exit code on failure, None on success.
+        """
+        sid = self.session_id[:SHORT_ID_LEN]
+        print(f"Bootstrapping Codex session for {sid}...")
+
+        # Build context for task prompt
+        context: dict[str, str] = {}
+        if self.project_name:
+            context["project"] = self.project_name
+        if self.project_dir:
+            context["dir"] = self.project_dir
+
+        try:
+            task_prompt = prompt.load("task", context=context if context else None)
+        except FileNotFoundError:
+            print("Task prompt not found: prompts/task.md")
+            return 1
+
+        exit_code, thread_id = bootstrap_codex(task_prompt, str(self.worktree_path))
+
+        if exit_code == 127:
+            print("codex command not found. Install codex to use task features.")
+            return 1
+        if exit_code != 0:
+            print(f"Codex bootstrap failed (exit {exit_code}).")
+            return 1
+        if not thread_id:
+            print("Failed to capture Codex session ID from bootstrap.")
+            return 1
+
+        # Store thread_id on the server
+        set_codex_thread_id(self.socket_path, self.session_id, thread_id)
+        print(f"Codex session {thread_id[:8]} ready.")
         return None
 
     def _build_command(self) -> tuple[list[str], str | None]:

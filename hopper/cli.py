@@ -541,7 +541,7 @@ def cmd_refined(args: list[str]) -> int:
 
 @command("task", "Run a task prompt via Codex")
 def cmd_task(args: list[str]) -> int:
-    """Run a task prompt via Codex in one-shot mode."""
+    """Run a task prompt via Codex, resuming the session's Codex thread."""
     from hopper.task import run_task
 
     parser = make_parser("task", "Run a prompts/<task>.md file via Codex for a session.")

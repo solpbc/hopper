@@ -523,3 +523,45 @@ def test_server_disconnects_stale_client_on_reconnect(socket_path, server, temp_
 
     client1.close()
     client2.close()
+
+
+def test_server_handles_session_set_codex_thread(socket_path, server, temp_config):
+    """Server handles session_set_codex_thread message."""
+    from hopper.sessions import Session, save_sessions
+
+    # Create a test session
+    session = Session(id="test-id", stage="processing", created_at=1000, state="running")
+    server.sessions = [session]
+    save_sessions(server.sessions)
+
+    # Connect client
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    # Wait for client to be registered
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    # Send session_set_codex_thread message
+    msg = {
+        "type": "session_set_codex_thread",
+        "session_id": "test-id",
+        "codex_thread_id": "codex-uuid-1234",
+    }
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    # Should receive broadcast
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "session_updated"
+    assert response["session"]["id"] == "test-id"
+    assert response["session"]["codex_thread_id"] == "codex-uuid-1234"
+
+    # Server's session object should be updated
+    assert server.sessions[0].codex_thread_id == "codex-uuid-1234"
+
+    client.close()

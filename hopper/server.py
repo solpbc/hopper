@@ -295,6 +295,17 @@ class Server:
                 if session:
                     self.broadcast({"type": "session_status_changed", "session": session.to_dict()})
 
+        elif msg_type == "session_set_codex_thread":
+            session_id = message.get("session_id")
+            thread_id = message.get("codex_thread_id")
+            if session_id and thread_id:
+                session = next((s for s in self.sessions if s.id == session_id), None)
+                if session:
+                    session.codex_thread_id = thread_id
+                    session.touch()
+                    save_sessions(self.sessions)
+                    self.broadcast({"type": "session_updated", "session": session.to_dict()})
+
         elif msg_type == "backlog_list":
             items_data = [item.to_dict() for item in self.backlog]
             self._send_response(conn, {"type": "backlog_list", "items": items_data})

@@ -368,6 +368,33 @@ def set_session_status(
         return False
 
 
+def set_codex_thread_id(
+    socket_path: Path, session_id: str, codex_thread_id: str, timeout: float = 2.0
+) -> bool:
+    """Set a session's Codex thread ID (fire-and-forget).
+
+    Args:
+        socket_path: Path to the Unix socket
+        session_id: The session ID to update
+        codex_thread_id: The Codex thread UUID to store
+        timeout: Connection timeout in seconds
+
+    Returns:
+        True if message was sent successfully, False otherwise
+    """
+    msg = {
+        "type": "session_set_codex_thread",
+        "session_id": session_id,
+        "codex_thread_id": codex_thread_id,
+        "ts": int(time.time() * 1000),
+    }
+    try:
+        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
+        return True
+    except Exception:
+        return False
+
+
 def add_backlog(
     socket_path: Path,
     project: str,

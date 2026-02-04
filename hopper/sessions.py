@@ -96,6 +96,7 @@ class Session:
     status: str = ""  # Human-readable status text
     active: bool = False  # Whether a hop ore client is connected
     tmux_pane: str | None = None  # tmux pane ID (e.g., "%1")
+    codex_thread_id: str | None = None  # Codex session ID for task resumption
 
     @property
     def short_id(self) -> str:
@@ -123,6 +124,7 @@ class Session:
             "status": self.status,
             "active": self.active,
             "tmux_pane": self.tmux_pane,
+            "codex_thread_id": self.codex_thread_id,
         }
 
     @classmethod
@@ -138,6 +140,7 @@ class Session:
             status=data.get("status", ""),
             active=data.get("active", False),  # Backwards compat
             tmux_pane=data.get("tmux_pane"),
+            codex_thread_id=data.get("codex_thread_id"),
         )
 
 

@@ -1,4 +1,4 @@
-"""Task runner - runs a prompt via Codex in one-shot mode."""
+"""Task runner - runs a prompt via Codex, resuming the session's Codex thread."""
 
 import json
 import logging
@@ -17,10 +17,11 @@ logger = logging.getLogger(__name__)
 def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
     """Run a task prompt via Codex for a processing-stage session.
 
-    Validates the prompt exists, session is in processing stage, and cwd
-    matches the session worktree. Runs Codex one-shot, saves artifacts
-    (<task>.in.md, <task>.out.md, <task>.json) to the session directory,
-    and prints the output to stdout.
+    Resumes the session's Codex thread so that context accumulates across
+    tasks. Validates the prompt exists, session is in processing stage,
+    cwd matches the session worktree, and a Codex thread ID is present.
+    Saves artifacts (<task>.in.md, <task>.out.md, <task>.json) to the
+    session directory and prints the output to stdout.
 
     Args:
         session_id: The hopper session ID.
@@ -44,6 +45,14 @@ def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
     # Validate session is in processing stage
     if session_data.get("stage") != "processing":
         print(f"Session {session_id[:8]} is not in processing stage.")
+        return 1
+
+    # Validate Codex thread ID exists
+    codex_thread_id = session_data.get("codex_thread_id")
+    if not codex_thread_id:
+        print(f"Session {session_id[:8]} has no Codex thread ID.")
+        print("The Codex session is bootstrapped during 'hop refine' first run.")
+        print("Re-run 'hop refine' to bootstrap the Codex session.")
         return 1
 
     # Validate cwd is the session worktree
@@ -84,16 +93,17 @@ def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
     # Set state to task name while running
     set_session_state(socket_path, session_id, task_name, f"Running {task_name}")
 
-    # Run codex
+    # Run codex (resume existing thread)
     output_path = session_dir / f"{task_name}.out.md"
     started_at = current_time_ms()
-    exit_code, cmd = run_codex(prompt_text, str(cwd), str(output_path))
+    exit_code, cmd = run_codex(prompt_text, str(cwd), str(output_path), codex_thread_id)
     finished_at = current_time_ms()
 
     # Save run metadata
     metadata = {
         "task": task_name,
         "session_id": session_id,
+        "codex_thread_id": codex_thread_id,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_ms": finished_at - started_at,

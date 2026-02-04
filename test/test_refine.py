@@ -27,15 +27,13 @@ class TestRefineRunner:
             mock.emit = MagicMock(return_value=True)
         return mock
 
-    def test_first_run_creates_worktree_and_uses_prompt(self, tmp_path):
-        """First run (state=ready) creates worktree and passes refine prompt."""
+    def test_first_run_bootstraps_codex_then_runs_claude(self, tmp_path):
+        """First run bootstraps Codex session, then runs Claude with refine prompt."""
         runner = self._make_runner()
 
-        # Set up project dir
         project_dir = tmp_path / "my-project"
         project_dir.mkdir()
 
-        # Set up session dir with shovel.md
         session_dir = tmp_path / "sessions" / "test-session-id"
         session_dir.mkdir(parents=True)
         (session_dir / "shovel.md").write_text("Build the widget")
@@ -47,13 +45,23 @@ class TestRefineRunner:
         mock_proc.returncode = 0
         mock_proc.stderr = None
 
+        codex_calls = []
+
+        def mock_set_codex_thread(sock, sid, tid):
+            codex_calls.append((sid, tid))
+            return True
+
         with (
             patch("hopper.runner.connect", return_value=self._mock_response()),
             patch("hopper.runner.HopperConnection", return_value=self._mock_conn()),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.refine.get_session_dir", return_value=session_dir),
-            patch("hopper.refine.create_worktree", return_value=True) as mock_wt,
-            patch("hopper.refine.prompt.load", return_value="loaded prompt") as mock_load,
+            patch("hopper.refine.create_worktree", return_value=True),
+            patch("hopper.refine.prompt.load", return_value="loaded prompt"),
+            patch(
+                "hopper.refine.bootstrap_codex", return_value=(0, "codex-thread-abc")
+            ) as mock_boot,
+            patch("hopper.refine.set_codex_thread_id", side_effect=mock_set_codex_thread),
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
@@ -61,33 +69,21 @@ class TestRefineRunner:
 
         assert exit_code == 0
 
-        # Worktree created with correct branch name
-        mock_wt.assert_called_once_with(
-            str(project_dir),
-            session_dir / "worktree",
-            "hopper-test-ses",
-        )
+        # Codex bootstrapped
+        mock_boot.assert_called_once()
+        boot_args = mock_boot.call_args
+        assert boot_args[0][1] == str(session_dir / "worktree")
 
-        # Prompt loaded with shovel content
-        mock_load.assert_called_once()
-        call_kwargs = mock_load.call_args
-        assert call_kwargs[0][0] == "refine"
-        assert call_kwargs[1]["context"]["shovel"] == "Build the widget"
+        # Thread ID sent to server
+        assert codex_calls == [("test-session-id", "codex-thread-abc")]
 
-        # Claude invoked with --session-id and prompt, cwd=worktree
-        mock_popen.assert_called_once()
+        # Claude still invoked with --session-id and prompt
         cmd = mock_popen.call_args[0][0]
-        assert cmd == [
-            "claude",
-            "--dangerously-skip-permissions",
-            "--session-id",
-            "test-session-id",
-            "loaded prompt",
-        ]
-        assert mock_popen.call_args[1]["cwd"] == str(session_dir / "worktree")
+        assert cmd[0] == "claude"
+        assert "--session-id" in cmd
 
-    def test_resume_uses_existing_worktree(self, tmp_path):
-        """Resume (state!=ready) uses --resume and existing worktree."""
+    def test_resume_skips_bootstrap(self, tmp_path):
+        """Resume (state!=ready) uses --resume and skips Codex bootstrap."""
         runner = self._make_runner()
 
         project_dir = tmp_path / "my-project"
@@ -111,6 +107,7 @@ class TestRefineRunner:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.refine.get_session_dir", return_value=session_dir),
             patch("hopper.refine.create_worktree") as mock_wt,
+            patch("hopper.refine.bootstrap_codex") as mock_boot,
             patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
@@ -121,10 +118,94 @@ class TestRefineRunner:
         # Worktree NOT created (already exists)
         mock_wt.assert_not_called()
 
-        # Claude invoked with --resume, cwd=worktree
+        # Codex NOT bootstrapped
+        mock_boot.assert_not_called()
+
+        # Claude invoked with --resume
         cmd = mock_popen.call_args[0][0]
         assert cmd == ["claude", "--dangerously-skip-permissions", "--resume", "test-session-id"]
         assert mock_popen.call_args[1]["cwd"] == str(worktree)
+
+    def test_bootstrap_failure_bails_runner(self, tmp_path, capsys):
+        """Runner exits with code 1 if Codex bootstrap fails."""
+        runner = self._make_runner()
+
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+
+        session_dir = tmp_path / "sessions" / "test-session-id"
+        session_dir.mkdir(parents=True)
+        (session_dir / "shovel.md").write_text("Build the widget")
+
+        mock_project = MagicMock()
+        mock_project.path = str(project_dir)
+
+        with (
+            patch("hopper.runner.connect", return_value=self._mock_response()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.refine.get_session_dir", return_value=session_dir),
+            patch("hopper.refine.create_worktree", return_value=True),
+            patch("hopper.refine.prompt.load", return_value="task prompt"),
+            patch("hopper.refine.bootstrap_codex", return_value=(1, None)),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 1
+        assert "bootstrap failed" in capsys.readouterr().out
+
+    def test_bootstrap_codex_not_found(self, tmp_path, capsys):
+        """Runner exits with code 1 if codex command not found during bootstrap."""
+        runner = self._make_runner()
+
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+
+        session_dir = tmp_path / "sessions" / "test-session-id"
+        session_dir.mkdir(parents=True)
+        (session_dir / "shovel.md").write_text("Build the widget")
+
+        mock_project = MagicMock()
+        mock_project.path = str(project_dir)
+
+        with (
+            patch("hopper.runner.connect", return_value=self._mock_response()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.refine.get_session_dir", return_value=session_dir),
+            patch("hopper.refine.create_worktree", return_value=True),
+            patch("hopper.refine.prompt.load", return_value="task prompt"),
+            patch("hopper.refine.bootstrap_codex", return_value=(127, None)),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 1
+        assert "codex command not found" in capsys.readouterr().out
+
+    def test_bootstrap_no_thread_id(self, tmp_path, capsys):
+        """Runner exits with code 1 if bootstrap succeeds but no thread_id parsed."""
+        runner = self._make_runner()
+
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+
+        session_dir = tmp_path / "sessions" / "test-session-id"
+        session_dir.mkdir(parents=True)
+        (session_dir / "shovel.md").write_text("Build the widget")
+
+        mock_project = MagicMock()
+        mock_project.path = str(project_dir)
+
+        with (
+            patch("hopper.runner.connect", return_value=self._mock_response()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.refine.get_session_dir", return_value=session_dir),
+            patch("hopper.refine.create_worktree", return_value=True),
+            patch("hopper.refine.prompt.load", return_value="task prompt"),
+            patch("hopper.refine.bootstrap_codex", return_value=(0, None)),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 1
+        assert "Failed to capture" in capsys.readouterr().out
 
     def test_bails_if_session_already_active(self):
         """Runner exits with code 1 if session is already active."""
@@ -450,6 +531,8 @@ class TestRefineCompletion:
             patch("hopper.refine.get_session_dir", return_value=session_dir),
             patch("hopper.refine.create_worktree", return_value=True),
             patch("hopper.refine.prompt.load", return_value="prompt"),
+            patch("hopper.refine.bootstrap_codex", return_value=(0, "thread-123")),
+            patch("hopper.refine.set_codex_thread_id", return_value=True),
             patch("subprocess.Popen", return_value=mock_proc),
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):

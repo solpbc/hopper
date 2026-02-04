@@ -6,14 +6,34 @@ from unittest.mock import MagicMock, patch
 
 from hopper.task import run_task
 
-MOCK_CMD = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-o", "/tmp/out.md", "p"]
+MOCK_CMD = [
+    "codex",
+    "exec",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "-o",
+    "/tmp/out.md",
+    "resume",
+    "codex-thread-1234",
+    "p",
+]
+THREAD_ID = "codex-thread-1234"
 
 
-def _mock_response(stage="processing", project="my-project", scope="build widget"):
+def _mock_response(
+    stage="processing",
+    project="my-project",
+    scope="build widget",
+    codex_thread_id=THREAD_ID,
+):
     return {
         "type": "connected",
         "tmux": None,
-        "session": {"stage": stage, "project": project, "scope": scope},
+        "session": {
+            "stage": stage,
+            "project": project,
+            "scope": scope,
+            "codex_thread_id": codex_thread_id,
+        },
         "session_found": True,
     }
 
@@ -34,6 +54,24 @@ class TestRunTask:
 
         assert exit_code == 1
         assert "not in processing stage" in capsys.readouterr().out
+
+    def test_missing_codex_thread_id(self, capsys):
+        """Returns 1 with helpful message when codex_thread_id is missing."""
+        with patch("hopper.task.connect", return_value=_mock_response(codex_thread_id=None)):
+            exit_code = run_task("test-1234", Path("/tmp/test.sock"), "audit")
+
+        assert exit_code == 1
+        output = capsys.readouterr().out
+        assert "no Codex thread ID" in output
+        assert "hop refine" in output
+
+    def test_empty_codex_thread_id(self, capsys):
+        """Returns 1 when codex_thread_id is empty string."""
+        with patch("hopper.task.connect", return_value=_mock_response(codex_thread_id="")):
+            exit_code = run_task("test-1234", Path("/tmp/test.sock"), "audit")
+
+        assert exit_code == 1
+        assert "no Codex thread ID" in capsys.readouterr().out
 
     def test_wrong_cwd(self, tmp_path, monkeypatch, capsys):
         """Returns 1 when cwd doesn't match worktree."""
@@ -71,8 +109,8 @@ class TestRunTask:
         assert exit_code == 1
         assert "not found" in capsys.readouterr().out
 
-    def test_runs_codex_and_saves_artifacts(self, tmp_path, monkeypatch, capsys):
-        """Runs codex, saves input/output/metadata, prints output, manages state."""
+    def test_runs_codex_resume_and_saves_artifacts(self, tmp_path, monkeypatch, capsys):
+        """Runs codex resume, saves input/output/metadata, prints output, manages state."""
         session_dir = tmp_path / "sessions" / "test-sid"
         worktree = session_dir / "worktree"
         worktree.mkdir(parents=True)
@@ -84,7 +122,8 @@ class TestRunTask:
             state_calls.append((state, status))
             return True
 
-        def mock_run_codex(prompt, cwd, output_file):
+        def mock_run_codex(prompt, cwd, output_file, thread_id):
+            assert thread_id == THREAD_ID
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -112,13 +151,14 @@ class TestRunTask:
         # Input prompt saved
         assert (session_dir / "audit.in.md").read_text() == "prompt text"
 
-        # Output saved with new name
+        # Output saved
         assert (session_dir / "audit.out.md").exists()
 
-        # Metadata saved
+        # Metadata saved with codex_thread_id
         meta = json.loads((session_dir / "audit.json").read_text())
         assert meta["task"] == "audit"
         assert meta["session_id"] == "test-sid"
+        assert meta["codex_thread_id"] == THREAD_ID
         assert meta["exit_code"] == 0
         assert meta["cmd"] == MOCK_CMD
         assert meta["duration_ms"] >= 0
@@ -204,7 +244,7 @@ class TestRunTask:
 
         input_existed = []
 
-        def mock_run_codex(prompt, cwd, output_file):
+        def mock_run_codex(prompt, cwd, output_file, thread_id):
             # Check that input was already written when codex starts
             input_existed.append((session_dir / "audit.in.md").exists())
             return 0, MOCK_CMD

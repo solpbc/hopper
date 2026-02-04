@@ -43,6 +43,52 @@ def test_session_to_dict_and_from_dict():
     assert restored.tmux_pane == session.tmux_pane
 
 
+def test_session_to_dict_includes_codex_thread_id():
+    """to_dict includes codex_thread_id field."""
+    session = Session(
+        id="abc-123",
+        stage="processing",
+        created_at=1000,
+        codex_thread_id="codex-uuid-1234",
+    )
+    data = session.to_dict()
+    assert data["codex_thread_id"] == "codex-uuid-1234"
+
+
+def test_session_codex_thread_id_roundtrip():
+    """codex_thread_id survives to_dict/from_dict roundtrip."""
+    session = Session(
+        id="abc-123",
+        stage="processing",
+        created_at=1000,
+        updated_at=1000,
+        state="running",
+        codex_thread_id="thread-xyz",
+    )
+    restored = Session.from_dict(session.to_dict())
+    assert restored.codex_thread_id == "thread-xyz"
+
+
+def test_session_codex_thread_id_default_none():
+    """codex_thread_id defaults to None."""
+    session = Session(id="abc-123", stage="ore", created_at=1000)
+    assert session.codex_thread_id is None
+    assert session.to_dict()["codex_thread_id"] is None
+
+
+def test_session_from_dict_backwards_compat_codex_thread_id():
+    """Sessions without 'codex_thread_id' field default to None."""
+    data = {
+        "id": "abc-123",
+        "stage": "ore",
+        "created_at": 1000,
+        "updated_at": 1000,
+        "state": "new",
+    }
+    session = Session.from_dict(data)
+    assert session.codex_thread_id is None
+
+
 def test_session_from_dict_backwards_compat_active():
     """Sessions without 'active' field default to False."""
     data = {
