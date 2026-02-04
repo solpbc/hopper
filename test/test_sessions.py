@@ -11,6 +11,7 @@ from hopper.sessions import (
     current_time_ms,
     find_by_short_id,
     format_age,
+    format_duration_ms,
     format_uptime,
     get_session_dir,
     load_sessions,
@@ -523,3 +524,34 @@ def test_session_from_dict_backwards_compat_backlog():
     }
     session = Session.from_dict(data)
     assert session.backlog is None
+
+
+# Tests for format_duration_ms
+
+
+def test_format_duration_ms_zero():
+    """Durations less than 1 second return '0s'."""
+    assert format_duration_ms(0) == "0s"
+    assert format_duration_ms(500) == "0s"
+    assert format_duration_ms(999) == "0s"
+
+
+def test_format_duration_ms_seconds():
+    """Durations 1-59 seconds return Xs."""
+    assert format_duration_ms(1000) == "1s"
+    assert format_duration_ms(5000) == "5s"
+    assert format_duration_ms(42_000) == "42s"
+    assert format_duration_ms(59_000) == "59s"
+
+
+def test_format_duration_ms_minutes():
+    """Durations 1-59 minutes return Xm."""
+    assert format_duration_ms(60_000) == "1m"
+    assert format_duration_ms(5 * 60_000) == "5m"
+    assert format_duration_ms(59 * 60_000) == "59m"
+
+
+def test_format_duration_ms_hours():
+    """Durations 1+ hours return Xh."""
+    assert format_duration_ms(60 * 60_000) == "1h"
+    assert format_duration_ms(3 * 60 * 60_000) == "3h"

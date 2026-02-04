@@ -9,7 +9,7 @@ from hopper import prompt
 from hopper.client import connect, set_session_state
 from hopper.codex import run_codex
 from hopper.projects import find_project
-from hopper.sessions import current_time_ms, get_session_dir
+from hopper.sessions import current_time_ms, format_duration_ms, get_session_dir
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +113,13 @@ def run_task(session_id: str, socket_path: Path, task_name: str) -> int:
     meta_path = session_dir / f"{task_name}.json"
     _atomic_write(meta_path, json.dumps(metadata, indent=2) + "\n")
 
-    # Restore state to running/processing regardless of outcome
-    set_session_state(socket_path, session_id, "running", "Processing")
+    # Update status with task result and duration
+    duration = format_duration_ms(finished_at - started_at)
+    if exit_code == 0:
+        status = f"{task_name} ran for {duration}"
+    else:
+        status = f"{task_name} failed after {duration}"
+    set_session_state(socket_path, session_id, "running", status)
 
     # Print output if it was written
     if output_path.exists():

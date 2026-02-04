@@ -604,7 +604,6 @@ def cmd_task(args: list[str]) -> int:
 
     parser = make_parser("task", "Run a prompts/<task>.md file via Codex for a session.")
     parser.add_argument("task", help="Task name (matches prompts/<task>.md)")
-    parser.add_argument("session_id", help="Session ID to run")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -617,7 +616,15 @@ def cmd_task(args: list[str]) -> int:
     if err := require_server():
         return err
 
-    return run_task(parsed.session_id, _socket(), parsed.task)
+    session_id = get_hopper_sid()
+    if not session_id:
+        print("HOPPER_SID not set. Run this from within a hopper session.")
+        return 1
+
+    if err := validate_hopper_sid():
+        return err
+
+    return run_task(session_id, _socket(), parsed.task)
 
 
 @command("backlog", "Manage backlog items")

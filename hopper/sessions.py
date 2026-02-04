@@ -82,6 +82,30 @@ def format_uptime(started_at_ms: int) -> str:
     return " ".join(parts) if parts else "0m"
 
 
+def format_duration_ms(duration_ms: int) -> str:
+    """Format a duration in milliseconds as a friendly string.
+
+    Args:
+        duration_ms: Duration in milliseconds
+
+    Returns:
+        Friendly string like "5s", "1m", "2m", "1h"
+    """
+    if duration_ms < 1000:
+        return "0s"
+
+    seconds = duration_ms // 1000
+    if seconds < 60:
+        return f"{seconds}s"
+
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+
+    hours = minutes // 60
+    return f"{hours}h"
+
+
 @dataclass
 class Session:
     """A hopper session."""

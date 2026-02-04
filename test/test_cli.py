@@ -1013,28 +1013,45 @@ def test_task_help(capsys):
 
 
 def test_task_missing_args(capsys):
-    """task requires both task name and session_id."""
+    """task requires task name argument."""
     result = cmd_task([])
     assert result == 1
     captured = capsys.readouterr()
     assert "error:" in captured.out
 
 
-def test_task_missing_session_id(capsys):
-    """task requires session_id argument."""
-    result = cmd_task(["audit"])
+def test_task_requires_hopper_sid(capsys):
+    """task returns 1 when HOPPER_SID not set."""
+    env = os.environ.copy()
+    env.pop("HOPPER_SID", None)
+    with patch.dict(os.environ, env, clear=True):
+        with patch("hopper.cli.require_server", return_value=None):
+            result = cmd_task(["audit"])
     assert result == 1
     captured = capsys.readouterr()
-    assert "error:" in captured.out
+    assert "HOPPER_SID not set" in captured.out
+
+
+def test_task_validates_hopper_sid(capsys):
+    """task validates HOPPER_SID exists on server."""
+    with patch.dict(os.environ, {"HOPPER_SID": "bad-session"}):
+        with patch("hopper.cli.require_server", return_value=None):
+            with patch("hopper.client.session_exists", return_value=False):
+                result = cmd_task(["audit"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "not found or archived" in captured.out
 
 
 def test_task_dispatches_to_run_task(capsys):
     """task dispatches to run_task on valid input."""
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.task.run_task", return_value=0) as mock_run:
-            result = cmd_task(["audit", "test-1234"])
+    with patch.dict(os.environ, {"HOPPER_SID": "test-1234"}):
+        with patch("hopper.cli.require_server", return_value=None):
+            with patch("hopper.client.session_exists", return_value=True):
+                with patch("hopper.task.run_task", return_value=0) as mock_run:
+                    result = cmd_task(["audit"])
     assert result == 0
     mock_run.assert_called_once()
     args = mock_run.call_args[0]
-    assert args[0] == "test-1234"  # session_id
+    assert args[0] == "test-1234"  # session_id from env
     assert args[2] == "audit"  # task_name

@@ -142,7 +142,8 @@ class TestRunTask:
 
         assert exit_code == 0
         assert state_calls[0] == ("audit", "Running audit")
-        assert state_calls[1] == ("running", "Processing")
+        assert state_calls[1][0] == "running"
+        assert "audit ran for" in state_calls[1][1]
 
         output = capsys.readouterr().out
         assert "Audit Result" in output
@@ -188,7 +189,8 @@ class TestRunTask:
             exit_code = run_task("test-sid", Path("/tmp/test.sock"), "audit")
 
         assert exit_code == 1
-        assert state_calls[-1] == ("running", "Processing")
+        assert state_calls[-1][0] == "running"
+        assert "audit failed after" in state_calls[-1][1]
 
         # Metadata written even on failure
         meta = json.loads((session_dir / "audit.json").read_text())
