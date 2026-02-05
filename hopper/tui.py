@@ -64,10 +64,6 @@ STATUS_ERROR = "✗"  # x mark
 HINT_LODE = "_hint_lode"
 HINT_BACKLOG = "_hint_backlog"
 
-# Stage indicators
-STAGE_MILL = "⚒"  # hammer and pick
-STAGE_REFINE = "⛭"  # gear
-STAGE_SHIP = "▲"  # triangle up
 AUTO_ON = "↻"
 AUTO_OFF = "·"
 
@@ -85,7 +81,7 @@ class Row:
     """A row in a table."""
 
     id: str
-    stage: str  # STAGE_MILL, STAGE_REFINE, or STAGE_SHIP
+    stage: str  # "mill", "refine", or "ship"
     age: str  # formatted age string
     status: str  # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR
     active: bool = False  # Whether a runner is connected
@@ -106,15 +102,7 @@ def lode_to_row(lode: dict) -> Row:
     else:
         status = STATUS_RUNNING
 
-    lode_stage = lode.get("stage", "mill")
-    if lode_stage == "mill":
-        stage = STAGE_MILL
-    elif lode_stage == "refine":
-        stage = STAGE_REFINE
-    elif lode_stage == "ship":
-        stage = STAGE_SHIP
-    else:
-        stage = STAGE_MILL
+    stage = lode.get("stage", "mill")
 
     return Row(
         id=lode["id"],
@@ -161,12 +149,13 @@ def format_auto_text(auto: bool) -> Text:
 
 def format_stage_text(stage: str) -> Text:
     """Format a stage indicator with color using Rich Text."""
-    if stage == STAGE_MILL:
+    if stage == "mill":
         return Text(stage, style="bright_blue")
-    elif stage == STAGE_SHIP:
-        return Text(stage, style="bright_green")
-    else:  # STAGE_REFINE
+    elif stage == "refine":
         return Text(stage, style="bright_yellow")
+    elif stage == "ship":
+        return Text(stage, style="bright_green")
+    return Text(stage)
 
 
 class ProjectPickerScreen(ModalScreen[Project | None]):
@@ -584,16 +573,6 @@ class LegendScreen(ModalScreen):
 
         t.append("\n")
 
-        t.append("Stage\n", style="bold")
-        t.append(f"  {STAGE_MILL}", style="bright_blue")
-        t.append("  mill\n", style="bright_black")
-        t.append(f"  {STAGE_REFINE}", style="bright_yellow")
-        t.append("  refine\n", style="bright_black")
-        t.append(f"  {STAGE_SHIP}", style="bright_green")
-        t.append("  ship\n", style="bright_black")
-
-        t.append("\n")
-
         t.append("Auto\n", style="bold")
         t.append(f"  {AUTO_ON}", style="bright_green")
         t.append("  auto-advance on\n", style="bright_black")
@@ -642,7 +621,7 @@ class LodeTable(DataTable):
         self.add_column("", key=self.COL_STATUS)
         self.add_column("", key=self.COL_ACTIVE)
         self.add_column(AUTO_ON, key=self.COL_AUTO, width=3)
-        self.add_column("s", key=self.COL_STAGE)
+        self.add_column("stage", key=self.COL_STAGE)
         self.add_column("id", key=self.COL_ID)
         self.add_column("project", key=self.COL_PROJECT)
         self.add_column("last", key=self.COL_AGE)
