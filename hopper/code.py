@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+
 """Code runner - runs a prompt via Codex, resuming the lode's Codex thread."""
 
 import json

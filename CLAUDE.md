@@ -49,6 +49,17 @@ pytest test/test_file.py::test_name  # Run a single test
 - **Fail fast** - Validate external state early (tmux presence, server running). Clear error messages.
 - **Test everything, mock everything** - All new code paths need tests. Tests must never read real user config, files, or system state. Use fixtures and monkeypatch to isolate completely.
 
+## File Headers
+
+All Python source files must include this header as the first two lines:
+
+```
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+```
+
+Add this header to new `.py` files in `hopper/` and `test/`. Do not add headers to markdown, TOML, or prompt files.
+
 ## TUI Conventions
 
 - **Framework**: [Textual](https://textual.textualize.io/) with `DataTable` for lode/backlog lists
