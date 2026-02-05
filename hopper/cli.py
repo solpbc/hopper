@@ -637,7 +637,7 @@ def cmd_backlog(args: list[str]) -> int:
     """Manage backlog items (list, add, remove)."""
     from hopper.backlog import (
         add_backlog_item,
-        find_by_short_id,
+        find_by_prefix,
         load_backlog,
         remove_backlog_item,
     )
@@ -673,7 +673,7 @@ def cmd_backlog(args: list[str]) -> int:
             return 0
         for item in items:
             age = format_age(item.created_at)
-            print(f"  {item.short_id}  {item.project:<16} {item.description}  ({age})")
+            print(f"  {item.id}  {item.project:<16} {item.description}  ({age})")
         return 0
 
     if parsed.action == "add":
@@ -717,7 +717,7 @@ def cmd_backlog(args: list[str]) -> int:
 
         prefix = parsed.text[0]
         items = load_backlog()
-        item = find_by_short_id(items, prefix)
+        item = find_by_prefix(items, prefix)
         if not item:
             print(f"No unique backlog item matching '{prefix}'")
             return 1
@@ -729,7 +729,7 @@ def cmd_backlog(args: list[str]) -> int:
         else:
             remove_backlog_item(items, item.id)
 
-        print(f"Removed: {item.short_id} [{item.project}] {item.description}")
+        print(f"Removed: {item.id} [{item.project}] {item.description}")
         return 0
 
     return 0

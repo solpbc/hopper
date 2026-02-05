@@ -64,7 +64,7 @@ class TestShipRunner:
         # Prompt loaded with correct context
         mock_load.assert_called_once()
         context = mock_load.call_args[1]["context"]
-        assert context["branch"] == "hopper-test-ses"
+        assert context["branch"] == "hopper-test-session-id"
         assert context["worktree"] == str(worktree)
         assert context["project"] == "my-project"
 

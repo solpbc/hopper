@@ -45,13 +45,13 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
 
     # Validate lode is in processing stage
     if lode_data.get("stage") != "processing":
-        print(f"Lode {lode_id[:8]} is not in processing stage.")
+        print(f"Lode {lode_id} is not in processing stage.")
         return 1
 
     # Validate Codex thread ID exists
     codex_thread_id = lode_data.get("codex_thread_id")
     if not codex_thread_id:
-        print(f"Lode {lode_id[:8]} has no Codex thread ID.")
+        print(f"Lode {lode_id} has no Codex thread ID.")
         print("The Codex session is bootstrapped during 'hop refine' first run.")
         print("Re-run 'hop refine' to bootstrap the Codex session.")
         return 1

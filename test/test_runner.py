@@ -131,7 +131,7 @@ class TestBaseRunnerActivityMonitor:
         assert runner._monitor_stop.is_set()
 
     def test_start_monitor_renames_window(self):
-        """Monitor renames tmux window to short session ID."""
+        """Monitor renames tmux window to session ID."""
         runner = self._make_runner()
 
         with (
@@ -141,7 +141,7 @@ class TestBaseRunnerActivityMonitor:
             runner._start_monitor()
             runner._stop_monitor()
 
-        mock_rename.assert_called_once_with("%5", "test-ses")
+        mock_rename.assert_called_once_with("%5", "test-session")
 
     def test_start_monitor_skips_without_tmux(self):
         """Monitor doesn't start when not in tmux."""

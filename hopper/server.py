@@ -18,7 +18,7 @@ from hopper.backlog import (
     remove_backlog_item,
 )
 from hopper.backlog import (
-    find_by_short_id as find_backlog_by_short_id,
+    find_by_prefix as find_backlog_by_prefix,
 )
 from hopper.lodes import (
     Lode,
@@ -184,7 +184,7 @@ class Server:
         lode.touch()
         save_lodes(self.lodes)
 
-        logger.debug(f"Lode {lode_id[:8]} disconnected, active=False")
+        logger.debug(f"Lode {lode_id} disconnected, active=False")
         self.broadcast({"type": "lode_updated", "lode": lode.to_dict()})
 
     def _register_lode_client(
@@ -206,7 +206,7 @@ class Server:
                     existing_conn.close()
                 except Exception:
                     pass
-                logger.debug(f"Disconnected stale client for lode {lode_id[:8]}")
+                logger.debug(f"Disconnected stale client for lode {lode_id}")
 
             # Register new owner
             self.lode_clients[lode_id] = conn
@@ -222,7 +222,7 @@ class Server:
             save_lodes(self.lodes)
             self.broadcast({"type": "lode_updated", "lode": lode.to_dict()})
 
-        logger.debug(f"Registered client for lode {lode_id[:8]}, active=True")
+        logger.debug(f"Registered client for lode {lode_id}, active=True")
 
     def _handle_message(self, message: dict, conn: socket.socket) -> None:
         """Handle an incoming message, responding directly if needed."""
@@ -320,7 +320,7 @@ class Server:
 
         elif msg_type == "backlog_remove":
             item_id = message.get("item_id", "")
-            item = find_backlog_by_short_id(self.backlog, item_id)
+            item = find_backlog_by_prefix(self.backlog, item_id)
             if item:
                 remove_backlog_item(self.backlog, item.id)
                 self.broadcast({"type": "backlog_removed", "item": item.to_dict()})

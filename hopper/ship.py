@@ -4,7 +4,7 @@ from pathlib import Path
 
 from hopper import prompt
 from hopper.git import current_branch, is_dirty
-from hopper.lodes import SHORT_ID_LEN, get_lode_dir
+from hopper.lodes import get_lode_dir
 from hopper.runner import BaseRunner
 
 
@@ -27,11 +27,9 @@ class ShipRunner(BaseRunner):
         self.stage = lode_data.get("stage", "")
 
     def _setup(self) -> int | None:
-        sid = self.lode_id[:SHORT_ID_LEN]
-
         # Validate stage
         if self.stage != "ship":
-            print(f"Lode {sid} is not in ship stage.")
+            print(f"Lode {self.lode_id} is not in ship stage.")
             return 1
 
         # Validate project directory
@@ -48,7 +46,7 @@ class ShipRunner(BaseRunner):
             print(f"Worktree not found: {self.worktree_path}")
             return 1
 
-        self.branch_name = f"hopper-{sid}"
+        self.branch_name = f"hopper-{self.lode_id}"
 
         # Pre-flight: project repo must be clean
         if is_dirty(self.project_dir):

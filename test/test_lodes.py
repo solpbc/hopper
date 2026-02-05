@@ -1,15 +1,14 @@
 """Tests for lode management."""
 
 import json
-import uuid
 
 from hopper.lodes import (
-    SHORT_ID_LEN,
+    ID_LEN,
     Lode,
     archive_lode,
     create_lode,
     current_time_ms,
-    find_by_short_id,
+    find_by_prefix,
     format_age,
     format_duration_ms,
     format_uptime,
@@ -130,8 +129,9 @@ def test_create_lode(temp_config):
     lodes_list = []
     lode = create_lode(lodes_list, "test-project")
 
-    # Verify UUID format
-    uuid.UUID(lode.id)  # Raises if invalid
+    # Verify 8-char hex ID format
+    assert len(lode.id) == ID_LEN
+    int(lode.id, 16)  # Raises if not valid hex
 
     assert lode.stage == "ore"
     assert lode.project == "test-project"
@@ -260,78 +260,51 @@ def test_get_lode_dir(temp_config):
     assert path == temp_config / "lodes" / "my-lode-id"
 
 
-# Tests for short_id
+# Tests for find_by_prefix
 
 
-def test_short_id_length():
-    """short_id returns exactly SHORT_ID_LEN characters."""
-    lode = Lode(id="abcd1234-5678-90ab-cdef-1234567890ab", stage="ore", created_at=1000)
-    assert len(lode.short_id) == SHORT_ID_LEN
-    assert lode.short_id == "abcd1234"
-
-
-def test_short_id_is_prefix():
-    """short_id is the first segment of the full ID."""
-    lode = Lode(id="deadbeef-1234-5678-90ab-cdef12345678", stage="ore", created_at=1000)
-    assert lode.id.startswith(lode.short_id)
-    assert lode.short_id == "deadbeef"
-
-
-# Tests for find_by_short_id
-
-
-def test_find_by_short_id_exact():
-    """find_by_short_id matches full ID."""
+def test_find_by_prefix_exact():
+    """find_by_prefix matches full ID."""
     lodes = [
-        Lode(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
-        Lode(id="bbbb2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+        Lode(id="aaaa1111", stage="ore", created_at=1000),
+        Lode(id="bbbb2222", stage="ore", created_at=2000),
     ]
-    result = find_by_short_id(lodes, "aaaa1111-0000-0000-0000-000000000000")
+    result = find_by_prefix(lodes, "aaaa1111")
     assert result is lodes[0]
 
 
-def test_find_by_short_id_prefix():
-    """find_by_short_id matches unique prefix."""
+def test_find_by_prefix_partial():
+    """find_by_prefix matches unique prefix."""
     lodes = [
-        Lode(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
-        Lode(id="bbbb2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+        Lode(id="aaaa1111", stage="ore", created_at=1000),
+        Lode(id="bbbb2222", stage="ore", created_at=2000),
     ]
-    result = find_by_short_id(lodes, "aaaa")
+    result = find_by_prefix(lodes, "aaaa")
     assert result is lodes[0]
 
 
-def test_find_by_short_id_short_id():
-    """find_by_short_id matches 8-char short_id."""
+def test_find_by_prefix_ambiguous():
+    """find_by_prefix returns None for ambiguous prefix."""
     lodes = [
-        Lode(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
-        Lode(id="bbbb2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
+        Lode(id="aaaa1111", stage="ore", created_at=1000),
+        Lode(id="aaaa2222", stage="ore", created_at=2000),
     ]
-    result = find_by_short_id(lodes, "bbbb2222")
-    assert result is lodes[1]
-
-
-def test_find_by_short_id_ambiguous():
-    """find_by_short_id returns None for ambiguous prefix."""
-    lodes = [
-        Lode(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
-        Lode(id="aaaa2222-0000-0000-0000-000000000000", stage="ore", created_at=2000),
-    ]
-    result = find_by_short_id(lodes, "aaaa")
+    result = find_by_prefix(lodes, "aaaa")
     assert result is None
 
 
-def test_find_by_short_id_not_found():
-    """find_by_short_id returns None when no match."""
+def test_find_by_prefix_not_found():
+    """find_by_prefix returns None when no match."""
     lodes = [
-        Lode(id="aaaa1111-0000-0000-0000-000000000000", stage="ore", created_at=1000),
+        Lode(id="aaaa1111", stage="ore", created_at=1000),
     ]
-    result = find_by_short_id(lodes, "xxxx")
+    result = find_by_prefix(lodes, "xxxx")
     assert result is None
 
 
-def test_find_by_short_id_empty():
-    """find_by_short_id returns None for empty list."""
-    result = find_by_short_id([], "aaaa")
+def test_find_by_prefix_empty():
+    """find_by_prefix returns None for empty list."""
+    result = find_by_prefix([], "aaaa")
     assert result is None
 
 
@@ -485,7 +458,7 @@ def test_update_lode_state_not_found(temp_config):
 def test_lode_backlog_field_roundtrip():
     """backlog field survives to_dict/from_dict roundtrip."""
     backlog_data = {
-        "id": "bl-uuid",
+        "id": "bl123456",
         "project": "proj",
         "description": "Original task",
         "created_at": 1000,

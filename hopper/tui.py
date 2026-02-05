@@ -81,7 +81,6 @@ class Row:
     """A row in a table."""
 
     id: str
-    short_id: str
     stage: str  # STAGE_ORE, STAGE_PROCESSING, or STAGE_SHIP
     age: str  # formatted age string
     status: str  # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR
@@ -110,7 +109,6 @@ def lode_to_row(lode: Lode) -> Row:
 
     return Row(
         id=lode.id,
-        short_id=lode.short_id,
         stage=stage,
         age=format_age(lode.created_at),
         status=status,
@@ -836,7 +834,7 @@ class HopperApp(App):
                 table.update_cell(row.id, LodeTable.COL_STATUS, format_status_text(row.status))
                 table.update_cell(row.id, LodeTable.COL_ACTIVE, format_active_text(row.active))
                 table.update_cell(row.id, LodeTable.COL_STAGE, format_stage_text(row.stage))
-                table.update_cell(row.id, LodeTable.COL_ID, row.short_id)
+                table.update_cell(row.id, LodeTable.COL_ID, row.id)
                 table.update_cell(row.id, LodeTable.COL_PROJECT, row.project)
                 table.update_cell(row.id, LodeTable.COL_AGE, row.age)
                 table.update_cell(
@@ -853,7 +851,7 @@ class HopperApp(App):
                     format_status_text(row.status),
                     format_active_text(row.active),
                     format_stage_text(row.stage),
-                    row.short_id,
+                    row.id,
                     row.project,
                     row.age,
                     format_status_label(row.status_text, row.status),
@@ -1005,7 +1003,7 @@ class HopperApp(App):
 
         lode = self._get_lode(key)
         if not lode:
-            self.notify(f"Lode {key[:8]} not found", severity="error")
+            self.notify(f"Lode {key} not found", severity="error")
             return
 
         project = find_project(lode.project) if lode.project else None

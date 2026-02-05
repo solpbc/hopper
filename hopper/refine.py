@@ -6,7 +6,7 @@ from hopper import prompt
 from hopper.client import set_codex_thread_id
 from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree
-from hopper.lodes import SHORT_ID_LEN, get_lode_dir
+from hopper.lodes import get_lode_dir
 from hopper.pyenv import get_venv_env, has_pyproject, setup_worktree_venv
 from hopper.runner import BaseRunner
 
@@ -33,7 +33,7 @@ class RefineRunner(BaseRunner):
     def _setup(self) -> int | None:
         # Validate stage
         if self.stage != "processing":
-            print(f"Lode {self.lode_id[:SHORT_ID_LEN]} is not in processing stage.")
+            print(f"Lode {self.lode_id} is not in processing stage.")
             return 1
 
         # Validate project directory
@@ -47,17 +47,16 @@ class RefineRunner(BaseRunner):
         # Ensure worktree exists
         self.worktree_path = get_lode_dir(self.lode_id) / "worktree"
         if not self.worktree_path.is_dir():
-            branch_name = f"hopper-{self.lode_id[:SHORT_ID_LEN]}"
+            branch_name = f"hopper-{self.lode_id}"
             if not create_worktree(self.project_dir, self.worktree_path, branch_name):
                 print("Failed to create git worktree.")
                 return 1
 
         # Set up venv if project has pyproject.toml
         if has_pyproject(self.worktree_path):
-            sid = self.lode_id[:SHORT_ID_LEN]
             venv_path = self.worktree_path / ".venv"
             if not venv_path.is_dir():
-                print(f"Setting up virtual environment for {sid}...")
+                print(f"Setting up virtual environment for {self.lode_id}...")
             if not setup_worktree_venv(self.worktree_path):
                 print("Failed to set up virtual environment.")
                 return 1
@@ -87,8 +86,7 @@ class RefineRunner(BaseRunner):
         Returns:
             Exit code on failure, None on success.
         """
-        sid = self.lode_id[:SHORT_ID_LEN]
-        print(f"Bootstrapping Codex session for {sid}...")
+        print(f"Bootstrapping Codex session for {self.lode_id}...")
 
         # Build context for code prompt
         context: dict[str, str] = {}

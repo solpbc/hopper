@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 from hopper.client import HopperConnection, connect
-from hopper.lodes import SHORT_ID_LEN, current_time_ms
+from hopper.lodes import current_time_ms
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
 
@@ -83,20 +83,19 @@ class BaseRunner:
 
         try:
             # Query server for lode state and project info
-            sid = self.lode_id[:SHORT_ID_LEN]
             response = connect(self.socket_path, lode_id=self.lode_id)
             if not response:
-                print(f"Failed to connect to server for lode {sid}")
+                print(f"Failed to connect to server for lode {self.lode_id}")
                 return 1
 
             lode_data = response.get("lode")
             if not lode_data:
-                print(f"Lode {sid} not found")
+                print(f"Lode {self.lode_id} not found")
                 return 1
 
             if lode_data.get("active", False):
-                logger.error(f"Lode {sid} already has an active connection")
-                print(f"Lode {sid} is already active")
+                logger.error(f"Lode {self.lode_id} already has an active connection")
+                print(f"Lode {self.lode_id} is already active")
                 return 1
 
             state = lode_data.get("state")
@@ -283,7 +282,7 @@ class BaseRunner:
             logger.debug("Not in tmux, skipping activity monitor")
             return
 
-        rename_window(self._pane_id, self.lode_id[:SHORT_ID_LEN])
+        rename_window(self._pane_id, self.lode_id)
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop, name="activity-monitor", daemon=True

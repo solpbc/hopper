@@ -2,14 +2,14 @@
 
 import json
 import os
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from hopper import config
 
-SHORT_ID_LEN = 8  # Standard short ID length (first segment of UUID)
+ID_LEN = 8  # Lode ID length (8 hex chars = 4 bytes)
 
 
 def current_time_ms() -> int:
@@ -124,11 +124,6 @@ class Lode:
     backlog: dict | None = None  # Original backlog item data if promoted from backlog
 
     @property
-    def short_id(self) -> str:
-        """Return the 8-character short ID (first segment of UUID)."""
-        return self.id[:SHORT_ID_LEN]
-
-    @property
     def effective_updated_at(self) -> int:
         """Return updated_at, falling back to created_at if not set."""
         return self.updated_at if self.updated_at else self.created_at
@@ -205,6 +200,44 @@ def save_lodes(lodes: list[Lode]) -> None:
     os.replace(tmp_path, lodes_file)
 
 
+def _generate_lode_id(lodes: list[Lode]) -> str:
+    """Generate a unique 8-character hex lode ID.
+
+    Checks for collisions against active lodes, archived lodes, and existing
+    lode directories.
+    """
+    # Load archived IDs for collision check
+    archived_ids: set[str] = set()
+    archived_file = config.hopper_dir() / "archived.jsonl"
+    if archived_file.exists():
+        with open(archived_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data = json.loads(line)
+                    archived_ids.add(data["id"])
+
+    # Get existing lode directories
+    lodes_dir = config.hopper_dir() / "lodes"
+    existing_dirs = set(lodes_dir.iterdir()) if lodes_dir.exists() else set()
+    existing_dir_names = {d.name for d in existing_dirs}
+
+    # Active lode IDs
+    active_ids = {lode.id for lode in lodes}
+
+    # Generate until unique
+    for _ in range(100):  # Safety limit
+        new_id = secrets.token_hex(4)  # 8 hex chars
+        if (
+            new_id not in active_ids
+            and new_id not in archived_ids
+            and new_id not in existing_dir_names
+        ):
+            return new_id
+
+    raise RuntimeError("Failed to generate unique lode ID after 100 attempts")
+
+
 def create_lode(lodes: list[Lode], project: str, scope: str = "") -> Lode:
     """Create a new lode, add to list, and create its directory.
 
@@ -218,7 +251,7 @@ def create_lode(lodes: list[Lode], project: str, scope: str = "") -> Lode:
     """
     now = current_time_ms()
     lode = Lode(
-        id=str(uuid.uuid4()),
+        id=_generate_lode_id(lodes),
         stage="ore",
         created_at=now,
         project=project,
@@ -288,12 +321,12 @@ def update_lode_status(lodes: list[Lode], lode_id: str, status: str) -> Lode | N
     return None
 
 
-def find_by_short_id(lodes: list[Lode], prefix: str) -> Lode | None:
+def find_by_prefix(lodes: list[Lode], prefix: str) -> Lode | None:
     """Find a lode by ID prefix.
 
     Args:
         lodes: List of lodes to search
-        prefix: ID prefix to match (can be full ID or short ID)
+        prefix: ID prefix to match
 
     Returns:
         The matching lode, or None if not found or ambiguous (multiple matches)

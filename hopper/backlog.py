@@ -2,11 +2,11 @@
 
 import json
 import os
-import uuid
+import secrets
 from dataclasses import dataclass
 
 from hopper import config
-from hopper.lodes import SHORT_ID_LEN, current_time_ms
+from hopper.lodes import current_time_ms
 
 
 @dataclass
@@ -18,11 +18,6 @@ class BacklogItem:
     description: str
     created_at: int  # milliseconds since epoch
     lode_id: str | None = None  # lode that added it
-
-    @property
-    def short_id(self) -> str:
-        """Return the 8-character short ID."""
-        return self.id[:SHORT_ID_LEN]
 
     def to_dict(self) -> dict:
         return {
@@ -80,8 +75,17 @@ def add_backlog_item(
     lode_id: str | None = None,
 ) -> BacklogItem:
     """Create a new backlog item, add to list, and persist."""
+    # Generate unique ID (collision unlikely but check anyway)
+    existing_ids = {item.id for item in items}
+    for _ in range(100):
+        new_id = secrets.token_hex(4)
+        if new_id not in existing_ids:
+            break
+    else:
+        raise RuntimeError("Failed to generate unique backlog ID")
+
     item = BacklogItem(
-        id=str(uuid.uuid4()),
+        id=new_id,
         project=project,
         description=description,
         created_at=current_time_ms(),
@@ -114,7 +118,7 @@ def update_backlog_item(
     return None
 
 
-def find_by_short_id(items: list[BacklogItem], prefix: str) -> BacklogItem | None:
+def find_by_prefix(items: list[BacklogItem], prefix: str) -> BacklogItem | None:
     """Find a backlog item by ID prefix. Returns None if not found or ambiguous."""
     matches = [item for item in items if item.id.startswith(prefix)]
     if len(matches) == 1:

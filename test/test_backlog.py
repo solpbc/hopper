@@ -3,7 +3,7 @@
 from hopper.backlog import (
     BacklogItem,
     add_backlog_item,
-    find_by_short_id,
+    find_by_prefix,
     load_backlog,
     remove_backlog_item,
     save_backlog,
@@ -14,11 +14,11 @@ from hopper.backlog import (
 def test_backlog_item_to_dict_and_from_dict():
     """Test BacklogItem serialization roundtrip."""
     item = BacklogItem(
-        id="abc-123",
+        id="abc12345",
         project="myproject",
         description="Fix the bug",
         created_at=1234567890,
-        lode_id="session-456",
+        lode_id="sess4567",
     )
     data = item.to_dict()
     restored = BacklogItem.from_dict(data)
@@ -28,12 +28,6 @@ def test_backlog_item_to_dict_and_from_dict():
     assert restored.description == item.description
     assert restored.created_at == item.created_at
     assert restored.lode_id == item.lode_id
-
-
-def test_backlog_item_short_id():
-    """Short ID is first 8 characters."""
-    item = BacklogItem(id="abcd1234-5678-uuid", project="p", description="d", created_at=1000)
-    assert item.short_id == "abcd1234"
 
 
 def test_backlog_item_no_lode_id():
@@ -159,28 +153,28 @@ def test_update_backlog_item_not_found(temp_config):
     assert items[0].description == "Keep"
 
 
-def test_find_by_short_id():
-    """find_by_short_id finds unique match."""
+def test_find_by_prefix():
+    """find_by_prefix finds unique match."""
     items = [
-        BacklogItem(id="aaaa1111-uuid", project="p", description="d", created_at=1000),
-        BacklogItem(id="bbbb2222-uuid", project="p", description="d", created_at=2000),
+        BacklogItem(id="aaaa1111", project="p", description="d", created_at=1000),
+        BacklogItem(id="bbbb2222", project="p", description="d", created_at=2000),
     ]
-    assert find_by_short_id(items, "aaaa1111") is not None
-    assert find_by_short_id(items, "aaaa1111").id == "aaaa1111-uuid"
+    assert find_by_prefix(items, "aaaa1111") is not None
+    assert find_by_prefix(items, "aaaa1111").id == "aaaa1111"
 
 
-def test_find_by_short_id_not_found():
-    """find_by_short_id returns None when no match."""
+def test_find_by_prefix_not_found():
+    """find_by_prefix returns None when no match."""
     items = [
-        BacklogItem(id="aaaa1111-uuid", project="p", description="d", created_at=1000),
+        BacklogItem(id="aaaa1111", project="p", description="d", created_at=1000),
     ]
-    assert find_by_short_id(items, "zzzz") is None
+    assert find_by_prefix(items, "zzzz") is None
 
 
-def test_find_by_short_id_ambiguous():
-    """find_by_short_id returns None when multiple matches."""
+def test_find_by_prefix_ambiguous():
+    """find_by_prefix returns None when multiple matches."""
     items = [
-        BacklogItem(id="aaaa1111-one", project="p", description="d", created_at=1000),
-        BacklogItem(id="aaaa1111-two", project="p", description="d", created_at=2000),
+        BacklogItem(id="aaaa1111", project="p", description="d", created_at=1000),
+        BacklogItem(id="aaaa1122", project="p", description="d", created_at=2000),
     ]
-    assert find_by_short_id(items, "aaaa1111") is None
+    assert find_by_prefix(items, "aaaa11") is None
