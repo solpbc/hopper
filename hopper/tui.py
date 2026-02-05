@@ -279,6 +279,14 @@ class TextInputScreen(ModalScreen):
         margin-bottom: 1;
     }
 
+    .text-input-hint {
+        text-align: right;
+        text-style: dim;
+        color: $text-muted;
+        height: 1;
+        margin-bottom: 0;
+    }
+
     .text-input-buttons {
         height: auto;
         align: center middle;
@@ -297,6 +305,7 @@ class TextInputScreen(ModalScreen):
         with Vertical(classes="text-input-container"):
             yield Static(self.MODAL_TITLE, classes="text-input-title")
             yield TextArea(classes="text-input-area")
+            yield Static("Shift+Enter to submit", classes="text-input-hint")
             with Horizontal(classes="text-input-buttons"):
                 yield from self.compose_buttons()
 
@@ -314,7 +323,11 @@ class TextInputScreen(ModalScreen):
         focused = self.focused
         buttons = list(self.query(".text-input-buttons Button"))
 
-        if event.key == "right" and focused in buttons:
+        if event.key == "shift+enter":
+            event.prevent_default()
+            event.stop()
+            self._submit_primary()
+        elif event.key == "right" and focused in buttons:
             event.prevent_default()
             event.stop()
             idx = buttons.index(focused)
@@ -332,15 +345,24 @@ class TextInputScreen(ModalScreen):
         """Get the stripped text from the TextArea."""
         return self.query_one(TextArea).text.strip()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn-cancel":
-            self.dismiss(None)
-            return
+    def _try_submit(self, button: Button) -> None:
+        """Validate text and call on_submit for the given button."""
         text = self._get_text()
         if not text:
             self.notify("Please enter a description", severity="warning")
             return
-        self.on_submit(event.button, text)
+        self.on_submit(button, text)
+
+    def _submit_primary(self) -> None:
+        """Submit using the primary button."""
+        button = self.query_one("Button.-primary", Button)
+        self._try_submit(button)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+            return
+        self._try_submit(event.button)
 
     def on_submit(self, button: Button, text: str) -> None:
         """Handle a validated submit. Subclasses must override."""

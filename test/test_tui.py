@@ -18,9 +18,11 @@ from hopper.tui import (
     STATUS_NEW,
     STATUS_RUNNING,
     STATUS_STUCK,
+    BacklogEditScreen,
     BacklogInputScreen,
     HopperApp,
     LegendScreen,
+    MillReviewScreen,
     ProjectPickerScreen,
     Row,
     ScopeInputScreen,
@@ -769,6 +771,40 @@ async def test_scope_input_arrow_key_select():
         assert app.scope_result == ("Arrow test", True)
 
 
+@pytest.mark.asyncio
+async def test_scope_input_shift_enter():
+    """Shift+Enter should submit via the primary (Foreground) button."""
+    from textual.widgets import TextArea
+
+    app = ScopeTestApp()
+    async with app.run_test() as pilot:
+        screen = app.screen
+        text_area = screen.query_one(TextArea)
+        text_area.insert("Shift enter test")
+        await pilot.press("shift+enter")
+        assert app.scope_result == ("Shift enter test", True)
+
+
+@pytest.mark.asyncio
+async def test_scope_input_shift_enter_empty_validation():
+    """Shift+Enter with empty text should not submit."""
+    app = ScopeTestApp()
+    async with app.run_test() as pilot:
+        await pilot.press("shift+enter")
+        assert app.scope_result == "not_set"
+
+
+@pytest.mark.asyncio
+async def test_text_input_hint_label():
+    """TextInputScreen should show a shift+enter hint."""
+    from textual.widgets import Static
+
+    app = ScopeTestApp()
+    async with app.run_test():
+        hint = app.screen.query_one(".text-input-hint", Static)
+        assert "Shift+Enter" in str(hint.render())
+
+
 # Tests for hint rows
 
 
@@ -904,6 +940,20 @@ async def test_backlog_input_arrow_navigation():
         assert app.screen.focused.id == "btn-add"
         await pilot.press("right")  # wraps
         assert app.screen.focused.id == "btn-cancel"
+
+
+@pytest.mark.asyncio
+async def test_backlog_input_shift_enter():
+    """Shift+Enter should submit via the primary (Add) button."""
+    from textual.widgets import TextArea
+
+    app = BacklogInputTestApp()
+    async with app.run_test() as pilot:
+        screen = app.screen
+        text_area = screen.query_one(TextArea)
+        text_area.insert("Shift enter backlog")
+        await pilot.press("shift+enter")
+        assert app.backlog_result == "Shift enter backlog"
 
 
 # Tests for BacklogTable
@@ -1153,6 +1203,21 @@ async def test_backlog_edit_arrow_navigation():
 
 
 @pytest.mark.asyncio
+async def test_backlog_edit_shift_enter():
+    """Shift+Enter should submit via the primary (Save) button."""
+    from textual.widgets import TextArea
+
+    app = BacklogEditTestApp(initial_text="Edit me")
+    async with app.run_test() as pilot:
+        assert isinstance(app.screen, BacklogEditScreen)
+        ta = app.screen.query_one(TextArea)
+        ta.clear()
+        ta.insert("Shift enter edit")
+        await pilot.press("shift+enter")
+        assert app.edit_result == ("save", "Shift enter edit")
+
+
+@pytest.mark.asyncio
 async def test_enter_on_backlog_item_opens_edit(temp_config):
     """Enter on a backlog item should open BacklogEditScreen."""
     from hopper.backlog import BacklogItem
@@ -1346,6 +1411,21 @@ async def test_mill_review_arrow_navigation():
         assert app.screen.focused.id == "btn-save"
         await pilot.press("right")  # wraps
         assert app.screen.focused.id == "btn-cancel"
+
+
+@pytest.mark.asyncio
+async def test_mill_review_shift_enter():
+    """Shift+Enter should submit via the primary (Save) button."""
+    from textual.widgets import TextArea
+
+    app = MillReviewTestApp(initial_text="Review me")
+    async with app.run_test() as pilot:
+        assert isinstance(app.screen, MillReviewScreen)
+        ta = app.screen.query_one(TextArea)
+        ta.clear()
+        ta.insert("Shift enter review")
+        await pilot.press("shift+enter")
+        assert app.review_result == ("save", "Shift enter review")
 
 
 @pytest.mark.asyncio
