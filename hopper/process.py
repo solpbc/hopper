@@ -6,7 +6,7 @@
 from pathlib import Path
 
 from hopper import prompt
-from hopper.client import set_codex_thread_id, set_lode_status
+from hopper.client import set_codex_thread_id, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree, current_branch, is_dirty
 from hopper.lodes import get_lode_dir
@@ -69,7 +69,8 @@ class ProcessRunner(BaseRunner):
     def _setup(self) -> int | None:
         # All stages validate their stage
         if self.stage != self._claude_stage:
-            print(f"Lode {self.lode_id} is not in {self._claude_stage} stage.")
+            self._setup_error = f"Lode {self.lode_id} is not in {self._claude_stage} stage."
+            print(self._setup_error)
             return 1
 
         # Dispatch to per-stage setup
@@ -82,7 +83,8 @@ class ProcessRunner(BaseRunner):
 
     def _setup_mill(self) -> int | None:
         if self.project_dir and not Path(self.project_dir).is_dir():
-            print(f"Project directory not found: {self.project_dir}")
+            self._setup_error = f"Project directory not found: {self.project_dir}"
+            print(self._setup_error)
             return 1
 
         self._cwd = self.project_dir if self.project_dir else None
@@ -99,10 +101,12 @@ class ProcessRunner(BaseRunner):
 
     def _setup_refine(self) -> int | None:
         if not self.project_dir:
-            print("No project directory found for lode.")
+            self._setup_error = "No project directory found for lode."
+            print(self._setup_error)
             return 1
         if not Path(self.project_dir).is_dir():
-            print(f"Project directory not found: {self.project_dir}")
+            self._setup_error = f"Project directory not found: {self.project_dir}"
+            print(self._setup_error)
             return 1
 
         # Ensure worktree exists
@@ -111,7 +115,8 @@ class ProcessRunner(BaseRunner):
             set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
             branch_name = f"hopper-{self.lode_id}"
             if not create_worktree(self.project_dir, self.worktree_path, branch_name):
-                print("Failed to create git worktree.")
+                self._setup_error = "Failed to create git worktree."
+                print(self._setup_error)
                 return 1
 
         # Set up venv if project has pyproject.toml
@@ -121,7 +126,8 @@ class ProcessRunner(BaseRunner):
                 set_lode_status(self.socket_path, self.lode_id, "Setting up venv...")
                 print(f"Setting up virtual environment for {self.lode_id}...")
             if not setup_worktree_venv(self.worktree_path):
-                print("Failed to set up virtual environment.")
+                self._setup_error = "Failed to set up virtual environment."
+                print(self._setup_error)
                 return 1
             self.use_venv = True
 
@@ -147,28 +153,35 @@ class ProcessRunner(BaseRunner):
 
     def _setup_ship(self) -> int | None:
         if not self.project_dir:
-            print("No project directory found for lode.")
+            self._setup_error = "No project directory found for lode."
+            print(self._setup_error)
             return 1
         if not Path(self.project_dir).is_dir():
-            print(f"Project directory not found: {self.project_dir}")
+            self._setup_error = f"Project directory not found: {self.project_dir}"
+            print(self._setup_error)
             return 1
 
         # Validate worktree exists
         self.worktree_path = get_lode_dir(self.lode_id) / "worktree"
         if not self.worktree_path.is_dir():
-            print(f"Worktree not found: {self.worktree_path}")
+            self._setup_error = f"Worktree not found: {self.worktree_path}"
+            print(self._setup_error)
             return 1
 
         # Pre-flight: project repo must be clean
         if is_dirty(self.project_dir):
-            print(f"Project repo has uncommitted changes: {self.project_dir}")
+            self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
+            print(self._setup_error)
             print("Commit or stash changes before shipping.")
             return 1
 
         # Pre-flight: project repo must be on main or master
         branch = current_branch(self.project_dir)
         if branch not in ("main", "master"):
-            print(f"Project repo is on branch '{branch}', expected 'main' or 'master'.")
+            self._setup_error = (
+                f"Project repo is on branch '{branch}', expected 'main' or 'master'."
+            )
+            print(self._setup_error)
             print("Switch to the main branch before shipping.")
             return 1
 
@@ -195,7 +208,8 @@ class ProcessRunner(BaseRunner):
             return None
         input_path = get_lode_dir(self.lode_id) / f"{self._input_from}_out.md"
         if not input_path.exists():
-            print(f"Input not found: {input_path}")
+            self._setup_error = f"Input not found: {input_path}"
+            print(self._setup_error)
             return 1
         self._context["input"] = input_path.read_text()
         return None
@@ -244,7 +258,8 @@ class ProcessRunner(BaseRunner):
         try:
             code_prompt = prompt.load("code", context=context if context else None)
         except FileNotFoundError:
-            print("Prompt not found: prompts/code.md")
+            self._setup_error = "Prompt not found: prompts/code.md"
+            print(self._setup_error)
             return 1
 
         env = self._get_subprocess_env() if self.use_venv else None
@@ -252,13 +267,16 @@ class ProcessRunner(BaseRunner):
         exit_code, thread_id = bootstrap_codex(code_prompt, str(self.worktree_path), env=env)
 
         if exit_code == 127:
-            print("codex command not found. Install codex to use code features.")
+            self._setup_error = "codex command not found. Install codex to use code features."
+            print(self._setup_error)
             return 1
         if exit_code != 0:
-            print(f"Codex bootstrap failed (exit {exit_code}).")
+            self._setup_error = f"Codex bootstrap failed (exit {exit_code})."
+            print(self._setup_error)
             return 1
         if not thread_id:
-            print("Failed to capture Codex session ID from bootstrap.")
+            self._setup_error = "Failed to capture Codex session ID from bootstrap."
+            print(self._setup_error)
             return 1
 
         set_codex_thread_id(self.socket_path, self.lode_id, thread_id)
@@ -283,6 +301,7 @@ def run_process(lode_id: str, socket_path: Path) -> int:
     stage = lode_data.get("stage", "")
     if stage not in STAGES:
         print(f"Unknown stage: {stage}")
+        set_lode_state(socket_path, lode_id, "error", f"Unknown stage: {stage}")
         return 1
 
     runner = ProcessRunner(lode_id, socket_path, stage)
