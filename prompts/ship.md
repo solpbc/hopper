@@ -11,7 +11,7 @@ You are merging completed work back into the main branch. The feature branch has
 
 You are running in the original project repo (not the worktree). The worktree at `$worktree` contains the feature branch with all committed work.
 
-## Refine summary
+## Work summary
 
 $input
 
@@ -61,6 +61,6 @@ When the merge is complete, validated, and main is clean:
 
 ```
 hop processed <<'EOF'
-<summary of what was merged>
+<summary of what was merged, including any merge conflicts resolved and how>
 EOF
 ```
