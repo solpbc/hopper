@@ -6,7 +6,7 @@
 import copy
 import io
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from hopper.process import ProcessRunner, run_process
 
@@ -419,6 +419,39 @@ class TestRefineStage:
         cmd = mock_popen.call_args[0][0]
         assert "--session-id" in cmd
 
+    def test_first_run_emits_setup_status(self, tmp_path):
+        """First-run refine emits setup status updates in order."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+        (session_dir / "mill_out.md").write_text("Build the widget")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.has_pyproject", return_value=True),
+            patch("hopper.process.setup_worktree_venv", return_value=True),
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc")),
+            patch("hopper.process.set_codex_thread_id", return_value=True),
+            patch("hopper.process.set_lode_status") as mock_status,
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        assert mock_status.call_args_list == [
+            call(runner.socket_path, runner.lode_id, "Creating worktree..."),
+            call(runner.socket_path, runner.lode_id, "Setting up venv..."),
+            call(runner.socket_path, runner.lode_id, "Bootstrapping Codex..."),
+        ]
+
     def test_resume_skips_bootstrap(self, tmp_path):
         """Resume uses --resume and skips Codex bootstrap."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
@@ -454,6 +487,38 @@ class TestRefineStage:
         cmd = mock_popen.call_args[0][0]
         assert "--resume" in cmd
         assert mock_popen.call_args[1]["cwd"] == str(worktree)
+
+    def test_resume_skips_setup_status(self, tmp_path):
+        """Resume with existing worktree and venv emits no setup status updates."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+        worktree = session_dir / "worktree"
+        worktree.mkdir()
+        (worktree / ".venv").mkdir()
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(
+                    stage="refine",
+                    state="running",
+                    project="my-project",
+                    claude=_claude_sessions(refine={"started": True}),
+                ),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.has_pyproject", return_value=True),
+            patch("hopper.process.setup_worktree_venv", return_value=True),
+            patch("hopper.process.set_lode_status") as mock_status,
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        mock_status.assert_not_called()
 
     def test_validates_stage(self):
         """Refine runner rejects lode not in refine stage."""

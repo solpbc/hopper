@@ -6,7 +6,7 @@
 from pathlib import Path
 
 from hopper import prompt
-from hopper.client import set_codex_thread_id
+from hopper.client import set_codex_thread_id, set_lode_status
 from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree, current_branch, is_dirty
 from hopper.lodes import get_lode_dir
@@ -108,6 +108,7 @@ class ProcessRunner(BaseRunner):
         # Ensure worktree exists
         self.worktree_path = get_lode_dir(self.lode_id) / "worktree"
         if not self.worktree_path.is_dir():
+            set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
             branch_name = f"hopper-{self.lode_id}"
             if not create_worktree(self.project_dir, self.worktree_path, branch_name):
                 print("Failed to create git worktree.")
@@ -117,6 +118,7 @@ class ProcessRunner(BaseRunner):
         if has_pyproject(self.worktree_path):
             venv_path = self.worktree_path / ".venv"
             if not venv_path.is_dir():
+                set_lode_status(self.socket_path, self.lode_id, "Setting up venv...")
                 print(f"Setting up virtual environment for {self.lode_id}...")
             if not setup_worktree_venv(self.worktree_path):
                 print("Failed to set up virtual environment.")
@@ -246,6 +248,7 @@ class ProcessRunner(BaseRunner):
             return 1
 
         env = self._get_subprocess_env() if self.use_venv else None
+        set_lode_status(self.socket_path, self.lode_id, "Bootstrapping Codex...")
         exit_code, thread_id = bootstrap_codex(code_prompt, str(self.worktree_path), env=env)
 
         if exit_code == 127:
