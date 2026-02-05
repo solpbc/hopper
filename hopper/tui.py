@@ -790,8 +790,7 @@ class HopperApp(App):
         Binding("c", "new_lode", "Create"),
         Binding("b", "new_backlog", "Backlog"),
         Binding("a", "toggle_auto", "Auto"),
-        Binding("x", "archive", "Archive"),
-        Binding("d", "delete_backlog", "Delete", show=False),
+        Binding("d", "delete", "Delete"),
         Binding("l", "legend", "Legend"),
     ]
 
@@ -1090,17 +1089,21 @@ class HopperApp(App):
 
         self.refresh_table()
 
-    def action_archive(self) -> None:
-        """Archive the selected lode (lode table only)."""
-        if not isinstance(self.focused, LodeTable):
-            return
-
-        lode_id = self._get_selected_lode_id()
-        if not lode_id:
-            return
-
-        archive_lode(self._lodes, lode_id)
-        self.refresh_table()
+    def action_delete(self) -> None:
+        """Delete: archive lode or remove backlog item, depending on focus."""
+        if isinstance(self.focused, LodeTable):
+            lode_id = self._get_selected_lode_id()
+            if not lode_id:
+                return
+            archive_lode(self._lodes, lode_id)
+            self.refresh_table()
+        elif isinstance(self.focused, BacklogTable):
+            item_id = self._get_selected_backlog_id()
+            if not item_id:
+                return
+            removed = remove_backlog_item(self._backlog, item_id)
+            if removed:
+                self.refresh_backlog()
 
     def action_toggle_auto(self) -> None:
         """Toggle auto-advance on the selected lode."""
@@ -1200,19 +1203,6 @@ class HopperApp(App):
             self.refresh_table()
 
         self.push_screen(ShipReviewScreen(diff_stat=diff_stat), on_review_result)
-
-    def action_delete_backlog(self) -> None:
-        """Delete the selected backlog item."""
-        if not isinstance(self.focused, BacklogTable):
-            return
-
-        item_id = self._get_selected_backlog_id()
-        if not item_id:
-            return
-
-        removed = remove_backlog_item(self._backlog, item_id)
-        if removed:
-            self.refresh_backlog()
 
 
 def run_tui(server=None) -> int:

@@ -3,7 +3,7 @@
 
 """Tests for the TUI module."""
 
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
 from textual.app import App
@@ -419,8 +419,8 @@ async def test_toggle_auto_with_a(temp_config):
 
 
 @pytest.mark.asyncio
-async def test_archive_with_x(temp_config):
-    """x archives selected lode."""
+async def test_archive_with_d(temp_config):
+    """d archives selected lode when lode table is focused."""
     sessions = [
         {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
         {"id": "bbbb2222", "stage": "mill", "created_at": 2000},
@@ -430,7 +430,7 @@ async def test_archive_with_x(temp_config):
     async with app.run_test() as pilot:
         table = app.query_one("#lode-table")
         assert table.row_count == 3  # 2 lodes + hint
-        await pilot.press("x")
+        await pilot.press("d")
         assert table.row_count == 2  # 1 lode + hint
 
 
@@ -1078,8 +1078,8 @@ async def test_delete_backlog_item(temp_config):
 
 
 @pytest.mark.asyncio
-async def test_delete_noop_on_session_table():
-    """d should do nothing when session table is focused."""
+async def test_delete_archives_on_session_table():
+    """d should archive selected lode when session table is focused."""
     from hopper.backlog import BacklogItem
 
     items = [
@@ -1094,10 +1094,62 @@ async def test_delete_noop_on_session_table():
         # Focus is on session table by default
         session_table = app.query_one("#lode-table")
         assert session_table.row_count == 2  # 1 session + hint
-        # Press d - should not delete session or backlog item
+        # Press d - should archive session and leave backlog unchanged
         await pilot.press("d")
-        assert session_table.row_count == 2  # unchanged
+        assert session_table.row_count == 1  # hint only
         assert len(app._backlog) == 1
+
+
+def test_action_delete_archives_lode():
+    """action_delete archives lode when lode table is focused."""
+    from hopper.tui import LodeTable
+
+    sessions = [{"id": "aaaa1111", "stage": "mill", "created_at": 1000}]
+    server = MockServer(sessions)
+    app = HopperApp(server=server)
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
+        patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
+        patch("hopper.tui.archive_lode") as mock_archive,
+        patch.object(app, "refresh_table") as mock_refresh,
+    ):
+        app.action_delete()
+    mock_archive.assert_called_once_with(app._lodes, "aaaa1111")
+    mock_refresh.assert_called_once()
+
+
+def test_action_delete_removes_backlog():
+    """action_delete removes backlog item when backlog table is focused."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogTable
+
+    items = [
+        BacklogItem(id="bl111111", project="proj", description="To delete", created_at=1000),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=BacklogTable()),
+        patch.object(app, "_get_selected_backlog_id", return_value="bl111111"),
+        patch("hopper.tui.remove_backlog_item", return_value=items[0]) as mock_remove,
+        patch.object(app, "refresh_backlog") as mock_refresh,
+    ):
+        app.action_delete()
+    mock_remove.assert_called_once_with(app._backlog, "bl111111")
+    mock_refresh.assert_called_once()
+
+
+def test_action_delete_noop_when_neither_focused():
+    """action_delete should noop when focus is not lode/backlog table."""
+    app = HopperApp()
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=object()),
+        patch("hopper.tui.archive_lode") as mock_archive,
+        patch("hopper.tui.remove_backlog_item") as mock_remove,
+    ):
+        app.action_delete()
+    mock_archive.assert_not_called()
+    mock_remove.assert_not_called()
 
 
 # Tests for BacklogEditScreen
