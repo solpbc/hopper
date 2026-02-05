@@ -11,7 +11,7 @@ import sys
 import threading
 from pathlib import Path
 
-from hopper.client import HopperConnection, connect
+from hopper.client import HopperConnection, connect, set_lode_state
 from hopper.lodes import current_time_ms
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
@@ -79,6 +79,7 @@ class BaseRunner:
         self._pane_id: str | None = None
         # Completion tracking
         self._done = threading.Event()
+        self._setup_error: str | None = None
 
     def run(self) -> int:
         """Run Claude for this lode. Returns exit code."""
@@ -120,6 +121,12 @@ class BaseRunner:
             # Subclass pre-flight validation and setup
             err = self._setup()
             if err is not None:
+                set_lode_state(
+                    self.socket_path,
+                    self.lode_id,
+                    "error",
+                    self._setup_error or "Setup failed",
+                )
                 return err
 
             # Start persistent connection and register ownership
