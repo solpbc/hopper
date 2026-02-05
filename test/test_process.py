@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from hopper.process import ProcessRunner, run_process
 
 CLAUDE_SESSIONS = {
-    "ore": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
+    "mill": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
     "refine": {"session_id": "22222222-2222-2222-2222-222222222222", "started": False},
     "ship": {"session_id": "33333333-3333-3333-3333-333333333333", "started": False},
 }
@@ -22,7 +22,7 @@ def _claude_sessions(**stage_overrides):
     return sessions
 
 
-def _mock_response(stage="ore", state="new", active=False, project="", claude=None, **extra):
+def _mock_response(stage="mill", state="new", active=False, project="", claude=None, **extra):
     lode = {
         "state": state,
         "active": active,
@@ -45,21 +45,21 @@ def _mock_conn(emitted=None):
 
 
 # ---------------------------------------------------------------------------
-# Ore stage tests
+# Mill stage tests
 # ---------------------------------------------------------------------------
 
 
-class TestOreStage:
+class TestMillStage:
     def test_emits_running_state(self):
-        """Ore runner emits running state when Claude starts."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        """Mill runner emits running state when Claude starts."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -73,17 +73,17 @@ class TestOreStage:
 
     def test_bails_if_already_active(self):
         """Runner exits 1 if lode is already active."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with patch(
             "hopper.runner.connect",
-            return_value=_mock_response(stage="ore", active=True),
+            return_value=_mock_response(stage="mill", active=True),
         ):
             assert runner.run() == 1
 
     def test_validates_stage(self):
-        """Ore runner rejects lode not in ore stage."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        """Mill runner rejects lode not in mill stage."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with patch(
             "hopper.runner.connect",
@@ -93,14 +93,14 @@ class TestOreStage:
 
     def test_emits_error_on_nonzero_exit(self):
         """Runner emits error state on non-zero exit."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -116,14 +116,14 @@ class TestOreStage:
 
     def test_captures_stderr_on_error(self):
         """Runner captures stderr as error message."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -144,13 +144,13 @@ class TestOreStage:
 
     def test_resume_uses_resume_flag(self):
         """Existing session uses --resume."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -166,17 +166,17 @@ class TestOreStage:
             "claude",
             "--dangerously-skip-permissions",
             "--resume",
-            CLAUDE_SESSIONS["ore"]["session_id"],
+            CLAUDE_SESSIONS["mill"]["session_id"],
         ]
 
     def test_new_session_uses_session_id_and_prompt(self):
         """New session uses --session-id and prompt."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with (
             patch(
                 "hopper.runner.connect",
-                return_value=_mock_response(stage="ore", state="new"),
+                return_value=_mock_response(stage="mill", state="new"),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
             patch(
@@ -188,12 +188,12 @@ class TestOreStage:
 
         cmd = mock_popen.call_args[0][0]
         assert cmd[0] == "claude"
-        assert cmd[2:4] == ["--session-id", CLAUDE_SESSIONS["ore"]["session_id"]]
+        assert cmd[2:4] == ["--session-id", CLAUDE_SESSIONS["mill"]["session_id"]]
         assert len(cmd) == 5  # claude, skip, --session-id, id, prompt
 
     def test_sets_cwd_to_project_dir(self, tmp_path):
         """Runner sets cwd to project directory."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         project_dir = tmp_path / "my-project"
         project_dir.mkdir()
@@ -203,10 +203,10 @@ class TestOreStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore",
+                    stage="mill",
                     state="running",
                     project="my-project",
-                    claude=_claude_sessions(ore={"started": True}),
+                    claude=_claude_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -222,13 +222,13 @@ class TestOreStage:
 
     def test_no_project_uses_none_cwd(self):
         """Runner passes cwd=None when no project set."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -243,13 +243,13 @@ class TestOreStage:
 
     def test_fails_if_project_dir_missing(self, tmp_path):
         """Runner returns 1 if project dir doesn't exist."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         mock_project = MagicMock(path=str(tmp_path / "nope"))
 
         with (
             patch(
                 "hopper.runner.connect",
-                return_value=_mock_response(stage="ore", project="my-project"),
+                return_value=_mock_response(stage="mill", project="my-project"),
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
         ):
@@ -257,12 +257,12 @@ class TestOreStage:
 
     def test_loads_scope_in_context(self):
         """Runner passes scope to prompt template."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with (
             patch(
                 "hopper.runner.connect",
-                return_value=_mock_response(stage="ore", state="new", scope="build the widget"),
+                return_value=_mock_response(stage="mill", state="new", scope="build the widget"),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
@@ -276,14 +276,14 @@ class TestOreStage:
 
     def test_handles_missing_claude(self):
         """Runner returns 127 if claude not found."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -293,14 +293,14 @@ class TestOreStage:
             assert runner.run() == 127
 
     def test_clean_exit_after_done_emits_ready_and_next_stage(self):
-        """Ore emits state=ready then stage=refine after completion."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        """Mill emits state=ready then stage=refine after completion."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
-                return_value=_mock_response(stage="ore", state="new"),
+                return_value=_mock_response(stage="mill", state="new"),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
@@ -318,18 +318,18 @@ class TestOreStage:
             i for i, e in enumerate(emitted) if e[0] == "lode_update" and e[1]["stage"] == "refine"
         )
         assert state_idx < stage_idx
-        assert "Ore complete" in emitted[state_idx][1]["status"]
+        assert "Mill complete" in emitted[state_idx][1]["status"]
 
     def test_clean_exit_without_done_no_transition(self):
         """No ready/stage transition if done was never signalled."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -343,14 +343,14 @@ class TestOreStage:
 
     def test_connection_stopped_on_exit(self):
         """Runner stops connection on exit."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ore")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         mock_conn = _mock_conn()
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=mock_conn),
@@ -382,7 +382,7 @@ class TestRefineStage:
         """First run bootstraps Codex then runs Claude with refine prompt."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
-        (session_dir / "ore.md").write_text("Build the widget")
+        (session_dir / "mill_out.md").write_text("Build the widget")
 
         codex_calls = []
 
@@ -458,7 +458,7 @@ class TestRefineStage:
 
         with patch(
             "hopper.runner.connect",
-            return_value=_mock_response(stage="ore"),
+            return_value=_mock_response(stage="mill"),
         ):
             assert runner.run() == 1
 
@@ -503,7 +503,7 @@ class TestRefineStage:
             assert runner.run() == 1
 
     def test_fails_if_input_missing_on_first_run(self, tmp_path):
-        """Runner exits 1 if ore.md missing on first run."""
+        """Runner exits 1 if mill_out.md missing on first run."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
 
@@ -522,7 +522,7 @@ class TestRefineStage:
         """Runner exits 1 if Codex bootstrap fails."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
-        (session_dir / "ore.md").write_text("Build it")
+        (session_dir / "mill_out.md").write_text("Build it")
 
         with (
             patch(
@@ -544,7 +544,7 @@ class TestRefineStage:
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         emitted = []
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
-        (session_dir / "ore.md").write_text("Build it")
+        (session_dir / "mill_out.md").write_text("Build it")
 
         with (
             patch(
@@ -596,7 +596,7 @@ class TestShipStage:
         """First run loads ship prompt with branch and worktree context."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
         session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
-        (session_dir / "refine.md").write_text("Refine summary")
+        (session_dir / "refine_out.md").write_text("Refine summary")
 
         with (
             patch(
@@ -739,7 +739,7 @@ class TestShipStage:
         """Runner accepts 'master' as the main branch."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
         session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
-        (session_dir / "refine.md").write_text("done")
+        (session_dir / "refine_out.md").write_text("done")
 
         with (
             patch(
@@ -762,7 +762,7 @@ class TestShipStage:
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
         emitted = []
         session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
-        (session_dir / "refine.md").write_text("done")
+        (session_dir / "refine_out.md").write_text("done")
 
         with (
             patch(
@@ -801,12 +801,12 @@ class TestRunProcess:
         with (
             patch(
                 "hopper.client.connect",
-                return_value={"lode": {"stage": "ore"}},
+                return_value={"lode": {"stage": "mill"}},
             ),
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="ore", state="running", claude=_claude_sessions(ore={"started": True})
+                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),

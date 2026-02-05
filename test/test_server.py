@@ -440,7 +440,7 @@ def test_server_handles_ready_state(socket_path, server, temp_config, make_lode)
         "type": "lode_set_state",
         "lode_id": "test-id",
         "state": "ready",
-        "status": "Ore output saved",
+        "status": "Mill output saved",
     }
     client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
 
@@ -449,7 +449,7 @@ def test_server_handles_ready_state(socket_path, server, temp_config, make_lode)
 
     assert response["type"] == "lode_state_changed"
     assert response["lode"]["state"] == "ready"
-    assert response["lode"]["status"] == "Ore output saved"
+    assert response["lode"]["status"] == "Mill output saved"
 
     client.close()
 
@@ -539,8 +539,8 @@ def test_server_handles_lode_set_codex_thread(socket_path, server, temp_config, 
 
 def test_server_handles_lode_set_claude_started(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_claude_started message."""
-    lode = make_lode(id="test-id", stage="ore", state="running")
-    assert lode["claude"]["ore"]["started"] is False
+    lode = make_lode(id="test-id", stage="mill", state="running")
+    assert lode["claude"]["mill"]["started"] is False
     server.lodes = [lode]
     save_lodes(server.lodes)
 
@@ -559,7 +559,7 @@ def test_server_handles_lode_set_claude_started(socket_path, server, temp_config
     msg = {
         "type": "lode_set_claude_started",
         "lode_id": "test-id",
-        "claude_stage": "ore",
+        "claude_stage": "mill",
     }
     client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
 
@@ -569,10 +569,10 @@ def test_server_handles_lode_set_claude_started(socket_path, server, temp_config
 
     assert response["type"] == "lode_updated"
     assert response["lode"]["id"] == "test-id"
-    assert response["lode"]["claude"]["ore"]["started"] is True
+    assert response["lode"]["claude"]["mill"]["started"] is True
 
     # Server's lode should be updated
-    assert server.lodes[0]["claude"]["ore"]["started"] is True
+    assert server.lodes[0]["claude"]["mill"]["started"] is True
     # Other stages unchanged
     assert server.lodes[0]["claude"]["refine"]["started"] is False
 

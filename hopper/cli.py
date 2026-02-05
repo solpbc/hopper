@@ -477,10 +477,10 @@ def cmd_processed(args: list[str]) -> int:
         print("No input received. Use: hop processed <<'EOF'\\n<output>\\nEOF")
         return 1
 
-    # Write to lode directory as <stage>.md
+    # Write to lode directory as <stage>_out.md
     lode_dir = get_lode_dir(lode_id)
     lode_dir.mkdir(parents=True, exist_ok=True)
-    output_path = lode_dir / f"{stage}.md"
+    output_path = lode_dir / f"{stage}_out.md"
     tmp_path = output_path.with_suffix(".md.tmp")
     tmp_path.write_text(output)
     os.replace(tmp_path, output_path)

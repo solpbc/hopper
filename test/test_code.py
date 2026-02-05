@@ -49,7 +49,7 @@ class TestRunCode:
 
     def test_not_refine_stage(self, capsys):
         """Returns 1 when session is not in refine stage."""
-        with patch("hopper.code.connect", return_value=_mock_response(stage="ore")):
+        with patch("hopper.code.connect", return_value=_mock_response(stage="mill")):
             exit_code = run_code("test-1234", Path("/tmp/test.sock"), "audit", "test request")
 
         assert exit_code == 1

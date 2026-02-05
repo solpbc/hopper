@@ -1,4 +1,4 @@
-You are the ore stage planner.
+You are the mill stage planner.
 
 ## $Name's Task Scope
 

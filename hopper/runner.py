@@ -55,7 +55,7 @@ class BaseRunner:
 
     # Subclasses set these to customize behavior
     _done_label: str = "done"
-    _claude_stage: str = ""  # Key into lode["claude"] dict ("ore", "refine", "ship")
+    _claude_stage: str = ""  # Key into lode["claude"] dict ("mill", "refine", "ship")
     _done_status: str = "Done"
     _next_stage: str = ""
     _always_dismiss: bool = False

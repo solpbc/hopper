@@ -2,7 +2,7 @@
 
 Lodes are plain dicts with these fields:
 - id: str - 8-character base32 ID
-- stage: str - "ore", "refine", or "ship"
+- stage: str - "mill", "refine", or "ship"
 - created_at: int - milliseconds since epoch
 - project: str - project name (default "")
 - scope: str - user's task scope description (default "")
@@ -14,7 +14,7 @@ Lodes are plain dicts with these fields:
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - backlog: dict | None - original backlog item data if promoted (default None)
 - claude: dict - per-stage Claude session tracking:
-    {"ore": {"session_id": "<uuid>", "started": false},
+    {"mill": {"session_id": "<uuid>", "started": false},
      "refine": {"session_id": "<uuid>", "started": false},
      "ship": {"session_id": "<uuid>", "started": false}}
 """
@@ -206,7 +206,7 @@ def _make_claude_sessions() -> dict:
     """Generate per-stage Claude session tracking with fresh UUIDs."""
     return {
         stage: {"session_id": str(uuid.uuid4()), "started": False}
-        for stage in ("ore", "refine", "ship")
+        for stage in ("mill", "refine", "ship")
     }
 
 
@@ -224,7 +224,7 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
     now = current_time_ms()
     lode = {
         "id": _generate_lode_id(lodes),
-        "stage": "ore",
+        "stage": "mill",
         "created_at": now,
         "project": project,
         "scope": scope,

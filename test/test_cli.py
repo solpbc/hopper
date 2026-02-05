@@ -778,7 +778,7 @@ def test_processed_empty_stdin(capsys):
     """processed returns 1 on empty stdin."""
     from io import StringIO
 
-    lode_data = {"id": "test-session", "stage": "ore"}
+    lode_data = {"id": "test-session", "stage": "mill"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.lode_exists", return_value=True):
@@ -796,8 +796,8 @@ def test_processed_saves_file(temp_config, capsys):
 
     lode_id = "test-session-1234"
     lode_dir = temp_config / "lodes" / lode_id
-    output_text = "# Ore output\n\nDo the thing.\n"
-    lode_data = {"id": lode_id, "stage": "ore"}
+    output_text = "# Mill output\n\nDo the thing.\n"
+    lode_data = {"id": lode_id, "stage": "mill"}
 
     with patch.dict(os.environ, {"HOPPER_LID": lode_id}):
         with patch("hopper.client.ping", return_value=True):
@@ -811,8 +811,8 @@ def test_processed_saves_file(temp_config, capsys):
     captured = capsys.readouterr()
     assert "Saved to" in captured.out
 
-    # Verify file was written as <stage>.md
-    output_path = lode_dir / "ore.md"
+    # Verify file was written as <stage>_out.md
+    output_path = lode_dir / "mill_out.md"
     assert output_path.exists()
     assert output_path.read_text() == output_text
 
@@ -838,7 +838,7 @@ def test_processed_no_stage(capsys):
 
 
 def test_processed_refine_stage(temp_config, capsys):
-    """processed saves refine.md for refine stage."""
+    """processed saves refine_out.md for refine stage."""
     from io import StringIO
 
     lode_id = "test-refine-1234"
@@ -856,8 +856,8 @@ def test_processed_refine_stage(temp_config, capsys):
 
     assert result == 0
 
-    # Verify file was written as refine.md
-    output_path = lode_dir / "refine.md"
+    # Verify file was written as refine_out.md
+    output_path = lode_dir / "refine_out.md"
     assert output_path.exists()
     assert output_path.read_text() == output_text
 

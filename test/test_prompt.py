@@ -13,14 +13,14 @@ def mock_config(tmp_path):
 
 def test_load_existing_prompt(mock_config):
     """Loading an existing prompt returns its content."""
-    content = prompt.load("ore")
-    assert "ore" in content.lower()  # Contains expected keyword
+    content = prompt.load("mill")
+    assert "mill" in content.lower()  # Contains expected keyword
 
 
 def test_load_with_md_extension(mock_config):
     """Loading with .md extension works the same."""
-    content = prompt.load("ore.md")
-    assert "ore" in content.lower()  # Contains expected keyword
+    content = prompt.load("mill.md")
+    assert "mill" in content.lower()  # Contains expected keyword
 
 
 def test_load_nonexistent_prompt(mock_config):
@@ -31,7 +31,7 @@ def test_load_nonexistent_prompt(mock_config):
 
 def test_load_strips_trailing_whitespace(mock_config):
     """Loaded prompts have trailing whitespace stripped."""
-    content = prompt.load("ore")
+    content = prompt.load("mill")
     assert content == content.strip()
 
 

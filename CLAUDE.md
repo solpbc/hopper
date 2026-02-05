@@ -9,7 +9,7 @@ Hopper manages multiple Claude Code sessions (called "lodes") through a terminal
 ## Key Concepts
 
 - **Lode** - A Claude Code instance with a unique ID, workflow stage, freeform state, active flag, and associated tmux window
-- **Stage** - Workflow position: "ore" (scoping), "refine" (implementing), or "ship" (merging back to main)
+- **Stage** - Workflow position: "mill" (scoping), "refine" (implementing), or "ship" (merging back to main)
 - **Backlog** - Future work items with project and description
 
 ## Architecture

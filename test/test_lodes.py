@@ -24,7 +24,7 @@ def test_lode_dict_json_roundtrip():
     """Test lode dict serialization roundtrip."""
     lode = {
         "id": "abc12345",
-        "stage": "ore",
+        "stage": "mill",
         "created_at": 1234567890,
         "updated_at": 1234567890,
         "state": "new",
@@ -82,7 +82,7 @@ def test_load_lodes_empty(temp_config):
 def test_save_and_load_lodes(temp_config):
     """Test save/load roundtrip."""
     lodes_list = [
-        {"id": "id111111", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"},
+        {"id": "id111111", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
         {
             "id": "id222222",
             "stage": "refine",
@@ -96,7 +96,7 @@ def test_save_and_load_lodes(temp_config):
     loaded = load_lodes()
     assert len(loaded) == 2
     assert loaded[0]["id"] == "id111111"
-    assert loaded[0]["stage"] == "ore"
+    assert loaded[0]["stage"] == "mill"
     assert loaded[1]["id"] == "id222222"
     assert loaded[1]["stage"] == "refine"
 
@@ -110,7 +110,7 @@ def test_create_lode(temp_config):
     assert len(lode["id"]) == ID_LEN
     assert all(c in ID_ALPHABET for c in lode["id"])
 
-    assert lode["stage"] == "ore"
+    assert lode["stage"] == "mill"
     assert lode["project"] == "test-project"
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
@@ -118,7 +118,7 @@ def test_create_lode(temp_config):
 
     # Verify per-stage Claude sessions
     claude = lode["claude"]
-    for stage in ("ore", "refine", "ship"):
+    for stage in ("mill", "refine", "ship"):
         assert stage in claude
         # Valid UUID format
         import uuid
@@ -153,7 +153,7 @@ def test_create_lode_with_scope(temp_config):
 def test_update_lode_stage(temp_config):
     """Test updating lode stage."""
     lodes_list = [
-        {"id": "testid11", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"}
+        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
     ]
     save_lodes(lodes_list)
 
@@ -178,7 +178,7 @@ def test_update_lode_stage_not_found(temp_config):
 def test_archive_lode(temp_config):
     """Test archiving a lode."""
     lodes_list = [
-        {"id": "keepid11", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"},
+        {"id": "keepid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
         {
             "id": "archivid",
             "stage": "refine",
@@ -221,8 +221,8 @@ def test_archive_lode_not_found(temp_config):
 def test_archive_appends(temp_config):
     """Test that archive appends to existing file."""
     lodes_list = [
-        {"id": "id111111", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"},
-        {"id": "id222222", "stage": "ore", "created_at": 2000, "updated_at": 2000, "state": "new"},
+        {"id": "id111111", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
+        {"id": "id222222", "stage": "mill", "created_at": 2000, "updated_at": 2000, "state": "new"},
     ]
     save_lodes(lodes_list)
 
@@ -238,7 +238,7 @@ def test_archive_appends(temp_config):
 def test_atomic_save(temp_config):
     """Test that save is atomic (no temp file left behind)."""
     lodes_list = [
-        {"id": "testid11", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"}
+        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
     ]
     save_lodes(lodes_list)
 
@@ -339,7 +339,7 @@ def test_format_uptime_days():
 
 def test_touch():
     """touch() updates the updated_at timestamp."""
-    lode = {"id": "testid11", "stage": "ore", "created_at": 1000, "updated_at": 1000}
+    lode = {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000}
     touch(lode)
     assert lode["updated_at"] > 1000
 
@@ -347,7 +347,7 @@ def test_touch():
 def test_update_lode_stage_touches(temp_config):
     """update_lode_stage updates the timestamp."""
     lodes_list = [
-        {"id": "testid11", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"}
+        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
     ]
     save_lodes(lodes_list)
 
@@ -360,7 +360,7 @@ def test_update_lode_stage_touches(temp_config):
 def test_update_lode_state(temp_config):
     """update_lode_state changes state and message, touches timestamp."""
     lodes_list = [
-        {"id": "testid11", "stage": "ore", "created_at": 1000, "updated_at": 1000, "state": "new"}
+        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
     ]
     save_lodes(lodes_list)
 
@@ -397,7 +397,7 @@ def test_lode_backlog_field_roundtrip():
     }
     lode = {
         "id": "abc12345",
-        "stage": "ore",
+        "stage": "mill",
         "created_at": 1000,
         "updated_at": 1000,
         "state": "new",

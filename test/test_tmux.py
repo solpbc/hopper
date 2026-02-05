@@ -150,10 +150,10 @@ class TestRenameWindow:
     def test_renames_successfully(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value.returncode = 0
-            result = rename_window("%0", "hop:ore")
+            result = rename_window("%0", "hop:mill")
             assert result is True
             mock_run.assert_called_once_with(
-                ["tmux", "rename-window", "-t", "%0", "hop:ore"],
+                ["tmux", "rename-window", "-t", "%0", "hop:mill"],
                 capture_output=True,
                 text=True,
             )

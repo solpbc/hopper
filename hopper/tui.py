@@ -62,7 +62,7 @@ HINT_LODE = "_hint_lode"
 HINT_BACKLOG = "_hint_backlog"
 
 # Stage indicators
-STAGE_ORE = "⚒"  # hammer and pick
+STAGE_MILL = "⚒"  # hammer and pick
 STAGE_REFINE = "⛭"  # gear
 STAGE_SHIP = "▲"  # triangle up
 
@@ -80,7 +80,7 @@ class Row:
     """A row in a table."""
 
     id: str
-    stage: str  # STAGE_ORE, STAGE_REFINE, or STAGE_SHIP
+    stage: str  # STAGE_MILL, STAGE_REFINE, or STAGE_SHIP
     age: str  # formatted age string
     status: str  # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR
     active: bool = False  # Whether a runner is connected
@@ -100,15 +100,15 @@ def lode_to_row(lode: dict) -> Row:
     else:
         status = STATUS_RUNNING
 
-    lode_stage = lode.get("stage", "ore")
-    if lode_stage == "ore":
-        stage = STAGE_ORE
+    lode_stage = lode.get("stage", "mill")
+    if lode_stage == "mill":
+        stage = STAGE_MILL
     elif lode_stage == "refine":
         stage = STAGE_REFINE
     elif lode_stage == "ship":
         stage = STAGE_SHIP
     else:
-        stage = STAGE_ORE
+        stage = STAGE_MILL
 
     return Row(
         id=lode["id"],
@@ -147,7 +147,7 @@ def format_active_text(active: bool) -> Text:
 
 def format_stage_text(stage: str) -> Text:
     """Format a stage indicator with color using Rich Text."""
-    if stage == STAGE_ORE:
+    if stage == STAGE_MILL:
         return Text(stage, style="bright_blue")
     elif stage == STAGE_SHIP:
         return Text(stage, style="bright_green")
@@ -376,10 +376,10 @@ class BacklogEditScreen(TextInputScreen):
         self.dismiss((action, text))
 
 
-class OreReviewScreen(TextInputScreen):
-    """Modal screen for reviewing/editing the ore output before refine."""
+class MillReviewScreen(TextInputScreen):
+    """Modal screen for reviewing/editing the mill output before refine."""
 
-    MODAL_TITLE = "Review Ore Output"
+    MODAL_TITLE = "Review Mill Output"
 
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
@@ -567,8 +567,8 @@ class LegendScreen(ModalScreen):
         t.append("\n")
 
         t.append("Stage\n", style="bold")
-        t.append(f"  {STAGE_ORE}", style="bright_blue")
-        t.append("  ore\n", style="bright_black")
+        t.append(f"  {STAGE_MILL}", style="bright_blue")
+        t.append("  mill\n", style="bright_black")
         t.append(f"  {STAGE_REFINE}", style="bright_yellow")
         t.append("  refine\n", style="bright_black")
         t.append(f"  {STAGE_SHIP}", style="bright_green")
@@ -806,8 +806,8 @@ class HopperApp(App):
         """
         table = self.query_one("#lode-table", LodeTable)
 
-        # Build rows from lodes (ore first, then refine, then ship)
-        stage_order = {"ore": 0, "refine": 1, "ship": 2}
+        # Build rows from lodes (mill first, then refine, then ship)
+        stage_order = {"mill": 0, "refine": 1, "ship": 2}
         rows = [
             lode_to_row(s)
             for s in sorted(self._lodes, key=lambda s: stage_order.get(s.get("stage", ""), 3))
@@ -1023,8 +1023,8 @@ class HopperApp(App):
             if not switch_to_pane(lode["tmux_pane"]):
                 self.notify("Failed to switch to window", severity="error")
         elif lode.get("stage") == "refine" and lode.get("state") == "ready":
-            # Ore complete, ready for refine - review before starting
-            self._review_ore_output(lode, project_path)
+            # Mill complete, ready for refine - review before starting
+            self._review_mill_output(lode, project_path)
         elif lode.get("stage") == "ship" and lode.get("state") == "ready":
             # Refine complete, ready to ship - review changes before shipping
             self._review_ship(lode, project_path)
@@ -1077,28 +1077,28 @@ class HopperApp(App):
 
         self.push_screen(BacklogEditScreen(initial_text=item.description), on_edit_result)
 
-    def _review_ore_output(self, lode: dict, project_path: str | None) -> None:
-        """Open the ore output review modal for a refine-ready lode."""
-        ore_path = get_lode_dir(lode["id"]) / "ore.md"
-        if not ore_path.exists():
-            self.notify("Ore output not found", severity="error")
+    def _review_mill_output(self, lode: dict, project_path: str | None) -> None:
+        """Open the mill output review modal for a refine-ready lode."""
+        mill_path = get_lode_dir(lode["id"]) / "mill_out.md"
+        if not mill_path.exists():
+            self.notify("Mill output not found", severity="error")
             return
 
-        ore_text = ore_path.read_text()
+        mill_text = mill_path.read_text()
 
         def on_review_result(result: tuple[str, str] | None) -> None:
             if result is None:
                 return  # Cancelled
             action, text = result
-            # Write edited text back to ore.md
-            tmp_path = ore_path.with_suffix(".md.tmp")
+            # Write edited text back to mill_out.md
+            tmp_path = mill_path.with_suffix(".md.tmp")
             tmp_path.write_text(text)
-            os.replace(tmp_path, ore_path)
+            os.replace(tmp_path, mill_path)
             if action == "process":
                 spawn_claude(lode["id"], project_path, foreground=False)
             self.refresh_table()
 
-        self.push_screen(OreReviewScreen(initial_text=ore_text), on_review_result)
+        self.push_screen(MillReviewScreen(initial_text=mill_text), on_review_result)
 
     def _review_ship(self, lode: dict, project_path: str | None) -> None:
         """Open the ship review modal for a ship-ready lode."""

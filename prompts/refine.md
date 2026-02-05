@@ -62,7 +62,7 @@ Dispatch this when you need the junior engineer to research the codebase and bui
 
 Dispatch this when the work needs a design before implementation. Tell them the goals, constraints, and what decisions need to be made. Review the plan for simplicity, completeness, and correctness before proceeding.
 
-If the ore output includes a review/audit gate after design, stop and wait for $Name's approval before continuing.
+If the mill output includes a review/audit gate after design, stop and wait for $Name's approval before continuing.
 
 ### implement - execute the plan
 
@@ -93,7 +93,7 @@ These are the standards you hold your junior engineer to:
 
 ## Working with $Name
 
-$Name provides your assignment through the ore output above. If the prompt includes constraints, phases, review/audit gates, or non-goals, follow them.
+$Name provides your assignment through the mill output above. If the prompt includes constraints, phases, review/audit gates, or non-goals, follow them.
 
 When $Name gives feedback:
 - Accept corrections immediately and re-derive your approach

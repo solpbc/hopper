@@ -7,7 +7,7 @@ from textual.app import App
 
 from hopper.projects import Project
 from hopper.tui import (
-    STAGE_ORE,
+    STAGE_MILL,
     STAGE_REFINE,
     STATUS_ERROR,
     STATUS_NEW,
@@ -32,45 +32,45 @@ from hopper.tui import (
 
 def test_lode_to_row_new():
     """New session has new status indicator."""
-    session = {"id": "abcd1234", "stage": "ore", "created_at": 1000, "state": "new"}
+    session = {"id": "abcd1234", "stage": "mill", "created_at": 1000, "state": "new"}
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_NEW
-    assert row.stage == STAGE_ORE
+    assert row.stage == STAGE_MILL
 
 
 def test_lode_to_row_running():
     """Running session has running status indicator."""
-    session = {"id": "abcd1234", "stage": "ore", "created_at": 1000, "state": "running"}
+    session = {"id": "abcd1234", "stage": "mill", "created_at": 1000, "state": "running"}
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_RUNNING
-    assert row.stage == STAGE_ORE
+    assert row.stage == STAGE_MILL
 
 
 def test_lode_to_row_stuck():
     """Stuck session has stuck status indicator."""
-    session = {"id": "abcd1234", "stage": "ore", "created_at": 1000, "state": "stuck"}
+    session = {"id": "abcd1234", "stage": "mill", "created_at": 1000, "state": "stuck"}
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_STUCK
-    assert row.stage == STAGE_ORE
+    assert row.stage == STAGE_MILL
 
 
 def test_lode_to_row_error():
     """Error session has error status indicator."""
-    session = {"id": "abcd1234", "stage": "ore", "created_at": 1000, "state": "error"}
+    session = {"id": "abcd1234", "stage": "mill", "created_at": 1000, "state": "error"}
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_ERROR
-    assert row.stage == STAGE_ORE
+    assert row.stage == STAGE_MILL
 
 
 def test_lode_to_row_active():
     """Active session has active=True in row."""
     session = {
         "id": "abcd1234",
-        "stage": "ore",
+        "stage": "mill",
         "created_at": 1000,
         "state": "running",
         "active": True,
@@ -81,7 +81,7 @@ def test_lode_to_row_active():
 
 def test_lode_to_row_inactive():
     """Inactive session has active=False in row."""
-    session = {"id": "abcd1234", "stage": "ore", "created_at": 1000, "state": "new"}
+    session = {"id": "abcd1234", "stage": "mill", "created_at": 1000, "state": "new"}
     row = lode_to_row(session)
     assert row.active is False
 
@@ -95,7 +95,7 @@ def test_lode_to_row_refine_stage():
 
 def test_lode_to_row_completed():
     """Completed session shows running indicator (transient state)."""
-    session = {"id": "abcd1234", "stage": "ore", "created_at": 1000, "state": "completed"}
+    session = {"id": "abcd1234", "stage": "mill", "created_at": 1000, "state": "completed"}
     row = lode_to_row(session)
     assert row.status == STATUS_RUNNING
 
@@ -165,10 +165,10 @@ def test_format_active_text_inactive():
 # Tests for format_stage_text
 
 
-def test_format_stage_text_ore():
-    """format_stage_text returns bright_blue for ore."""
-    text = format_stage_text(STAGE_ORE)
-    assert str(text) == STAGE_ORE
+def test_format_stage_text_mill():
+    """format_stage_text returns bright_blue for mill."""
+    text = format_stage_text(STAGE_MILL)
+    assert str(text) == STAGE_MILL
     assert text.style == "bright_blue"
 
 
@@ -252,14 +252,14 @@ def test_row_dataclass():
     """Row dataclass stores all fields."""
     row = Row(
         id="test1234",
-        stage=STAGE_ORE,
+        stage=STAGE_MILL,
         age="1m",
         status=STATUS_RUNNING,
         project="proj",
         status_text="Working on it",
     )
     assert row.id == "test1234"
-    assert row.stage == STAGE_ORE
+    assert row.stage == STAGE_MILL
     assert row.age == "1m"
     assert row.status == STATUS_RUNNING
     assert row.project == "proj"
@@ -346,7 +346,7 @@ async def test_app_handles_no_git_hash_or_uptime():
 async def test_app_with_lodes():
     """App should display all sessions in unified table."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
         {"id": "bbbb2222", "stage": "refine", "created_at": 2000},
     ]
     server = MockServer(sessions)
@@ -371,8 +371,8 @@ async def test_quit_with_q():
 async def test_cursor_down_navigation():
     """down should move cursor down."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
-        {"id": "bbbb2222", "stage": "ore", "created_at": 2000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
+        {"id": "bbbb2222", "stage": "mill", "created_at": 2000},
     ]
     server = MockServer(sessions)
     app = HopperApp(server=server)
@@ -389,8 +389,8 @@ async def test_cursor_down_navigation():
 async def test_cursor_up_navigation():
     """up should move cursor up."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
-        {"id": "bbbb2222", "stage": "ore", "created_at": 2000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
+        {"id": "bbbb2222", "stage": "mill", "created_at": 2000},
     ]
     server = MockServer(sessions)
     app = HopperApp(server=server)
@@ -408,9 +408,9 @@ async def test_cursor_up_navigation():
 async def test_cursor_preserved_after_refresh():
     """Cursor position should be preserved when table is refreshed."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
-        {"id": "bbbb2222", "stage": "ore", "created_at": 2000},
-        {"id": "cccc3333", "stage": "ore", "created_at": 3000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
+        {"id": "bbbb2222", "stage": "mill", "created_at": 2000},
+        {"id": "cccc3333", "stage": "mill", "created_at": 3000},
     ]
     server = MockServer(sessions)
     app = HopperApp(server=server)
@@ -430,7 +430,7 @@ async def test_cursor_preserved_after_refresh():
 async def test_get_lode():
     """_get_lode should find session by ID."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
         {"id": "bbbb2222", "stage": "refine", "created_at": 2000},
     ]
     server = MockServer(sessions)
@@ -701,7 +701,7 @@ async def test_scope_input_arrow_key_select():
 async def test_hint_row_stays_highlighted():
     """Cursor should stay on hint row across refresh cycles."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
     ]
     server = MockServer(sessions)
     app = HopperApp(server=server)
@@ -720,7 +720,7 @@ async def test_hint_row_stays_highlighted():
 async def test_enter_on_session_hint_triggers_new_session():
     """Enter on session hint row should trigger new session action."""
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
     ]
     server = MockServer(sessions)
     app = HopperApp(server=server)
@@ -873,7 +873,7 @@ async def test_tab_switches_focus_to_backlog():
         BacklogItem(id="bl111111", project="proj", description="Item", created_at=1000),
     ]
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
     ]
     server = MockServer(sessions, backlog=items)
     app = HopperApp(server=server)
@@ -894,7 +894,7 @@ async def test_tab_switches_to_backlog_even_when_empty():
     from hopper.tui import BacklogTable, LodeTable
 
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
     ]
     server = MockServer(sessions)
     app = HopperApp(server=server)
@@ -961,7 +961,7 @@ async def test_delete_noop_on_session_table():
         BacklogItem(id="bl111111", project="proj", description="Item", created_at=1000),
     ]
     sessions = [
-        {"id": "aaaa1111", "stage": "ore", "created_at": 1000},
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
     ]
     server = MockServer(sessions, backlog=items)
     app = HopperApp(server=server)
@@ -1172,11 +1172,11 @@ async def test_backlog_promote_creates_session(monkeypatch, temp_config):
         assert spawned[0]["fg"] is False
 
 
-# Tests for OreReviewScreen
+# Tests for MillReviewScreen
 
 
-class OreReviewTestApp(App):
-    """Test app wrapper for OreReviewScreen."""
+class MillReviewTestApp(App):
+    """Test app wrapper for MillReviewScreen."""
 
     def __init__(self, initial_text: str = ""):
         super().__init__()
@@ -1184,40 +1184,40 @@ class OreReviewTestApp(App):
         self._initial_text = initial_text
 
     def on_mount(self) -> None:
-        from hopper.tui import OreReviewScreen
+        from hopper.tui import MillReviewScreen
 
         def capture_result(r):
             self.review_result = r
 
-        self.push_screen(OreReviewScreen(initial_text=self._initial_text), capture_result)
+        self.push_screen(MillReviewScreen(initial_text=self._initial_text), capture_result)
 
 
 @pytest.mark.asyncio
-async def test_ore_review_prefills_text():
-    """OreReviewScreen should show pre-filled text."""
+async def test_mill_review_prefills_text():
+    """MillReviewScreen should show pre-filled text."""
     from textual.widgets import TextArea
 
-    app = OreReviewTestApp(initial_text="Ore output content")
+    app = MillReviewTestApp(initial_text="Mill output content")
     async with app.run_test():
         ta = app.screen.query_one(TextArea)
-        assert ta.text == "Ore output content"
+        assert ta.text == "Mill output content"
 
 
 @pytest.mark.asyncio
-async def test_ore_review_cancel_escape():
+async def test_mill_review_cancel_escape():
     """Escape should dismiss the review screen with None."""
-    app = OreReviewTestApp(initial_text="Some text")
+    app = MillReviewTestApp(initial_text="Some text")
     async with app.run_test() as pilot:
         await pilot.press("escape")
         assert app.review_result is None
 
 
 @pytest.mark.asyncio
-async def test_ore_review_save():
+async def test_mill_review_save():
     """Save button should return ('save', text)."""
     from textual.widgets import TextArea
 
-    app = OreReviewTestApp(initial_text="Original prompt")
+    app = MillReviewTestApp(initial_text="Original prompt")
     async with app.run_test() as pilot:
         ta = app.screen.query_one(TextArea)
         ta.clear()
@@ -1231,11 +1231,11 @@ async def test_ore_review_save():
 
 
 @pytest.mark.asyncio
-async def test_ore_review_process():
+async def test_mill_review_process():
     """Process button should return ('process', text)."""
     from textual.widgets import TextArea
 
-    app = OreReviewTestApp(initial_text="Process this prompt")
+    app = MillReviewTestApp(initial_text="Process this prompt")
     async with app.run_test() as pilot:
         ta = app.screen.query_one(TextArea)
         assert ta.text == "Process this prompt"
@@ -1247,9 +1247,9 @@ async def test_ore_review_process():
 
 
 @pytest.mark.asyncio
-async def test_ore_review_empty_validation():
+async def test_mill_review_empty_validation():
     """Empty text should not submit."""
-    app = OreReviewTestApp(initial_text="")
+    app = MillReviewTestApp(initial_text="")
     async with app.run_test() as pilot:
         await pilot.press("tab")  # Cancel
         await pilot.press("tab")  # Process
@@ -1259,9 +1259,9 @@ async def test_ore_review_empty_validation():
 
 
 @pytest.mark.asyncio
-async def test_ore_review_arrow_navigation():
+async def test_mill_review_arrow_navigation():
     """Arrow keys should navigate between buttons."""
-    app = OreReviewTestApp(initial_text="Text")
+    app = MillReviewTestApp(initial_text="Text")
     async with app.run_test() as pilot:
         await pilot.press("tab")
         assert app.screen.focused.id == "btn-cancel"
@@ -1274,63 +1274,63 @@ async def test_ore_review_arrow_navigation():
 
 
 @pytest.mark.asyncio
-async def test_enter_on_refine_ready_opens_ore_review(temp_config):
-    """Enter on a refine/ready session should open OreReviewScreen."""
+async def test_enter_on_refine_ready_opens_mill_review(temp_config):
+    """Enter on a refine/ready session should open MillReviewScreen."""
     from hopper.lodes import get_lode_dir
-    from hopper.tui import OreReviewScreen
+    from hopper.tui import MillReviewScreen
 
     session = {"id": "aaaa1111", "stage": "refine", "state": "ready", "created_at": 1000}
-    # Write ore.md for this session
+    # Write mill_out.md for this session
     session_dir = get_lode_dir(session["id"])
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "ore.md").write_text("The ore output")
+    (session_dir / "mill_out.md").write_text("The mill output")
 
     server = MockServer([session])
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         await pilot.press("enter")
-        assert isinstance(app.screen, OreReviewScreen)
+        assert isinstance(app.screen, MillReviewScreen)
         from textual.widgets import TextArea
 
         ta = app.screen.query_one(TextArea)
-        assert ta.text == "The ore output"
+        assert ta.text == "The mill output"
 
 
 @pytest.mark.asyncio
-async def test_ore_review_save_writes_file(temp_config):
-    """Save from review should write edited text back to ore.md."""
+async def test_mill_review_save_writes_file(temp_config):
+    """Save from review should write edited text back to mill_out.md."""
     from textual.widgets import TextArea
 
     from hopper.lodes import get_lode_dir
-    from hopper.tui import OreReviewScreen
+    from hopper.tui import MillReviewScreen
 
     session = {"id": "aaaa1111", "stage": "refine", "state": "ready", "created_at": 1000}
     session_dir = get_lode_dir(session["id"])
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "ore.md").write_text("Original ore output")
+    (session_dir / "mill_out.md").write_text("Original mill output")
 
     server = MockServer([session])
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         await pilot.press("enter")
-        assert isinstance(app.screen, OreReviewScreen)
+        assert isinstance(app.screen, MillReviewScreen)
         ta = app.screen.query_one(TextArea)
         ta.clear()
-        ta.insert("Edited ore output")
+        ta.insert("Edited mill output")
         await pilot.press("tab")  # Cancel
         await pilot.press("tab")  # Process
         await pilot.press("tab")  # Save
         await pilot.press("enter")
-        assert (session_dir / "ore.md").read_text() == "Edited ore output"
+        assert (session_dir / "mill_out.md").read_text() == "Edited mill output"
 
 
 @pytest.mark.asyncio
-async def test_ore_review_process_spawns_refine(monkeypatch, temp_config):
+async def test_mill_review_process_spawns_refine(monkeypatch, temp_config):
     """Process from review should write file and spawn refine in background."""
     from textual.widgets import TextArea
 
     from hopper.lodes import get_lode_dir
-    from hopper.tui import OreReviewScreen
+    from hopper.tui import MillReviewScreen
 
     session = {
         "id": "aaaa1111",
@@ -1341,7 +1341,7 @@ async def test_ore_review_process_spawns_refine(monkeypatch, temp_config):
     }
     session_dir = get_lode_dir(session["id"])
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "ore.md").write_text("Ore output content")
+    (session_dir / "mill_out.md").write_text("Mill output content")
 
     spawned = []
     monkeypatch.setattr(
@@ -1356,9 +1356,9 @@ async def test_ore_review_process_spawns_refine(monkeypatch, temp_config):
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         await pilot.press("enter")
-        assert isinstance(app.screen, OreReviewScreen)
+        assert isinstance(app.screen, MillReviewScreen)
         ta = app.screen.query_one(TextArea)
-        assert ta.text == "Ore output content"
+        assert ta.text == "Mill output content"
         ta.clear()
         ta.insert("Edited for processing")
         # Tab to Process button
@@ -1367,7 +1367,7 @@ async def test_ore_review_process_spawns_refine(monkeypatch, temp_config):
         await pilot.press("enter")
 
         # File should be updated
-        assert (session_dir / "ore.md").read_text() == "Edited for processing"
+        assert (session_dir / "mill_out.md").read_text() == "Edited for processing"
         # Should have spawned refine in background
         assert len(spawned) == 1
         assert spawned[0]["sid"] == session["id"]
@@ -1432,7 +1432,7 @@ async def test_legend_contains_all_symbols():
         assert STATUS_STUCK in text
         assert STATUS_ERROR in text
         assert STATUS_NEW in text
-        assert STAGE_ORE in text
+        assert STAGE_MILL in text
         assert STAGE_REFINE in text
         assert "▸" in text
         assert "▹" in text

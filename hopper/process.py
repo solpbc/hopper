@@ -1,4 +1,4 @@
-"""Process runner - unified stage runner for ore, refine, and ship."""
+"""Process runner - unified stage runner for mill, refine, and ship."""
 
 from pathlib import Path
 
@@ -12,9 +12,9 @@ from hopper.runner import BaseRunner
 
 # Stage configuration: keyed by stage name
 STAGES = {
-    "ore": {
-        "prompt": "ore",
-        "done_status": "Ore complete",
+    "mill": {
+        "prompt": "mill",
+        "done_status": "Mill complete",
         "next_stage": "refine",
         "always_dismiss": False,
         "input_from": None,
@@ -24,7 +24,7 @@ STAGES = {
         "done_status": "Refine complete",
         "next_stage": "ship",
         "always_dismiss": True,
-        "input_from": "ore",
+        "input_from": "mill",
     },
     "ship": {
         "prompt": "ship",
@@ -71,13 +71,13 @@ class ProcessRunner(BaseRunner):
 
         # Dispatch to per-stage setup
         setup_method = {
-            "ore": self._setup_ore,
+            "mill": self._setup_mill,
             "refine": self._setup_refine,
             "ship": self._setup_ship,
         }[self._claude_stage]
         return setup_method()
 
-    def _setup_ore(self) -> int | None:
+    def _setup_mill(self) -> int | None:
         if self.project_dir and not Path(self.project_dir).is_dir():
             print(f"Project directory not found: {self.project_dir}")
             return 1
@@ -90,6 +90,8 @@ class ProcessRunner(BaseRunner):
                 self._context["dir"] = self.project_dir
             if self.scope:
                 self._context["scope"] = self.scope
+                # Save raw scope as mill input
+                self._save_stage_input(self.scope)
         return None
 
     def _setup_refine(self) -> int | None:
@@ -186,12 +188,23 @@ class ProcessRunner(BaseRunner):
         """Load the previous stage's output as $input context."""
         if not self._input_from:
             return None
-        input_path = get_lode_dir(self.lode_id) / f"{self._input_from}.md"
+        input_path = get_lode_dir(self.lode_id) / f"{self._input_from}_out.md"
         if not input_path.exists():
             print(f"Input not found: {input_path}")
             return 1
         self._context["input"] = input_path.read_text()
         return None
+
+    def _save_stage_input(self, content: str) -> None:
+        """Save stage input to <stage>_in.md via atomic write."""
+        import os
+
+        lode_dir = get_lode_dir(self.lode_id)
+        lode_dir.mkdir(parents=True, exist_ok=True)
+        path = lode_dir / f"{self._claude_stage}_in.md"
+        tmp = path.with_suffix(".md.tmp")
+        tmp.write_text(content)
+        os.replace(tmp, path)
 
     def _get_subprocess_env(self) -> dict:
         """Build environment with venv activated if applicable."""
