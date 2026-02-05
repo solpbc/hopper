@@ -279,14 +279,6 @@ class TextInputScreen(ModalScreen):
         margin-bottom: 1;
     }
 
-    .text-input-hint {
-        text-align: right;
-        text-style: dim;
-        color: $text-muted;
-        height: 1;
-        margin-bottom: 0;
-    }
-
     .text-input-buttons {
         height: auto;
         align: center middle;
@@ -305,7 +297,6 @@ class TextInputScreen(ModalScreen):
         with Vertical(classes="text-input-container"):
             yield Static(self.MODAL_TITLE, classes="text-input-title")
             yield TextArea(classes="text-input-area")
-            yield Static("Shift+Enter to submit", classes="text-input-hint")
             with Horizontal(classes="text-input-buttons"):
                 yield from self.compose_buttons()
 
@@ -323,11 +314,7 @@ class TextInputScreen(ModalScreen):
         focused = self.focused
         buttons = list(self.query(".text-input-buttons Button"))
 
-        if event.key == "shift+enter":
-            event.prevent_default()
-            event.stop()
-            self._submit_primary()
-        elif event.key == "right" and focused in buttons:
+        if event.key == "right" and focused in buttons:
             event.prevent_default()
             event.stop()
             idx = buttons.index(focused)
@@ -352,11 +339,6 @@ class TextInputScreen(ModalScreen):
             self.notify("Please enter a description", severity="warning")
             return
         self.on_submit(button, text)
-
-    def _submit_primary(self) -> None:
-        """Submit using the primary button."""
-        button = self.query_one("Button.-primary", Button)
-        self._try_submit(button)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-cancel":
