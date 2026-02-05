@@ -12,8 +12,6 @@ from hopper.projects import Project
 from hopper.tui import (
     AUTO_OFF,
     AUTO_ON,
-    STAGE_MILL,
-    STAGE_REFINE,
     STATUS_ERROR,
     STATUS_NEW,
     STATUS_RUNNING,
@@ -42,7 +40,7 @@ def test_lode_to_row_new():
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_NEW
-    assert row.stage == STAGE_MILL
+    assert row.stage == "mill"
 
 
 def test_lode_to_row_running():
@@ -51,7 +49,7 @@ def test_lode_to_row_running():
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_RUNNING
-    assert row.stage == STAGE_MILL
+    assert row.stage == "mill"
 
 
 def test_lode_to_row_stuck():
@@ -60,7 +58,7 @@ def test_lode_to_row_stuck():
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_STUCK
-    assert row.stage == STAGE_MILL
+    assert row.stage == "mill"
 
 
 def test_lode_to_row_error():
@@ -69,7 +67,7 @@ def test_lode_to_row_error():
     row = lode_to_row(session)
     assert row.id == "abcd1234"
     assert row.status == STATUS_ERROR
-    assert row.stage == STAGE_MILL
+    assert row.stage == "mill"
 
 
 def test_lode_to_row_active():
@@ -100,10 +98,10 @@ def test_lode_to_row_auto():
 
 
 def test_lode_to_row_refine_stage():
-    """Refine session has gear stage indicator."""
+    """Refine session has refine stage indicator."""
     session = {"id": "abcd1234", "stage": "refine", "created_at": 1000, "state": "new"}
     row = lode_to_row(session)
-    assert row.stage == STAGE_REFINE
+    assert row.stage == "refine"
 
 
 def test_lode_to_row_completed():
@@ -194,16 +192,23 @@ def test_format_auto_text_off():
 
 def test_format_stage_text_mill():
     """format_stage_text returns bright_blue for mill."""
-    text = format_stage_text(STAGE_MILL)
-    assert str(text) == STAGE_MILL
+    text = format_stage_text("mill")
+    assert str(text) == "mill"
     assert text.style == "bright_blue"
 
 
 def test_format_stage_text_refine():
     """format_stage_text returns bright_yellow for refine."""
-    text = format_stage_text(STAGE_REFINE)
-    assert str(text) == STAGE_REFINE
+    text = format_stage_text("refine")
+    assert str(text) == "refine"
     assert text.style == "bright_yellow"
+
+
+def test_format_stage_text_ship():
+    """format_stage_text returns bright_green for ship."""
+    text = format_stage_text("ship")
+    assert str(text) == "ship"
+    assert text.style == "bright_green"
 
 
 # Tests for format_status_label
@@ -279,7 +284,7 @@ def test_row_dataclass():
     """Row dataclass stores all fields."""
     row = Row(
         id="test1234",
-        stage=STAGE_MILL,
+        stage="mill",
         age="1m",
         status=STATUS_RUNNING,
         auto=True,
@@ -287,7 +292,7 @@ def test_row_dataclass():
         status_text="Working on it",
     )
     assert row.id == "test1234"
-    assert row.stage == STAGE_MILL
+    assert row.stage == "mill"
     assert row.age == "1m"
     assert row.status == STATUS_RUNNING
     assert row.auto is True
@@ -1547,7 +1552,7 @@ async def test_legend_dismiss_with_escape():
 
 @pytest.mark.asyncio
 async def test_legend_contains_all_symbols():
-    """Legend should contain all status, stage, and connection symbols."""
+    """Legend should contain all status, auto, and connection symbols."""
     from textual.widgets import Static
 
     app = HopperApp()
@@ -1559,8 +1564,6 @@ async def test_legend_contains_all_symbols():
         assert STATUS_STUCK in text
         assert STATUS_ERROR in text
         assert STATUS_NEW in text
-        assert STAGE_MILL in text
-        assert STAGE_REFINE in text
         assert AUTO_ON in text
         assert AUTO_OFF in text
         assert "▸" in text
