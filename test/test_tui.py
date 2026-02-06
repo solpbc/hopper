@@ -846,7 +846,18 @@ class ScopeTestApp(App):
         def capture_result(r):
             self.scope_result = r
 
-        self.push_screen(ScopeInputScreen(), capture_result)
+        self.push_screen(ScopeInputScreen("testproject"), capture_result)
+
+
+@pytest.mark.asyncio
+async def test_scope_screen_title_includes_project_name():
+    """ScopeInputScreen title includes the capitalized project name."""
+    from textual.widgets import Static
+
+    async with ScopeTestApp().run_test() as pilot:
+        screen = pilot.app.screen
+        title = screen.query_one(".text-input-title", Static)
+        assert "Testproject" in str(title.render())
 
 
 @pytest.mark.asyncio

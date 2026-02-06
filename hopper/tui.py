@@ -368,6 +368,10 @@ class ScopeInputScreen(TextInputScreen):
 
     MODAL_TITLE = "Describe Task Scope"
 
+    def __init__(self, project_name: str) -> None:
+        super().__init__()
+        self.MODAL_TITLE = f"Describe {project_name.capitalize()} Task Scope"
+
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
         yield Button("Backlog", id="btn-backlog", variant="default")
@@ -1321,7 +1325,7 @@ class HopperApp(App):
                     spawn_claude(lode["id"], project.path, foreground=False)
                     self.refresh_table()
 
-            self.push_screen(ScopeInputScreen(), on_scope_entered)
+            self.push_screen(ScopeInputScreen(project.name), on_scope_entered)
 
         self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
 
