@@ -13,6 +13,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Key
 from textual.highlight import highlight
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
@@ -87,6 +88,8 @@ STATUS_COLORS = {
     STATUS_NEW: "bright_black",
     STATUS_SHIPPED: "bright_green",
 }
+
+STAGE_ORDER = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
 
 
 @dataclass
@@ -924,6 +927,16 @@ class LodeTable(DataTable):
         last.width = max(1, event.size.width - fixed_width - 2 * self.cell_padding)
         last.auto_width = False
 
+    def on_key(self, event: Key) -> None:
+        if event.key == "left":
+            event.prevent_default()
+            event.stop()
+            self.app.set_archive_view(True)
+        elif event.key == "right":
+            event.prevent_default()
+            event.stop()
+            self.app.set_archive_view(False)
+
 
 class BacklogTable(DataTable):
     """Table displaying backlog items."""
@@ -1047,6 +1060,8 @@ class HopperApp(App):
         super().__init__()
         self.server = server
         self._lodes: list[dict] = server.lodes if server else []
+        self._archived_lodes = server.archived_lodes if server else []
+        self._archive_view: bool = False
         self._backlog: list[BacklogItem] = server.backlog if server else []
         self._projects: list[Project] = []
         self._git_hash: str = server.git_hash if server and server.git_hash else ""
@@ -1057,7 +1072,7 @@ class HopperApp(App):
         """Create the UI layout."""
         yield Header()
         with Vertical(id="lode-panel", classes="section"):
-            yield Static("lodes", classes="section-label")
+            yield Static("lodes", id="lodes_label", classes="section-label")
             yield LodeTable(id="lode-table")
         with Vertical(id="backlog-panel", classes="section"):
             yield Static("backlog", classes="section-label")
@@ -1093,6 +1108,15 @@ class HopperApp(App):
             parts.append(format_uptime(self._started_at))
         self.sub_title = " · ".join(parts)
 
+    def set_archive_view(self, archived: bool) -> None:
+        """Switch between active and archived lode views."""
+        if self._archive_view == archived:
+            return
+        self._archive_view = archived
+        label = self.query_one("#lodes_label", Static)
+        label.update("lodes · archived" if archived else "lodes")
+        self.refresh_table()
+
     def refresh_table(self) -> None:
         """Refresh the table using incremental updates to preserve cursor position.
 
@@ -1101,12 +1125,24 @@ class HopperApp(App):
         """
         table = self.query_one("#lode-table", LodeTable)
 
-        # Build rows from lodes (mill first, then refine, then ship, then shipped)
-        stage_order = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
+        def archived_sort_key(lode: dict) -> int:
+            updated_at = lode.get("updated_at")
+            return updated_at if isinstance(updated_at, int) else 0
+
+        if self._archive_view:
+            lodes = sorted(
+                self._archived_lodes,
+                key=archived_sort_key,
+                reverse=True,
+            )
+        else:
+            lodes = sorted(
+                self._lodes, key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 0)
+            )
+
+        # Build rows for the current view.
         rows = [
-            lode_to_row(s)
-            for s in sorted(self._lodes, key=lambda s: stage_order.get(s.get("stage", ""), 3))
-            if s.get("stage") in stage_order
+            lode_to_row(s) for s in lodes if self._archive_view or s.get("stage") in STAGE_ORDER
         ]
 
         # Get current row keys in table (excluding hint row)
@@ -1160,9 +1196,13 @@ class HopperApp(App):
                     key=row.id,
                 )
 
-        # Add hint row at the bottom if not already there
-        if not has_hint:
-            hint = Text("c to create new lode", style="bright_black italic")
+        hint_text = "← back to active lodes" if self._archive_view else "c to create new lode"
+        hint = Text(hint_text, style="bright_black italic")
+
+        # Keep hint row text in sync with active/archive mode.
+        if has_hint:
+            table.update_cell(HINT_LODE, LodeTable.COL_STATUS_TEXT, hint)
+        else:
             table.add_row("", "", "", "", "", "", "", "", hint, key=HINT_LODE)
 
     def refresh_backlog(self) -> None:
@@ -1246,6 +1286,8 @@ class HopperApp(App):
 
     def action_new_lode(self) -> None:
         """Open project picker, then scope input, to create a lode or backlog item."""
+        if self._archive_view:
+            return
         if not self._require_projects():
             return
 
@@ -1296,6 +1338,8 @@ class HopperApp(App):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter key on selected row in any table."""
+        if isinstance(event.data_table, LodeTable) and self._archive_view:
+            return
         key = str(event.row_key.value)
 
         # Hint row actions
@@ -1349,6 +1393,8 @@ class HopperApp(App):
     def action_delete(self) -> None:
         """Delete: archive lode or remove backlog item, depending on focus."""
         if isinstance(self.focused, LodeTable):
+            if self._archive_view:
+                return
             lode_id = self._get_selected_lode_id()
             if not lode_id:
                 return
@@ -1360,7 +1406,9 @@ class HopperApp(App):
                     # Has unmerged changes - show confirmation modal
                     def on_confirm(result: bool | None) -> None:
                         if result:
-                            archive_lode(self._lodes, lode_id)
+                            archived = archive_lode(self._lodes, lode_id)
+                            if archived is not None:
+                                self._archived_lodes.append(archived)
                             self.refresh_table()
 
                     self.push_screen(
@@ -1369,7 +1417,9 @@ class HopperApp(App):
                     )
                     return
             # No worktree or no changes - archive immediately
-            archive_lode(self._lodes, lode_id)
+            archived = archive_lode(self._lodes, lode_id)
+            if archived is not None:
+                self._archived_lodes.append(archived)
             self.refresh_table()
         elif isinstance(self.focused, BacklogTable):
             item_id = self._get_selected_backlog_id()
@@ -1382,6 +1432,8 @@ class HopperApp(App):
     def action_toggle_auto(self) -> None:
         """Toggle auto-advance on the selected lode."""
         if not isinstance(self.focused, LodeTable):
+            return
+        if self._archive_view:
             return
 
         lode_id = self._get_selected_lode_id()
@@ -1409,6 +1461,8 @@ class HopperApp(App):
     def action_view_files(self) -> None:
         """Open the file viewer for the selected lode."""
         if not isinstance(self.focused, LodeTable):
+            return
+        if self._archive_view:
             return
         lode_id = self._get_selected_lode_id()
         if lode_id is None:

@@ -156,6 +156,20 @@ def load_lodes() -> list[dict]:
     return lodes
 
 
+def load_archived_lodes() -> list[dict]:
+    """Load archived lodes from archived.jsonl."""
+    archived_file = config.hopper_dir() / "archived.jsonl"
+    if not archived_file.exists():
+        return []
+    lodes = []
+    with open(archived_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                lodes.append(json.loads(line))
+    return lodes
+
+
 def save_lodes(lodes: list[dict]) -> None:
     """Atomically save lodes to JSONL file."""
     lodes_file = config.hopper_dir() / "active.jsonl"

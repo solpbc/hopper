@@ -29,6 +29,7 @@ from hopper.lodes import (
     archive_lode,
     create_lode,
     current_time_ms,
+    load_archived_lodes,
     load_lodes,
     save_lodes,
     touch,
@@ -80,6 +81,7 @@ class Server:
         self.broadcast_queue: queue.Queue = queue.Queue(maxsize=10000)
         self.writer_thread: threading.Thread | None = None
         self.lodes: list[dict] = []
+        self.archived_lodes: list[dict] = []
         self.backlog: list[BacklogItem] = []
         # Lode ownership tracking: lode_id -> socket, socket -> lode_id
         self.lode_clients: dict[str, socket.socket] = {}
@@ -107,6 +109,7 @@ class Server:
         hopper_logger.addHandler(handler)
         self._log_handler = handler
         self.lodes = load_lodes()
+        self.archived_lodes = load_archived_lodes()
         self.backlog = load_backlog()
 
         # Clear stale active flags from previous run (no clients connected yet)
@@ -318,6 +321,7 @@ class Server:
             if lode_id:
                 lode = archive_lode(self.lodes, lode_id)
                 if lode:
+                    self.archived_lodes.append(lode)
                     logger.info(f"Lode {lode_id} archived")
                     self.broadcast({"type": "lode_archived", "lode": lode})
 

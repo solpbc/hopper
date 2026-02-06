@@ -345,11 +345,13 @@ class MockServer:
     def __init__(
         self,
         sessions: list[dict] | None = None,
+        archived_lodes: list[dict] | None = None,
         backlog: list | None = None,
         git_hash: str | None = None,
         started_at: int | None = None,
     ):
         self.lodes = sessions if sessions is not None else []
+        self.archived_lodes = archived_lodes if archived_lodes is not None else []
         self.backlog = backlog if backlog is not None else []
         self.git_hash = git_hash
         self.started_at = started_at
@@ -455,6 +457,178 @@ async def test_app_lode_table_has_auto_column():
     async with app.run_test():
         table = app.query_one("#lode-table", LodeTable)
         assert LodeTable.COL_AUTO in table.columns
+
+
+@pytest.mark.asyncio
+async def test_archive_view_toggle(make_lode):
+    """Left/right should toggle archive view on the lode table."""
+    server = MockServer([make_lode(id="active01")], archived_lodes=[make_lode(id="arch0001")])
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        assert app._archive_view is False
+        await pilot.press("left")
+        assert app._archive_view is True
+        await pilot.press("right")
+        assert app._archive_view is False
+        await pilot.press("right")
+        assert app._archive_view is False
+
+
+@pytest.mark.asyncio
+async def test_archive_view_label_updates():
+    """Archive view toggling should update the lodes section label."""
+    app = HopperApp(server=MockServer([]))
+    async with app.run_test() as pilot:
+        label = app.query_one("#lodes_label")
+        assert label.content == "lodes"
+        await pilot.press("left")
+        assert label.content == "lodes · archived"
+        await pilot.press("right")
+        assert label.content == "lodes"
+
+
+@pytest.mark.asyncio
+async def test_archive_view_shows_archived_lodes(make_lode):
+    """Archive view should render archived lodes instead of active lodes."""
+    archived = [
+        make_lode(id="arch0001", updated_at=1000),
+        make_lode(id="arch0002", updated_at=2000),
+    ]
+    server = MockServer([make_lode(id="active01")], archived_lodes=archived)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("left")
+        table = app.query_one("#lode-table")
+        row_keys = [str(k.value) for k in table.rows]
+        assert "arch0001" in row_keys
+        assert "arch0002" in row_keys
+        assert "active01" not in row_keys
+        top_key = str(table.coordinate_to_cell_key((0, 0)).row_key.value)
+        assert top_key == "arch0002"
+
+
+@pytest.mark.asyncio
+async def test_archive_view_hint_row():
+    """Archive view should show a back-to-active hint row."""
+    app = HopperApp(server=MockServer([]))
+    async with app.run_test() as pilot:
+        await pilot.press("left")
+        table = app.query_one("#lode-table")
+        hint_row = table.get_row("_hint_lode")
+        assert str(hint_row[-1]) == "← back to active lodes"
+
+
+@pytest.mark.asyncio
+async def test_archive_view_guards_actions(make_lode):
+    """Lode actions should be guarded while archive view is active."""
+    server = MockServer(
+        [make_lode(id="active01", auto=False)],
+        archived_lodes=[make_lode(id="arch0001")],
+    )
+    app = HopperApp(server=server)
+    with (
+        patch.object(app, "_require_projects") as mock_require_projects,
+        patch.object(app, "_get_selected_lode_id") as mock_selected_lode_id,
+        patch.object(app, "_get_lode") as mock_get_lode,
+        patch("hopper.tui.archive_lode") as mock_archive_lode,
+    ):
+        async with app.run_test() as pilot:
+            await pilot.press("left")
+            assert app._archive_view is True
+            await pilot.press("c")
+            await pilot.press("d")
+            await pilot.press("a")
+            await pilot.press("v")
+            await pilot.press("enter")
+    mock_require_projects.assert_not_called()
+    mock_selected_lode_id.assert_not_called()
+    mock_get_lode.assert_not_called()
+    mock_archive_lode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_archive_view_backlog_unaffected():
+    """Backlog actions should still work while archive view is active."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogTable
+
+    items = [
+        BacklogItem(id="bl111111", project="proj", description="First", created_at=1000),
+        BacklogItem(id="bl222222", project="proj", description="Second", created_at=2000),
+    ]
+    app = HopperApp(server=MockServer([], backlog=items))
+    async with app.run_test() as pilot:
+        await pilot.press("left")
+        assert app._archive_view is True
+        await pilot.press("tab")
+        assert isinstance(app.focused, BacklogTable)
+        await pilot.press("d")
+        assert len(app._backlog) == 1
+        await pilot.press("right")
+        assert app._archive_view is True
+        await pilot.press("left")
+        assert app._archive_view is True
+
+
+@pytest.mark.asyncio
+async def test_left_right_only_on_lode_table():
+    """Left/right should not toggle archive view when backlog table is focused."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogTable
+
+    items = [BacklogItem(id="bl111111", project="proj", description="First", created_at=1000)]
+    app = HopperApp(server=MockServer([], backlog=items))
+    async with app.run_test() as pilot:
+        assert app._archive_view is False
+        await pilot.press("tab")
+        assert isinstance(app.focused, BacklogTable)
+        await pilot.press("left")
+        assert app._archive_view is False
+        await pilot.press("right")
+        assert app._archive_view is False
+
+
+@pytest.mark.asyncio
+async def test_archive_view_handles_missing_updated_at(make_lode):
+    """Archive view should handle archived rows that don't have updated_at."""
+    archived_a = make_lode(id="arch0001", updated_at=3000)
+    archived_b = make_lode(id="arch0002")
+    archived_b.pop("updated_at")
+
+    app = HopperApp(server=MockServer([], archived_lodes=[archived_b, archived_a]))
+    async with app.run_test() as pilot:
+        await pilot.press("left")
+        table = app.query_one("#lode-table")
+        row_keys = [str(k.value) for k in table.rows]
+        assert "arch0001" in row_keys
+        assert "arch0002" in row_keys
+        top_key = str(table.coordinate_to_cell_key((0, 0)).row_key.value)
+        assert top_key == "arch0001"
+
+
+@pytest.mark.asyncio
+async def test_archive_confirm_modal_arrows_do_not_toggle_archive_view(temp_config, make_lode):
+    """Left/right in archive modal should not toggle archive view."""
+    from hopper.lodes import get_lode_dir
+    from hopper.tui import ArchiveConfirmScreen
+
+    session = make_lode(id="aaaa1111")
+    worktree = get_lode_dir(session["id"]) / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    app = HopperApp(server=MockServer([session]))
+    with patch("hopper.tui.get_diff_stat", return_value=" file.py | 1 +"):
+        async with app.run_test() as pilot:
+            assert app._archive_view is False
+            await pilot.press("d")
+            assert isinstance(app.screen, ArchiveConfirmScreen)
+            assert app.screen.focused.id == "btn-cancel"
+            await pilot.press("right")
+            assert app.screen.focused.id == "btn-archive"
+            assert app._archive_view is False
+            await pilot.press("left")
+            assert app.screen.focused.id == "btn-cancel"
+            assert app._archive_view is False
 
 
 @pytest.mark.asyncio
