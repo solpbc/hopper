@@ -5,6 +5,7 @@
 
 import copy
 import io
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1104,4 +1105,62 @@ class TestRunProcess:
             "test-id",
             "error",
             "unexpected crash",
+        )
+
+
+class TestProcessingLog:
+    """Tests for processing.log file handler setup."""
+
+    def test_processing_log_created(self, isolate_config):
+        """processing.log is created by run_process."""
+        log_path = isolate_config / "processing.log"
+        with (
+            patch("hopper.client.connect", return_value={"lode": {"stage": "mill"}}),
+            patch("hopper.runner.connect", return_value=_mock_response()),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.process.ProcessRunner.run", return_value=0),
+        ):
+            run_process("test-id", Path("/tmp/test.sock"))
+
+        assert log_path.exists()
+        content = log_path.read_text()
+        assert "process start" in content
+        assert "lode=test-id" in content
+
+    def test_processing_log_contains_stage(self, isolate_config):
+        """processing.log includes the loaded stage."""
+        log_path = isolate_config / "processing.log"
+        with (
+            patch("hopper.client.connect", return_value={"lode": {"stage": "refine"}}),
+            patch("hopper.runner.connect", return_value=_mock_response()),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.process.ProcessRunner.run", return_value=0),
+        ):
+            run_process("test-id", Path("/tmp/test.sock"))
+
+        content = log_path.read_text()
+        assert "stage=refine" in content
+
+    def test_processing_log_error_path(self, isolate_config):
+        """processing.log captures connection failures."""
+        log_path = isolate_config / "processing.log"
+        with patch("hopper.client.connect", return_value=None):
+            run_process("fail-id", Path("/tmp/test.sock"))
+
+        content = log_path.read_text()
+        assert "connect failed" in content
+        assert "lode=fail-id" in content
+
+    def test_processing_log_handler_cleaned_up(self, isolate_config):
+        """Handler is removed after run_process completes."""
+        log_path = isolate_config / "processing.log"
+        hopper_logger = logging.getLogger("hopper")
+        initial_count = len(hopper_logger.handlers)
+        with patch("hopper.client.connect", return_value=None):
+            run_process("test-id", Path("/tmp/test.sock"))
+        assert len(hopper_logger.handlers) == initial_count
+        assert not any(
+            isinstance(handler, logging.FileHandler)
+            and Path(getattr(handler, "baseFilename", "")) == log_path
+            for handler in hopper_logger.handlers
         )

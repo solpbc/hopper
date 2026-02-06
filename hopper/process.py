@@ -8,7 +8,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from hopper import prompt
+from hopper import config, prompt
 from hopper.client import set_codex_thread_id, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree, current_branch, is_dirty
@@ -34,11 +34,11 @@ def _run_make_install(worktree_path: Path) -> bool:
             cwd=str(worktree_path),
         )
         if result.returncode != 0:
-            logger.error(f"make install failed (exit code {result.returncode})")
+            logger.error(f"make install failed exit_code={result.returncode}")
             return False
         return True
     except (FileNotFoundError, subprocess.SubprocessError) as e:
-        logger.error(f"make install failed: {e}")
+        logger.error(f"make install failed error={e}")
         return False
 
 
@@ -113,10 +113,12 @@ class ProcessRunner(BaseRunner):
         self.scope = lode_data.get("scope", "")
 
     def _setup(self) -> int | None:
+        logger.debug(f"setup dispatching lode={self.lode_id} stage={self.stage}")
         # All stages validate their stage
         if self.stage != self._claude_stage:
             self._setup_error = f"Lode {self.lode_id} is not in {self._claude_stage} stage."
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         # Dispatch to per-stage setup
@@ -131,6 +133,7 @@ class ProcessRunner(BaseRunner):
         if self.project_dir and not Path(self.project_dir).is_dir():
             self._setup_error = f"Project directory not found: {self.project_dir}"
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         self._cwd = self.project_dir if self.project_dir else None
@@ -143,16 +146,19 @@ class ProcessRunner(BaseRunner):
                 self._context["scope"] = self.scope
                 # Save raw scope as mill input
                 self._save_stage_input(self.scope)
+        logger.debug(f"mill setup complete lode={self.lode_id}")
         return None
 
     def _setup_refine(self) -> int | None:
         if not self.project_dir:
             self._setup_error = "No project directory found for lode."
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         if not Path(self.project_dir).is_dir():
             self._setup_error = f"Project directory not found: {self.project_dir}"
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         # Ensure worktree exists
@@ -163,18 +169,25 @@ class ProcessRunner(BaseRunner):
             if not create_worktree(self.project_dir, self.worktree_path, branch_name):
                 self._setup_error = "Failed to create git worktree."
                 print(self._setup_error)
+                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
+            logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
 
         # Set up venv via make install if project has a Makefile
         if _has_makefile(self.worktree_path):
             venv_path = self.worktree_path / ".venv"
-            if not venv_path.is_dir():
+            venv_missing = not venv_path.is_dir()
+            if venv_missing:
                 set_lode_status(self.socket_path, self.lode_id, "Running make install...")
+                logger.debug(f"make install start lode={self.lode_id}")
                 print(f"Running make install for {self.lode_id}...")
-            if not venv_path.is_dir() and not _run_make_install(self.worktree_path):
+            if venv_missing and not _run_make_install(self.worktree_path):
                 self._setup_error = "Failed to run make install."
                 print(self._setup_error)
+                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
+            if venv_missing:
+                logger.debug(f"make install complete lode={self.lode_id}")
             self.use_venv = True
 
         self._cwd = str(self.worktree_path)
@@ -184,6 +197,7 @@ class ProcessRunner(BaseRunner):
             err = self._load_input()
             if err is not None:
                 return err
+            logger.debug(f"input loaded lode={self.lode_id}")
 
             if self.project_name:
                 self._context["project"] = self.project_name
@@ -195,16 +209,19 @@ class ProcessRunner(BaseRunner):
             if err is not None:
                 return err
 
+        logger.debug(f"refine setup complete lode={self.lode_id}")
         return None
 
     def _setup_ship(self) -> int | None:
         if not self.project_dir:
             self._setup_error = "No project directory found for lode."
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         if not Path(self.project_dir).is_dir():
             self._setup_error = f"Project directory not found: {self.project_dir}"
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         # Validate worktree exists
@@ -212,6 +229,7 @@ class ProcessRunner(BaseRunner):
         if not self.worktree_path.is_dir():
             self._setup_error = f"Worktree not found: {self.worktree_path}"
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         # Pre-flight: project repo must be clean
@@ -219,6 +237,7 @@ class ProcessRunner(BaseRunner):
             self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
             print(self._setup_error)
             print("Commit or stash changes before shipping.")
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         # Pre-flight: project repo must be on main or master
@@ -229,6 +248,7 @@ class ProcessRunner(BaseRunner):
             )
             print(self._setup_error)
             print("Switch to the main branch before shipping.")
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         self._cwd = self.project_dir
@@ -238,6 +258,7 @@ class ProcessRunner(BaseRunner):
             err = self._load_input()
             if err is not None:
                 return err
+            logger.debug(f"input loaded lode={self.lode_id}")
 
             self._context["branch"] = f"hopper-{self.lode_id}"
             self._context["worktree"] = str(self.worktree_path)
@@ -246,6 +267,7 @@ class ProcessRunner(BaseRunner):
             if self.project_dir:
                 self._context["dir"] = self.project_dir
 
+        logger.debug(f"ship setup complete lode={self.lode_id}")
         return None
 
     def _load_input(self) -> int | None:
@@ -256,6 +278,7 @@ class ProcessRunner(BaseRunner):
         if not input_path.exists():
             self._setup_error = f"Input not found: {input_path}"
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         self._context["input"] = input_path.read_text()
         return None
@@ -291,6 +314,7 @@ class ProcessRunner(BaseRunner):
 
     def _bootstrap_codex(self) -> int | None:
         """Bootstrap a Codex session for the refine stage."""
+        logger.debug(f"codex bootstrap start lode={self.lode_id}")
         print(f"Bootstrapping Codex session for {self.lode_id}...")
 
         context: dict[str, str] = {}
@@ -304,6 +328,7 @@ class ProcessRunner(BaseRunner):
         except FileNotFoundError:
             self._setup_error = "Prompt not found: prompts/code.md"
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         env = self._get_subprocess_env() if self.use_venv else None
@@ -313,18 +338,22 @@ class ProcessRunner(BaseRunner):
         if exit_code == 127:
             self._setup_error = "codex command not found. Install codex to use code features."
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         if exit_code != 0:
             self._setup_error = f"Codex bootstrap failed (exit {exit_code})."
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         if not thread_id:
             self._setup_error = "Failed to capture Codex session ID from bootstrap."
             print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
         set_codex_thread_id(self.socket_path, self.lode_id, thread_id)
         print(f"Codex session {thread_id[:8]} ready.")
+        logger.debug(f"codex bootstrap complete lode={self.lode_id} thread={thread_id[:8]}")
         return None
 
 
@@ -332,29 +361,51 @@ def run_process(lode_id: str, socket_path: Path) -> int:
     """Entry point for process command. Reads stage from server."""
     from hopper.client import connect
 
-    response = connect(socket_path, lode_id=lode_id)
-    if not response:
-        print(f"Failed to connect to server for lode {lode_id}")
-        return 1
+    # Configure file logging (mirrors server.py activity.log pattern)
+    log_path = config.hopper_dir() / "processing.log"
+    handler = logging.FileHandler(log_path)
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    hopper_logger = logging.getLogger("hopper")
+    hopper_logger.setLevel(logging.DEBUG)
+    hopper_logger.addHandler(handler)
 
-    lode_data = response.get("lode")
-    if not lode_data:
-        print(f"Lode {lode_id} not found")
-        return 1
-
-    stage = lode_data.get("stage", "")
-    if stage not in STAGES:
-        print(f"Unknown stage: {stage}")
-        set_lode_state(socket_path, lode_id, "error", f"Unknown stage: {stage}")
-        return 1
-
-    runner = ProcessRunner(lode_id, socket_path, stage)
     try:
-        return runner.run()
-    except Exception as exc:
-        print(f"Error [{lode_id}]: {exc}")
+        response = connect(socket_path, lode_id=lode_id)
+        if not response:
+            logger.error(f"connect failed lode={lode_id}")
+            print(f"Failed to connect to server for lode {lode_id}")
+            return 1
+
+        lode_data = response.get("lode")
+        if not lode_data:
+            logger.error(f"lode not found lode={lode_id}")
+            print(f"Lode {lode_id} not found")
+            return 1
+
+        stage = lode_data.get("stage", "")
+        logger.info(f"process start lode={lode_id} stage={stage}")
+        if stage not in STAGES:
+            logger.error(f"unknown stage lode={lode_id} stage={stage}")
+            print(f"Unknown stage: {stage}")
+            set_lode_state(socket_path, lode_id, "error", f"Unknown stage: {stage}")
+            return 1
+
+        runner = ProcessRunner(lode_id, socket_path, stage)
         try:
-            set_lode_state(socket_path, lode_id, "error", str(exc))
-        except Exception:
-            pass
-        return 1
+            return runner.run()
+        except Exception as exc:
+            print(f"Error [{lode_id}]: {exc}")
+            logger.exception(f"unexpected error lode={lode_id}")
+            try:
+                set_lode_state(socket_path, lode_id, "error", str(exc))
+            except Exception:
+                pass
+            return 1
+    finally:
+        hopper_logger.removeHandler(handler)
+        handler.close()

@@ -88,6 +88,7 @@ class BaseRunner:
 
         try:
             try:
+                logger.info(f"run start lode={self.lode_id}")
                 # Query server for lode state and project info
                 response = connect(self.socket_path, lode_id=self.lode_id)
                 if not response:
@@ -100,7 +101,7 @@ class BaseRunner:
                     return 1
 
                 if lode_data.get("active", False):
-                    logger.error(f"Lode {self.lode_id} already has an active connection")
+                    logger.error(f"lode already active lode={self.lode_id}")
                     print(f"Lode {self.lode_id} is already active")
                     return 1
 
@@ -108,6 +109,8 @@ class BaseRunner:
                 claude_info = lode_data.get("claude", {}).get(self._claude_stage, {})
                 self.claude_session_id = claude_info.get("session_id", "")
                 self.is_first_run = not claude_info.get("started", False)
+                if self.is_first_run:
+                    logger.debug(f"first run detected lode={self.lode_id}")
 
                 project_name = lode_data.get("project", "")
                 if project_name:
@@ -118,6 +121,7 @@ class BaseRunner:
 
                 # Let subclass extract additional data
                 self._load_lode_data(lode_data)
+                logger.info(f"lode loaded lode={self.lode_id} first_run={self.is_first_run}")
 
                 # Start persistent connection and register ownership
                 self.connection = HopperConnection(self.socket_path)
@@ -133,25 +137,35 @@ class BaseRunner:
                 # Subclass pre-flight validation and setup
                 err = self._setup()
                 if err is not None:
+                    logger.info(f"setup failed lode={self.lode_id}")
                     self._emit_state("error", self._setup_error or "Setup failed")
                     return err
+                logger.info(f"setup complete lode={self.lode_id}")
 
                 # Run Claude (blocking)
                 exit_code, error_msg = self._run_claude()
+                logger.info(f"claude exited lode={self.lode_id} exit_code={exit_code}")
 
                 # Mark this stage's Claude session as started
                 if self.is_first_run and exit_code != 127:
                     self._emit_claude_started()
 
                 if exit_code == 127:
+                    logger.error(
+                        f"claude error lode={self.lode_id} exit_code={exit_code}: {error_msg}"
+                    )
                     msg = error_msg or "Command not found"
                     print(f"Error [{self.lode_id}]: {msg}")
                     self._emit_state("error", msg)
                 elif exit_code != 0 and exit_code != 130:
+                    logger.error(
+                        f"claude error lode={self.lode_id} exit_code={exit_code}: {error_msg}"
+                    )
                     msg = error_msg or f"Exited with code {exit_code}"
                     print(f"Error [{self.lode_id}]: {msg}")
                     self._emit_state("error", msg)
                 elif exit_code == 0 and self._done.is_set():
+                    logger.info(f"stage transition lode={self.lode_id}")
                     self._emit_state("ready", self._done_status)
                     if self._next_stage:
                         self._emit_stage(self._next_stage)
@@ -159,6 +173,7 @@ class BaseRunner:
                 return exit_code
             except Exception as exc:
                 print(f"Error [{self.lode_id}]: {exc}")
+                logger.exception(f"unexpected error lode={self.lode_id}")
                 try:
                     self._emit_state("error", str(exc))
                 except Exception:
@@ -171,6 +186,7 @@ class BaseRunner:
             signal.signal(signal.SIGTERM, original_sigterm)
             if self.connection:
                 self.connection.stop()
+            logger.debug(f"cleanup complete lode={self.lode_id}")
 
     def _load_lode_data(self, lode_data: dict) -> None:
         """Extract additional fields from lode data. Override in subclasses."""
@@ -200,7 +216,7 @@ class BaseRunner:
 
         env = self._get_subprocess_env()
 
-        logger.debug(f"Running: {' '.join(cmd[:3])}...")
+        logger.debug(f"running: {' '.join(cmd[:3])}...")
 
         try:
             proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, cwd=cwd)
@@ -233,7 +249,7 @@ class BaseRunner:
 
     def _handle_signal(self, signum: int, frame) -> None:
         """Handle shutdown signals gracefully."""
-        logger.debug(f"Received signal {signum}")
+        logger.debug(f"received signal {signum}")
         if signum == signal.SIGINT:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
@@ -247,7 +263,7 @@ class BaseRunner:
                 state=state,
                 status=status,
             )
-            logger.debug(f"Emitted state: {state}, status: {status}")
+            logger.debug(f"emitted state: {state}, status: {status}")
 
     def _emit_stage(self, stage: str) -> None:
         """Emit stage change to server via persistent connection."""
@@ -257,7 +273,7 @@ class BaseRunner:
                 lode_id=self.lode_id,
                 stage=stage,
             )
-            logger.debug(f"Emitted stage: {stage}")
+            logger.debug(f"emitted stage: {stage}")
 
     def _emit_claude_started(self) -> None:
         """Mark this stage's Claude session as started on the server."""
@@ -267,7 +283,7 @@ class BaseRunner:
                 lode_id=self.lode_id,
                 claude_stage=self._claude_stage,
             )
-            logger.debug(f"Emitted claude started for stage: {self._claude_stage}")
+            logger.debug(f"emitted claude started for stage: {self._claude_stage}")
 
     def _on_server_message(self, message: dict) -> None:
         """Handle incoming server broadcast messages."""
@@ -304,7 +320,7 @@ class BaseRunner:
         if self._monitor_stop.is_set():
             return
 
-        logger.debug("Screen stable, sending Ctrl-D")
+        logger.debug("screen stable, sending ctrl-d")
         send_keys(self._pane_id, "C-d")
         send_keys(self._pane_id, "C-d")
 
@@ -312,7 +328,7 @@ class BaseRunner:
         """Start the activity monitor thread."""
         self._pane_id = get_current_pane_id()
         if not self._pane_id:
-            logger.debug("Not in tmux, skipping activity monitor")
+            logger.debug("not in tmux, skipping activity monitor")
             return
 
         rename_window(self._pane_id, self.lode_id)
@@ -321,14 +337,14 @@ class BaseRunner:
             target=self._monitor_loop, name="activity-monitor", daemon=True
         )
         self._monitor_thread.start()
-        logger.debug(f"Started activity monitor for pane {self._pane_id}")
+        logger.debug(f"started activity monitor for pane {self._pane_id}")
 
     def _stop_monitor(self) -> None:
         """Stop the activity monitor thread."""
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_stop.set()
             self._monitor_thread.join(timeout=1.0)
-            logger.debug("Stopped activity monitor")
+            logger.debug("stopped activity monitor")
 
     def _monitor_loop(self) -> None:
         """Monitor loop that checks for activity every MONITOR_INTERVAL seconds."""
@@ -346,7 +362,7 @@ class BaseRunner:
 
         snapshot = capture_pane(self._pane_id)
         if snapshot is None:
-            logger.debug("Failed to capture pane, stopping monitor")
+            logger.debug("failed to capture pane, stopping monitor")
             self._monitor_stop.set()
             return
 
