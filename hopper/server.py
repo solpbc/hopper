@@ -67,7 +67,7 @@ class Server:
     race conditions when multiple client handler threads send concurrently.
 
     Tracks which clients own which lodes. Sets active=False and clears
-    tmux_pane on disconnect; state/status are client-driven.
+    tmux_pane and pid on disconnect; state/status are client-driven.
     """
 
     def __init__(self, socket_path: Path, tmux_location: dict | None = None):
@@ -118,9 +118,10 @@ class Server:
         # Clear stale active flags from previous run (no clients connected yet)
         stale = False
         for lode in self.lodes:
-            if lode.get("active") or lode.get("tmux_pane"):
+            if lode.get("active") or lode.get("tmux_pane") or lode.get("pid"):
                 lode["active"] = False
                 lode["tmux_pane"] = None
+                lode["pid"] = None
                 stale = True
         if stale:
             save_lodes(self.lodes)
@@ -198,7 +199,7 @@ class Server:
             logger.debug(f"Client disconnected ({len(self.clients)} remaining)")
 
     def _on_client_disconnect(self, conn: socket.socket) -> None:
-        """Handle client disconnect - set active=False and clear tmux_pane."""
+        """Handle client disconnect - set active=False and clear tmux_pane and pid."""
         with self.lock:
             lode_id = self.client_lodes.pop(conn, None)
             if lode_id:
@@ -213,6 +214,7 @@ class Server:
 
         lode["active"] = False
         lode["tmux_pane"] = None
+        lode["pid"] = None
         touch(lode)
         save_lodes(self.lodes)
 
@@ -235,7 +237,11 @@ class Server:
                 logger.warning(f"Auto-advance skipped for {lode_id}: project not found")
 
     def _register_lode_client(
-        self, lode_id: str, conn: socket.socket, tmux_pane: str | None = None
+        self,
+        lode_id: str,
+        conn: socket.socket,
+        tmux_pane: str | None = None,
+        pid: int | None = None,
     ) -> None:
         """Register a client as owning a lode.
 
@@ -265,6 +271,8 @@ class Server:
             lode["active"] = True
             if tmux_pane:
                 lode["tmux_pane"] = tmux_pane
+            if pid:
+                lode["pid"] = pid
             touch(lode)
             save_lodes(self.lodes)
             self.broadcast({"type": "lode_updated", "lode": lode})
@@ -296,7 +304,8 @@ class Server:
                 lode = self._find_lode(lode_id)
                 if lode:
                     tmux_pane = message.get("tmux_pane")
-                    self._register_lode_client(lode_id, conn, tmux_pane)
+                    pid = message.get("pid")
+                    self._register_lode_client(lode_id, conn, tmux_pane, pid)
 
         elif msg_type == "ping":
             self._send_response(conn, {"type": "pong"})
