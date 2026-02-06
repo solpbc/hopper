@@ -83,11 +83,10 @@ class TestMillStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="mill", active=True),
             ),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_not_called()
+        assert runner.connection is None
 
     def test_validates_stage(self):
         """Mill runner rejects lode not in mill stage."""
@@ -98,16 +97,18 @@ class TestMillStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine"),
             ),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "Lode test-id is not in mill stage.",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Lode test-id is not in mill stage.",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_emits_error_on_nonzero_exit(self):
         """Runner emits error state on non-zero exit."""
@@ -270,16 +271,18 @@ class TestMillStage:
                 return_value=_mock_response(stage="mill", project="my-project"),
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            f"Project directory not found: {mock_project.path}",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Project directory not found: {mock_project.path}",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_loads_scope_in_context(self):
         """Runner passes scope to prompt template."""
@@ -552,16 +555,18 @@ class TestRefineStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="mill"),
             ),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "Lode test-id is not in refine stage.",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Lode test-id is not in refine stage.",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_no_project(self):
         """Runner exits 1 if no project directory."""
@@ -572,16 +577,18 @@ class TestRefineStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine", project=""),
             ),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "No project directory found for lode.",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="No project directory found for lode.",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_project_dir_missing(self, tmp_path):
         """Runner exits 1 if project dir doesn't exist."""
@@ -594,16 +601,18 @@ class TestRefineStage:
                 return_value=_mock_response(stage="refine", project="my-project"),
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            f"Project directory not found: {mock_project.path}",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Project directory not found: {mock_project.path}",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_worktree_creation_fails(self, tmp_path):
         """Runner exits 1 if git worktree creation fails."""
@@ -618,16 +627,18 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=False),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "Failed to create git worktree.",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Failed to create git worktree.",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_input_missing_on_first_run(self, tmp_path):
         """Runner exits 1 if mill_out.md missing on first run."""
@@ -642,13 +653,18 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once()
-        assert mock_set_state.call_args[0][:3] == (runner.socket_path, runner.lode_id, "error")
-        assert "Input not found" in mock_set_state.call_args[0][3]
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Input not found: {session_dir / 'mill_out.md'}",
+        )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_bootstrap_failure_bails(self, tmp_path, capsys):
         """Runner exits 1 if Codex bootstrap fails."""
@@ -666,17 +682,19 @@ class TestRefineStage:
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(1, None)),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
         assert "bootstrap failed" in capsys.readouterr().out
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "Codex bootstrap failed (exit 1).",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Codex bootstrap failed (exit 1).",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_clean_exit_after_done_emits_ready_and_ship(self, tmp_path):
         """Refine emits state=ready then stage=ship after completion."""
@@ -802,17 +820,19 @@ class TestShipStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine", project="my-project"),
             ),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
         assert "not in ship stage" in capsys.readouterr().out
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "Lode test-id is not in ship stage.",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Lode test-id is not in ship stage.",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_no_project(self):
         """Runner exits 1 if no project directory."""
@@ -823,16 +843,18 @@ class TestShipStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="ship", project=""),
             ),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
-        mock_set_state.assert_called_once_with(
-            runner.socket_path,
-            runner.lode_id,
-            "error",
-            "No project directory found for lode.",
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="No project directory found for lode.",
         )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_worktree_missing(self, tmp_path, capsys):
         """Runner exits 1 if worktree doesn't exist."""
@@ -851,14 +873,19 @@ class TestShipStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
         assert "Worktree not found" in capsys.readouterr().out
-        mock_set_state.assert_called_once()
-        assert mock_set_state.call_args[0][:3] == (runner.socket_path, runner.lode_id, "error")
-        assert "Worktree not found" in mock_set_state.call_args[0][3]
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Worktree not found: {session_dir / 'worktree'}",
+        )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_repo_dirty(self, tmp_path, capsys):
         """Runner exits 1 if project repo has uncommitted changes."""
@@ -873,14 +900,19 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=True),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
         assert "uncommitted changes" in capsys.readouterr().out
-        mock_set_state.assert_called_once()
-        assert mock_set_state.call_args[0][:3] == (runner.socket_path, runner.lode_id, "error")
-        assert "uncommitted changes" in mock_set_state.call_args[0][3]
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Project repo has uncommitted changes: {project_dir}",
+        )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_not_on_main(self, tmp_path, capsys):
         """Runner exits 1 if not on main or master."""
@@ -896,14 +928,19 @@ class TestShipStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
             patch("hopper.process.current_branch", return_value="feature-xyz"),
-            patch("hopper.runner.set_lode_state") as mock_set_state,
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 1
 
         assert "feature-xyz" in capsys.readouterr().out
-        mock_set_state.assert_called_once()
-        assert mock_set_state.call_args[0][:3] == (runner.socket_path, runner.lode_id, "error")
-        assert "feature-xyz" in mock_set_state.call_args[0][3]
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Project repo is on branch 'feature-xyz', expected 'main' or 'master'.",
+        )
+        MockConn.return_value.stop.assert_called_once()
 
     def test_accepts_master_branch(self, tmp_path):
         """Runner accepts 'master' as the main branch."""

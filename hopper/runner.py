@@ -11,7 +11,7 @@ import sys
 import threading
 from pathlib import Path
 
-from hopper.client import HopperConnection, connect, set_lode_state
+from hopper.client import HopperConnection, connect
 from hopper.lodes import current_time_ms
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
@@ -118,17 +118,6 @@ class BaseRunner:
             # Let subclass extract additional data
             self._load_lode_data(lode_data)
 
-            # Subclass pre-flight validation and setup
-            err = self._setup()
-            if err is not None:
-                set_lode_state(
-                    self.socket_path,
-                    self.lode_id,
-                    "error",
-                    self._setup_error or "Setup failed",
-                )
-                return err
-
             # Start persistent connection and register ownership
             self.connection = HopperConnection(self.socket_path)
             self.connection.start(
@@ -139,6 +128,12 @@ class BaseRunner:
                     tmux_pane=get_current_pane_id(),
                 ),
             )
+
+            # Subclass pre-flight validation and setup
+            err = self._setup()
+            if err is not None:
+                self._emit_state("error", self._setup_error or "Setup failed")
+                return err
 
             # Run Claude (blocking)
             exit_code, error_msg = self._run_claude()
