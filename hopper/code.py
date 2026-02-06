@@ -91,14 +91,19 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
 
     # Save input prompt
     lode_dir = get_lode_dir(lode_id)
-    input_path = lode_dir / f"{stage_name}.in.md"
+    version = _next_version(lode_dir, stage_name)
+    if version is None:
+        suffix = stage_name
+    else:
+        suffix = f"{stage_name}_{version}"
+    input_path = lode_dir / f"{suffix}.in.md"
     _atomic_write(input_path, prompt_text)
 
     # Set state to stage name while running
     set_lode_state(socket_path, lode_id, stage_name, f"Running {stage_name}")
 
     # Run codex (resume existing thread)
-    output_path = lode_dir / f"{stage_name}.out.md"
+    output_path = lode_dir / f"{suffix}.out.md"
     started_at = current_time_ms()
     exit_code, cmd = run_codex(prompt_text, str(cwd), str(output_path), codex_thread_id)
     finished_at = current_time_ms()
@@ -114,7 +119,7 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         "exit_code": exit_code,
         "cmd": cmd,
     }
-    meta_path = lode_dir / f"{stage_name}.json"
+    meta_path = lode_dir / f"{suffix}.json"
     _atomic_write(meta_path, json.dumps(metadata, indent=2) + "\n")
 
     # Update status with stage result and duration
@@ -132,6 +137,20 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
             print(content)
 
     return exit_code
+
+
+def _next_version(lode_dir: Path, stage_name: str) -> int | None:
+    """Return the next version number for stage artifacts, or None for first run.
+
+    Checks if the base output file exists. If not, returns None (first run uses
+    base names). If it does, probes _1, _2, ... until a free slot is found.
+    """
+    if not (lode_dir / f"{stage_name}.out.md").exists():
+        return None
+    n = 1
+    while (lode_dir / f"{stage_name}_{n}.out.md").exists():
+        n += 1
+    return n
 
 
 def _atomic_write(path: Path, content: str) -> None:

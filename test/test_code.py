@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from hopper.code import run_code
+from hopper.code import _next_version, run_code
 
 MOCK_CMD = [
     "codex",
@@ -267,3 +267,106 @@ class TestRunCode:
 
         assert input_existed == [True]
         assert (session_dir / "audit.in.md").read_text() == "the prompt"
+
+    def test_first_run_uses_base_names(self, tmp_path, monkeypatch):
+        """First run writes unversioned artifact names."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        def mock_run_codex(prompt, cwd, output_file, thread_id):
+            Path(output_file).write_text("# Audit Result\nAll good.")
+            return 0, MOCK_CMD
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
+
+        assert exit_code == 0
+        assert (session_dir / "audit.in.md").exists()
+        assert (session_dir / "audit.out.md").exists()
+        assert (session_dir / "audit.json").exists()
+        assert not (session_dir / "audit_1.in.md").exists()
+
+    def test_second_run_uses_version_1(self, tmp_path, monkeypatch):
+        """Second run writes _1 artifact names when base output already exists."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        original_content = "existing output\n"
+        (session_dir / "audit.out.md").write_text(original_content)
+
+        def mock_run_codex(prompt, cwd, output_file, thread_id):
+            Path(output_file).write_text("# Audit Result\nAll good.")
+            return 0, MOCK_CMD
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
+
+        assert exit_code == 0
+        assert (session_dir / "audit_1.in.md").exists()
+        assert (session_dir / "audit_1.out.md").exists()
+        assert (session_dir / "audit_1.json").exists()
+        assert (session_dir / "audit.out.md").read_text() == original_content
+
+    def test_third_run_uses_version_2(self, tmp_path, monkeypatch):
+        """Third run writes _2 artifact names when base and _1 outputs exist."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        (session_dir / "audit.out.md").write_text("existing output\n")
+        (session_dir / "audit_1.out.md").write_text("existing output 1\n")
+
+        def mock_run_codex(prompt, cwd, output_file, thread_id):
+            Path(output_file).write_text("# Audit Result\nAll good.")
+            return 0, MOCK_CMD
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
+
+        assert exit_code == 0
+        assert (session_dir / "audit_2.in.md").exists()
+        assert (session_dir / "audit_2.out.md").exists()
+        assert (session_dir / "audit_2.json").exists()
+
+
+class TestNextVersion:
+    def test_no_existing_files_returns_none(self, tmp_path):
+        """Returns None when base output does not exist."""
+        assert _next_version(tmp_path, "audit") is None
+
+    def test_base_exists_returns_1(self, tmp_path):
+        """Returns 1 when only base output exists."""
+        (tmp_path / "audit.out.md").write_text("existing output\n")
+        assert _next_version(tmp_path, "audit") == 1
+
+    def test_base_and_1_exist_returns_2(self, tmp_path):
+        """Returns 2 when base and _1 outputs exist."""
+        (tmp_path / "audit.out.md").write_text("existing output\n")
+        (tmp_path / "audit_1.out.md").write_text("existing output 1\n")
+        assert _next_version(tmp_path, "audit") == 2
