@@ -755,6 +755,50 @@ def test_server_handles_lode_set_claude_started(socket_path, server, temp_config
     client.close()
 
 
+def test_server_handles_lode_reset_claude_stage(socket_path, server, temp_config, make_lode):
+    """Server handles lode_reset_claude_stage message."""
+    lode = make_lode(id="test-id", stage="mill", state="running")
+    lode["claude"]["mill"]["started"] = True
+    old_session_id = lode["claude"]["mill"]["session_id"]
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+
+    # Connect client
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    # Wait for client to be registered
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    # Send lode_reset_claude_stage message
+    msg = {
+        "type": "lode_reset_claude_stage",
+        "lode_id": "test-id",
+        "claude_stage": "mill",
+    }
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    # Should receive broadcast
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "lode_updated"
+    assert response["lode"]["claude"]["mill"]["started"] is False
+    assert response["lode"]["claude"]["mill"]["session_id"] != old_session_id
+
+    # Server's lode should be updated
+    assert server.lodes[0]["claude"]["mill"]["started"] is False
+    assert server.lodes[0]["claude"]["mill"]["session_id"] != old_session_id
+    # Other stages unchanged
+    assert server.lodes[0]["claude"]["refine"]["started"] is False
+
+    client.close()
+
+
 class TestActivityLog:
     def test_activity_log_created_on_start(self, isolate_config, server):
         """Server start creates activity.log with listening message."""

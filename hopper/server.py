@@ -12,6 +12,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from hopper import config
@@ -385,6 +386,19 @@ class Server:
                 if lode and claude_stage in lode.get("claude", {}):
                     lode["claude"][claude_stage]["started"] = True
                     logger.info(f"Lode {lode_id} claude_started stage={claude_stage}")
+                    touch(lode)
+                    save_lodes(self.lodes)
+                    self.broadcast({"type": "lode_updated", "lode": lode})
+
+        elif msg_type == "lode_reset_claude_stage":
+            lode_id = message.get("lode_id")
+            claude_stage = message.get("claude_stage")
+            if lode_id and claude_stage:
+                lode = self._find_lode(lode_id)
+                if lode and claude_stage in lode.get("claude", {}):
+                    lode["claude"][claude_stage]["session_id"] = str(uuid.uuid4())
+                    lode["claude"][claude_stage]["started"] = False
+                    logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
                     touch(lode)
                     save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})

@@ -5,6 +5,7 @@
 
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -805,6 +806,15 @@ class LegendScreen(ModalScreen):
         t.append("  ▹", style="bright_black")
         t.append("  disconnected", style="bright_black")
 
+        t.append("\n")
+        t.append("Keys\n", style="bold")
+        t.append("  r", style="bright_cyan")
+        t.append("  reload stage\n", style="bright_black")
+        t.append("  a", style="bright_cyan")
+        t.append("  toggle auto-advance\n", style="bright_black")
+        t.append("  d", style="bright_cyan")
+        t.append("  delete/archive", style="bright_black")
+
         return t
 
     def action_cancel(self) -> None:
@@ -1054,6 +1064,7 @@ class HopperApp(App):
         Binding("d", "delete", "Delete"),
         Binding("l", "legend", "Legend"),
         Binding("v", "view_files", "View"),
+        Binding("r", "reload", "Reload"),
     ]
 
     def __init__(self, server=None):
@@ -1453,6 +1464,48 @@ class HopperApp(App):
             self.server.broadcast({"type": "lode_updated", "lode": lode})
 
         self.refresh_table()
+
+    def action_reload(self) -> None:
+        """Reload the current stage with a fresh Claude session."""
+        if not isinstance(self.focused, LodeTable):
+            return
+        if self._archive_view:
+            return
+
+        lode_id = self._get_selected_lode_id()
+        if not lode_id:
+            return
+
+        lode = self._get_lode(lode_id)
+        if not lode:
+            return
+
+        if lode.get("active"):
+            self.notify("Cannot reload while active", severity="warning")
+            return
+
+        stage = lode.get("stage", "")
+        if stage not in ("mill", "refine", "ship"):
+            return
+
+        # Reset claude session for current stage
+        lode["claude"][stage]["session_id"] = str(uuid.uuid4())
+        lode["claude"][stage]["started"] = False
+
+        if self.server:
+            from hopper.lodes import touch
+
+            touch(lode)
+            save_lodes(self.server.lodes)
+            self.server.broadcast({"type": "lode_updated", "lode": lode})
+
+        self.notify(f"Reloading {stage}...")
+        self.refresh_table()
+
+        # Spawn Claude with fresh session
+        project = find_project(lode.get("project", ""))
+        if project:
+            spawn_claude(lode["id"], project.path)
 
     def action_legend(self) -> None:
         """Show the symbol legend modal."""
