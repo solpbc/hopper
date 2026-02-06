@@ -12,10 +12,6 @@ dependencies = [
     "textual>=1.0.0",
     "platformdirs",
     "setproctitle",
-]
-
-[project.optional-dependencies]
-dev = [
     "pytest",
     "pytest-asyncio",
     "ruff",

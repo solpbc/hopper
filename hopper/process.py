@@ -3,6 +3,9 @@
 
 """Process runner - unified stage runner for mill, refine, and ship."""
 
+import logging
+import os
+import subprocess
 from pathlib import Path
 
 from hopper import prompt
@@ -10,8 +13,51 @@ from hopper.client import set_codex_thread_id, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree, current_branch, is_dirty
 from hopper.lodes import get_lode_dir
-from hopper.pyenv import get_venv_env, has_pyproject, setup_worktree_venv
 from hopper.runner import BaseRunner
+
+logger = logging.getLogger(__name__)
+
+
+def _has_makefile(worktree_path: Path) -> bool:
+    """Check if worktree has a Makefile."""
+    return (worktree_path / "Makefile").exists()
+
+
+def _run_make_install(worktree_path: Path) -> bool:
+    """Run 'make install' in the worktree to set up venv via uv.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["make", "install"],
+            cwd=str(worktree_path),
+        )
+        if result.returncode != 0:
+            logger.error(f"make install failed (exit code {result.returncode})")
+            return False
+        return True
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        logger.error(f"make install failed: {e}")
+        return False
+
+
+def _get_venv_env(worktree_path: Path, base_env: dict | None = None) -> dict:
+    """Get environment dict with venv activated.
+
+    Prepends .venv/bin to PATH and sets VIRTUAL_ENV.
+    """
+    env = dict(base_env) if base_env else os.environ.copy()
+
+    venv_path = worktree_path / ".venv"
+    venv_bin = venv_path / "bin"
+
+    current_path = env.get("PATH", "")
+    env["PATH"] = f"{venv_bin}:{current_path}" if current_path else str(venv_bin)
+    env["VIRTUAL_ENV"] = str(venv_path)
+
+    return env
+
 
 # Stage configuration: keyed by stage name
 STAGES = {
@@ -119,14 +165,14 @@ class ProcessRunner(BaseRunner):
                 print(self._setup_error)
                 return 1
 
-        # Set up venv if project has pyproject.toml
-        if has_pyproject(self.worktree_path):
+        # Set up venv via make install if project has a Makefile
+        if _has_makefile(self.worktree_path):
             venv_path = self.worktree_path / ".venv"
             if not venv_path.is_dir():
-                set_lode_status(self.socket_path, self.lode_id, "Setting up venv...")
-                print(f"Setting up virtual environment for {self.lode_id}...")
-            if not setup_worktree_venv(self.worktree_path):
-                self._setup_error = "Failed to set up virtual environment."
+                set_lode_status(self.socket_path, self.lode_id, "Running make install...")
+                print(f"Running make install for {self.lode_id}...")
+            if not venv_path.is_dir() and not _run_make_install(self.worktree_path):
+                self._setup_error = "Failed to run make install."
                 print(self._setup_error)
                 return 1
             self.use_venv = True
@@ -216,8 +262,6 @@ class ProcessRunner(BaseRunner):
 
     def _save_stage_input(self, content: str) -> None:
         """Save stage input to <stage>_in.md via atomic write."""
-        import os
-
         lode_dir = get_lode_dir(self.lode_id)
         lode_dir.mkdir(parents=True, exist_ok=True)
         path = lode_dir / f"{self._claude_stage}_in.md"
@@ -229,7 +273,7 @@ class ProcessRunner(BaseRunner):
         """Build environment with venv activated if applicable."""
         base_env = super()._get_subprocess_env()
         if self.use_venv and self.worktree_path:
-            return get_venv_env(self.worktree_path, base_env)
+            return _get_venv_env(self.worktree_path, base_env)
         return base_env
 
     def _build_command(self) -> tuple[list[str], str | None]:
