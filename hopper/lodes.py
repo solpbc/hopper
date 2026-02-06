@@ -16,6 +16,7 @@ Lodes are plain dicts with these fields:
 - active: bool - whether a runner client is connected (default False)
 - auto: bool - whether to auto-advance to next stage on completion (default True)
 - tmux_pane: str | None - tmux pane ID (default None)
+- pid: int | None - process ID of active runner (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - backlog: dict | None - original backlog item data if promoted (default None)
 - claude: dict - per-stage Claude session tracking:
@@ -254,6 +255,7 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "active": False,
         "auto": True,
         "tmux_pane": None,
+        "pid": None,
         "codex_thread_id": None,
         "backlog": None,
         "claude": _make_claude_sessions(),

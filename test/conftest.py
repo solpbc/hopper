@@ -50,6 +50,7 @@ def make_lode():
             "active": False,
             "auto": auto,
             "tmux_pane": None,
+            "pid": None,
             "codex_thread_id": None,
             "backlog": None,
             "claude": {

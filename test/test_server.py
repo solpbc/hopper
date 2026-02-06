@@ -95,6 +95,29 @@ def test_server_creates_socket(socket_path):
     assert not socket_path.exists()
 
 
+def test_server_clears_stale_pid_on_startup(socket_path, temp_config, make_lode):
+    """Server startup clears stale pid from persisted lode state."""
+    stale_lode = make_lode(id="test-id", pid=99999)
+    save_lodes([stale_lode])
+
+    srv = Server(socket_path)
+    thread = threading.Thread(target=srv.start, daemon=True)
+    thread.start()
+
+    try:
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("Server did not start")
+
+        assert srv.lodes[0]["pid"] is None
+    finally:
+        srv.stop()
+        thread.join(timeout=2)
+
+
 def test_server_broadcast_requires_type():
     """Broadcast rejects messages without type field."""
     srv = Server(socket_path="/tmp/unused.sock")
@@ -370,7 +393,7 @@ def test_server_registers_on_lode_register(socket_path, server, temp_config, mak
     client.connect(str(socket_path))
     client.settimeout(2.0)
 
-    msg = {"type": "lode_register", "lode_id": "test-id"}
+    msg = {"type": "lode_register", "lode_id": "test-id", "pid": 12345}
     client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
 
     # Wait for registration
@@ -381,6 +404,7 @@ def test_server_registers_on_lode_register(socket_path, server, temp_config, mak
 
     assert "test-id" in server.lode_clients
     assert server.lodes[0]["active"] is True
+    assert server.lodes[0]["pid"] == 12345
 
     client.close()
 
@@ -421,6 +445,37 @@ def test_server_sets_active_false_on_disconnect(socket_path, server, temp_config
     assert server.lodes[0]["tmux_pane"] is None
     assert server.lodes[0]["state"] == "running"
     assert "test-id" not in server.lode_clients
+
+
+def test_server_clears_pid_on_disconnect(socket_path, server, temp_config, make_lode):
+    """Server clears pid on client disconnect."""
+    lode = make_lode(id="test-id", state="running", pid=54321)
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    msg = {"type": "lode_register", "lode_id": "test-id", "pid": 12345}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    for _ in range(50):
+        if server.lodes[0]["pid"] == 12345:
+            break
+        time.sleep(0.1)
+
+    assert server.lodes[0]["pid"] == 12345
+
+    client.close()
+
+    for _ in range(50):
+        if server.lodes[0]["pid"] is None:
+            break
+        time.sleep(0.1)
+
+    assert server.lodes[0]["active"] is False
+    assert server.lodes[0]["pid"] is None
 
 
 def test_server_preserves_state_on_disconnect(socket_path, server, temp_config, make_lode):

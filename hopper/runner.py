@@ -131,6 +131,7 @@ class BaseRunner:
                         "lode_register",
                         lode_id=self.lode_id,
                         tmux_pane=get_current_pane_id(),
+                        pid=os.getpid(),
                     ),
                 )
 
