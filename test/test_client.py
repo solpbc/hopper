@@ -211,6 +211,22 @@ def test_set_lode_title_sends_message(server, socket_path):
     assert server.lodes[0]["title"] == "Auth Flow"
 
 
+def test_reload_projects_success(server, socket_path):
+    """reload_projects sends message successfully."""
+    from hopper.client import reload_projects
+
+    result = reload_projects(socket_path)
+    assert result is True
+
+
+def test_reload_projects_no_server(socket_path):
+    """reload_projects returns True when no server (fire-and-forget)."""
+    from hopper.client import reload_projects
+
+    result = reload_projects(socket_path, timeout=0.5)
+    assert result is True
+
+
 class TestHopperConnection:
     """Tests for the persistent HopperConnection class."""
 

@@ -347,12 +347,14 @@ class MockServer:
         sessions: list[dict] | None = None,
         archived_lodes: list[dict] | None = None,
         backlog: list | None = None,
+        projects: list[Project] | None = None,
         git_hash: str | None = None,
         started_at: int | None = None,
     ):
         self.lodes = sessions if sessions is not None else []
         self.archived_lodes = archived_lodes if archived_lodes is not None else []
         self.backlog = backlog if backlog is not None else []
+        self.projects = projects if projects is not None else []
         self.git_hash = git_hash
         self.started_at = started_at
         self.broadcasts: list[dict] = []

@@ -40,7 +40,7 @@ from hopper.lodes import (
     update_lode_title,
 )
 from hopper.process import STAGES
-from hopper.projects import find_project
+from hopper.projects import Project, find_project, get_active_projects
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,7 @@ class Server:
         self.lodes: list[dict] = []
         self.archived_lodes: list[dict] = []
         self.backlog: list[BacklogItem] = []
+        self.projects: list[Project] = []
         # Lode ownership tracking: lode_id -> socket, socket -> lode_id
         self.lode_clients: dict[str, socket.socket] = {}
         self.client_lodes: dict[socket.socket, str] = {}
@@ -112,6 +113,7 @@ class Server:
         self.lodes = load_lodes()
         self.archived_lodes = load_archived_lodes()
         self.backlog = load_backlog()
+        self.projects = get_active_projects()
 
         # Clear stale active flags from previous run (no clients connected yet)
         stale = False
@@ -426,6 +428,10 @@ class Server:
                     f" project={item.project} description={item.description}"
                 )
                 self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
+
+        elif msg_type == "projects_reload":
+            self.projects = get_active_projects()
+            logger.info("Projects reloaded from disk")
 
         else:
             # Broadcast other messages

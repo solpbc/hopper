@@ -479,3 +479,24 @@ def remove_backlog(socket_path: Path, item_id: str, timeout: float = 2.0) -> boo
         return True
     except Exception:
         return False
+
+
+def reload_projects(socket_path: Path, timeout: float = 2.0) -> bool:
+    """Ask server to reload projects from disk (fire-and-forget).
+
+    Args:
+        socket_path: Path to the Unix socket
+        timeout: Connection timeout in seconds
+
+    Returns:
+        True if message was sent successfully, False otherwise
+    """
+    msg = {
+        "type": "projects_reload",
+        "ts": current_time_ms(),
+    }
+    try:
+        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
+        return True
+    except Exception:
+        return False

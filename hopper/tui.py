@@ -44,7 +44,7 @@ from hopper.lodes import (
     update_lode_stage,
     update_lode_state,
 )
-from hopper.projects import Project, find_project, get_active_projects, touch_project
+from hopper.projects import Project, find_project, touch_project
 
 # Claude Code-inspired theme
 # Colors derived from Claude Code's terminal UI (ANSI bright colors)
@@ -1074,7 +1074,7 @@ class HopperApp(App):
         self._archived_lodes = server.archived_lodes if server else []
         self._archive_view: bool = False
         self._backlog: list[BacklogItem] = server.backlog if server else []
-        self._projects: list[Project] = []
+        self._projects: list[Project] = list(server.projects) if server else []
         self._git_hash: str = server.git_hash if server and server.git_hash else ""
         self._started_at: int | None = server.started_at if server else None
         self._update_sub_title()
@@ -1096,7 +1096,6 @@ class HopperApp(App):
         self.register_theme(CLAUDE_THEME)
         self.theme = "claude"
 
-        self._projects = get_active_projects()
         self.refresh_table()
         self.refresh_backlog()
         # Start polling for server updates
@@ -1109,6 +1108,8 @@ class HopperApp(App):
         self._update_sub_title()
         self.refresh_table()
         self.refresh_backlog()
+        if self.server:
+            self._projects = list(self.server.projects)
 
     def _update_sub_title(self) -> None:
         """Update sub_title with git hash and uptime."""
@@ -1307,7 +1308,6 @@ class HopperApp(App):
                 return  # Cancelled
 
             touch_project(project.name)
-            self._projects = get_active_projects()
 
             def on_scope_entered(result: tuple[str, str] | None) -> None:
                 if result is None:
@@ -1335,7 +1335,6 @@ class HopperApp(App):
                 return  # Cancelled
 
             touch_project(project.name)
-            self._projects = get_active_projects()
 
             def on_description_entered(description: str | None) -> None:
                 if description is None:

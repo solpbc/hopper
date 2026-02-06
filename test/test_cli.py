@@ -826,6 +826,47 @@ def test_project_remove_not_found(tmp_path, monkeypatch, capsys):
     assert "not found" in captured.out
 
 
+def test_project_add_notifies_server(tmp_path, monkeypatch, capsys):
+    """project add sends reload_projects to server."""
+    from hopper.cli import cmd_project
+    from hopper.projects import Project
+
+    mock_project = Project(path="/path/to/repo", name="repo")
+    monkeypatch.setattr("hopper.projects.add_project", lambda path: mock_project)
+    calls = []
+    monkeypatch.setattr("hopper.client.reload_projects", lambda sock: calls.append(sock) or True)
+    result = cmd_project(["add", "/path/to/repo"])
+    assert result == 0
+    assert len(calls) == 1
+
+
+def test_project_remove_notifies_server(tmp_path, monkeypatch, capsys):
+    """project remove sends reload_projects to server."""
+    from hopper.cli import cmd_project
+
+    monkeypatch.setattr("hopper.projects.remove_project", lambda name: True)
+    calls = []
+    monkeypatch.setattr("hopper.client.reload_projects", lambda sock: calls.append(sock) or True)
+    result = cmd_project(["remove", "myproj"])
+    assert result == 0
+    assert len(calls) == 1
+
+
+def test_project_add_works_without_server(tmp_path, monkeypatch, capsys):
+    """project add succeeds even if server notification fails."""
+    from hopper.cli import cmd_project
+    from hopper.projects import Project
+
+    mock_project = Project(path="/path/to/repo", name="repo")
+    monkeypatch.setattr("hopper.projects.add_project", lambda path: mock_project)
+    monkeypatch.setattr(
+        "hopper.client.reload_projects",
+        lambda sock: (_ for _ in ()).throw(ConnectionRefusedError()),
+    )
+    result = cmd_project(["add", "/path/to/repo"])
+    assert result == 0
+
+
 # Tests for screenshot command
 
 

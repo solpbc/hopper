@@ -293,6 +293,7 @@ def cmd_status(args: list[str]) -> int:
 @command("project", "Manage projects")
 def cmd_project(args: list[str]) -> int:
     """Manage projects (git directories for lodes)."""
+    from hopper.client import reload_projects
     from hopper.projects import add_project, load_projects, remove_project
 
     parser = make_parser(
@@ -336,6 +337,10 @@ def cmd_project(args: list[str]) -> int:
             project = add_project(parsed.path)
             print(f"Added project: {project.name}")
             print(f"  {project.path}")
+            try:
+                reload_projects(_socket())
+            except Exception:
+                pass
             return 0
         except ValueError as e:
             print(f"error: {e}")
@@ -348,6 +353,10 @@ def cmd_project(args: list[str]) -> int:
             return 1
         if remove_project(parsed.path):
             print(f"Disabled project: {parsed.path}")
+            try:
+                reload_projects(_socket())
+            except Exception:
+                pass
             return 0
         else:
             print(f"Project not found: {parsed.path}")

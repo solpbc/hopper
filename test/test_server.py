@@ -850,6 +850,27 @@ class TestActivityLog:
         content = log_path.read_text()
         assert "added project=myproj" in content
 
+    def test_projects_reload(self, isolate_config, server, socket_path):
+        """projects_reload reloads project list from disk."""
+        # Server starts with empty projects
+        assert server.projects == []
+
+        # Send projects_reload message
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(socket_path))
+        client.settimeout(2.0)
+        try:
+            msg = {"type": "projects_reload"}
+            client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+        finally:
+            client.close()
+
+        time.sleep(0.1)
+        # Projects reloaded (empty since no config, but handler ran)
+        log_path = isolate_config / "activity.log"
+        content = log_path.read_text()
+        assert "Projects reloaded" in content
+
     def test_server_stop_closes_handler(self, isolate_config, socket_path):
         """Server stop removes and closes the file handler."""
         srv = Server(socket_path)
