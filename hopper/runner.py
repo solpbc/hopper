@@ -101,7 +101,7 @@ class BaseRunner:
                     return 1
 
                 if lode_data.get("active", False):
-                    logger.error(f"lode already active lode={self.lode_id}")
+                    logger.error(f"Lode {self.lode_id} already has an active connection")
                     print(f"Lode {self.lode_id} is already active")
                     return 1
 
@@ -216,7 +216,7 @@ class BaseRunner:
 
         env = self._get_subprocess_env()
 
-        logger.debug(f"running: {' '.join(cmd[:3])}...")
+        logger.debug(f"Running: {' '.join(cmd[:3])}...")
 
         try:
             proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, cwd=cwd)
@@ -249,7 +249,7 @@ class BaseRunner:
 
     def _handle_signal(self, signum: int, frame) -> None:
         """Handle shutdown signals gracefully."""
-        logger.debug(f"received signal {signum}")
+        logger.debug(f"Received signal {signum}")
         if signum == signal.SIGINT:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
@@ -263,7 +263,7 @@ class BaseRunner:
                 state=state,
                 status=status,
             )
-            logger.debug(f"emitted state: {state}, status: {status}")
+            logger.debug(f"Emitted state: {state}, status: {status}")
 
     def _emit_stage(self, stage: str) -> None:
         """Emit stage change to server via persistent connection."""
@@ -273,7 +273,7 @@ class BaseRunner:
                 lode_id=self.lode_id,
                 stage=stage,
             )
-            logger.debug(f"emitted stage: {stage}")
+            logger.debug(f"Emitted stage: {stage}")
 
     def _emit_claude_started(self) -> None:
         """Mark this stage's Claude session as started on the server."""
@@ -283,7 +283,7 @@ class BaseRunner:
                 lode_id=self.lode_id,
                 claude_stage=self._claude_stage,
             )
-            logger.debug(f"emitted claude started for stage: {self._claude_stage}")
+            logger.debug(f"Emitted claude started for stage: {self._claude_stage}")
 
     def _on_server_message(self, message: dict) -> None:
         """Handle incoming server broadcast messages."""
@@ -320,7 +320,7 @@ class BaseRunner:
         if self._monitor_stop.is_set():
             return
 
-        logger.debug("screen stable, sending ctrl-d")
+        logger.debug("Screen stable, sending Ctrl-D")
         send_keys(self._pane_id, "C-d")
         send_keys(self._pane_id, "C-d")
 
@@ -328,7 +328,7 @@ class BaseRunner:
         """Start the activity monitor thread."""
         self._pane_id = get_current_pane_id()
         if not self._pane_id:
-            logger.debug("not in tmux, skipping activity monitor")
+            logger.debug("Not in tmux, skipping activity monitor")
             return
 
         rename_window(self._pane_id, self.lode_id)
@@ -337,14 +337,14 @@ class BaseRunner:
             target=self._monitor_loop, name="activity-monitor", daemon=True
         )
         self._monitor_thread.start()
-        logger.debug(f"started activity monitor for pane {self._pane_id}")
+        logger.debug(f"Started activity monitor for pane {self._pane_id}")
 
     def _stop_monitor(self) -> None:
         """Stop the activity monitor thread."""
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_stop.set()
             self._monitor_thread.join(timeout=1.0)
-            logger.debug("stopped activity monitor")
+            logger.debug("Stopped activity monitor")
 
     def _monitor_loop(self) -> None:
         """Monitor loop that checks for activity every MONITOR_INTERVAL seconds."""
@@ -362,7 +362,7 @@ class BaseRunner:
 
         snapshot = capture_pane(self._pane_id)
         if snapshot is None:
-            logger.debug("failed to capture pane, stopping monitor")
+            logger.debug("Failed to capture pane, stopping monitor")
             self._monitor_stop.set()
             return
 

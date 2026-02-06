@@ -34,11 +34,11 @@ def _run_make_install(worktree_path: Path) -> bool:
             cwd=str(worktree_path),
         )
         if result.returncode != 0:
-            logger.error(f"make install failed exit_code={result.returncode}")
+            logger.error(f"make install failed (exit code {result.returncode})")
             return False
         return True
     except (FileNotFoundError, subprocess.SubprocessError) as e:
-        logger.error(f"make install failed error={e}")
+        logger.error(f"make install failed: {e}")
         return False
 
 
