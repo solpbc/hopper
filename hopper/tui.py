@@ -12,10 +12,21 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.highlight import highlight
+from textual.reactive import reactive
+from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
-from textual.widgets import Button, DataTable, Footer, Header, OptionList, Static, TextArea
+from textual.widgets import (
+    Button,
+    DataTable,
+    DirectoryTree,
+    Footer,
+    Header,
+    OptionList,
+    Static,
+    TextArea,
+)
 from textual.widgets.option_list import Option
 
 from hopper.backlog import BacklogItem, add_backlog_item, remove_backlog_item, update_backlog_item
@@ -593,6 +604,76 @@ class LegendScreen(ModalScreen):
         self.dismiss()
 
 
+class FileViewerScreen(Screen):
+    """Fullscreen file viewer for a lode directory."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Back"),
+    ]
+
+    CSS = """
+    FileViewerScreen {
+        background: $background;
+    }
+    FileViewerScreen DirectoryTree {
+        dock: left;
+        width: auto;
+        min-width: 20;
+        max-width: 50%;
+        background: $surface;
+        border-right: solid $primary;
+        scrollbar-background: $surface;
+        scrollbar-color: $primary;
+    }
+    FileViewerScreen VerticalScroll {
+        background: $background;
+    }
+    FileViewerScreen #code-view {
+        padding: 1 2;
+    }
+    """
+
+    path: reactive[str] = reactive("")
+
+    def __init__(self, lode_dir: Path, lode_id: str) -> None:
+        super().__init__()
+        self.lode_dir = lode_dir
+        self.lode_id = lode_id
+
+    def compose(self) -> ComposeResult:
+        yield DirectoryTree(str(self.lode_dir))
+        with VerticalScroll():
+            yield Static(id="code-view")
+
+    @property
+    def sub_title(self) -> str:
+        return f"lode {self.lode_id}"
+
+    @sub_title.setter
+    def sub_title(self, _value: str) -> None:
+        """Ignore base Screen assignment; subtitle is derived from lode ID."""
+
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.path = str(event.path)
+
+    def watch_path(self) -> None:
+        code_view = self.query_one("#code-view", Static)
+        if not self.path:
+            code_view.update("")
+            return
+        try:
+            code = Path(self.path).read_text(encoding="utf-8")
+        except Exception:
+            code_view.update("Cannot read file")
+            return
+        syntax = highlight(code, path=self.path)
+        code_view.update(syntax)
+        self.query_one(VerticalScroll).scroll_home(animate=False)
+
+    def action_dismiss(self) -> None:
+        self.dismiss()
+
+
 class LodeTable(DataTable):
     """Table displaying all lodes.
 
@@ -753,6 +834,7 @@ class HopperApp(App):
         Binding("a", "toggle_auto", "Auto"),
         Binding("d", "delete", "Delete"),
         Binding("l", "legend", "Legend"),
+        Binding("v", "view_files", "View"),
     ]
 
     def __init__(self, server=None):
@@ -1096,6 +1178,16 @@ class HopperApp(App):
     def action_legend(self) -> None:
         """Show the symbol legend modal."""
         self.push_screen(LegendScreen())
+
+    def action_view_files(self) -> None:
+        """Open the file viewer for the selected lode."""
+        if not isinstance(self.focused, LodeTable):
+            return
+        lode_id = self._get_selected_lode_id()
+        if lode_id is None:
+            return
+        lode_dir = get_lode_dir(lode_id)
+        self.push_screen(FileViewerScreen(lode_dir, lode_id))
 
     def _edit_backlog_item(self, item_id: str) -> None:
         """Open the edit modal for a backlog item."""

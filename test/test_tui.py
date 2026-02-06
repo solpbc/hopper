@@ -17,6 +17,7 @@ from hopper.tui import (
     STATUS_RUNNING,
     STATUS_STUCK,
     BacklogInputScreen,
+    FileViewerScreen,
     HopperApp,
     LegendScreen,
     ProjectPickerScreen,
@@ -1779,3 +1780,40 @@ async def test_ship_review_refine_changes_stage_and_spawns(monkeypatch, temp_con
             assert len(spawned) == 1
             assert spawned[0]["sid"] == session["id"]
             assert spawned[0]["fg"] is False
+
+
+def test_action_view_files_noop_when_backlog_focused():
+    """action_view_files is a no-op when BacklogTable is focused."""
+    from hopper.tui import BacklogTable
+
+    app = HopperApp()
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=BacklogTable()),
+        patch.object(app, "_get_selected_lode_id") as mock_selected,
+        patch.object(app, "push_screen") as mock_push,
+    ):
+        app.action_view_files()
+    mock_selected.assert_not_called()
+    mock_push.assert_not_called()
+
+
+def test_action_view_files_noop_when_no_lode_selected():
+    """action_view_files is a no-op when no lode is selected."""
+    from hopper.tui import LodeTable
+
+    app = HopperApp()
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
+        patch.object(app, "_get_selected_lode_id", return_value=None) as mock_selected,
+        patch.object(app, "push_screen") as mock_push,
+    ):
+        app.action_view_files()
+    mock_selected.assert_called_once()
+    mock_push.assert_not_called()
+
+
+def test_file_viewer_screen_init(tmp_path):
+    """FileViewerScreen can be instantiated with a lode directory."""
+    screen = FileViewerScreen(tmp_path, "test123")
+    assert screen.lode_dir == tmp_path
+    assert screen.lode_id == "test123"
