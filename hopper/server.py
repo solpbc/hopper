@@ -394,7 +394,8 @@ class Server:
             if item:
                 remove_backlog_item(self.backlog, item.id)
                 logger.info(
-                    f"Backlog {item.id} removed project={item.project} description={item.description}"
+                    f"Backlog {item.id} removed"
+                    f" project={item.project} description={item.description}"
                 )
                 self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
 
