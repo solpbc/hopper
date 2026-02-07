@@ -378,7 +378,9 @@ class TestMillStage:
             if e[0] == "lode_set_state" and e[1]["state"] == "ready"
         )
         stage_idx = next(
-            i for i, e in enumerate(emitted) if e[0] == "lode_update" and e[1]["stage"] == "refine"
+            i
+            for i, e in enumerate(emitted)
+            if e[0] == "lode_set_stage" and e[1]["stage"] == "refine"
         )
         assert state_idx < stage_idx
         assert "Mill complete" in emitted[state_idx][1]["status"]
@@ -401,7 +403,7 @@ class TestMillStage:
         ):
             runner.run()
 
-        assert not any(e[0] == "lode_update" for e in emitted)
+        assert not any(e[0] == "lode_set_stage" for e in emitted)
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "ready" for e in emitted)
 
     def test_connection_stopped_on_exit(self):
@@ -791,7 +793,7 @@ class TestRefineStage:
             if e[0] == "lode_set_state" and e[1]["state"] == "ready"
         )
         stage_idx = next(
-            i for i, e in enumerate(emitted) if e[0] == "lode_update" and e[1]["stage"] == "ship"
+            i for i, e in enumerate(emitted) if e[0] == "lode_set_stage" and e[1]["stage"] == "ship"
         )
         assert state_idx < stage_idx
         assert "Refine complete" in emitted[state_idx][1]["status"]
@@ -1058,7 +1060,7 @@ class TestShipStage:
             and "Ship complete" in e[1]["status"]
             for e in emitted
         )
-        assert any(e[0] == "lode_update" and e[1]["stage"] == "shipped" for e in emitted)
+        assert any(e[0] == "lode_set_stage" and e[1]["stage"] == "shipped" for e in emitted)
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@
 """Tests for lode management."""
 
 import json
+import uuid
 
 from hopper.lodes import (
     ID_ALPHABET,
@@ -16,8 +17,12 @@ from hopper.lodes import (
     format_uptime,
     get_lode_dir,
     load_lodes,
+    reset_lode_claude_stage,
     save_lodes,
+    set_lode_claude_started,
     touch,
+    update_lode_auto,
+    update_lode_codex_thread,
     update_lode_stage,
     update_lode_state,
     update_lode_title,
@@ -407,6 +412,170 @@ def test_update_lode_title(temp_config):
     # Verify persistence
     loaded = load_lodes()
     assert loaded[0]["title"] == "Auth Flow"
+
+
+def test_update_lode_auto(temp_config):
+    """update_lode_auto changes auto flag and touches timestamp."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "new",
+            "auto": False,
+        }
+    ]
+    save_lodes(lodes_list)
+
+    updated = update_lode_auto(lodes_list, "testid11", True)
+
+    assert updated is not None
+    assert updated["auto"] is True
+    assert updated["updated_at"] > 1000
+
+    loaded = load_lodes()
+    assert loaded[0]["auto"] is True
+
+
+def test_update_lode_auto_not_found(temp_config):
+    """update_lode_auto returns None for unknown lode."""
+    result = update_lode_auto([], "nonexistent", True)
+    assert result is None
+
+
+def test_update_lode_codex_thread(temp_config):
+    """update_lode_codex_thread changes thread ID and touches timestamp."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "refine",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "codex_thread_id": None,
+        }
+    ]
+    save_lodes(lodes_list)
+
+    updated = update_lode_codex_thread(lodes_list, "testid11", "thread-123")
+
+    assert updated is not None
+    assert updated["codex_thread_id"] == "thread-123"
+    assert updated["updated_at"] > 1000
+
+    loaded = load_lodes()
+    assert loaded[0]["codex_thread_id"] == "thread-123"
+
+
+def test_update_lode_codex_thread_not_found(temp_config):
+    """update_lode_codex_thread returns None for unknown lode."""
+    result = update_lode_codex_thread([], "nonexistent", "thread-123")
+    assert result is None
+
+
+def test_set_lode_claude_started(temp_config):
+    """set_lode_claude_started marks stage as started and touches timestamp."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "claude": {"mill": {"session_id": "session-1", "started": False}},
+        }
+    ]
+    save_lodes(lodes_list)
+
+    updated = set_lode_claude_started(lodes_list, "testid11", "mill")
+
+    assert updated is not None
+    assert updated["claude"]["mill"]["started"] is True
+    assert updated["updated_at"] > 1000
+
+    loaded = load_lodes()
+    assert loaded[0]["claude"]["mill"]["started"] is True
+
+
+def test_set_lode_claude_started_not_found(temp_config):
+    """set_lode_claude_started returns None for unknown lode."""
+    result = set_lode_claude_started([], "nonexistent", "mill")
+    assert result is None
+
+
+def test_set_lode_claude_started_invalid_stage(temp_config):
+    """set_lode_claude_started returns None for unknown claude stage."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "claude": {"mill": {"session_id": "session-1", "started": False}},
+        }
+    ]
+    save_lodes(lodes_list)
+
+    result = set_lode_claude_started(lodes_list, "testid11", "ship")
+
+    assert result is None
+    assert lodes_list[0]["claude"]["mill"]["started"] is False
+
+
+def test_reset_lode_claude_stage(temp_config):
+    """reset_lode_claude_stage resets session and started flag, then touches timestamp."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "claude": {"mill": {"session_id": "session-1", "started": True}},
+        }
+    ]
+    save_lodes(lodes_list)
+
+    updated = reset_lode_claude_stage(lodes_list, "testid11", "mill")
+
+    assert updated is not None
+    assert updated["claude"]["mill"]["started"] is False
+    assert updated["claude"]["mill"]["session_id"] != "session-1"
+    uuid.UUID(updated["claude"]["mill"]["session_id"])
+    assert updated["updated_at"] > 1000
+
+    loaded = load_lodes()
+    assert loaded[0]["claude"]["mill"]["started"] is False
+    assert loaded[0]["claude"]["mill"]["session_id"] != "session-1"
+
+
+def test_reset_lode_claude_stage_not_found(temp_config):
+    """reset_lode_claude_stage returns None for unknown lode."""
+    result = reset_lode_claude_stage([], "nonexistent", "mill")
+    assert result is None
+
+
+def test_reset_lode_claude_stage_invalid_stage(temp_config):
+    """reset_lode_claude_stage returns None for unknown claude stage."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "claude": {"mill": {"session_id": "session-1", "started": True}},
+        }
+    ]
+    save_lodes(lodes_list)
+
+    result = reset_lode_claude_stage(lodes_list, "testid11", "ship")
+
+    assert result is None
+    assert lodes_list[0]["claude"]["mill"]["started"] is True
+    assert lodes_list[0]["claude"]["mill"]["session_id"] == "session-1"
 
 
 def test_lode_backlog_field_roundtrip():

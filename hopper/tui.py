@@ -5,7 +5,6 @@
 
 import os
 import re
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +39,9 @@ from hopper.lodes import (
     format_age,
     format_uptime,
     get_lode_dir,
+    reset_lode_claude_stage,
     save_lodes,
+    update_lode_auto,
     update_lode_stage,
     update_lode_state,
 )
@@ -1449,13 +1450,10 @@ class HopperApp(App):
         if not lode:
             return
 
-        lode["auto"] = not lode.get("auto", False)
-        if self.server:
-            from hopper.lodes import touch
-
-            touch(lode)
-            save_lodes(self.server.lodes)
-            self.server.broadcast({"type": "lode_updated", "lode": lode})
+        new_auto = not lode.get("auto", False)
+        updated = update_lode_auto(self._lodes, lode["id"], new_auto)
+        if updated and self.server:
+            self.server.broadcast({"type": "lode_updated", "lode": updated})
 
         self.refresh_table()
 
@@ -1482,16 +1480,9 @@ class HopperApp(App):
         if stage not in ("mill", "refine", "ship"):
             return
 
-        # Reset claude session for current stage
-        lode["claude"][stage]["session_id"] = str(uuid.uuid4())
-        lode["claude"][stage]["started"] = False
-
-        if self.server:
-            from hopper.lodes import touch
-
-            touch(lode)
-            save_lodes(self.server.lodes)
-            self.server.broadcast({"type": "lode_updated", "lode": lode})
+        updated = reset_lode_claude_stage(self._lodes, lode["id"], stage)
+        if updated and self.server:
+            self.server.broadcast({"type": "lode_updated", "lode": updated})
 
         self.notify(f"Reloading {stage}...")
         self.refresh_table()

@@ -12,7 +12,6 @@ import socket
 import subprocess
 import threading
 import time
-import uuid
 from pathlib import Path
 
 from hopper import config
@@ -32,8 +31,12 @@ from hopper.lodes import (
     current_time_ms,
     load_archived_lodes,
     load_lodes,
+    reset_lode_claude_stage,
     save_lodes,
+    set_lode_claude_started,
     touch,
+    update_lode_auto,
+    update_lode_codex_thread,
     update_lode_stage,
     update_lode_state,
     update_lode_status,
@@ -319,7 +322,7 @@ class Server:
             logger.info(f"Lode {lode['id']} created project={project}")
             self.broadcast({"type": "lode_created", "lode": lode})
 
-        elif msg_type == "lode_update":
+        elif msg_type == "lode_set_stage":
             lode_id = message.get("lode_id")
             stage = message.get("stage")
             if lode_id and stage:
@@ -345,7 +348,7 @@ class Server:
                 lode = update_lode_state(self.lodes, lode_id, state, status)
                 if lode:
                     logger.info(f"Lode {lode_id} state={state} status={status}")
-                    self.broadcast({"type": "lode_state_changed", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_status":
             lode_id = message.get("lode_id")
@@ -354,7 +357,7 @@ class Server:
                 lode = update_lode_status(self.lodes, lode_id, status)
                 if lode:
                     logger.info(f"Lode {lode_id} status={status}")
-                    self.broadcast({"type": "lode_status_changed", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_title":
             lode_id = message.get("lode_id")
@@ -363,55 +366,42 @@ class Server:
                 lode = update_lode_title(self.lodes, lode_id, title)
                 if lode:
                     logger.info(f"Lode {lode_id} title={title}")
-                    self.broadcast({"type": "lode_title_changed", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_auto":
             lode_id = message.get("lode_id")
             auto = bool(message.get("auto", False))
             if lode_id:
-                lode = self._find_lode(lode_id)
+                lode = update_lode_auto(self.lodes, lode_id, auto)
                 if lode:
-                    lode["auto"] = auto
                     logger.info(f"Lode {lode_id} auto={auto}")
-                    touch(lode)
-                    save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_codex_thread":
             lode_id = message.get("lode_id")
             thread_id = message.get("codex_thread_id")
             if lode_id and thread_id:
-                lode = self._find_lode(lode_id)
+                lode = update_lode_codex_thread(self.lodes, lode_id, thread_id)
                 if lode:
-                    lode["codex_thread_id"] = thread_id
                     logger.info(f"Lode {lode_id} codex_thread={thread_id}")
-                    touch(lode)
-                    save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_claude_started":
             lode_id = message.get("lode_id")
             claude_stage = message.get("claude_stage")
             if lode_id and claude_stage:
-                lode = self._find_lode(lode_id)
-                if lode and claude_stage in lode.get("claude", {}):
-                    lode["claude"][claude_stage]["started"] = True
+                lode = set_lode_claude_started(self.lodes, lode_id, claude_stage)
+                if lode:
                     logger.info(f"Lode {lode_id} claude_started stage={claude_stage}")
-                    touch(lode)
-                    save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_reset_claude_stage":
             lode_id = message.get("lode_id")
             claude_stage = message.get("claude_stage")
             if lode_id and claude_stage:
-                lode = self._find_lode(lode_id)
-                if lode and claude_stage in lode.get("claude", {}):
-                    lode["claude"][claude_stage]["session_id"] = str(uuid.uuid4())
-                    lode["claude"][claude_stage]["started"] = False
+                lode = reset_lode_claude_stage(self.lodes, lode_id, claude_stage)
+                if lode:
                     logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
-                    touch(lode)
-                    save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "backlog_list":
@@ -443,8 +433,7 @@ class Server:
             logger.info("Projects reloaded from disk")
 
         else:
-            # Broadcast other messages
-            self.broadcast(message)
+            logger.warning(f"Unknown message type: {msg_type}")
 
     def _send_response(self, conn: socket.socket, message: dict) -> None:
         """Send a response directly to a client."""

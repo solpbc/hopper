@@ -270,7 +270,7 @@ class BaseRunner:
         """Emit stage change to server via persistent connection."""
         if self.connection:
             self.connection.emit(
-                "lode_update",
+                "lode_set_stage",
                 lode_id=self.lode_id,
                 stage=stage,
             )
@@ -288,7 +288,7 @@ class BaseRunner:
 
     def _on_server_message(self, message: dict) -> None:
         """Handle incoming server broadcast messages."""
-        if message.get("type") != "lode_state_changed":
+        if message.get("type") != "lode_updated":
             return
         lode = message.get("lode", {})
         if lode.get("id") != self.lode_id:

@@ -330,3 +330,52 @@ def update_lode_title(lodes: list[dict], lode_id: str, title: str) -> dict | Non
             save_lodes(lodes)
             return lode
     return None
+
+
+def update_lode_auto(lodes: list[dict], lode_id: str, auto: bool) -> dict | None:
+    """Update the auto flag on a lode."""
+    for lode in lodes:
+        if lode["id"] == lode_id:
+            lode["auto"] = auto
+            touch(lode)
+            save_lodes(lodes)
+            return lode
+    return None
+
+
+def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: str) -> dict | None:
+    """Update the codex thread ID on a lode."""
+    for lode in lodes:
+        if lode["id"] == lode_id:
+            lode["codex_thread_id"] = codex_thread_id
+            touch(lode)
+            save_lodes(lodes)
+            return lode
+    return None
+
+
+def set_lode_claude_started(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:
+    """Mark a claude stage as started on a lode."""
+    for lode in lodes:
+        if lode["id"] == lode_id:
+            if claude_stage not in lode.get("claude", {}):
+                return None
+            lode["claude"][claude_stage]["started"] = True
+            touch(lode)
+            save_lodes(lodes)
+            return lode
+    return None
+
+
+def reset_lode_claude_stage(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:
+    """Reset a claude stage (new session_id, started=False)."""
+    for lode in lodes:
+        if lode["id"] == lode_id:
+            if claude_stage not in lode.get("claude", {}):
+                return None
+            lode["claude"][claude_stage]["session_id"] = str(uuid.uuid4())
+            lode["claude"][claude_stage]["started"] = False
+            touch(lode)
+            save_lodes(lodes)
+            return lode
+    return None

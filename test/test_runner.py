@@ -186,7 +186,7 @@ class TestBaseRunnerServerMessages:
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
 
         msg = {
-            "type": "lode_state_changed",
+            "type": "lode_updated",
             "lode": {"id": "test-session", "state": "completed"},
         }
         runner._on_server_message(msg)
@@ -198,7 +198,7 @@ class TestBaseRunnerServerMessages:
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
 
         msg = {
-            "type": "lode_state_changed",
+            "type": "lode_updated",
             "lode": {"id": "other-session", "state": "completed"},
         }
         runner._on_server_message(msg)
@@ -210,7 +210,7 @@ class TestBaseRunnerServerMessages:
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
 
         msg = {
-            "type": "lode_state_changed",
+            "type": "lode_updated",
             "lode": {"id": "test-session", "state": "running"},
         }
         runner._on_server_message(msg)
@@ -218,11 +218,11 @@ class TestBaseRunnerServerMessages:
         assert not runner._done.is_set()
 
     def test_on_server_message_ignores_other_message_types(self):
-        """Callback ignores non-state-changed messages."""
+        """Callback ignores non-lode-updated messages."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
 
         msg = {
-            "type": "lode_updated",
+            "type": "backlog_added",
             "lode": {"id": "test-session", "state": "completed"},
         }
         runner._on_server_message(msg)

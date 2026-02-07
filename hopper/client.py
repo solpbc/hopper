@@ -315,6 +315,15 @@ def get_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
     return response.get("lode")
 
 
+def _fire_and_forget(socket_path: Path, msg: dict, timeout: float = 2.0) -> bool:
+    """Send a message to the server without waiting for a response."""
+    try:
+        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
+        return True
+    except Exception:
+        return False
+
+
 def set_lode_state(
     socket_path: Path, lode_id: str, state: str, status: str, timeout: float = 2.0
 ) -> bool:
@@ -337,12 +346,7 @@ def set_lode_state(
         "status": status,
         "ts": current_time_ms(),
     }
-    # Fire-and-forget: don't wait for response
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)
 
 
 def set_lode_status(socket_path: Path, lode_id: str, status: str, timeout: float = 2.0) -> bool:
@@ -363,12 +367,7 @@ def set_lode_status(socket_path: Path, lode_id: str, status: str, timeout: float
         "status": status,
         "ts": current_time_ms(),
     }
-    # Fire-and-forget: don't wait for response
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)
 
 
 def set_lode_title(socket_path: Path, lode_id: str, title: str, timeout: float = 2.0) -> bool:
@@ -389,12 +388,7 @@ def set_lode_title(socket_path: Path, lode_id: str, title: str, timeout: float =
         "title": title,
         "ts": current_time_ms(),
     }
-    # Fire-and-forget: don't wait for response
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)
 
 
 def set_codex_thread_id(
@@ -417,11 +411,7 @@ def set_codex_thread_id(
         "codex_thread_id": codex_thread_id,
         "ts": current_time_ms(),
     }
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)
 
 
 def add_backlog(
@@ -451,11 +441,7 @@ def add_backlog(
     }
     if lode_id:
         msg["lode_id"] = lode_id
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)
 
 
 def remove_backlog(socket_path: Path, item_id: str, timeout: float = 2.0) -> bool:
@@ -474,11 +460,7 @@ def remove_backlog(socket_path: Path, item_id: str, timeout: float = 2.0) -> boo
         "item_id": item_id,
         "ts": current_time_ms(),
     }
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)
 
 
 def reload_projects(socket_path: Path, timeout: float = 2.0) -> bool:
@@ -495,8 +477,4 @@ def reload_projects(socket_path: Path, timeout: float = 2.0) -> bool:
         "type": "projects_reload",
         "ts": current_time_ms(),
     }
-    try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
-        return True
-    except Exception:
-        return False
+    return _fire_and_forget(socket_path, msg, timeout)

@@ -314,7 +314,7 @@ def test_server_handles_lode_set_state(socket_path, server, temp_config, make_lo
     data = client.recv(4096).decode("utf-8")
     response = json.loads(data.strip().split("\n")[0])
 
-    assert response["type"] == "lode_state_changed"
+    assert response["type"] == "lode_updated"
     assert response["lode"]["id"] == "test-id"
     assert response["lode"]["state"] == "running"
 
@@ -349,7 +349,7 @@ def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lo
     data = client.recv(4096).decode("utf-8")
     response = json.loads(data.strip().split("\n")[0])
 
-    assert response["type"] == "lode_title_changed"
+    assert response["type"] == "lode_updated"
     assert response["lode"]["id"] == "test-id"
     assert response["lode"]["title"] == "Auth Flow"
 
@@ -540,7 +540,7 @@ def test_server_handles_ready_state(socket_path, server, temp_config, make_lode)
     data = client.recv(4096).decode("utf-8")
     response = json.loads(data.strip().split("\n")[0])
 
-    assert response["type"] == "lode_state_changed"
+    assert response["type"] == "lode_updated"
     assert response["lode"]["state"] == "ready"
     assert response["lode"]["status"] == "Mill output saved"
 
