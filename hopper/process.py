@@ -24,7 +24,7 @@ def _has_makefile(worktree_path: Path) -> bool:
 
 
 def _run_make_install(worktree_path: Path) -> bool:
-    """Run 'make install' in the worktree to set up venv via uv.
+    """Run 'make install' in the worktree to set up project tooling.
 
     Returns True on success, False on failure.
     """
@@ -42,19 +42,29 @@ def _run_make_install(worktree_path: Path) -> bool:
         return False
 
 
-def _get_venv_env(worktree_path: Path, base_env: dict | None = None) -> dict:
-    """Get environment dict with venv activated.
+def _get_worktree_env(worktree_path: Path, base_env: dict | None = None) -> dict:
+    """Get environment dict with worktree tooling activated.
 
-    Prepends .venv/bin to PATH and sets VIRTUAL_ENV.
+    Prepends .venv/bin and/or node_modules/.bin to PATH as available.
+    Sets VIRTUAL_ENV when .venv is present.
     """
     env = dict(base_env) if base_env else os.environ.copy()
 
-    venv_path = worktree_path / ".venv"
-    venv_bin = venv_path / "bin"
+    prepend: list[str] = []
 
-    current_path = env.get("PATH", "")
-    env["PATH"] = f"{venv_bin}:{current_path}" if current_path else str(venv_bin)
-    env["VIRTUAL_ENV"] = str(venv_path)
+    venv_bin = worktree_path / ".venv" / "bin"
+    if venv_bin.is_dir():
+        prepend.append(str(venv_bin))
+        env["VIRTUAL_ENV"] = str(worktree_path / ".venv")
+
+    node_bin = worktree_path / "node_modules" / ".bin"
+    if node_bin.is_dir():
+        prepend.append(str(node_bin))
+
+    if prepend:
+        current_path = env.get("PATH", "")
+        prefix = ":".join(prepend)
+        env["PATH"] = f"{prefix}:{current_path}" if current_path else prefix
 
     return env
 
@@ -104,7 +114,7 @@ class ProcessRunner(BaseRunner):
         self._context: dict[str, str] = {}
         self._cwd: str | None = None
         self.worktree_path: Path | None = None
-        self.use_venv: bool = False
+        self.use_env: bool = False
         self.scope: str = ""
         self.stage: str = ""
         self.lode_title: str = ""
@@ -184,22 +194,23 @@ class ProcessRunner(BaseRunner):
             self.lode_branch = branch_name
             logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
 
-        # Set up venv via make install if project has a Makefile
+        # Set up environment via make install if project has a Makefile
         if _has_makefile(self.worktree_path):
-            venv_path = self.worktree_path / ".venv"
-            venv_missing = not venv_path.is_dir()
-            if venv_missing:
+            has_venv = (self.worktree_path / ".venv").is_dir()
+            has_node = (self.worktree_path / "node_modules").is_dir()
+            needs_install = not has_venv and not has_node
+            if needs_install:
                 set_lode_status(self.socket_path, self.lode_id, "Running make install...")
                 logger.debug(f"make install start lode={self.lode_id}")
                 print(f"Running make install for {self.lode_id}...")
-            if venv_missing and not _run_make_install(self.worktree_path):
+            if needs_install and not _run_make_install(self.worktree_path):
                 self._setup_error = "Failed to run make install."
                 print(self._setup_error)
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
-            if venv_missing:
+            if needs_install:
                 logger.debug(f"make install complete lode={self.lode_id}")
-            self.use_venv = True
+            self.use_env = True
 
         self._cwd = str(self.worktree_path)
 
@@ -306,10 +317,10 @@ class ProcessRunner(BaseRunner):
         os.replace(tmp, path)
 
     def _get_subprocess_env(self) -> dict:
-        """Build environment with venv activated if applicable."""
+        """Build environment with worktree tooling activated if applicable."""
         base_env = super()._get_subprocess_env()
-        if self.use_venv and self.worktree_path:
-            return _get_venv_env(self.worktree_path, base_env)
+        if self.use_env and self.worktree_path:
+            return _get_worktree_env(self.worktree_path, base_env)
         return base_env
 
     def _build_command(self) -> tuple[list[str], str | None]:
@@ -344,7 +355,7 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
-        env = self._get_subprocess_env() if self.use_venv else None
+        env = self._get_subprocess_env() if self.use_env else None
         set_lode_status(self.socket_path, self.lode_id, "Bootstrapping Codex...")
         exit_code, thread_id = bootstrap_codex(code_prompt, str(self.worktree_path), env=env)
 

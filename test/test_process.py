@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
-from hopper.process import STAGES, ProcessRunner, run_process
+from hopper.process import STAGES, ProcessRunner, _get_worktree_env, run_process
 
 CLAUDE_SESSIONS = {
     "mill": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
@@ -515,7 +515,7 @@ class TestRefineStage:
         ]
 
     def test_no_makefile_skips_make_install(self, tmp_path):
-        """First-run refine without Makefile skips make install and venv."""
+        """First-run refine without Makefile skips make install and env setup."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
         (session_dir / "mill_out.md").write_text("Build the widget")
@@ -542,7 +542,7 @@ class TestRefineStage:
 
         assert exit_code == 0
         mock_make_install.assert_not_called()
-        assert runner.use_venv is False
+        assert runner.use_env is False
 
     def test_resume_skips_bootstrap(self, tmp_path):
         """Resume uses --resume and skips Codex bootstrap."""
@@ -579,6 +579,39 @@ class TestRefineStage:
         cmd = mock_popen.call_args[0][0]
         assert "--resume" in cmd
         assert mock_popen.call_args[1]["cwd"] == str(worktree)
+
+    def test_resume_skips_setup_status_with_node_modules(self, tmp_path):
+        """Resume with existing worktree and node_modules emits no setup status updates."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+        worktree = session_dir / "worktree"
+        worktree.mkdir()
+        (worktree / "node_modules").mkdir()
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(
+                    stage="refine",
+                    state="running",
+                    project="my-project",
+                    claude=_claude_sessions(refine={"started": True}),
+                ),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process._has_makefile", return_value=True),
+            patch("hopper.process._run_make_install", return_value=True) as mock_install,
+            patch("hopper.process.set_lode_status") as mock_status,
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        mock_status.assert_not_called()
+        mock_install.assert_not_called()
 
     def test_resume_skips_setup_status(self, tmp_path):
         """Resume with existing worktree and venv emits no setup status updates."""
@@ -797,6 +830,44 @@ class TestRefineStage:
         )
         assert state_idx < stage_idx
         assert "Refine complete" in emitted[state_idx][1]["status"]
+
+
+# ---------------------------------------------------------------------------
+# _get_worktree_env tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetWorktreeEnv:
+    def test_venv_only(self, tmp_path):
+        """Prepends .venv/bin to PATH and sets VIRTUAL_ENV."""
+        (tmp_path / ".venv" / "bin").mkdir(parents=True)
+        env = _get_worktree_env(tmp_path, {"PATH": "/usr/bin"})
+        assert env["PATH"].startswith(str(tmp_path / ".venv" / "bin"))
+        assert env["VIRTUAL_ENV"] == str(tmp_path / ".venv")
+        assert "node_modules" not in env["PATH"]
+
+    def test_node_modules_only(self, tmp_path):
+        """Prepends node_modules/.bin to PATH, no VIRTUAL_ENV."""
+        (tmp_path / "node_modules" / ".bin").mkdir(parents=True)
+        env = _get_worktree_env(tmp_path, {"PATH": "/usr/bin"})
+        assert str(tmp_path / "node_modules" / ".bin") in env["PATH"]
+        assert "VIRTUAL_ENV" not in env
+
+    def test_both(self, tmp_path):
+        """Both .venv/bin and node_modules/.bin prepended."""
+        (tmp_path / ".venv" / "bin").mkdir(parents=True)
+        (tmp_path / "node_modules" / ".bin").mkdir(parents=True)
+        env = _get_worktree_env(tmp_path, {"PATH": "/usr/bin"})
+        venv_pos = env["PATH"].index(str(tmp_path / ".venv" / "bin"))
+        node_pos = env["PATH"].index(str(tmp_path / "node_modules" / ".bin"))
+        assert venv_pos < node_pos  # venv first
+        assert env["VIRTUAL_ENV"] == str(tmp_path / ".venv")
+
+    def test_neither(self, tmp_path):
+        """No tooling dirs — PATH unchanged, no VIRTUAL_ENV."""
+        env = _get_worktree_env(tmp_path, {"PATH": "/usr/bin"})
+        assert env["PATH"] == "/usr/bin"
+        assert "VIRTUAL_ENV" not in env
 
 
 # ---------------------------------------------------------------------------
