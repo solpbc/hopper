@@ -3,14 +3,9 @@
 
 """Claude Code wrapper for hopper."""
 
-import shutil
+import sys
 
 from hopper.tmux import new_window, select_window
-
-
-def _hop_bin() -> str:
-    """Resolve the absolute path to the hop CLI binary."""
-    return shutil.which("hop") or "hop"
 
 
 def spawn_claude(
@@ -28,7 +23,7 @@ def spawn_claude(
     Returns:
         The tmux pane ID on success, None on failure.
     """
-    hop = _hop_bin()
+    hop = sys.argv[0]
     # On failure, pause so user can see the error before window closes
     command = f"{hop} process {lode_id} || {{ echo 'Failed. Press Enter to close.'; read; }}"
     return new_window(command, cwd=project_path, background=not foreground)
