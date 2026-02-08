@@ -15,6 +15,7 @@ from hopper.client import (
     lode_exists,
     ping,
     send_message,
+    set_lode_branch,
     set_lode_state,
     set_lode_title,
 )
@@ -209,6 +210,27 @@ def test_set_lode_title_sends_message(server, socket_path):
 
     # Lode should be updated
     assert server.lodes[0]["title"] == "Auth Flow"
+
+
+def test_set_lode_branch_no_server(socket_path):
+    """set_lode_branch returns True even when server not running (fire-and-forget)."""
+    result = set_lode_branch(
+        socket_path, "any-session", "hopper-any-session-auth-flow", timeout=0.5
+    )
+    assert result is True
+
+
+def test_set_lode_branch_sends_message(server, socket_path):
+    """set_lode_branch sends the correct message type."""
+    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    server.lodes = [session]
+
+    result = set_lode_branch(socket_path, "test-id", "hopper-test-id-auth-flow")
+    assert result is True
+
+    time.sleep(0.1)
+
+    assert server.lodes[0]["branch"] == "hopper-test-id-auth-flow"
 
 
 def test_reload_projects_success(server, socket_path):

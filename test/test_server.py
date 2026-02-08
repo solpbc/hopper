@@ -155,7 +155,12 @@ def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
 
 def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode):
     """Startup archive triggers worktree and branch cleanup."""
-    shipped_lode = make_lode(id="test-id", stage="shipped", project="myproject")
+    shipped_lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        project="myproject",
+        branch="hopper-test-id",
+    )
     save_lodes([shipped_lode])
     worktree_dir = temp_config / "lodes" / shipped_lode["id"] / "worktree"
     worktree_dir.mkdir(parents=True)
@@ -185,7 +190,7 @@ def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode
                 time.sleep(0.1)
 
             mock_remove_worktree.assert_called_once_with("/fake/repo", str(worktree_dir))
-            mock_delete_branch.assert_called_once_with("/fake/repo", f"hopper-{shipped_lode['id']}")
+            mock_delete_branch.assert_called_once_with("/fake/repo", shipped_lode["branch"])
         finally:
             srv.stop()
             thread.join(timeout=2)
@@ -504,6 +509,35 @@ def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lo
     client.close()
 
 
+def test_server_handles_lode_set_branch(socket_path, server, temp_config, make_lode):
+    """Server handles lode_set_branch message."""
+    lode = make_lode(id="test-id")
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    msg = {"type": "lode_set_branch", "lode_id": "test-id", "branch": "hopper-test-id-auth-flow"}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "lode_updated"
+    assert response["lode"]["id"] == "test-id"
+    assert response["lode"]["branch"] == "hopper-test-id-auth-flow"
+    assert server.lodes[0]["branch"] == "hopper-test-id-auth-flow"
+
+    client.close()
+
+
 def test_server_connect_does_not_register_ownership(socket_path, server, temp_config, make_lode):
     """Connect message returns lode data but does not register ownership."""
     lode = make_lode(id="test-id")
@@ -805,6 +839,7 @@ def test_cleanup_worktree_on_disconnect_archive(socket_path, server, temp_config
         state="ready",
         status="Ship complete",
         project="myproject",
+        branch="hopper-test-id",
     )
     server.lodes = [lode]
     save_lodes(server.lodes)
@@ -837,7 +872,7 @@ def test_cleanup_worktree_on_disconnect_archive(socket_path, server, temp_config
                 break
 
         mock_remove_worktree.assert_called_once_with("/fake/repo", str(worktree_dir))
-        mock_delete_branch.assert_called_once_with("/fake/repo", f"hopper-{lode['id']}")
+        mock_delete_branch.assert_called_once_with("/fake/repo", lode["branch"])
 
 
 def test_no_auto_archive_non_shipped_on_disconnect(socket_path, server, temp_config, make_lode):

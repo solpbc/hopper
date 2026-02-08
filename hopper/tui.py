@@ -592,15 +592,15 @@ class ArchiveConfirmScreen(ModalScreen[bool | None]):
     }
     """
 
-    def __init__(self, diff_stat: str, lode_id: str):
+    def __init__(self, diff_stat: str, branch: str):
         super().__init__()
         self._diff_stat = diff_stat
-        self._lode_id = lode_id
+        self._branch = branch
 
     def compose(self) -> ComposeResult:
         with Vertical(id="archive-container"):
             yield Static(
-                f"Unmerged changes on hopper-{self._lode_id}",
+                f"Unmerged changes on {self._branch}",
                 id="archive-title",
             )
             yield Static(format_diff_stat(self._diff_stat), id="archive-diff")
@@ -1417,6 +1417,9 @@ class HopperApp(App):
             lode_id = self._get_selected_lode_id()
             if not lode_id:
                 return
+            lode = self._get_lode(lode_id)
+            branch = lode.get("branch", "") if lode else ""
+            branch = branch or f"hopper-{lode_id}"
             # Check for worktree with unmerged changes
             worktree_path = get_lode_dir(lode_id) / "worktree"
             if worktree_path.is_dir():
@@ -1428,7 +1431,7 @@ class HopperApp(App):
                             self.server.enqueue({"type": "lode_archive", "lode_id": lode_id})
 
                     self.push_screen(
-                        ArchiveConfirmScreen(diff_stat=diff_stat, lode_id=lode_id),
+                        ArchiveConfirmScreen(diff_stat=diff_stat, branch=branch),
                         on_confirm,
                     )
                     return

@@ -39,6 +39,7 @@ from hopper.lodes import (
     set_lode_claude_started,
     touch,
     update_lode_auto,
+    update_lode_branch,
     update_lode_codex_thread,
     update_lode_stage,
     update_lode_state,
@@ -299,7 +300,8 @@ class Server:
             logger.warning(f"Cleanup skipped for {lode_id}: project not found")
             return
         remove_worktree(project.path, str(worktree_path))
-        delete_branch(project.path, f"hopper-{lode_id}")
+        branch = lode.get("branch", "") or f"hopper-{lode_id}"
+        delete_branch(project.path, branch)
 
     def _register_lode_client(
         self,
@@ -451,6 +453,15 @@ class Server:
                 lode = update_lode_title(self.lodes, lode_id, title)
                 if lode:
                     logger.info(f"Lode {lode_id} title={title}")
+                    self.broadcast({"type": "lode_updated", "lode": lode})
+
+        elif msg_type == "lode_set_branch":
+            lode_id = message.get("lode_id")
+            branch = message.get("branch", "")
+            if lode_id:
+                lode = update_lode_branch(self.lodes, lode_id, branch)
+                if lode:
+                    logger.info(f"Lode {lode_id} branch={branch}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_auto":

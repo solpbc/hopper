@@ -20,8 +20,10 @@ from hopper.lodes import (
     reset_lode_claude_stage,
     save_lodes,
     set_lode_claude_started,
+    slugify,
     touch,
     update_lode_auto,
+    update_lode_branch,
     update_lode_codex_thread,
     update_lode_stage,
     update_lode_state,
@@ -122,6 +124,7 @@ def test_create_lode(temp_config):
 
     assert lode["stage"] == "mill"
     assert lode["project"] == "test-project"
+    assert lode["branch"] == ""
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
@@ -347,6 +350,48 @@ def test_format_uptime_days():
     assert format_uptime(now - (1 * 24 * 60 + 30) * 60_000) == "1d"
 
 
+def test_slugify_empty():
+    """slugify returns empty string for empty input."""
+    assert slugify("") == ""
+
+
+def test_slugify_all_special_chars():
+    """slugify strips all special characters."""
+    assert slugify("!!!@@@###") == ""
+
+
+def test_slugify_basic():
+    """slugify lowercases and hyphenates words."""
+    assert slugify("Branch Naming") == "branch-naming"
+
+
+def test_slugify_symbols():
+    """slugify removes symbols and keeps separators normalized."""
+    assert slugify("hello world! @#$ test") == "hello-world-test"
+
+
+def test_slugify_truncates_to_40_chars():
+    """slugify truncates to max length and avoids trailing hyphen."""
+    result = slugify("a" * 60)
+    assert len(result) == 40
+    assert not result.endswith("-")
+
+
+def test_slugify_strips_wrapping_hyphens():
+    """slugify strips leading and trailing separators."""
+    assert slugify("---hello---") == "hello"
+
+
+def test_slugify_non_ascii():
+    """slugify strips non-ascii characters."""
+    assert slugify("名前テスト") == ""
+
+
+def test_slugify_strips_lock_suffix():
+    """slugify removes a trailing .lock suffix."""
+    assert slugify("test.lock") == "test"
+
+
 def test_touch():
     """touch() updates the updated_at timestamp."""
     lode = {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000}
@@ -412,6 +457,30 @@ def test_update_lode_title(temp_config):
     # Verify persistence
     loaded = load_lodes()
     assert loaded[0]["title"] == "Auth Flow"
+
+
+def test_update_lode_branch(temp_config):
+    """update_lode_branch changes branch and touches timestamp."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "new",
+            "branch": "",
+        }
+    ]
+    save_lodes(lodes_list)
+
+    updated = update_lode_branch(lodes_list, "testid11", "hopper-testid11-auth-flow")
+
+    assert updated is not None
+    assert updated["branch"] == "hopper-testid11-auth-flow"
+    assert updated["updated_at"] > 1000
+
+    loaded = load_lodes()
+    assert loaded[0]["branch"] == "hopper-testid11-auth-flow"
 
 
 def test_update_lode_auto(temp_config):

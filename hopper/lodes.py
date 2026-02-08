@@ -13,6 +13,7 @@ Lodes are plain dicts with these fields:
 - state: str - "new", "running", "stuck", "error", etc. (default "new")
 - status: str - human-readable status text (default "")
 - title: str - short human-readable label (default "")
+- branch: str - git branch name for this lode's worktree (default "")
 - active: bool - whether a runner client is connected (default False)
 - auto: bool - whether to auto-advance to next stage on completion (default True)
 - tmux_pane: str | None - tmux pane ID (default None)
@@ -27,6 +28,7 @@ Lodes are plain dicts with these fields:
 
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -130,6 +132,22 @@ def format_duration_ms(duration_ms: int) -> str:
 
     hours = minutes // 60
     return f"{hours}h"
+
+
+def slugify(title: str) -> str:
+    """Convert a title to a git-branch-safe slug.
+
+    Lowercase, alphanumeric + hyphens only, no leading/trailing/consecutive
+    hyphens, truncated to 40 chars, no '.lock' suffix.
+    """
+    s = title.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    s = re.sub(r"-{2,}", "-", s)
+    s = s[:40].rstrip("-")
+    if s.endswith("-lock"):
+        s = s[:-5]
+    return s
 
 
 def touch(lode: dict) -> None:
@@ -252,6 +270,7 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "state": "new",
         "status": "Ready to start",
         "title": "",
+        "branch": "",
         "active": False,
         "auto": True,
         "tmux_pane": None,
@@ -327,6 +346,17 @@ def update_lode_title(lodes: list[dict], lode_id: str, title: str) -> dict | Non
     for lode in lodes:
         if lode["id"] == lode_id:
             lode["title"] = title
+            touch(lode)
+            save_lodes(lodes)
+            return lode
+    return None
+
+
+def update_lode_branch(lodes: list[dict], lode_id: str, branch: str) -> dict | None:
+    """Update a lode's branch only. Returns the updated lode or None if not found."""
+    for lode in lodes:
+        if lode["id"] == lode_id:
+            lode["branch"] = branch
             touch(lode)
             save_lodes(lodes)
             return lode

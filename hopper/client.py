@@ -447,6 +447,27 @@ def set_lode_title(socket_path: Path, lode_id: str, title: str, timeout: float =
     return _fire_and_forget(socket_path, msg, timeout)
 
 
+def set_lode_branch(socket_path: Path, lode_id: str, branch: str, timeout: float = 2.0) -> bool:
+    """Set a lode's branch only (fire-and-forget).
+
+    Args:
+        socket_path: Path to the Unix socket
+        lode_id: The lode ID to update
+        branch: Git branch name for this lode
+        timeout: Connection timeout in seconds
+
+    Returns:
+        True if message was sent successfully, False otherwise
+    """
+    msg = {
+        "type": "lode_set_branch",
+        "lode_id": lode_id,
+        "branch": branch,
+        "ts": current_time_ms(),
+    }
+    return _fire_and_forget(socket_path, msg, timeout)
+
+
 def set_codex_thread_id(
     socket_path: Path, lode_id: str, codex_thread_id: str, timeout: float = 2.0
 ) -> bool:

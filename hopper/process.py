@@ -9,10 +9,10 @@ import subprocess
 from pathlib import Path
 
 from hopper import config, prompt
-from hopper.client import set_codex_thread_id, set_lode_state, set_lode_status
+from hopper.client import set_codex_thread_id, set_lode_branch, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
 from hopper.git import create_worktree, current_branch, is_dirty
-from hopper.lodes import get_lode_dir
+from hopper.lodes import get_lode_dir, slugify
 from hopper.runner import BaseRunner
 
 logger = logging.getLogger(__name__)
@@ -107,10 +107,14 @@ class ProcessRunner(BaseRunner):
         self.use_venv: bool = False
         self.scope: str = ""
         self.stage: str = ""
+        self.lode_title: str = ""
+        self.lode_branch: str = ""
 
     def _load_lode_data(self, lode_data: dict) -> None:
         self.stage = lode_data.get("stage", "")
         self.scope = lode_data.get("scope", "")
+        self.lode_title = lode_data.get("title", "")
+        self.lode_branch = lode_data.get("branch", "")
 
     def _setup(self) -> int | None:
         logger.debug(f"setup dispatching lode={self.lode_id} stage={self.stage}")
@@ -165,12 +169,19 @@ class ProcessRunner(BaseRunner):
         self.worktree_path = get_lode_dir(self.lode_id) / "worktree"
         if not self.worktree_path.is_dir():
             set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
-            branch_name = f"hopper-{self.lode_id}"
+            if self.lode_branch:
+                branch_name = self.lode_branch
+            else:
+                slug = slugify(self.lode_title)
+                branch_name = f"hopper-{self.lode_id}-{slug}" if slug else f"hopper-{self.lode_id}"
             if not create_worktree(self.project_dir, self.worktree_path, branch_name):
                 self._setup_error = "Failed to create git worktree."
                 print(self._setup_error)
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
+            if not self.lode_branch:
+                set_lode_branch(self.socket_path, self.lode_id, branch_name)
+            self.lode_branch = branch_name
             logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
 
         # Set up venv via make install if project has a Makefile
@@ -260,7 +271,9 @@ class ProcessRunner(BaseRunner):
                 return err
             logger.debug(f"input loaded lode={self.lode_id}")
 
-            self._context["branch"] = f"hopper-{self.lode_id}"
+            self._context["branch"] = (
+                self.lode_branch if self.lode_branch else f"hopper-{self.lode_id}"
+            )
             self._context["worktree"] = str(self.worktree_path)
             if self.project_name:
                 self._context["project"] = self.project_name
