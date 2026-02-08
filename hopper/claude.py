@@ -3,7 +3,7 @@
 
 """Claude Code wrapper for hopper."""
 
-import sys
+import os
 
 from hopper.tmux import new_window, select_window
 
@@ -23,10 +23,11 @@ def spawn_claude(
     Returns:
         The tmux pane ID on success, None on failure.
     """
-    hop = sys.argv[0]
     # On failure, pause so user can see the error before window closes
-    command = f"{hop} process {lode_id} || {{ echo 'Failed. Press Enter to close.'; read; }}"
-    return new_window(command, cwd=project_path, background=not foreground)
+    command = f"hop process {lode_id} || {{ echo 'Failed. Press Enter to close.'; read; }}"
+    # Pass PATH so the tmux window can find hop, claude, and other tools
+    env = {"PATH": os.environ.get("PATH", "")}
+    return new_window(command, cwd=project_path, env=env, background=not foreground)
 
 
 def switch_to_pane(pane_id: str) -> bool:
