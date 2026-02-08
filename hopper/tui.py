@@ -1297,6 +1297,8 @@ class HopperApp(App):
                 return  # Cancelled
 
             touch_project(project.name)
+            if self.server:
+                self.server.enqueue({"type": "projects_reload"})
 
             def on_scope_entered(result: tuple[str, str] | None) -> None:
                 if result is None:
@@ -1336,6 +1338,8 @@ class HopperApp(App):
                 return  # Cancelled
 
             touch_project(project.name)
+            if self.server:
+                self.server.enqueue({"type": "projects_reload"})
 
             def on_description_entered(description: str | None) -> None:
                 if description is None:

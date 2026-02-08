@@ -11,8 +11,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hopper.config import save_config
 from hopper.lodes import save_lodes
-from hopper.projects import Project
+from hopper.projects import Project, touch_project
 from hopper.server import Server, get_git_hash
 
 
@@ -1188,6 +1189,44 @@ class TestActivityLog:
         log_path = isolate_config / "activity.log"
         content = log_path.read_text()
         assert "Projects reloaded" in content
+
+    def test_projects_reload_refreshes_project_order_after_touch(self, socket_path):
+        """projects_reload updates in-memory project recency order after touch_project."""
+        save_config(
+            {
+                "projects": [
+                    {"path": "/tmp/A", "name": "A", "disabled": False, "last_used_at": 200},
+                    {"path": "/tmp/B", "name": "B", "disabled": False, "last_used_at": 100},
+                ]
+            }
+        )
+
+        srv = Server(socket_path)
+        thread = threading.Thread(target=srv.start, daemon=True)
+        thread.start()
+
+        try:
+            for _ in range(50):
+                if socket_path.exists():
+                    break
+                time.sleep(0.1)
+            else:
+                raise TimeoutError("Server did not start")
+
+            assert [project.name for project in srv.projects] == ["A", "B"]
+
+            touch_project("B")
+            srv.enqueue({"type": "projects_reload"})
+
+            for _ in range(50):
+                if [project.name for project in srv.projects] == ["B", "A"]:
+                    break
+                time.sleep(0.02)
+
+            assert [project.name for project in srv.projects] == ["B", "A"]
+        finally:
+            srv.stop()
+            thread.join(timeout=2)
 
     def test_server_stop_closes_handler(self, isolate_config, socket_path):
         """Server stop removes and closes the file handler."""
