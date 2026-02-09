@@ -11,7 +11,7 @@ from pathlib import Path
 from hopper import config, prompt
 from hopper.client import set_codex_thread_id, set_lode_branch, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
-from hopper.git import create_worktree, current_branch, is_dirty
+from hopper.git import create_worktree, current_branch, get_diff_numstat, is_dirty
 from hopper.lodes import get_lode_dir, slugify
 from hopper.runner import BaseRunner
 
@@ -292,6 +292,19 @@ class ProcessRunner(BaseRunner):
                 self._context["dir"] = self.project_dir
 
         logger.debug(f"ship setup complete lode={self.lode_id}")
+        # Capture diff numstat for stats analysis
+        if self.is_first_run:
+            try:
+                diff_output = get_diff_numstat(str(self.worktree_path))
+                if diff_output:
+                    lode_dir = get_lode_dir(self.lode_id)
+                    diff_path = lode_dir / "diff.txt"
+                    tmp_path = diff_path.with_suffix(".txt.tmp")
+                    tmp_path.write_text(diff_output)
+                    os.replace(tmp_path, diff_path)
+                    logger.debug(f"diff numstat saved lode={self.lode_id}")
+            except Exception:
+                logger.warning(f"failed to capture diff numstat lode={self.lode_id}", exc_info=True)
         return None
 
     def _load_input(self) -> int | None:

@@ -1133,6 +1133,86 @@ class TestShipStage:
         )
         assert any(e[0] == "lode_set_stage" and e[1]["stage"] == "shipped" for e in emitted)
 
+    def test_first_run_writes_diff_txt(self, tmp_path):
+        """First run captures diff numstat to diff.txt."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
+        (session_dir / "refine_out.md").write_text("Refine summary")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="ship", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.is_dirty", return_value=False),
+            patch("hopper.process.current_branch", return_value="main"),
+            patch("hopper.process.get_diff_numstat", return_value="10\t5\tfile.py"),
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        diff_file = session_dir / "diff.txt"
+        assert diff_file.exists()
+        assert diff_file.read_text() == "10\t5\tfile.py"
+
+    def test_first_run_no_diff_txt_when_empty(self, tmp_path):
+        """No diff.txt when diff numstat returns empty."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
+        (session_dir / "refine_out.md").write_text("Refine summary")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="ship", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.is_dirty", return_value=False),
+            patch("hopper.process.current_branch", return_value="main"),
+            patch("hopper.process.get_diff_numstat", return_value=""),
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        assert not (session_dir / "diff.txt").exists()
+
+    def test_diff_failure_does_not_abort_setup(self, tmp_path):
+        """Diff numstat failure does not prevent ship setup."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
+        (session_dir / "refine_out.md").write_text("Refine summary")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="ship", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.is_dirty", return_value=False),
+            patch("hopper.process.current_branch", return_value="main"),
+            patch("hopper.process.get_diff_numstat", side_effect=Exception("git broke")),
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        assert not (session_dir / "diff.txt").exists()
+
 
 # ---------------------------------------------------------------------------
 # run_process entry point tests

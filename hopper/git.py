@@ -107,6 +107,30 @@ def get_diff_stat(worktree_path: str) -> str:
     return ""
 
 
+def get_diff_numstat(worktree_path: str) -> str:
+    """Get diff numstat output comparing worktree to main/master.
+
+    Args:
+        worktree_path: Path to the git worktree.
+
+    Returns:
+        The diff --numstat output as a string, or empty string on error.
+    """
+    for base in ("main", "master"):
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--numstat", base],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
+    return ""
+
+
 def remove_worktree(repo_dir: str, worktree_path: str) -> bool:
     """Remove a git worktree.
 

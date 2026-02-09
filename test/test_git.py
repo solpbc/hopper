@@ -9,6 +9,7 @@ from hopper.git import (
     create_worktree,
     current_branch,
     delete_branch,
+    get_diff_numstat,
     get_diff_stat,
     is_dirty,
     remove_worktree,
@@ -176,6 +177,61 @@ class TestGetDiffStat:
 
         with patch("subprocess.run", return_value=mock_result):
             result = get_diff_stat("/worktree")
+
+        assert result == ""
+
+
+class TestGetDiffNumstat:
+    def test_returns_numstat_output_for_main(self):
+        """Returns diff --numstat output when comparing to main."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "10\t6\tfile.py\n"
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            result = get_diff_numstat("/worktree")
+
+        assert "file.py" in result
+        mock_run.assert_called_with(
+            ["git", "diff", "--numstat", "main"],
+            cwd="/worktree",
+            capture_output=True,
+            text=True,
+        )
+
+    def test_falls_back_to_master(self):
+        """Falls back to master when main doesn't exist."""
+        main_result = MagicMock()
+        main_result.returncode = 128
+
+        master_result = MagicMock()
+        master_result.returncode = 0
+        master_result.stdout = "5\t0\tfile.py\n"
+
+        def mock_run(cmd, **kwargs):
+            if "main" in cmd:
+                return main_result
+            return master_result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            result = get_diff_numstat("/worktree")
+
+        assert "file.py" in result
+
+    def test_returns_empty_on_error(self):
+        """Returns empty string when both main and master fail."""
+        mock_result = MagicMock()
+        mock_result.returncode = 128
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = get_diff_numstat("/worktree")
+
+        assert result == ""
+
+    def test_returns_empty_when_git_not_found(self):
+        """Returns empty string when git is not installed."""
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = get_diff_numstat("/worktree")
 
         assert result == ""
 
