@@ -1051,6 +1051,28 @@ async def test_scope_input_empty_validation():
 
 
 @pytest.mark.asyncio
+async def test_scope_input_ctrl_enter_submit():
+    """Ctrl+Enter should submit using the primary action."""
+    from textual.widgets import TextArea
+
+    app = ScopeTestApp()
+    async with app.run_test() as pilot:
+        text_area = app.screen.query_one(TextArea)
+        text_area.insert("test scope")
+        await pilot.press("ctrl+enter")
+        assert app.scope_result == ("test scope", "start")
+
+
+@pytest.mark.asyncio
+async def test_ctrl_enter_empty_no_submit():
+    """Ctrl+Enter with empty input should not dismiss."""
+    app = ScopeTestApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+enter")
+        assert app.scope_result == "not_set"
+
+
+@pytest.mark.asyncio
 async def test_scope_input_arrow_keys_navigate_buttons():
     """Left/right arrows should cycle focus between buttons."""
     app = ScopeTestApp()
@@ -1262,6 +1284,19 @@ async def test_backlog_input_arrow_navigation():
         assert app.screen.focused.id == "btn-add"
         await pilot.press("right")  # wraps
         assert app.screen.focused.id == "btn-cancel"
+
+
+@pytest.mark.asyncio
+async def test_backlog_input_ctrl_enter_submit():
+    """Ctrl+Enter should submit using Add."""
+    from textual.widgets import TextArea
+
+    app = BacklogInputTestApp()
+    async with app.run_test() as pilot:
+        text_area = app.screen.query_one(TextArea)
+        text_area.insert("test backlog")
+        await pilot.press("ctrl+enter")
+        assert app.backlog_result == "test backlog"
 
 
 # Tests for BacklogTable
@@ -1694,6 +1729,20 @@ async def test_backlog_edit_arrow_navigation():
 
 
 @pytest.mark.asyncio
+async def test_backlog_edit_ctrl_enter_submit():
+    """Ctrl+Enter should submit using Save."""
+    from textual.widgets import TextArea
+
+    app = BacklogEditTestApp(initial_text="Original")
+    async with app.run_test() as pilot:
+        ta = app.screen.query_one(TextArea)
+        ta.clear()
+        ta.insert("Updated text")
+        await pilot.press("ctrl+enter")
+        assert app.edit_result == ("save", "Updated text")
+
+
+@pytest.mark.asyncio
 async def test_enter_on_backlog_item_opens_edit(temp_config):
     """Enter on a backlog item should open BacklogEditScreen."""
     from hopper.backlog import BacklogItem
@@ -1870,6 +1919,20 @@ async def test_mill_review_arrow_navigation():
         assert app.screen.focused.id == "btn-save"
         await pilot.press("right")  # wraps
         assert app.screen.focused.id == "btn-cancel"
+
+
+@pytest.mark.asyncio
+async def test_mill_review_ctrl_enter_submit():
+    """Ctrl+Enter should submit using Save."""
+    from textual.widgets import TextArea
+
+    app = MillReviewTestApp(initial_text="Original prompt")
+    async with app.run_test() as pilot:
+        ta = app.screen.query_one(TextArea)
+        ta.clear()
+        ta.insert("test review")
+        await pilot.press("ctrl+enter")
+        assert app.review_result == ("save", "test review")
 
 
 @pytest.mark.asyncio

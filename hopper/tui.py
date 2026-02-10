@@ -317,6 +317,14 @@ class TextInputScreen(ModalScreen):
         focused = self.focused
         buttons = list(self.query(".text-input-buttons Button"))
 
+        if event.key == "ctrl+enter":
+            event.prevent_default()
+            event.stop()
+            primary = next((b for b in buttons if b.variant == "primary"), None)
+            if primary:
+                self._try_submit(primary)
+            return
+
         if event.key == "right" and focused in buttons:
             event.prevent_default()
             event.stop()
