@@ -1368,6 +1368,11 @@ class HopperApp(App):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter key on selected row in any table."""
         if isinstance(event.data_table, LodeTable) and self._archive_view:
+            lode_id = self._get_selected_lode_id()
+            if lode_id is None:
+                return
+            lode_dir = get_lode_dir(lode_id)
+            self.push_screen(FileViewerScreen(lode_dir, lode_id))
             return
         key = str(event.row_key.value)
 
@@ -1513,8 +1518,6 @@ class HopperApp(App):
     def action_view_files(self) -> None:
         """Open the file viewer for the selected lode."""
         if not isinstance(self.focused, LodeTable):
-            return
-        if self._archive_view:
             return
         lode_id = self._get_selected_lode_id()
         if lode_id is None:

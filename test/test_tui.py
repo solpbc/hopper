@@ -637,7 +637,7 @@ async def test_archive_view_hint_row():
 
 @pytest.mark.asyncio
 async def test_archive_view_guards_actions(make_lode):
-    """Lode actions should be guarded while archive view is active."""
+    """Create/delete/auto actions should be guarded while archive view is active."""
     server = MockServer(
         [make_lode(id="active01", auto=False)],
         archived_lodes=[make_lode(id="arch0001")],
@@ -654,13 +654,32 @@ async def test_archive_view_guards_actions(make_lode):
             await pilot.press("c")
             await pilot.press("d")
             await pilot.press("a")
-            await pilot.press("v")
-            await pilot.press("enter")
     mock_require_projects.assert_not_called()
     mock_selected_lode_id.assert_not_called()
     mock_get_lode.assert_not_called()
     # No events should have been enqueued
     assert server.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["enter", "v"])
+async def test_archive_view_opens_file_viewer(make_lode, key):
+    """Enter and v should open the file viewer in archive view."""
+    server = MockServer(
+        [make_lode(id="active01")],
+        archived_lodes=[make_lode(id="arch0001")],
+    )
+    app = HopperApp(server=server)
+    with patch.object(app, "push_screen") as mock_push:
+        async with app.run_test() as pilot:
+            await pilot.press("left")
+            assert app._archive_view is True
+            await pilot.press(key)
+
+    mock_push.assert_called_once()
+    screen = mock_push.call_args.args[0]
+    assert isinstance(screen, FileViewerScreen)
+    assert screen.lode_id == "arch0001"
 
 
 @pytest.mark.asyncio
