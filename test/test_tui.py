@@ -11,6 +11,7 @@ from textual.app import App
 from hopper.lodes import format_age
 from hopper.projects import Project
 from hopper.tui import (
+    SHIPPED_24H_MS,
     STATUS_DISCONNECTED,
     STATUS_ERROR,
     STATUS_NEW,
@@ -24,6 +25,7 @@ from hopper.tui import (
     ProjectPickerScreen,
     Row,
     ScopeInputScreen,
+    ShippedTable,
     format_stage_text,
     format_status_label,
     format_status_text,
@@ -687,6 +689,7 @@ async def test_archive_view_backlog_unaffected():
         await pilot.press("left")
         assert app._archive_view is True
         await pilot.press("tab")
+        await pilot.press("tab")
         assert isinstance(app.focused, BacklogTable)
         await pilot.press("d")
         assert server.events == [{"type": "backlog_remove", "item_id": "bl111111"}]
@@ -706,6 +709,7 @@ async def test_left_right_only_on_lode_table():
     app = HopperApp(server=MockServer([], backlog=items))
     async with app.run_test() as pilot:
         assert app._archive_view is False
+        await pilot.press("tab")
         await pilot.press("tab")
         assert isinstance(app.focused, BacklogTable)
         await pilot.press("left")
@@ -1197,6 +1201,7 @@ async def test_enter_on_backlog_hint_triggers_new_backlog():
         app.action_new_backlog = lambda: called.append(True)
         # Switch to backlog, move to hint row
         await pilot.press("tab")
+        await pilot.press("tab")
         await pilot.press("down")
         await pilot.press("enter")
         assert len(called) == 1
@@ -1326,33 +1331,126 @@ async def test_backlog_shown_with_items():
 
 
 @pytest.mark.asyncio
-async def test_tab_switches_focus_to_backlog():
-    """Tab should switch focus from session table to backlog table."""
+async def test_shipped_table_filters_by_stage_and_time(make_lode):
+    """Shipped table only shows archived lodes with stage=shipped within 24h."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    shipped_recent = make_lode(id="ship0001", stage="shipped", updated_at=now - 1000)
+    shipped_old = make_lode(
+        id="ship0002",
+        stage="shipped",
+        updated_at=now - SHIPPED_24H_MS - 1,
+    )
+    refine_recent = make_lode(id="refi0001", stage="refine", updated_at=now - 1000)
+
+    server = MockServer([], archived_lodes=[shipped_recent, shipped_old, refine_recent])
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#shipped-table", ShippedTable)
+        assert table.row_count == 1
+        # Verify it's the recent shipped one
+        cell_key = table.coordinate_to_cell_key((0, 0))
+        assert str(cell_key.row_key.value) == "ship0001"
+
+
+@pytest.mark.asyncio
+async def test_shipped_table_enter_opens_file_viewer(make_lode):
+    """Enter on a shipped row should open FileViewerScreen."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    shipped = make_lode(id="ship0001", stage="shipped", updated_at=now - 1000)
+    server = MockServer([], archived_lodes=[shipped])
+    app = HopperApp(server=server)
+    with patch.object(app, "push_screen") as mock_push:
+        async with app.run_test() as pilot:
+            await pilot.press("tab")  # lode -> shipped
+            await pilot.press("enter")
+
+    mock_push.assert_called_once()
+    screen = mock_push.call_args.args[0]
+    assert isinstance(screen, FileViewerScreen)
+    assert screen.lode_id == "ship0001"
+
+
+@pytest.mark.asyncio
+async def test_shipped_table_columns():
+    """Shipped table should have id, age, title columns."""
+    server = MockServer([])
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#shipped-table", ShippedTable)
+        col_keys = [str(k.value) for k in table.columns]
+        assert col_keys == ["id", "age", "title"]
+
+
+@pytest.mark.asyncio
+async def test_tab_cycles_three_tables(make_lode):
+    """Tab should cycle focus: lode -> shipped -> backlog -> lode."""
     from hopper.backlog import BacklogItem
+    from hopper.lodes import current_time_ms
     from hopper.tui import BacklogTable, LodeTable
 
-    items = [
-        BacklogItem(id="bl111111", project="proj", description="Item", created_at=1000),
-    ]
-    sessions = [
-        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
-    ]
-    server = MockServer(sessions, backlog=items)
+    now = current_time_ms()
+    items = [BacklogItem(id="bl111111", project="proj", description="Item", created_at=1000)]
+    shipped = make_lode(id="ship0001", stage="shipped", updated_at=now - 1000)
+    sessions = [make_lode(id="aaaa1111", stage="mill", created_at=1000)]
+    server = MockServer(sessions, backlog=items, archived_lodes=[shipped])
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
-        # Should start focused on session table
         assert isinstance(app.focused, LodeTable)
-        # Tab to switch
+        await pilot.press("tab")
+        assert isinstance(app.focused, ShippedTable)
         await pilot.press("tab")
         assert isinstance(app.focused, BacklogTable)
-        # Tab back
         await pilot.press("tab")
         assert isinstance(app.focused, LodeTable)
 
 
 @pytest.mark.asyncio
+async def test_shipped_table_empty_when_no_recent():
+    """Shipped table should be empty when no recently shipped lodes."""
+    server = MockServer([])
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#shipped-table", ShippedTable)
+        assert table.row_count == 0
+
+
+@pytest.mark.asyncio
+async def test_tab_switches_focus_to_backlog():
+    """Tab should switch focus from lode table to shipped then backlog."""
+    from hopper.backlog import BacklogItem
+    from hopper.lodes import current_time_ms
+    from hopper.tui import BacklogTable, LodeTable
+
+    now = current_time_ms()
+    items = [
+        BacklogItem(id="bl111111", project="proj", description="Item", created_at=1000),
+    ]
+    shipped = [
+        {"id": "ship0001", "stage": "shipped", "created_at": 1000, "updated_at": now - 1000},
+    ]
+    sessions = [
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
+    ]
+    server = MockServer(sessions, archived_lodes=shipped, backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        # Should start focused on lode table
+        assert isinstance(app.focused, LodeTable)
+        # Tab to shipped, then backlog
+        await pilot.press("tab")
+        assert isinstance(app.focused, ShippedTable)
+        # Tab back
+        await pilot.press("tab")
+        assert isinstance(app.focused, BacklogTable)
+
+
+@pytest.mark.asyncio
 async def test_tab_switches_to_backlog_even_when_empty():
-    """Tab should switch to backlog table even when it has no items (hint row visible)."""
+    """Tab should switch to backlog table even when it has no items."""
     from hopper.tui import BacklogTable, LodeTable
 
     sessions = [
@@ -1363,7 +1461,7 @@ async def test_tab_switches_to_backlog_even_when_empty():
     async with app.run_test() as pilot:
         assert isinstance(app.focused, LodeTable)
         await pilot.press("tab")
-        # Backlog is always visible, so Tab switches to it
+        await pilot.press("tab")
         assert isinstance(app.focused, BacklogTable)
 
 
@@ -1381,6 +1479,7 @@ async def test_arrow_navigation_in_backlog():
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         # Switch to backlog table
+        await pilot.press("tab")
         await pilot.press("tab")
         table = app.query_one("#backlog-table", BacklogTable)
         assert table.cursor_row == 0
@@ -1403,6 +1502,7 @@ async def test_delete_backlog_item(temp_config):
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         # Switch to backlog table
+        await pilot.press("tab")
         await pilot.press("tab")
         # Delete first item
         await pilot.press("d")
@@ -1748,6 +1848,7 @@ async def test_enter_on_backlog_item_opens_edit(temp_config):
     server = MockServer([], backlog=items)
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
+        await pilot.press("tab")
         await pilot.press("tab")  # Focus backlog table
         await pilot.press("enter")  # Enter on first item
         assert isinstance(app.screen, BacklogEditScreen)
@@ -1767,6 +1868,7 @@ async def test_backlog_edit_save_updates_item(temp_config):
     server = MockServer([], backlog=items)
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
+        await pilot.press("tab")
         await pilot.press("tab")
         await pilot.press("enter")
         assert isinstance(app.screen, BacklogEditScreen)
@@ -1799,6 +1901,7 @@ async def test_backlog_promote_creates_session(monkeypatch, temp_config):
     app = HopperApp(server=server)
 
     async with app.run_test() as pilot:
+        await pilot.press("tab")
         await pilot.press("tab")
         await pilot.press("enter")
         assert isinstance(app.screen, BacklogEditScreen)

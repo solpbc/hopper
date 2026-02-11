@@ -34,6 +34,7 @@ from hopper.backlog import BacklogItem
 from hopper.claude import spawn_claude, switch_to_pane
 from hopper.git import get_diff_stat
 from hopper.lodes import (
+    current_time_ms,
     format_age,
     format_uptime,
     get_lode_dir,
@@ -72,6 +73,7 @@ STATUS_DISCONNECTED = "⊘"  # circled division slash — runner not connected
 # Hint row keys (always present at bottom of each table)
 HINT_LODE = "_hint_lode"
 HINT_BACKLOG = "_hint_backlog"
+SHIPPED_24H_MS = 24 * 60 * 60 * 1000
 
 # Status -> color mapping (shared by icon and text formatting)
 STATUS_COLORS = {
@@ -961,6 +963,34 @@ class BacklogTable(DataTable):
         last.auto_width = False
 
 
+class ShippedTable(DataTable):
+    """Table displaying recently shipped lodes."""
+
+    COL_ID = "id"
+    COL_AGE = "age"
+    COL_TITLE = "title"
+
+    def __init__(self, **kwargs):
+        super().__init__(cursor_foreground_priority="renderable", **kwargs)
+        self.cursor_type = "row"
+
+    def on_mount(self) -> None:
+        """Set up columns when mounted with explicit keys."""
+        self.add_column("id", key=self.COL_ID)
+        self.add_column("age", key=self.COL_AGE)
+        self.add_column("title", key=self.COL_TITLE)
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Make the last column fill remaining width."""
+        cols = list(self.columns.values())
+        if not cols:
+            return
+        fixed_width = sum(c.get_render_width(self) for c in cols[:-1])
+        last = cols[-1]
+        last.width = max(1, event.size.width - fixed_width - 2 * self.cell_padding)
+        last.auto_width = False
+
+
 class HopperApp(App):
     """Hopper TUI application."""
 
@@ -1020,6 +1050,17 @@ class HopperApp(App):
         background: $background;
     }
 
+    #shipped-panel {
+        height: auto;
+        max-height: 30%;
+    }
+
+    #shipped-table {
+        height: auto;
+        max-height: 100%;
+        background: $background;
+    }
+
     DataTable > .datatable--cursor {
         background: $panel;
     }
@@ -1069,6 +1110,9 @@ class HopperApp(App):
         with Vertical(id="lode-panel", classes="section"):
             yield Static("lodes", id="lodes_label", classes="section-label")
             yield LodeTable(id="lode-table")
+        with Vertical(id="shipped-panel", classes="section"):
+            yield Static("shipped", classes="section-label")
+            yield ShippedTable(id="shipped-table")
         with Vertical(id="backlog-panel", classes="section"):
             yield Static("backlog", classes="section-label")
             yield BacklogTable(id="backlog-table")
@@ -1082,6 +1126,7 @@ class HopperApp(App):
 
         self.refresh_table()
         self.refresh_backlog()
+        self.refresh_shipped()
         # Start polling for server updates
         self.set_interval(1.0, self.check_server_updates)
         # Focus the lode table
@@ -1092,6 +1137,7 @@ class HopperApp(App):
         self._update_sub_title()
         self.refresh_table()
         self.refresh_backlog()
+        self.refresh_shipped()
         if self.server:
             self._projects = list(self.server.projects)
 
@@ -1237,6 +1283,42 @@ class HopperApp(App):
             hint = Text("b to add to backlog", style="bright_black italic")
             table.add_row("", "", hint, key=HINT_BACKLOG)
 
+    def refresh_shipped(self) -> None:
+        """Refresh the shipped table with recently shipped lodes."""
+        table = self.query_one("#shipped-table", ShippedTable)
+        cutoff = current_time_ms() - SHIPPED_24H_MS
+
+        shipped = sorted(
+            [
+                lode
+                for lode in self._archived_lodes
+                if lode.get("stage") == "shipped"
+                and isinstance(lode.get("updated_at"), int)
+                and lode["updated_at"] >= cutoff
+            ],
+            key=lambda lode: lode["updated_at"],
+            reverse=True,
+        )
+
+        existing_keys: set[str] = set()
+        for row_key in table.rows:
+            existing_keys.add(str(row_key.value))
+
+        desired_keys = {lode["id"] for lode in shipped}
+
+        for key in existing_keys - desired_keys:
+            table.remove_row(key)
+
+        for lode in shipped:
+            lode_id = lode["id"]
+            age = format_age(lode.get("created_at", 0))
+            title = lode.get("title", "")
+            if lode_id in existing_keys:
+                table.update_cell(lode_id, ShippedTable.COL_AGE, age)
+                table.update_cell(lode_id, ShippedTable.COL_TITLE, title)
+            else:
+                table.add_row(lode_id, age, title, key=lode_id)
+
     def _get_selected_row_key(self, table: DataTable) -> str | None:
         """Get the row key of the selected row in a table."""
         if table.cursor_row is not None and table.row_count > 0:
@@ -1353,6 +1435,12 @@ class HopperApp(App):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter key on selected row in any table."""
+        if isinstance(event.data_table, ShippedTable):
+            lode_id = str(event.row_key.value)
+            if lode_id:
+                lode_dir = get_lode_dir(lode_id)
+                self.push_screen(FileViewerScreen(lode_dir, lode_id))
+            return
         if isinstance(event.data_table, LodeTable) and self._archive_view:
             lode_id = self._get_selected_lode_id()
             if lode_id is None:
@@ -1484,6 +1572,12 @@ class HopperApp(App):
 
     def action_view_files(self) -> None:
         """Open the file viewer for the selected lode."""
+        if isinstance(self.focused, ShippedTable):
+            key = self._get_selected_row_key(self.query_one("#shipped-table", ShippedTable))
+            if key:
+                lode_dir = get_lode_dir(key)
+                self.push_screen(FileViewerScreen(lode_dir, key))
+            return
         if not isinstance(self.focused, LodeTable):
             return
         lode_id = self._get_selected_lode_id()
