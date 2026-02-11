@@ -163,6 +163,18 @@ def format_stage_text(stage: str) -> Text:
     return Text(stage)
 
 
+def format_diff_summary(diff: str) -> Text:
+    """Format a diff summary like '+30 -8' with green additions and red deletions."""
+    if not diff:
+        return Text("")
+    parts = diff.split(" ")
+    text = Text()
+    text.append(parts[0], "bright_green")
+    text.append(" ")
+    text.append(parts[1], "bright_red")
+    return text
+
+
 class ProjectPickerScreen(ModalScreen[Project | None]):
     """Modal screen for picking a project."""
 
@@ -1226,7 +1238,7 @@ class HopperApp(App):
                 table.update_cell(row.id, LodeTable.COL_PROJECT, row.project)
                 table.update_cell(row.id, LodeTable.COL_AGE, row.age)
                 table.update_cell(row.id, LodeTable.COL_LAST, row.last)
-                table.update_cell(row.id, LodeTable.COL_DIFF, diff)
+                table.update_cell(row.id, LodeTable.COL_DIFF, format_diff_summary(diff))
                 table.update_cell(row.id, LodeTable.COL_TITLE, row.title)
                 table.update_cell(
                     row.id,
@@ -1245,7 +1257,7 @@ class HopperApp(App):
                     row.project,
                     row.age,
                     row.last,
-                    diff,
+                    format_diff_summary(diff),
                     row.title,
                     format_status_label(row.status_text, row.status),
                     key=row.id,
@@ -1321,7 +1333,7 @@ class HopperApp(App):
             age = format_age(lode.get("created_at", 0))
             diff = read_diff_summary(lode_id)
             title = lode.get("title", "")
-            table.add_row(project, age, lode_id, diff, title, key=lode_id)
+            table.add_row(project, age, lode_id, format_diff_summary(diff), title, key=lode_id)
 
     def _get_selected_row_key(self, table: DataTable) -> str | None:
         """Get the row key of the selected row in a table."""

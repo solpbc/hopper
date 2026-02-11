@@ -26,6 +26,7 @@ from hopper.tui import (
     Row,
     ScopeInputScreen,
     ShippedTable,
+    format_diff_summary,
     format_stage_text,
     format_status_label,
     format_status_text,
@@ -358,6 +359,18 @@ def test_format_stage_text_shipped():
     text = format_stage_text("shipped")
     assert str(text) == "shipped"
     assert text.style == "bright_green"
+
+
+def test_format_diff_summary():
+    """format_diff_summary colorizes summary counts and handles empty input."""
+    from rich.text import Span, Text
+
+    text = format_diff_summary("+30 -8")
+    assert text.plain == "+30 -8"
+    assert text.spans == [Span(0, 3, "bright_green"), Span(4, 6, "bright_red")]
+
+    assert format_diff_summary("") == Text("")
+    assert format_diff_summary(None) == Text("")  # type: ignore[arg-type]
 
 
 # Tests for format_status_label
