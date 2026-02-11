@@ -1061,6 +1061,10 @@ class HopperApp(App):
         background: $background;
     }
 
+    DataTable {
+        overflow-x: hidden;
+    }
+
     DataTable > .datatable--cursor {
         background: $panel;
     }
