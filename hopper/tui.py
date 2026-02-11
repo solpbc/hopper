@@ -884,6 +884,8 @@ class LodeTable(DataTable):
     COL_LAST = "last"
     COL_TITLE = "title"
     COL_STATUS_TEXT = "status_text"
+    MAX_TITLE_WIDTH = 26
+    MIN_TITLE_WIDTH = 5
 
     def __init__(self, **kwargs):
         super().__init__(cursor_foreground_priority="renderable", **kwargs)
@@ -897,7 +899,7 @@ class LodeTable(DataTable):
         self.add_column("project", key=self.COL_PROJECT)
         self.add_column("age", key=self.COL_AGE)
         self.add_column("last", key=self.COL_LAST)
-        self.add_column("title", key=self.COL_TITLE, width=26)
+        self.add_column("title", key=self.COL_TITLE, width=self.MAX_TITLE_WIDTH)
         self.add_column("status", key=self.COL_STATUS_TEXT)
 
     def on_resize(self, event: events.Resize) -> None:
@@ -909,6 +911,16 @@ class LodeTable(DataTable):
         last = cols[-1]
         last.width = max(1, event.size.width - fixed_width - 2 * self.cell_padding)
         last.auto_width = False
+
+    def update_title_width(self, rows: list) -> None:
+        """Resize the title column to fit the longest visible title."""
+        max_len = max((len(row.title) for row in rows), default=0)
+        clamped = max(self.MIN_TITLE_WIDTH, min(max_len, self.MAX_TITLE_WIDTH))
+        col = self.columns[self.COL_TITLE]
+        if col.width != clamped:
+            col.width = clamped
+            col.auto_width = False
+            self.on_resize(events.Resize(self.size, self.virtual_size, self.container_size))
 
     def on_key(self, event: Key) -> None:
         if event.key == "left":
@@ -1128,6 +1140,7 @@ class HopperApp(App):
         rows = [
             lode_to_row(s) for s in lodes if self._archive_view or s.get("stage") in STAGE_ORDER
         ]
+        table.update_title_width(rows)
 
         # Get current row keys in table (excluding hint row)
         existing_keys: set[str] = set()

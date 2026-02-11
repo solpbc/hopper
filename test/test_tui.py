@@ -220,6 +220,40 @@ def test_lode_to_row_title():
     assert row_without_title.title == ""
 
 
+@pytest.mark.asyncio
+async def test_title_column_width_adjusts_to_content(make_lode):
+    """Title column width should shrink to fit short titles and cap at MAX_TITLE_WIDTH."""
+    from hopper.tui import LodeTable, Row
+
+    short = [make_lode(id="aaa11111", title="Fix")]
+    server = MockServer(short)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#lode-table", LodeTable)
+        col = table.columns[LodeTable.COL_TITLE]
+        # "Fix" is 3 chars, clamped to MIN_TITLE_WIDTH=5
+        assert col.width == LodeTable.MIN_TITLE_WIDTH
+
+        # Now add a lode with a longer title
+        server.lodes.append(make_lode(id="bbb22222", title="A" * 20))
+        app.refresh_table()
+        assert col.width == 20
+
+        # Direct Row input should also clamp to MAX_TITLE_WIDTH.
+        rows = [
+            Row(
+                id="ccc33333",
+                stage="mill",
+                age="",
+                last="",
+                status=STATUS_NEW,
+                title="B" * 40,
+            )
+        ]
+        table.update_title_width(rows)
+        assert col.width == LodeTable.MAX_TITLE_WIDTH
+
+
 # Tests for format_status_text
 
 
