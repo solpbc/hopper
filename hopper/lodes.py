@@ -159,12 +159,10 @@ def get_lode_dir(lode_id: str) -> Path:
     return config.hopper_dir() / "lodes" / lode_id
 
 
-def parse_diff_numstat(text: str) -> str:
-    """Parse git numstat output and return a compact summary."""
+def parse_diff_numstat_totals(text: str) -> tuple[int, int]:
+    """Parse git numstat output and return (total_additions, total_deletions)."""
     total_additions = 0
     total_deletions = 0
-    has_valid_lines = False
-
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -177,20 +175,24 @@ def parse_diff_numstat(text: str) -> str:
             continue
         total_additions += int(additions)
         total_deletions += int(deletions)
-        has_valid_lines = True
+    return (total_additions, total_deletions)
 
-    if not has_valid_lines:
+
+def parse_diff_numstat(text: str) -> str:
+    """Parse git numstat output and return a compact summary."""
+    additions, deletions = parse_diff_numstat_totals(text)
+    if additions == 0 and deletions == 0:
         return ""
-    return f"+{total_additions} -{total_deletions}"
+    return f"+{additions} -{deletions}"
 
 
-def read_diff_summary(lode_id: str) -> str:
-    """Read a lode's diff.txt and return parsed +X -Y summary."""
+def read_diff_totals(lode_id: str) -> tuple[int, int]:
+    """Read a lode's diff.txt and return (additions, deletions) totals."""
     diff_path = get_lode_dir(lode_id) / "diff.txt"
     try:
-        return parse_diff_numstat(diff_path.read_text())
+        return parse_diff_numstat_totals(diff_path.read_text())
     except Exception:
-        return ""
+        return (0, 0)
 
 
 def load_lodes() -> list[dict]:

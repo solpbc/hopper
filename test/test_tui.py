@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 from textual.app import App
 
-from hopper.lodes import format_age, parse_diff_numstat
+from hopper.lodes import (
+    format_age,
+    parse_diff_numstat,
+    parse_diff_numstat_totals,
+    read_diff_totals,
+)
 from hopper.projects import Project
 from hopper.tui import (
     SHIPPED_24H_MS,
@@ -607,6 +612,42 @@ async def test_archive_view_label_updates():
         assert label.content == "lodes · archived"
         await pilot.press("right")
         assert label.content == "lodes"
+
+
+@pytest.mark.asyncio
+async def test_archive_view_label_shows_total_loc(make_lode):
+    """Archive view label should include total LOC when available."""
+    archived = [
+        make_lode(id="arch0001", updated_at=1000),
+        make_lode(id="arch0002", updated_at=2000),
+    ]
+    server = MockServer([], archived_lodes=archived)
+    app = HopperApp(server=server)
+    diff_totals = {"arch0001": (10, 2), "arch0002": (3, 5)}
+
+    with patch("hopper.tui.read_diff_totals", side_effect=lambda lode_id: diff_totals[lode_id]):
+        async with app.run_test() as pilot:
+            label = app.query_one("#lodes_label")
+            await pilot.press("left")
+            assert label.content == "lodes · archived · 20 lines"
+
+
+@pytest.mark.asyncio
+async def test_archive_view_label_hides_zero_loc_suffix(make_lode):
+    """Archive view label should omit LOC suffix when totals are all zero."""
+    archived = [
+        make_lode(id="arch0001", updated_at=1000),
+        make_lode(id="arch0002", updated_at=2000),
+    ]
+    server = MockServer([], archived_lodes=archived)
+    app = HopperApp(server=server)
+    diff_totals = {"arch0001": (0, 0), "arch0002": (0, 0)}
+
+    with patch("hopper.tui.read_diff_totals", side_effect=lambda lode_id: diff_totals[lode_id]):
+        async with app.run_test() as pilot:
+            label = app.query_one("#lodes_label")
+            await pilot.press("left")
+            assert label.content == "lodes · archived"
 
 
 @pytest.mark.asyncio
@@ -1419,6 +1460,44 @@ async def test_shipped_table_populates_diff_column(temp_config, make_lode):
 
 
 @pytest.mark.asyncio
+async def test_shipped_label_shows_total_loc(make_lode):
+    """Shipped label should include total LOC for shipped-today rows."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    shipped = [
+        make_lode(id="ship0001", stage="shipped", updated_at=now - 2000),
+        make_lode(id="ship0002", stage="shipped", updated_at=now - 1000),
+    ]
+    app = HopperApp(server=MockServer([], archived_lodes=shipped))
+    diff_totals = {"ship0001": (10, 5), "ship0002": (2, 3)}
+
+    with patch("hopper.tui.read_diff_totals", side_effect=lambda lode_id: diff_totals[lode_id]):
+        async with app.run_test():
+            label = app.query_one("#shipped_label")
+            assert label.content == "shipped today · 20 lines"
+
+
+@pytest.mark.asyncio
+async def test_shipped_label_hides_zero_loc_suffix(make_lode):
+    """Shipped label should omit LOC suffix when totals are all zero."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    shipped = [
+        make_lode(id="ship0001", stage="shipped", updated_at=now - 2000),
+        make_lode(id="ship0002", stage="shipped", updated_at=now - 1000),
+    ]
+    app = HopperApp(server=MockServer([], archived_lodes=shipped))
+    diff_totals = {"ship0001": (0, 0), "ship0002": (0, 0)}
+
+    with patch("hopper.tui.read_diff_totals", side_effect=lambda lode_id: diff_totals[lode_id]):
+        async with app.run_test():
+            label = app.query_one("#shipped_label")
+            assert label.content == "shipped today"
+
+
+@pytest.mark.asyncio
 async def test_tab_cycles_three_tables(make_lode):
     """Tab should cycle focus: lode -> shipped -> backlog -> lode."""
     from hopper.backlog import BacklogItem
@@ -1486,6 +1565,24 @@ def test_parse_diff_numstat_normal_input():
     assert parse_diff_numstat(text) == "+30 -8"
 
 
+def test_parse_diff_numstat_totals_normal_input():
+    """parse_diff_numstat_totals sums additions and deletions across valid lines."""
+    text = "10\t5\tfile.py\n20\t3\tother.py"
+    assert parse_diff_numstat_totals(text) == (30, 8)
+
+
+def test_parse_diff_numstat_totals_empty_or_invalid_input():
+    """Empty and invalid numstat input should return zero totals."""
+    assert parse_diff_numstat_totals("") == (0, 0)
+    assert parse_diff_numstat_totals("not\ta\tvalid") == (0, 0)
+
+
+def test_parse_diff_numstat_totals_skips_binary_entries():
+    """Binary numstat rows are ignored by totals parser."""
+    text = "-\t-\tbinary.bin\n10\t5\tfile.py"
+    assert parse_diff_numstat_totals(text) == (10, 5)
+
+
 def test_parse_diff_numstat_skips_binary_entries():
     """Binary numstat rows are skipped."""
     text = "-\t-\tbinary.bin\n10\t5\tfile.py"
@@ -1510,6 +1607,21 @@ def test_parse_diff_numstat_only_binary():
 def test_parse_diff_numstat_whitespace_only():
     """Whitespace-only input should return empty summary."""
     assert parse_diff_numstat("  \n  ") == ""
+
+
+def test_read_diff_totals_reads_existing_file(temp_config):
+    """read_diff_totals should parse totals from diff.txt."""
+    lode_id = "ship0001"
+    lode_dir = temp_config / "lodes" / lode_id
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    (lode_dir / "diff.txt").write_text("10\t5\tfile.py\n20\t3\tother.py")
+
+    assert read_diff_totals(lode_id) == (30, 8)
+
+
+def test_read_diff_totals_missing_file_returns_zeros(temp_config):
+    """read_diff_totals should return zeros when diff.txt is missing."""
+    assert read_diff_totals("missing01") == (0, 0)
 
 
 @pytest.mark.asyncio

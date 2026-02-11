@@ -38,7 +38,7 @@ from hopper.lodes import (
     format_age,
     format_uptime,
     get_lode_dir,
-    read_diff_summary,
+    read_diff_totals,
 )
 from hopper.projects import Project, find_project, touch_project
 
@@ -1134,7 +1134,7 @@ class HopperApp(App):
             yield Static("lodes", id="lodes_label", classes="section-label")
             yield LodeTable(id="lode-table")
         with Vertical(id="shipped-panel", classes="section"):
-            yield Static("shipped", classes="section-label")
+            yield Static("shipped today", id="shipped_label", classes="section-label")
             yield ShippedTable(id="shipped-table")
         with Vertical(id="backlog-panel", classes="section"):
             yield Static("backlog", classes="section-label")
@@ -1211,6 +1211,18 @@ class HopperApp(App):
         ]
         table.update_title_width(rows)
 
+        # Pre-compute diff data for archive view.
+        diff_data: dict[str, tuple[int, int]] = {}
+        if self._archive_view:
+            for row in rows:
+                diff_data[row.id] = read_diff_totals(row.id)
+            total_loc = sum(additions + deletions for additions, deletions in diff_data.values())
+            lodes_label = self.query_one("#lodes_label", Static)
+            if total_loc > 0:
+                lodes_label.update(f"lodes · archived · {total_loc} lines")
+            else:
+                lodes_label.update("lodes · archived")
+
         # Get current row keys in table (excluding hint row)
         existing_keys: set[str] = set()
         for row_key in table.rows:
@@ -1229,7 +1241,11 @@ class HopperApp(App):
 
         # Add or update rows (insert before hint row if it exists)
         for row in rows:
-            diff = read_diff_summary(row.id) if self._archive_view else ""
+            if self._archive_view:
+                additions, deletions = diff_data[row.id]
+                diff = f"+{additions} -{deletions}" if additions or deletions else ""
+            else:
+                diff = ""
             if row.id in existing_keys:
                 # Update existing row cells
                 table.update_cell(row.id, LodeTable.COL_STATUS, format_status_text(row.status))
@@ -1326,12 +1342,24 @@ class HopperApp(App):
             reverse=True,
         )
 
+        diff_data: dict[str, tuple[int, int]] = {}
+        for lode in shipped:
+            diff_data[lode["id"]] = read_diff_totals(lode["id"])
+        total_loc = sum(additions + deletions for additions, deletions in diff_data.values())
+
+        shipped_label = self.query_one("#shipped_label", Static)
+        if total_loc > 0:
+            shipped_label.update(f"shipped today · {total_loc} lines")
+        else:
+            shipped_label.update("shipped today")
+
         table.clear()
         for lode in shipped:
             lode_id = lode["id"]
             project = lode.get("project", "")
             age = format_age(lode.get("created_at", 0))
-            diff = read_diff_summary(lode_id)
+            additions, deletions = diff_data[lode_id]
+            diff = f"+{additions} -{deletions}" if additions or deletions else ""
             title = lode.get("title", "")
             table.add_row(project, age, lode_id, format_diff_summary(diff), title, key=lode_id)
 
