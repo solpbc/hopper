@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 from textual.app import App
 
-from hopper.lodes import format_age
+from hopper.lodes import format_age, parse_diff_numstat
 from hopper.projects import Project
 from hopper.tui import (
     SHIPPED_24H_MS,
@@ -1376,13 +1376,33 @@ async def test_shipped_table_enter_opens_file_viewer(make_lode):
 
 @pytest.mark.asyncio
 async def test_shipped_table_columns():
-    """Shipped table should have project, age, id, title columns."""
+    """Shipped table should have project, age, id, diff, title columns."""
     server = MockServer([])
     app = HopperApp(server=server)
     async with app.run_test():
         table = app.query_one("#shipped-table", ShippedTable)
         col_keys = [str(k.value) for k in table.columns]
-        assert col_keys == ["project", "age", "id", "title"]
+        assert col_keys == ["project", "age", "id", "diff", "title"]
+
+
+@pytest.mark.asyncio
+async def test_shipped_table_populates_diff_column(temp_config, make_lode):
+    """Shipped table should display parsed diff summaries from diff.txt."""
+    from hopper.lodes import current_time_ms
+
+    lode_id = "ship0001"
+    lode_dir = temp_config / "lodes" / lode_id
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    (lode_dir / "diff.txt").write_text("10\t5\tfile.py\n20\t3\tother.py")
+
+    now = current_time_ms()
+    shipped = make_lode(id=lode_id, stage="shipped", updated_at=now - 1000)
+    server = MockServer([], archived_lodes=[shipped])
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#shipped-table", ShippedTable)
+        row = table.get_row(lode_id)
+        assert str(row[3]) == "+30 -8"
 
 
 @pytest.mark.asyncio
@@ -1416,6 +1436,38 @@ async def test_shipped_table_empty_when_no_recent():
     async with app.run_test():
         table = app.query_one("#shipped-table", ShippedTable)
         assert table.row_count == 0
+
+
+def test_parse_diff_numstat_normal_input():
+    """parse_diff_numstat sums additions and deletions across valid lines."""
+    text = "10\t5\tfile.py\n20\t3\tother.py"
+    assert parse_diff_numstat(text) == "+30 -8"
+
+
+def test_parse_diff_numstat_skips_binary_entries():
+    """Binary numstat rows are skipped."""
+    text = "-\t-\tbinary.bin\n10\t5\tfile.py"
+    assert parse_diff_numstat(text) == "+10 -5"
+
+
+def test_parse_diff_numstat_empty_input():
+    """Empty input should return empty summary."""
+    assert parse_diff_numstat("") == ""
+
+
+def test_parse_diff_numstat_skips_malformed_lines():
+    """Non-numeric malformed entries are skipped."""
+    assert parse_diff_numstat("not\ta\tvalid") == ""
+
+
+def test_parse_diff_numstat_only_binary():
+    """Only binary entries should return empty summary."""
+    assert parse_diff_numstat("-\t-\tbinary.bin") == ""
+
+
+def test_parse_diff_numstat_whitespace_only():
+    """Whitespace-only input should return empty summary."""
+    assert parse_diff_numstat("  \n  ") == ""
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ from hopper.lodes import (
     format_age,
     format_uptime,
     get_lode_dir,
+    read_diff_summary,
 )
 from hopper.projects import Project, find_project, touch_project
 
@@ -884,6 +885,7 @@ class LodeTable(DataTable):
     COL_PROJECT = "project"
     COL_AGE = "age"
     COL_LAST = "last"
+    COL_DIFF = "diff"
     COL_TITLE = "title"
     COL_STATUS_TEXT = "status_text"
     MAX_TITLE_WIDTH = 26
@@ -901,6 +903,7 @@ class LodeTable(DataTable):
         self.add_column("project", key=self.COL_PROJECT)
         self.add_column("age", key=self.COL_AGE)
         self.add_column("last", key=self.COL_LAST)
+        self.add_column("diff", key=self.COL_DIFF)
         self.add_column("title", key=self.COL_TITLE, width=self.MAX_TITLE_WIDTH)
         self.add_column("status", key=self.COL_STATUS_TEXT)
 
@@ -968,6 +971,7 @@ class ShippedTable(DataTable):
 
     COL_PROJECT = "project"
     COL_ID = "id"
+    COL_DIFF = "diff"
     COL_AGE = "age"
     COL_TITLE = "title"
 
@@ -980,6 +984,7 @@ class ShippedTable(DataTable):
         self.add_column("project", key=self.COL_PROJECT)
         self.add_column("age", key=self.COL_AGE)
         self.add_column("id", key=self.COL_ID)
+        self.add_column("diff", key=self.COL_DIFF)
         self.add_column("title", key=self.COL_TITLE)
 
     def on_resize(self, event: events.Resize) -> None:
@@ -1212,6 +1217,7 @@ class HopperApp(App):
 
         # Add or update rows (insert before hint row if it exists)
         for row in rows:
+            diff = read_diff_summary(row.id) if self._archive_view else ""
             if row.id in existing_keys:
                 # Update existing row cells
                 table.update_cell(row.id, LodeTable.COL_STATUS, format_status_text(row.status))
@@ -1220,6 +1226,7 @@ class HopperApp(App):
                 table.update_cell(row.id, LodeTable.COL_PROJECT, row.project)
                 table.update_cell(row.id, LodeTable.COL_AGE, row.age)
                 table.update_cell(row.id, LodeTable.COL_LAST, row.last)
+                table.update_cell(row.id, LodeTable.COL_DIFF, diff)
                 table.update_cell(row.id, LodeTable.COL_TITLE, row.title)
                 table.update_cell(
                     row.id,
@@ -1238,6 +1245,7 @@ class HopperApp(App):
                     row.project,
                     row.age,
                     row.last,
+                    diff,
                     row.title,
                     format_status_label(row.status_text, row.status),
                     key=row.id,
@@ -1250,7 +1258,7 @@ class HopperApp(App):
         if has_hint:
             table.update_cell(HINT_LODE, LodeTable.COL_STATUS_TEXT, hint)
         else:
-            table.add_row("", "", "", "", "", "", "", hint, key=HINT_LODE)
+            table.add_row("", "", "", "", "", "", "", "", hint, key=HINT_LODE)
 
     def refresh_backlog(self) -> None:
         """Refresh the backlog table using incremental updates."""
@@ -1319,14 +1327,16 @@ class HopperApp(App):
             lode_id = lode["id"]
             project = lode.get("project", "")
             age = format_age(lode.get("created_at", 0))
+            diff = read_diff_summary(lode_id)
             title = lode.get("title", "")
             if lode_id in existing_keys:
                 table.update_cell(lode_id, ShippedTable.COL_PROJECT, project)
                 table.update_cell(lode_id, ShippedTable.COL_AGE, age)
                 table.update_cell(lode_id, ShippedTable.COL_ID, lode_id)
+                table.update_cell(lode_id, ShippedTable.COL_DIFF, diff)
                 table.update_cell(lode_id, ShippedTable.COL_TITLE, title)
             else:
-                table.add_row(project, age, lode_id, title, key=lode_id)
+                table.add_row(project, age, lode_id, diff, title, key=lode_id)
 
     def _get_selected_row_key(self, table: DataTable) -> str | None:
         """Get the row key of the selected row in a table."""

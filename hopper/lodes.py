@@ -159,6 +159,40 @@ def get_lode_dir(lode_id: str) -> Path:
     return config.hopper_dir() / "lodes" / lode_id
 
 
+def parse_diff_numstat(text: str) -> str:
+    """Parse git numstat output and return a compact summary."""
+    total_additions = 0
+    total_deletions = 0
+    has_valid_lines = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        additions, deletions, _filename = parts
+        if not additions.isdigit() or not deletions.isdigit():
+            continue
+        total_additions += int(additions)
+        total_deletions += int(deletions)
+        has_valid_lines = True
+
+    if not has_valid_lines:
+        return ""
+    return f"+{total_additions} -{total_deletions}"
+
+
+def read_diff_summary(lode_id: str) -> str:
+    """Read a lode's diff.txt and return parsed +X -Y summary."""
+    diff_path = get_lode_dir(lode_id) / "diff.txt"
+    try:
+        return parse_diff_numstat(diff_path.read_text())
+    except Exception:
+        return ""
+
+
 def load_lodes() -> list[dict]:
     """Load active lodes from JSONL file."""
     lodes_file = config.hopper_dir() / "active.jsonl"
