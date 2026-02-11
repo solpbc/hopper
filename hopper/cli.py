@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -701,7 +702,7 @@ def cmd_backlog(args: list[str]) -> int:
 
 @command("lode", "Manage lodes")
 def cmd_lode(args: list[str]) -> int:
-    """Manage lodes — list, create, restart."""
+    """Manage lodes — list, create, restart, watch."""
     import hopper.client as client
     from hopper.projects import find_project
 
@@ -741,20 +742,29 @@ def cmd_lode(args: list[str]) -> int:
         status_text = lode.get("status", "")
         return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
 
+    def format_watch_line(lode: dict) -> str:
+        icon = lode_icon(lode)
+        lode_id = lode.get("id", "")
+        stage = lode.get("stage", "")
+        status = lode.get("status", "")
+        return f"{icon} {lode_id} {stage}  {status}"
+
     parser = make_parser("lode", "Manage lodes")
-    parser.add_argument(
-        "action",
-        nargs="?",
-        default="active",
-        choices=["active", "archived", "create", "restart"],
-        help="Action to perform (default: active)",
-    )
-    parser.add_argument("args", nargs="*", help="Action arguments")
-    parser.add_argument(
-        "--no-spawn",
-        action="store_true",
-        help="Don't spawn Claude after creating (create only)",
-    )
+    subs = parser.add_subparsers(dest="subcommand")
+
+    list_p = subs.add_parser("list", help="List lodes (default)", exit_on_error=False)
+    list_p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
+
+    create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
+    create_p.add_argument("project", help="Project name")
+    create_p.add_argument("scope", nargs="+", help="Task scope description")
+
+    restart_p = subs.add_parser("restart", help="Restart an inactive lode", exit_on_error=False)
+    restart_p.add_argument("lode_id", help="Lode ID to restart")
+
+    watch_p = subs.add_parser("watch", help="Watch lode status events", exit_on_error=False)
+    watch_p.add_argument("lode_id", help="Lode ID to watch")
+
     try:
         parsed = parse_args(parser, args)
     except ArgumentError as e:
@@ -763,46 +773,34 @@ def cmd_lode(args: list[str]) -> int:
     except SystemExit:
         return 0
 
-    action = parsed.action
-    extra = parsed.args or []
+    subcommand = parsed.subcommand or "list"
     socket_path = _socket()
 
-    if action == "active":
+    if subcommand == "list":
         err = require_server()
         if err:
             return err
-        lodes = client.list_lodes(socket_path)
-        lodes = [lode for lode in lodes if lode.get("stage") in STAGE_ORDER]
-        lodes.sort(key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 99))
-        if not lodes:
-            print("No active lodes")
-            return 0
+        archived = getattr(parsed, "archived", False)
+        if archived:
+            lodes = client.list_archived_lodes(socket_path)
+            lodes.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
+            if not lodes:
+                print("No archived lodes")
+                return 0
+        else:
+            lodes = client.list_lodes(socket_path)
+            lodes = [lode for lode in lodes if lode.get("stage") in STAGE_ORDER]
+            lodes.sort(key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 99))
+            if not lodes:
+                print("No active lodes")
+                return 0
         for lode in lodes:
             print(format_lode_line(lode))
         return 0
 
-    if action == "archived":
-        err = require_server()
-        if err:
-            return err
-        lodes = client.list_archived_lodes(socket_path)
-        lodes.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
-        if not lodes:
-            print("No archived lodes")
-            return 0
-        for lode in lodes:
-            print(format_lode_line(lode))
-        return 0
-
-    if action == "create":
-        if len(extra) < 1:
-            print("Usage: hop lode create <project> <scope>")
-            return 1
-        project_name = extra[0]
-        scope = " ".join(extra[1:])
-        if not scope:
-            print("Usage: hop lode create <project> <scope>")
-            return 1
+    if subcommand == "create":
+        project_name = parsed.project
+        scope = " ".join(parsed.scope)
         project = find_project(project_name)
         if not project:
             print(f"Project not found: {project_name}")
@@ -810,19 +808,15 @@ def cmd_lode(args: list[str]) -> int:
         err = require_server()
         if err:
             return err
-        spawn = not parsed.no_spawn
-        lode = client.create_lode(socket_path, project_name, scope, spawn=spawn)
+        lode = client.create_lode(socket_path, project_name, scope, spawn=True)
         if lode:
             print(f"Created lode {lode['id']} ({project_name})")
         else:
             print(f"Created lode for {project_name}")
         return 0
 
-    if action == "restart":
-        if len(extra) < 1:
-            print("Usage: hop lode restart <lode-id>")
-            return 1
-        lode_id = extra[0]
+    if subcommand == "restart":
+        lode_id = parsed.lode_id
         err = require_server()
         if err:
             return err
@@ -840,6 +834,50 @@ def cmd_lode(args: list[str]) -> int:
         client.restart_lode(socket_path, lode_id, stage)
         print(f"Restarting {stage} for {lode_id}")
         return 0
+
+    if subcommand == "watch":
+        lode_id = parsed.lode_id
+        if require_server():
+            return 1
+        lode = client.get_lode(socket_path, lode_id)
+        if not lode:
+            print(f"Lode '{lode_id}' not found")
+            return 1
+        if not lode.get("active"):
+            print(f"Lode '{lode_id}' is not active")
+            return 1
+
+        # Print initial state
+        print(format_watch_line(lode))
+
+        done = threading.Event()
+        result = [0]
+
+        def on_message(message: dict) -> None:
+            msg_type = message.get("type")
+            if msg_type not in ("lode_updated", "lode_archived"):
+                return
+            msg_lode = message.get("lode", {})
+            if msg_lode.get("id") != lode_id:
+                return
+            print(format_watch_line(msg_lode))
+            if msg_type == "lode_archived":
+                done.set()
+            elif msg_lode.get("state") == "error":
+                result[0] = 1
+                done.set()
+            elif msg_lode.get("stage") == "shipped":
+                done.set()
+
+        conn = client.HopperConnection(socket_path)
+        try:
+            conn.start(callback=on_message)
+            done.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            conn.stop()
+        return result[0]
 
     return 0
 

@@ -5,7 +5,7 @@
 
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hopper import __version__
 from hopper.cli import (
@@ -551,7 +551,8 @@ def test_lode_help(capsys):
     """--help prints usage and exits."""
     assert cmd_lode(["--help"]) == 0
     out = capsys.readouterr().out
-    assert "lode" in out.lower()
+    assert "list" in out
+    assert "create" in out
 
 
 def test_lode_no_server(capsys):
@@ -560,8 +561,8 @@ def test_lode_no_server(capsys):
         assert cmd_lode([]) == 1
 
 
-def test_lode_active_empty(capsys):
-    """Active list with no lodes prints empty message."""
+def test_lode_list_empty(capsys):
+    """List with no active lodes prints empty message."""
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.list_lodes", return_value=[]):
             assert cmd_lode([]) == 0
@@ -569,8 +570,8 @@ def test_lode_active_empty(capsys):
     assert "No active lodes" in out
 
 
-def test_lode_active_with_lodes(capsys):
-    """Active list shows lodes sorted by stage order with correct icons."""
+def test_lode_list_with_lodes(capsys):
+    """List shows lodes sorted by stage order with correct icons."""
     lodes = [
         {
             "id": "refine01",
@@ -593,7 +594,7 @@ def test_lode_active_with_lodes(capsys):
     ]
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.list_lodes", return_value=lodes):
-            assert cmd_lode(["active"]) == 0
+            assert cmd_lode([]) == 0
     out = capsys.readouterr().out
     lines = [line for line in out.strip().split("\n") if line.strip()]
     assert "mill0001" in lines[0]
@@ -604,8 +605,8 @@ def test_lode_active_with_lodes(capsys):
     assert "●" in lines[1]
 
 
-def test_lode_active_disconnected_icon(capsys):
-    """Inactive non-shipped lode gets disconnected icon."""
+def test_lode_list_disconnected_icon(capsys):
+    """List shows disconnected icon for inactive non-shipped lode."""
     lodes = [
         {
             "id": "test0001",
@@ -619,22 +620,22 @@ def test_lode_active_disconnected_icon(capsys):
     ]
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.list_lodes", return_value=lodes):
-            assert cmd_lode(["active"]) == 0
+            assert cmd_lode([]) == 0
     out = capsys.readouterr().out
     assert "⊘" in out
 
 
-def test_lode_archived_empty(capsys):
-    """Archived list with no lodes prints empty message."""
+def test_lode_list_archived_empty(capsys):
+    """List --archived with no lodes prints empty message."""
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.list_archived_lodes", return_value=[]):
-            assert cmd_lode(["archived"]) == 0
+            assert cmd_lode(["list", "-a"]) == 0
     out = capsys.readouterr().out
     assert "No archived lodes" in out
 
 
-def test_lode_archived_sorted(capsys):
-    """Archived lodes are sorted by updated_at descending."""
+def test_lode_list_archived_sorted(capsys):
+    """List --archived sorts lodes by updated_at descending."""
     lodes = [
         {
             "id": "old00001",
@@ -661,7 +662,7 @@ def test_lode_archived_sorted(capsys):
     ]
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.list_archived_lodes", return_value=lodes):
-            assert cmd_lode(["archived"]) == 0
+            assert cmd_lode(["list", "--archived"]) == 0
     out = capsys.readouterr().out
     lines = [line for line in out.strip().split("\n") if line.strip()]
     # new00001 (updated_at=2000) should appear first
@@ -683,30 +684,18 @@ def test_lode_create_happy(capsys):
     assert "myproj" in out
 
 
-def test_lode_create_no_spawn(capsys):
-    """Create with --no-spawn passes spawn=False."""
-    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                assert cmd_lode(["create", "myproj", "do stuff", "--no-spawn"]) == 0
-                assert mock_create.call_args.kwargs["spawn"] is False
-    out = capsys.readouterr().out
-    assert "abc12345" in out
-
-
 def test_lode_create_missing_project(capsys):
-    """Create with no project arg prints usage."""
+    """Create with no project arg reports missing required argument."""
     assert cmd_lode(["create"]) == 1
     out = capsys.readouterr().out
-    assert "Usage" in out
+    assert "required" in out
 
 
 def test_lode_create_missing_scope(capsys):
-    """Create with project but no scope prints usage."""
+    """Create with project but no scope reports missing required argument."""
     assert cmd_lode(["create", "myproj"]) == 1
     out = capsys.readouterr().out
-    assert "Usage" in out
+    assert "required" in out
 
 
 def test_lode_create_invalid_project(capsys):
@@ -760,10 +749,130 @@ def test_lode_restart_shipped(capsys):
 
 
 def test_lode_restart_missing_id(capsys):
-    """Restart with no lode ID prints usage."""
+    """Restart with no lode ID reports missing required argument."""
     assert cmd_lode(["restart"]) == 1
     out = capsys.readouterr().out
-    assert "Usage" in out
+    assert "required" in out
+
+
+def test_lode_watch_happy_shipped(capsys):
+    """watch exits 0 when lode reaches shipped stage."""
+    lode = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working...",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "stage": "shipped", "status": "Done"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["watch", "abc123"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+    assert "shipped" in out
+
+
+def test_lode_watch_error_exit(capsys):
+    """watch exits 1 when lode enters error state."""
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "state": "error", "status": "Failed"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["watch", "abc123"])
+    assert result == 1
+
+
+def test_lode_watch_archived_exit(capsys):
+    """watch exits 0 when lode is archived."""
+    lode = {
+        "id": "abc123",
+        "stage": "shipped",
+        "state": "ready",
+        "status": "Shipped",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback({"type": "lode_archived", "lode": {**lode, "active": False}})
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["watch", "abc123"])
+    assert result == 0
+
+
+def test_lode_watch_not_found(capsys):
+    """watch fails when lode not found."""
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=None):
+            result = cmd_lode(["watch", "bogus"])
+    assert result == 1
+    assert "not found" in capsys.readouterr().out
+
+
+def test_lode_watch_not_active(capsys):
+    """watch fails when lode is not active."""
+    lode = {"id": "abc123", "active": False, "stage": "mill", "state": "new", "status": ""}
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            result = cmd_lode(["watch", "abc123"])
+    assert result == 1
+    assert "not active" in capsys.readouterr().out
+
+
+def test_lode_watch_initial_state(capsys):
+    """watch prints initial lode state before streaming."""
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "running",
+        "status": "Starting",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "stage": "shipped", "status": "Done"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                cmd_lode(["watch", "abc123"])
+    out = capsys.readouterr().out
+    lines = out.strip().split("\n")
+    assert len(lines) >= 2  # initial + at least one update
+    assert "Starting" in lines[0]  # initial state
+    assert "shipped" in lines[-1]  # final state
 
 
 # Tests for config command
