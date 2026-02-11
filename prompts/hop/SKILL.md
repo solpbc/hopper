@@ -70,6 +70,14 @@ Add a backlog item with explicit project (`--project` / `-p`):
 hop backlog add -p myproject Add rate limiting to API
 ```
 
+Add a backlog item from stdin/heredoc:
+
+```bash
+hop backlog add -p myproject <<'EOF'
+Refactor auth module for clarity
+EOF
+```
+
 ## E. Lode Management
 
 List active lodes (`hop lode` defaults to list, and `hop lode list` is equivalent):
@@ -83,6 +91,14 @@ Create a new lode and start processing immediately:
 
 ```bash
 hop lode create myproject Add user authentication flow
+```
+
+Create a lode with scope from stdin/heredoc:
+
+```bash
+hop lode create myproject <<'EOF'
+Add user authentication flow
+EOF
 ```
 
 Watch a lode until it reaches `shipped`, enters `error`, or is archived (exit code `1` on error):

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from hopper import __version__
 from hopper.cli import (
+    cmd_backlog,
     cmd_code,
     cmd_config,
     cmd_lode,
@@ -544,6 +545,39 @@ def test_status_empty_text_error(capsys):
     assert "Status text required" in captured.out
 
 
+# --- cmd_backlog tests ---
+
+
+def test_backlog_add_reads_description_from_stdin(capsys):
+    """backlog add accepts description from stdin when text args are omitted."""
+    from io import StringIO
+
+    with patch("hopper.client.ping", return_value=False):
+        with patch("hopper.backlog.load_backlog", return_value=[]):
+            with patch("hopper.backlog.add_backlog_item", return_value=MagicMock()) as mock_add:
+                with patch("sys.stdin", StringIO("Backlog from stdin")):
+                    assert cmd_backlog(["add", "-p", "myproj"]) == 0
+
+    mock_add.assert_called_once()
+    _, project, description = mock_add.call_args.args[:3]
+    assert project == "myproj"
+    assert description == "Backlog from stdin"
+    out = capsys.readouterr().out
+    assert "Added: [myproj] Backlog from stdin" in out
+
+
+def test_backlog_add_requires_description_or_stdin(capsys):
+    """backlog add returns 1 when both args and stdin description are empty."""
+    from io import StringIO
+
+    with patch("sys.stdin", StringIO(" \n")):
+        assert cmd_backlog(["add", "-p", "myproj"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Error: no description provided" in out
+    assert "Use: hop backlog add [-p project] <text...>" in out
+
+
 # --- cmd_lode tests ---
 
 
@@ -691,11 +725,28 @@ def test_lode_create_missing_project(capsys):
     assert "required" in out
 
 
+def test_lode_create_reads_scope_from_stdin(capsys):
+    """Create accepts scope from stdin when positional scope is omitted."""
+    from io import StringIO
+
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.projects.find_project", return_value=object()):
+            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                with patch("sys.stdin", StringIO("stdin scope")):
+                    assert cmd_lode(["create", "myproj"]) == 0
+                mock_create.assert_called_once()
+                assert mock_create.call_args.args[2] == "stdin scope"
+
+
 def test_lode_create_missing_scope(capsys):
-    """Create with project but no scope reports missing required argument."""
-    assert cmd_lode(["create", "myproj"]) == 1
+    """Create with no positional scope and empty stdin returns a helpful error."""
+    from io import StringIO
+
+    with patch("sys.stdin", StringIO("")):
+        assert cmd_lode(["create", "myproj"]) == 1
     out = capsys.readouterr().out
-    assert "required" in out
+    assert "Error: no scope provided" in out
 
 
 def test_lode_create_invalid_project(capsys):
