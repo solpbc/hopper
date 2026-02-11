@@ -642,12 +642,19 @@ def cmd_backlog(args: list[str]) -> int:
         return 0
 
     if parsed.action == "add":
-        if not parsed.text:
-            print("error: description required for add")
-            parser.print_usage()
-            return 1
+        if parsed.text:
+            description = " ".join(parsed.text)
+        else:
+            description = sys.stdin.read().strip()
+            if not description:
+                print(
+                    "Error: no description provided\n"
+                    "Use: hop backlog add [-p project] <text...>\n"
+                    " or: hop backlog add [-p project] <<'EOF'\n"
+                    "<description>\nEOF"
+                )
+                return 1
 
-        description = " ".join(parsed.text)
         project = parsed.project
         lode_id = get_hopper_lid()
 
@@ -757,7 +764,7 @@ def cmd_lode(args: list[str]) -> int:
 
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
     create_p.add_argument("project", help="Project name")
-    create_p.add_argument("scope", nargs="+", help="Task scope description")
+    create_p.add_argument("scope", nargs="*", help="Task scope description")
 
     restart_p = subs.add_parser("restart", help="Restart an inactive lode", exit_on_error=False)
     restart_p.add_argument("lode_id", help="Lode ID to restart")
@@ -800,7 +807,18 @@ def cmd_lode(args: list[str]) -> int:
 
     if subcommand == "create":
         project_name = parsed.project
-        scope = " ".join(parsed.scope)
+        if parsed.scope:
+            scope = " ".join(parsed.scope)
+        else:
+            scope = sys.stdin.read().strip()
+            if not scope:
+                print(
+                    "Error: no scope provided\n"
+                    "Use: hop lode create <project> <scope...>\n"
+                    " or: hop lode create <project> <<'EOF'\n"
+                    "<scope>\nEOF"
+                )
+                return 1
         project = find_project(project_name)
         if not project:
             print(f"Project not found: {project_name}")
