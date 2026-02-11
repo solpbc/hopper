@@ -18,16 +18,21 @@ def _socket() -> Path:
     return config.hopper_dir() / "server.sock"
 
 
-# Command registry: name -> (handler, description)
+# Command registry: name -> (handler, description, group)
 # Handler signature: (args: list[str]) -> int
-COMMANDS: dict[str, tuple[Callable[[list[str]], int], str]] = {}
+COMMANDS: dict[str, tuple[Callable[[list[str]], int], str, str]] = {}
+
+HELP_GROUPS = [
+    ("commands", "Commands"),
+    ("lode", "Inside a lode"),
+]
 
 
-def command(name: str, description: str):
+def command(name: str, description: str, group: str = "commands"):
     """Decorator to register a command."""
 
     def decorator(func):
-        COMMANDS[name] = (func, description)
+        COMMANDS[name] = (func, description, group)
         return func
 
     return decorator
@@ -69,10 +74,12 @@ def print_help() -> None:
     print(f"hop v{__version__} - TUI for managing coding agents")
     print()
     print("Usage: hop <command> [options]")
-    print()
-    print("Commands:")
-    for name, (_, desc) in COMMANDS.items():
-        print(f"  {name:<12} {desc}")
+    for group_key, group_label in HELP_GROUPS:
+        cmds = [(n, d) for n, (_, d, g) in COMMANDS.items() if g == group_key]
+        if cmds:
+            print(f"\n{group_label}:")
+            for name, desc in cmds:
+                print(f"  {name:<12} {desc}")
     print()
     print("Options:")
     print("  -h, --help   Show this help message")
@@ -233,7 +240,7 @@ def cmd_up(args: list[str]) -> int:
     return start_server_with_tui(_socket(), tmux_location=tmux_location)
 
 
-@command("process", "Run Claude for a lode's current stage")
+@command("process", "Run Claude for a lode's current stage", group="internal")
 def cmd_process(args: list[str]) -> int:
     """Run Claude for a lode, dispatching to the correct stage runner."""
     from hopper.process import run_process
@@ -255,7 +262,7 @@ def cmd_process(args: list[str]) -> int:
     return run_process(parsed.lode_id, _socket())
 
 
-@command("status", "Show or update lode status")
+@command("status", "Show or update lode status", group="lode")
 def cmd_status(args: list[str]) -> int:
     """Show or update the current lode's status text and title."""
     from hopper.client import get_lode, set_lode_status, set_lode_title
@@ -535,7 +542,7 @@ def cmd_screenshot(args: list[str]) -> int:
     return 0
 
 
-@command("processed", "Signal stage completion with output")
+@command("processed", "Signal stage completion with output", group="lode")
 def cmd_processed(args: list[str]) -> int:
     """Read stage output from stdin and signal stage completion."""
     from hopper.client import get_lode, set_lode_state
@@ -599,7 +606,7 @@ def cmd_processed(args: list[str]) -> int:
     return 0
 
 
-@command("code", "Run a stage prompt via Codex")
+@command("code", "Run a stage prompt via Codex", group="lode")
 def cmd_code(args: list[str]) -> int:
     """Run a stage prompt via Codex, resuming the lode's Codex thread."""
     from hopper.code import run_code
@@ -1010,5 +1017,5 @@ def main() -> int:
     setproctitle.setproctitle(f"hop:{cmd}")
 
     # Dispatch to command handler
-    handler, _ = COMMANDS[cmd]
+    handler, *_ = COMMANDS[cmd]
     return handler(cmd_args)
