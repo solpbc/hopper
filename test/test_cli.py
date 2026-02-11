@@ -19,10 +19,12 @@ from hopper.cli import (
     cmd_screenshot,
     cmd_status,
     cmd_up,
+    detect_coding_agent,
     get_hopper_lid,
     main,
     require_config_name,
     require_no_server,
+    require_not_coding_agent,
     require_server,
     validate_hopper_lid,
 )
@@ -234,12 +236,13 @@ def test_ping_command_success(capsys):
 def test_up_command_requires_tmux(capsys):
     """Up command returns 1 when not inside tmux."""
     with patch.object(sys, "argv", ["hopper", "up"]):
-        with patch("hopper.cli.require_no_server", return_value=None):
-            with patch("hopper.cli.require_config_name", return_value=None):
-                with patch("hopper.cli.require_projects", return_value=None):
-                    with patch("hopper.tmux.is_inside_tmux", return_value=False):
-                        with patch("hopper.tmux.get_tmux_sessions", return_value=[]):
-                            result = main()
+        with patch("hopper.cli.require_not_coding_agent", return_value=None):
+            with patch("hopper.cli.require_no_server", return_value=None):
+                with patch("hopper.cli.require_config_name", return_value=None):
+                    with patch("hopper.cli.require_projects", return_value=None):
+                        with patch("hopper.tmux.is_inside_tmux", return_value=False):
+                            with patch("hopper.tmux.get_tmux_sessions", return_value=[]):
+                                result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "hop up must run inside tmux" in captured.out
@@ -249,12 +252,15 @@ def test_up_command_requires_tmux(capsys):
 def test_up_command_shows_existing_lodes(capsys):
     """Up command shows existing sessions when tmux is running."""
     with patch.object(sys, "argv", ["hopper", "up"]):
-        with patch("hopper.cli.require_no_server", return_value=None):
-            with patch("hopper.cli.require_config_name", return_value=None):
-                with patch("hopper.cli.require_projects", return_value=None):
-                    with patch("hopper.tmux.is_inside_tmux", return_value=False):
-                        with patch("hopper.tmux.get_tmux_sessions", return_value=["main", "dev"]):
-                            result = main()
+        with patch("hopper.cli.require_not_coding_agent", return_value=None):
+            with patch("hopper.cli.require_no_server", return_value=None):
+                with patch("hopper.cli.require_config_name", return_value=None):
+                    with patch("hopper.cli.require_projects", return_value=None):
+                        with patch("hopper.tmux.is_inside_tmux", return_value=False):
+                            with patch(
+                                "hopper.tmux.get_tmux_sessions", return_value=["main", "dev"]
+                            ):
+                                result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "tmux attach -t main" in captured.out
@@ -264,8 +270,9 @@ def test_up_command_shows_existing_lodes(capsys):
 def test_up_command_fails_if_server_running(capsys):
     """Up command returns 1 if server already running."""
     with patch.object(sys, "argv", ["hopper", "up"]):
-        with patch("hopper.client.ping", return_value=True):
-            result = main()
+        with patch("hopper.cli.require_not_coding_agent", return_value=None):
+            with patch("hopper.client.ping", return_value=True):
+                result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "Server already running" in captured.out
@@ -274,8 +281,9 @@ def test_up_command_fails_if_server_running(capsys):
 def test_up_command_requires_name_config(capsys):
     """Up command returns 1 if name not configured."""
     with patch.object(sys, "argv", ["hopper", "up"]):
-        with patch("hopper.cli.require_no_server", return_value=None):
-            result = main()
+        with patch("hopper.cli.require_not_coding_agent", return_value=None):
+            with patch("hopper.cli.require_no_server", return_value=None):
+                result = main()
     assert result == 1
     captured = capsys.readouterr()
     assert "Please set your name first" in captured.out
@@ -340,6 +348,86 @@ def test_require_no_server_failure(capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "Server already running" in captured.out
+
+
+# Tests for detect_coding_agent
+
+
+def test_detect_coding_agent_clean_env():
+    """detect_coding_agent returns None with no agent env vars."""
+    env = os.environ.copy()
+    for var in ("CLAUDECODE", "GEMINI_CLI", "CODEX_CI"):
+        env.pop(var, None)
+    with patch.dict(os.environ, env, clear=True):
+        result = detect_coding_agent()
+    assert result is None
+
+
+def test_detect_coding_agent_claude_code():
+    """detect_coding_agent returns 'Claude Code' when CLAUDECODE=1."""
+    with patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=True):
+        result = detect_coding_agent()
+    assert result == "Claude Code"
+
+
+def test_detect_coding_agent_gemini_cli():
+    """detect_coding_agent returns 'Gemini CLI' when GEMINI_CLI=1."""
+    with patch.dict(os.environ, {"GEMINI_CLI": "1"}, clear=True):
+        result = detect_coding_agent()
+    assert result == "Gemini CLI"
+
+
+def test_detect_coding_agent_codex():
+    """detect_coding_agent returns 'Codex' when CODEX_CI=1."""
+    with patch.dict(os.environ, {"CODEX_CI": "1"}, clear=True):
+        result = detect_coding_agent()
+    assert result == "Codex"
+
+
+def test_detect_coding_agent_ignores_non_one():
+    """detect_coding_agent returns None when env var is not '1'."""
+    with patch.dict(os.environ, {"CLAUDECODE": "0"}, clear=True):
+        result = detect_coding_agent()
+    assert result is None
+
+
+def test_detect_coding_agent_ignores_empty():
+    """detect_coding_agent returns None when env var is empty string."""
+    with patch.dict(os.environ, {"CLAUDECODE": ""}, clear=True):
+        result = detect_coding_agent()
+    assert result is None
+
+
+# Tests for require_not_coding_agent
+
+
+def test_require_not_coding_agent_success():
+    """require_not_coding_agent returns None when no agent detected."""
+    with patch("hopper.cli.detect_coding_agent", return_value=None):
+        result = require_not_coding_agent()
+    assert result is None
+
+
+def test_require_not_coding_agent_failure(capsys):
+    """require_not_coding_agent returns 1 with message when agent detected."""
+    with patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=True):
+        result = require_not_coding_agent()
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Claude Code" in captured.out
+    assert "CLAUDECODE=1" in captured.out
+    assert "TUI" in captured.out
+
+
+# Tests for cmd_up agent guard
+
+
+def test_up_command_rejects_coding_agent():
+    """Up command returns 1 when inside a coding agent."""
+    with patch.object(sys, "argv", ["hopper", "up"]):
+        with patch("hopper.cli.require_not_coding_agent", return_value=1):
+            result = main()
+    assert result == 1
 
 
 # Tests for get_hopper_lid
