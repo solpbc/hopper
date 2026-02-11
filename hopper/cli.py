@@ -739,7 +739,7 @@ def cmd_lode(args: list[str]) -> int:
         project = lode.get("project", "")
         title = lode.get("title", "")
         status_text = lode.get("status", "")
-        return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<22} {status_text}"
+        return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
 
     parser = make_parser("lode", "Manage lodes")
     parser.add_argument(

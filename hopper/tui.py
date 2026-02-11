@@ -921,7 +921,7 @@ class LodeTable(DataTable):
         self.add_column("project", key=self.COL_PROJECT)
         self.add_column("age", key=self.COL_AGE)
         self.add_column("last", key=self.COL_LAST)
-        self.add_column("title", key=self.COL_TITLE, width=18)
+        self.add_column("title", key=self.COL_TITLE, width=26)
         self.add_column("status", key=self.COL_STATUS_TEXT)
 
     def on_resize(self, event: events.Resize) -> None:
