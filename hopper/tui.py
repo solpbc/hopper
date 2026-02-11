@@ -1314,29 +1314,14 @@ class HopperApp(App):
             reverse=True,
         )
 
-        existing_keys: set[str] = set()
-        for row_key in table.rows:
-            existing_keys.add(str(row_key.value))
-
-        desired_keys = {lode["id"] for lode in shipped}
-
-        for key in existing_keys - desired_keys:
-            table.remove_row(key)
-
+        table.clear()
         for lode in shipped:
             lode_id = lode["id"]
             project = lode.get("project", "")
             age = format_age(lode.get("created_at", 0))
             diff = read_diff_summary(lode_id)
             title = lode.get("title", "")
-            if lode_id in existing_keys:
-                table.update_cell(lode_id, ShippedTable.COL_PROJECT, project)
-                table.update_cell(lode_id, ShippedTable.COL_AGE, age)
-                table.update_cell(lode_id, ShippedTable.COL_ID, lode_id)
-                table.update_cell(lode_id, ShippedTable.COL_DIFF, diff)
-                table.update_cell(lode_id, ShippedTable.COL_TITLE, title)
-            else:
-                table.add_row(project, age, lode_id, diff, title, key=lode_id)
+            table.add_row(project, age, lode_id, diff, title, key=lode_id)
 
     def _get_selected_row_key(self, table: DataTable) -> str | None:
         """Get the row key of the selected row in a table."""

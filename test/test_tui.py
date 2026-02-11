@@ -1438,6 +1438,35 @@ async def test_shipped_table_empty_when_no_recent():
         assert table.row_count == 0
 
 
+@pytest.mark.asyncio
+async def test_shipped_table_updates_dynamically(make_lode):
+    """Shipped table refresh should pick up new archived shipped lodes in sorted order."""
+    from hopper.lodes import current_time_ms
+
+    server = MockServer([make_lode(id="active01", stage="mill")], archived_lodes=[])
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#shipped-table", ShippedTable)
+        assert table.row_count == 0
+
+        now = current_time_ms()
+        first = make_lode(id="ship0001", stage="shipped", updated_at=now - 2000)
+        server.archived_lodes.append(first)
+        app.refresh_shipped()
+
+        assert table.row_count == 1
+        first_key = table.coordinate_to_cell_key((0, 0))
+        assert str(first_key.row_key.value) == "ship0001"
+
+        second = make_lode(id="ship0002", stage="shipped", updated_at=now - 1000)
+        server.archived_lodes.append(second)
+        app.refresh_shipped()
+
+        assert table.row_count == 2
+        top_key = table.coordinate_to_cell_key((0, 0))
+        assert str(top_key.row_key.value) == "ship0002"
+
+
 def test_parse_diff_numstat_normal_input():
     """parse_diff_numstat sums additions and deletions across valid lines."""
     text = "10\t5\tfile.py\n20\t3\tother.py"
