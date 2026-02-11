@@ -1,130 +1,95 @@
 ---
-name: using-hopper
-description: Teaches agents to use the hop CLI for reporting status, signaling stage completion, managing the backlog, and coordinating lodes within hopper. Use this skill when working inside a hopper lode and needing to communicate with the hopper server.
+name: hop-external
+description: Commands for external agents to create lodes, manage backlog, and monitor progress via the hop CLI. Use this skill when coordinating with a running hopper instance from outside a lode.
 ---
 
-## A. Environment
+## A. Lode Management
 
-`HOPPER_LID` is set automatically when hopper spawns the agent and identifies the current lode.
-
-- Required by `hop status` and `hop processed`.
-- Used optionally by `hop backlog add` to auto-resolve project.
-- Used optionally by `hop ping` to validate the lode.
-
-## B. Status Reporting
-
-`hop status` requires `HOPPER_LID` and a running hopper server.
-
-Show current status and title:
+List active lodes (`hop lode` defaults to `list`; `hop lode list` is equivalent):
 
 ```bash
-hop status
+hop lode
+hop lode list
+hop lode list -a
 ```
 
-Set status text visible in the TUI dashboard:
+Use `-a` or `--archived` to show archived lodes.
+
+Create a new lode with required `project` and optional `scope` args:
 
 ```bash
-hop status Investigating auth bug
+hop lode create myproject Fix login timeout
 ```
 
-Set a short title for the lode:
+If `scope` is omitted, provide it on stdin:
 
 ```bash
-hop status -t "auth-fix"
-```
-
-Combine title and status in one command:
-
-```bash
-hop status -t "auth-fix" Investigating auth module
-```
-
-## C. Stage Completion
-
-Signal stage completion. Reads output from stdin, saves it to `<lode_dir>/<stage>_out.md`, and auto-advances to the next stage. Requires `HOPPER_LID`, a running server, and non-empty stdin.
-
-```bash
-hop processed <<'EOF'
-Summary of what was accomplished in this stage.
+hop lode create myproject <<'EOF'
+Fix login timeout and add regression coverage
 EOF
 ```
 
-## D. Backlog Management
+Restart an inactive lode by ID (only valid for inactive lodes in `mill`, `refine`, or `ship`):
 
-List backlog items (`hop backlog` defaults to list, and `hop backlog list` is equivalent):
+```bash
+hop lode restart abc123
+```
+
+Watch a lode by ID until it reaches `shipped`, enters `error`, or is archived (exit code `1` on error):
+
+```bash
+hop lode watch abc123
+```
+
+Practical create + watch workflow:
+
+```bash
+hop lode create myproject Improve retry logic
+# note the new lode ID from output
+hop lode watch <lode_id>
+```
+
+## B. Backlog Management
+
+List backlog items (`hop backlog` defaults to `list`; `hop backlog list` is equivalent):
 
 ```bash
 hop backlog
 hop backlog list
 ```
 
-Add a backlog item with project auto-resolved from the current lode (`HOPPER_LID`):
+Add a backlog item with explicit project (`-p` / `--project`) and inline description:
 
 ```bash
-hop backlog add Refactor auth module for clarity
+hop backlog add -p myproject Add request timeout metrics
 ```
 
-Add a backlog item with explicit project (`--project` / `-p`):
-
-```bash
-hop backlog add -p myproject Add rate limiting to API
-```
-
-Add a backlog item from stdin/heredoc:
+`description` comes from positional args, or from stdin when omitted:
 
 ```bash
 hop backlog add -p myproject <<'EOF'
-Refactor auth module for clarity
+Add request timeout metrics and dashboard alerts
 EOF
 ```
 
-## E. Lode Management
-
-List active lodes (`hop lode` defaults to list, and `hop lode list` is equivalent):
+Remove a backlog item by ID prefix:
 
 ```bash
-hop lode
-hop lode list
+hop backlog remove 7f3a
 ```
 
-Create a new lode and start processing immediately:
+## C. Diagnostics
+
+Check whether the server is running:
 
 ```bash
-hop lode create myproject Add user authentication flow
+hop ping
 ```
 
-Create a lode with scope from stdin/heredoc:
-
-```bash
-hop lode create myproject <<'EOF'
-Add user authentication flow
-EOF
-```
-
-Watch a lode until it reaches `shipped`, enters `error`, or is archived (exit code `1` on error):
-
-```bash
-hop lode watch abc123
-```
-
-Practical create + watch pattern:
-
-```bash
-hop lode create myproject Fix login timeout
-# note the lode ID from output, then:
-hop lode watch <lode_id>
-```
-
-## F. Diagnostics
+On success, prints `pong` with tmux information.
 
 Capture the TUI window as ANSI text:
 
 ```bash
 hop screenshot
-```
-
-Check if the server is running; with `HOPPER_LID` set, also validate the lode and print `pong` with tmux and lode info:
-
-```bash
-hop ping
 ```
