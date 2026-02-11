@@ -174,6 +174,15 @@ def require_not_coding_agent() -> int | None:
     return None
 
 
+def require_not_inside_lode() -> int | None:
+    lid = get_hopper_lid()
+    if lid is not None:
+        print(f"Cannot run this command inside lode {lid}.")
+        print("Use hop backlog add to queue work instead.")
+        return 1
+    return None
+
+
 @command("up", "Start the server and TUI")
 def cmd_up(args: list[str]) -> int:
     """Start the server and TUI."""
@@ -835,6 +844,8 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     if subcommand == "create":
+        if (rc := require_not_inside_lode()) is not None:
+            return rc
         project_name = parsed.project
         if parsed.scope:
             scope = " ".join(parsed.scope)
@@ -863,6 +874,8 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     if subcommand == "restart":
+        if (rc := require_not_inside_lode()) is not None:
+            return rc
         lode_id = parsed.lode_id
         err = require_server()
         if err:
@@ -883,6 +896,8 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     if subcommand == "watch":
+        if (rc := require_not_inside_lode()) is not None:
+            return rc
         lode_id = parsed.lode_id
         if require_server():
             return 1

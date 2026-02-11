@@ -7,6 +7,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hopper import __version__
 from hopper.cli import (
     cmd_backlog,
@@ -28,6 +30,12 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_hopper_lid_env(monkeypatch):
+    """Default tests to not running inside a lode unless explicitly set."""
+    monkeypatch.delenv("HOPPER_LID", raising=False)
 
 
 def test_main_is_callable():
@@ -419,6 +427,22 @@ def test_require_not_coding_agent_failure(capsys):
     assert "TUI" in captured.out
 
 
+def test_require_not_inside_lode_blocks(monkeypatch):
+    """require_not_inside_lode() returns 1 when HOPPER_LID is set."""
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+    from hopper.cli import require_not_inside_lode
+
+    assert require_not_inside_lode() == 1
+
+
+def test_require_not_inside_lode_allows(monkeypatch):
+    """require_not_inside_lode() returns None when HOPPER_LID is not set."""
+    monkeypatch.delenv("HOPPER_LID", raising=False)
+    from hopper.cli import require_not_inside_lode
+
+    assert require_not_inside_lode() is None
+
+
 # Tests for cmd_up agent guard
 
 
@@ -806,6 +830,16 @@ def test_lode_create_happy(capsys):
     assert "myproj" in out
 
 
+def test_lode_create_rejects_inside_lode(monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    rc = cmd_lode(["create", "proj", "scope"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Cannot run this command inside lode test-lode-123." in out
+    assert "hop backlog add" in out
+
+
 def test_lode_create_missing_project(capsys):
     """Create with no project arg reports missing required argument."""
     assert cmd_lode(["create"]) == 1
@@ -856,6 +890,16 @@ def test_lode_restart_happy(capsys):
     out = capsys.readouterr().out
     assert "test1234" in out
     assert "mill" in out
+
+
+def test_lode_restart_rejects_inside_lode(monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    rc = cmd_lode(["restart", "some-id"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Cannot run this command inside lode test-lode-123." in out
+    assert "hop backlog add" in out
 
 
 def test_lode_restart_not_found(capsys):
@@ -919,6 +963,28 @@ def test_lode_watch_happy_shipped(capsys):
     out = capsys.readouterr().out
     assert "abc123" in out
     assert "shipped" in out
+
+
+def test_lode_watch_rejects_inside_lode(monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    rc = cmd_lode(["watch", "some-id"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Cannot run this command inside lode test-lode-123." in out
+    assert "hop backlog add" in out
+
+
+def test_lode_list_allowed_inside_lode(monkeypatch, capsys):
+    """hop lode list should work inside a lode (read-only, no guard)."""
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    with patch("hopper.cli.require_server", return_value=1) as mock_require_server:
+        rc = cmd_lode(["list"])
+    assert rc == 1
+    mock_require_server.assert_called_once()
+    out = capsys.readouterr().out
+    assert "Cannot run this command inside lode" not in out
 
 
 def test_lode_watch_error_exit(capsys):
