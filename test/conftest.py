@@ -36,7 +36,7 @@ def make_lode():
     Returns a callable that creates lode dicts. Override any field via kwargs.
     """
 
-    def _make(auto=True, **overrides):
+    def _make(**overrides):
         lode = {
             "id": "testid11",
             "stage": "mill",
@@ -49,7 +49,6 @@ def make_lode():
             "title": "",
             "branch": "",
             "active": False,
-            "auto": auto,
             "tmux_pane": None,
             "pid": None,
             "codex_thread_id": None,

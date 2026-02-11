@@ -15,7 +15,6 @@ Lodes are plain dicts with these fields:
 - title: str - short human-readable label (default "")
 - branch: str - git branch name for this lode's worktree (default "")
 - active: bool - whether a runner client is connected (default False)
-- auto: bool - whether to auto-advance to next stage on completion (default True)
 - tmux_pane: str | None - tmux pane ID (default None)
 - pid: int | None - process ID of active runner (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
@@ -272,7 +271,6 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "title": "",
         "branch": "",
         "active": False,
-        "auto": True,
         "tmux_pane": None,
         "pid": None,
         "codex_thread_id": None,
@@ -357,17 +355,6 @@ def update_lode_branch(lodes: list[dict], lode_id: str, branch: str) -> dict | N
     for lode in lodes:
         if lode["id"] == lode_id:
             lode["branch"] = branch
-            touch(lode)
-            save_lodes(lodes)
-            return lode
-    return None
-
-
-def update_lode_auto(lodes: list[dict], lode_id: str, auto: bool) -> dict | None:
-    """Update the auto flag on a lode."""
-    for lode in lodes:
-        if lode["id"] == lode_id:
-            lode["auto"] = auto
             touch(lode)
             save_lodes(lodes)
             return lode

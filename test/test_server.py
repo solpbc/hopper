@@ -726,34 +726,10 @@ def test_server_handles_ready_state(socket_path, server, temp_config, make_lode)
     client.close()
 
 
-def test_server_handles_lode_set_auto(socket_path, server, temp_config, make_lode):
-    """Server handles lode_set_auto message."""
-    lode = make_lode(id="test-id")
-    server.lodes = [lode]
-    save_lodes(server.lodes)
-
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.connect(str(socket_path))
-    client.settimeout(2.0)
-
-    msg = {"type": "lode_set_auto", "lode_id": "test-id", "auto": True}
-    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
-
-    data = client.recv(4096).decode("utf-8")
-    response = json.loads(data.strip().split("\n")[0])
-
-    assert response["type"] == "lode_updated"
-    assert response["lode"]["auto"] is True
-    assert server.lodes[0]["auto"] is True
-
-    client.close()
-
-
 def test_auto_spawn_on_disconnect(socket_path, server, temp_config, make_lode):
     """Auto-advance spawns next stage runner on disconnect."""
     lode = make_lode(
         id="test-id",
-        auto=True,
         state="ready",
         stage="ship",
         status="Refine complete",
@@ -913,7 +889,6 @@ def test_auto_spawn_skipped_when_stage_done(socket_path, server, temp_config, ma
     """Auto-advance does not spawn when current stage is already complete."""
     lode = make_lode(
         id="test-id",
-        auto=True,
         state="ready",
         stage="ship",
         status="Ship complete",
@@ -928,41 +903,6 @@ def test_auto_spawn_skipped_when_stage_done(socket_path, server, temp_config, ma
     ):
         mock_find.return_value = MagicMock(path="/some/path")
 
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.connect(str(socket_path))
-        client.settimeout(2.0)
-        msg = {"type": "lode_register", "lode_id": "test-id"}
-        client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
-
-        for _ in range(50):
-            if "test-id" in server.lode_clients:
-                break
-            time.sleep(0.1)
-
-        client.close()
-
-        for _ in range(20):
-            time.sleep(0.1)
-            if not server.lodes[0]["active"]:
-                break
-
-        mock_spawn.assert_not_called()
-
-
-def test_no_auto_spawn_when_auto_false(socket_path, server, temp_config, make_lode):
-    """No auto-spawn when auto is False."""
-    lode = make_lode(
-        id="test-id",
-        auto=False,
-        state="ready",
-        stage="ship",
-        status="Refine complete",
-        project="my-project",
-    )
-    server.lodes = [lode]
-    save_lodes(server.lodes)
-
-    with patch("hopper.server.spawn_claude") as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
