@@ -148,6 +148,32 @@ def get_hopper_lid() -> str | None:
     return os.environ.get("HOPPER_LID")
 
 
+_CODING_AGENTS = {
+    "CLAUDECODE": "Claude Code",
+    "GEMINI_CLI": "Gemini CLI",
+    "CODEX_CI": "Codex",
+}
+
+
+def detect_coding_agent() -> str | None:
+    """Return the name of a detected coding agent, or None."""
+    for var, name in _CODING_AGENTS.items():
+        if os.environ.get(var) == "1":
+            return name
+    return None
+
+
+def require_not_coding_agent() -> int | None:
+    """Check that we're not inside a coding agent. Returns exit code on failure, None on success."""
+    agent = detect_coding_agent()
+    if agent:
+        var = next(v for v, n in _CODING_AGENTS.items() if n == agent)
+        print(f"hop up cannot run inside {agent} (detected {var}=1).")
+        print("hop is a TUI that needs its own terminal.")
+        return 1
+    return None
+
+
 @command("up", "Start the server and TUI")
 def cmd_up(args: list[str]) -> int:
     """Start the server and TUI."""
@@ -163,6 +189,9 @@ def cmd_up(args: list[str]) -> int:
         print(f"error: {e}")
         parser.print_usage()
         return 1
+
+    if err := require_not_coding_agent():
+        return err
 
     if err := require_no_server():
         return err
