@@ -11,8 +11,6 @@ from textual.app import App
 from hopper.lodes import format_age
 from hopper.projects import Project
 from hopper.tui import (
-    AUTO_OFF,
-    AUTO_ON,
     STATUS_DISCONNECTED,
     STATUS_ERROR,
     STATUS_NEW,
@@ -26,7 +24,6 @@ from hopper.tui import (
     ProjectPickerScreen,
     Row,
     ScopeInputScreen,
-    format_auto_text,
     format_stage_text,
     format_status_label,
     format_status_text,
@@ -128,19 +125,6 @@ def test_lode_to_row_error():
     assert row.id == "abcd1234"
     assert row.status == STATUS_ERROR
     assert row.stage == "mill"
-
-
-def test_lode_to_row_auto():
-    """Auto field is passed through to Row."""
-    session = {
-        "id": "abcd1234",
-        "stage": "mill",
-        "created_at": 1000,
-        "updated_at": 1000,
-        "auto": True,
-    }
-    row = lode_to_row(session)
-    assert row.auto is True
 
 
 def test_lode_to_row_refine_stage():
@@ -309,20 +293,6 @@ def test_lode_to_row_active_shows_state_icon():
     assert row.status == STATUS_RUNNING
 
 
-def test_format_auto_text_on():
-    """Auto on shows bright green indicator."""
-    text = format_auto_text(True)
-    assert str(text) == AUTO_ON
-    assert text.style == "bright_green"
-
-
-def test_format_auto_text_off():
-    """Auto off shows dim indicator."""
-    text = format_auto_text(False)
-    assert str(text) == AUTO_OFF
-    assert text.style == "bright_black"
-
-
 # Tests for format_stage_text
 
 
@@ -431,7 +401,6 @@ def test_row_dataclass():
         age="1m",
         last="5m",
         status=STATUS_RUNNING,
-        auto=True,
         project="proj",
         title="Auth Flow",
         status_text="Working on it",
@@ -441,7 +410,6 @@ def test_row_dataclass():
     assert row.age == "1m"
     assert row.last == "5m"
     assert row.status == STATUS_RUNNING
-    assert row.auto is True
     assert row.project == "proj"
     assert row.title == "Auth Flow"
     assert row.status_text == "Working on it"
@@ -565,18 +533,6 @@ async def test_app_with_shipped_lode():
 
 
 @pytest.mark.asyncio
-async def test_app_lode_table_has_auto_column():
-    """Lode table includes the auto column."""
-    from hopper.tui import LodeTable
-
-    server = MockServer([])
-    app = HopperApp(server=server)
-    async with app.run_test():
-        table = app.query_one("#lode-table", LodeTable)
-        assert LodeTable.COL_AUTO in table.columns
-
-
-@pytest.mark.asyncio
 async def test_archive_view_toggle(make_lode):
     """Left/right should toggle archive view on the lode table."""
     server = MockServer([make_lode(id="active01")], archived_lodes=[make_lode(id="arch0001")])
@@ -637,9 +593,9 @@ async def test_archive_view_hint_row():
 
 @pytest.mark.asyncio
 async def test_archive_view_guards_actions(make_lode):
-    """Create/delete/auto actions should be guarded while archive view is active."""
+    """Create/delete actions should be guarded while archive view is active."""
     server = MockServer(
-        [make_lode(id="active01", auto=False)],
+        [make_lode(id="active01")],
         archived_lodes=[make_lode(id="arch0001")],
     )
     app = HopperApp(server=server)
@@ -653,7 +609,6 @@ async def test_archive_view_guards_actions(make_lode):
             assert app._archive_view is True
             await pilot.press("c")
             await pilot.press("d")
-            await pilot.press("a")
     mock_require_projects.assert_not_called()
     mock_selected_lode_id.assert_not_called()
     mock_get_lode.assert_not_called()
@@ -766,20 +721,6 @@ async def test_archive_confirm_modal_arrows_do_not_toggle_archive_view(temp_conf
             await pilot.press("left")
             assert app.screen.focused.id == "btn-cancel"
             assert app._archive_view is False
-
-
-@pytest.mark.asyncio
-async def test_toggle_auto_with_a(temp_config):
-    """a enqueues auto toggle on selected lode."""
-    sessions = [{"id": "aaaa1111", "stage": "mill", "created_at": 1000, "auto": False}]
-    server = MockServer(sessions)
-    app = HopperApp(server=server)
-    async with app.run_test() as pilot:
-        await pilot.press("a")
-        assert len(server.events) == 1
-        assert server.events[0]["type"] == "lode_set_auto"
-        assert server.events[0]["lode_id"] == "aaaa1111"
-        assert server.events[0]["auto"] is True
 
 
 @pytest.mark.asyncio
@@ -2101,7 +2042,7 @@ async def test_legend_dismiss_with_escape():
 
 @pytest.mark.asyncio
 async def test_legend_contains_all_symbols():
-    """Legend should contain all status and auto symbols."""
+    """Legend should contain all status symbols."""
     from textual.widgets import Static
 
     app = HopperApp()
@@ -2115,8 +2056,6 @@ async def test_legend_contains_all_symbols():
         assert STATUS_NEW in text
         assert STATUS_SHIPPED in text
         assert STATUS_DISCONNECTED in text
-        assert AUTO_ON in text
-        assert AUTO_OFF in text
 
 
 # Tests for ShipReviewScreen

@@ -38,7 +38,6 @@ from hopper.lodes import (
     save_lodes,
     set_lode_claude_started,
     touch,
-    update_lode_auto,
     update_lode_branch,
     update_lode_codex_thread,
     update_lode_stage,
@@ -264,8 +263,7 @@ class Server:
 
         stage = lode.get("stage", "")
         if (
-            lode.get("auto")
-            and lode.get("state") == "ready"
+            lode.get("state") == "ready"
             and stage in STAGES
             and lode.get("status") != STAGES[stage]["done_status"]
         ):
@@ -462,15 +460,6 @@ class Server:
                 lode = update_lode_branch(self.lodes, lode_id, branch)
                 if lode:
                     logger.info(f"Lode {lode_id} branch={branch}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
-
-        elif msg_type == "lode_set_auto":
-            lode_id = message.get("lode_id")
-            auto = bool(message.get("auto", False))
-            if lode_id:
-                lode = update_lode_auto(self.lodes, lode_id, auto)
-                if lode:
-                    logger.info(f"Lode {lode_id} auto={auto}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_codex_thread":

@@ -22,7 +22,6 @@ from hopper.lodes import (
     set_lode_claude_started,
     slugify,
     touch,
-    update_lode_auto,
     update_lode_branch,
     update_lode_codex_thread,
     update_lode_stage,
@@ -481,36 +480,6 @@ def test_update_lode_branch(temp_config):
 
     loaded = load_lodes()
     assert loaded[0]["branch"] == "hopper-testid11-auth-flow"
-
-
-def test_update_lode_auto(temp_config):
-    """update_lode_auto changes auto flag and touches timestamp."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "new",
-            "auto": False,
-        }
-    ]
-    save_lodes(lodes_list)
-
-    updated = update_lode_auto(lodes_list, "testid11", True)
-
-    assert updated is not None
-    assert updated["auto"] is True
-    assert updated["updated_at"] > 1000
-
-    loaded = load_lodes()
-    assert loaded[0]["auto"] is True
-
-
-def test_update_lode_auto_not_found(temp_config):
-    """update_lode_auto returns None for unknown lode."""
-    result = update_lode_auto([], "nonexistent", True)
-    assert result is None
 
 
 def test_update_lode_codex_thread(temp_config):
