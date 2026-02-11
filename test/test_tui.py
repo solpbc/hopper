@@ -1376,13 +1376,13 @@ async def test_shipped_table_enter_opens_file_viewer(make_lode):
 
 @pytest.mark.asyncio
 async def test_shipped_table_columns():
-    """Shipped table should have id, age, title columns."""
+    """Shipped table should have project, age, id, title columns."""
     server = MockServer([])
     app = HopperApp(server=server)
     async with app.run_test():
         table = app.query_one("#shipped-table", ShippedTable)
         col_keys = [str(k.value) for k in table.columns]
-        assert col_keys == ["id", "age", "title"]
+        assert col_keys == ["project", "age", "id", "title"]
 
 
 @pytest.mark.asyncio

@@ -966,6 +966,7 @@ class BacklogTable(DataTable):
 class ShippedTable(DataTable):
     """Table displaying recently shipped lodes."""
 
+    COL_PROJECT = "project"
     COL_ID = "id"
     COL_AGE = "age"
     COL_TITLE = "title"
@@ -976,8 +977,9 @@ class ShippedTable(DataTable):
 
     def on_mount(self) -> None:
         """Set up columns when mounted with explicit keys."""
-        self.add_column("id", key=self.COL_ID)
+        self.add_column("project", key=self.COL_PROJECT)
         self.add_column("age", key=self.COL_AGE)
+        self.add_column("id", key=self.COL_ID)
         self.add_column("title", key=self.COL_TITLE)
 
     def on_resize(self, event: events.Resize) -> None:
@@ -1315,13 +1317,16 @@ class HopperApp(App):
 
         for lode in shipped:
             lode_id = lode["id"]
+            project = lode.get("project", "")
             age = format_age(lode.get("created_at", 0))
             title = lode.get("title", "")
             if lode_id in existing_keys:
+                table.update_cell(lode_id, ShippedTable.COL_PROJECT, project)
                 table.update_cell(lode_id, ShippedTable.COL_AGE, age)
+                table.update_cell(lode_id, ShippedTable.COL_ID, lode_id)
                 table.update_cell(lode_id, ShippedTable.COL_TITLE, title)
             else:
-                table.add_row(lode_id, age, title, key=lode_id)
+                table.add_row(project, age, lode_id, title, key=lode_id)
 
     def _get_selected_row_key(self, table: DataTable) -> str | None:
         """Get the row key of the selected row in a table."""
