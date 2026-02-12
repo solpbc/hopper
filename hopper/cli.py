@@ -340,7 +340,13 @@ def cmd_status(args: list[str]) -> int:
 def cmd_project(args: list[str]) -> int:
     """Manage projects (git directories for lodes)."""
     from hopper.client import reload_projects
-    from hopper.projects import add_project, load_projects, remove_project
+    from hopper.projects import (
+        add_project,
+        load_projects,
+        remove_project,
+        rename_project,
+        rename_project_in_data,
+    )
 
     parser = make_parser(
         "project",
@@ -349,17 +355,23 @@ def cmd_project(args: list[str]) -> int:
     parser.add_argument(
         "action",
         nargs="?",
-        choices=["add", "remove", "list"],
+        choices=["add", "remove", "rename", "list"],
         default="list",
         help="Action to perform (default: list)",
     )
-    parser.add_argument("path", nargs="?", help="Path (for add) or name (for remove)")
+    parser.add_argument("path", nargs="?", help="Path (for add) or name (for remove/rename)")
+    parser.add_argument("new_name", nargs="?", help="New name (for rename)")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
         return 0
     except ArgumentError as e:
         print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if parsed.action != "rename" and parsed.new_name is not None:
+        print(f"error: unexpected argument: {parsed.new_name}")
         parser.print_usage()
         return 1
 
@@ -373,6 +385,28 @@ def cmd_project(args: list[str]) -> int:
             print(f"{p.name}{status}")
             print(f"  {p.path}")
         return 0
+
+    if parsed.action == "rename":
+        if not parsed.path:
+            print("error: current name required for rename")
+            parser.print_usage()
+            return 1
+        if not parsed.new_name:
+            print("error: new name required for rename")
+            parser.print_usage()
+            return 1
+        try:
+            rename_project(parsed.path, parsed.new_name)
+            rename_project_in_data(parsed.path, parsed.new_name)
+            print(f"Renamed project: {parsed.path} -> {parsed.new_name}")
+            try:
+                reload_projects(_socket())
+            except Exception:
+                pass
+            return 0
+        except ValueError as e:
+            print(f"error: {e}")
+            return 1
 
     if parsed.action == "add":
         if not parsed.path:

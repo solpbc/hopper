@@ -583,7 +583,10 @@ class Server:
 
         elif msg_type == "projects_reload":
             self.projects = get_active_projects()
-            logger.info("Projects reloaded from disk")
+            self.lodes = load_lodes()
+            self.archived_lodes = load_archived_lodes()
+            self.backlog = load_backlog()
+            logger.info("Projects and lodes reloaded from disk")
 
         else:
             logger.warning(f"Unknown message type: {msg_type}")

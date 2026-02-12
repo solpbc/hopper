@@ -1404,6 +1404,80 @@ def test_project_add_works_without_server(tmp_path, monkeypatch, capsys):
     assert result == 0
 
 
+def test_project_rename_success(tmp_path, monkeypatch, capsys):
+    """project rename updates name and notifies server."""
+    from hopper.cli import cmd_project
+
+    monkeypatch.setattr("hopper.projects.rename_project", lambda cur, new: None)
+    monkeypatch.setattr("hopper.projects.rename_project_in_data", lambda cur, new: None)
+    calls = []
+    monkeypatch.setattr("hopper.client.reload_projects", lambda sock: calls.append(sock) or True)
+    result = cmd_project(["rename", "old-name", "new-name"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "old-name" in captured.out
+    assert "new-name" in captured.out
+    assert len(calls) == 1
+
+
+def test_project_rename_missing_current(capsys):
+    """project rename without current name shows error."""
+    from hopper.cli import cmd_project
+
+    result = cmd_project(["rename"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "current name required" in captured.out
+
+
+def test_project_rename_missing_new(capsys):
+    """project rename without new name shows error."""
+    from hopper.cli import cmd_project
+
+    result = cmd_project(["rename", "old-name"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "new name required" in captured.out
+
+
+def test_project_rename_error(tmp_path, monkeypatch, capsys):
+    """project rename shows error on ValueError."""
+    from hopper.cli import cmd_project
+
+    monkeypatch.setattr(
+        "hopper.projects.rename_project",
+        lambda cur, new: (_ for _ in ()).throw(ValueError("Project not found: old")),
+    )
+    result = cmd_project(["rename", "old", "new"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "not found" in captured.out
+
+
+def test_project_rename_works_without_server(tmp_path, monkeypatch, capsys):
+    """project rename succeeds even if server notification fails."""
+    from hopper.cli import cmd_project
+
+    monkeypatch.setattr("hopper.projects.rename_project", lambda cur, new: None)
+    monkeypatch.setattr("hopper.projects.rename_project_in_data", lambda cur, new: None)
+    monkeypatch.setattr(
+        "hopper.client.reload_projects",
+        lambda sock: (_ for _ in ()).throw(ConnectionRefusedError()),
+    )
+    result = cmd_project(["rename", "old", "new"])
+    assert result == 0
+
+
+def test_project_add_rejects_extra_arg(capsys):
+    """project add with extra arg shows error."""
+    from hopper.cli import cmd_project
+
+    result = cmd_project(["add", "/some/path", "extra"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "unexpected argument" in captured.out
+
+
 # Tests for screenshot command
 
 

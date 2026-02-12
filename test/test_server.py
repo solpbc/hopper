@@ -1312,7 +1312,7 @@ class TestActivityLog:
         # Projects reloaded (empty since no config, but handler ran)
         log_path = isolate_config / "activity.log"
         content = log_path.read_text()
-        assert "Projects reloaded" in content
+        assert "Projects and lodes reloaded" in content
 
     def test_projects_reload_refreshes_project_order_after_touch(self, socket_path):
         """projects_reload updates in-memory project recency order after touch_project."""

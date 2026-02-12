@@ -224,6 +224,19 @@ def load_archived_lodes() -> list[dict]:
     return lodes
 
 
+def save_archived_lodes(lodes: list[dict]) -> None:
+    """Atomically save archived lodes to JSONL file."""
+    archived_file = config.hopper_dir() / "archived.jsonl"
+    archived_file.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = archived_file.with_suffix(".jsonl.tmp")
+    with open(tmp_path, "w") as f:
+        for lode in lodes:
+            f.write(json.dumps(lode) + "\n")
+
+    os.replace(tmp_path, archived_file)
+
+
 def save_lodes(lodes: list[dict]) -> None:
     """Atomically save lodes to JSONL file."""
     lodes_file = config.hopper_dir() / "active.jsonl"

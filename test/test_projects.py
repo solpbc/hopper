@@ -15,6 +15,8 @@ from hopper.projects import (
     get_active_projects,
     load_projects,
     remove_project,
+    rename_project,
+    rename_project_in_data,
     save_projects,
     touch_project,
     validate_git_dir,
@@ -194,6 +196,97 @@ def test_remove_project_not_found(mock_config):
     """remove_project returns False for unknown project."""
     result = remove_project("nonexistent")
     assert result is False
+
+
+# Tests for rename_project
+
+
+def test_rename_project_success(mock_config, git_dir):
+    """rename_project changes the project name."""
+    add_project(str(git_dir))
+    rename_project("test-repo", "new-name")
+
+    projects = load_projects()
+    assert len(projects) == 1
+    assert projects[0].name == "new-name"
+    assert projects[0].path == str(git_dir)  # path unchanged
+
+
+def test_rename_project_not_found(mock_config):
+    """rename_project raises ValueError for unknown project."""
+    with pytest.raises(ValueError, match="not found"):
+        rename_project("nonexistent", "new-name")
+
+
+def test_rename_project_disabled(mock_config, git_dir):
+    """rename_project raises ValueError for disabled project."""
+    add_project(str(git_dir))
+    remove_project("test-repo")
+    with pytest.raises(ValueError, match="disabled"):
+        rename_project("test-repo", "new-name")
+
+
+def test_rename_project_duplicate_new_name(mock_config, tmp_path):
+    """rename_project raises ValueError if new name already exists."""
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    subprocess.run(["git", "init"], cwd=repo1, capture_output=True, check=True)
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+    subprocess.run(["git", "init"], cwd=repo2, capture_output=True, check=True)
+    add_project(str(repo1))
+    add_project(str(repo2))
+    with pytest.raises(ValueError, match="already exists"):
+        rename_project("repo1", "repo2")
+
+
+def test_rename_project_in_data(mock_config, git_dir):
+    """rename_project_in_data updates project name in all data files."""
+    from hopper.backlog import BacklogItem, load_backlog, save_backlog
+    from hopper.lodes import (
+        load_archived_lodes,
+        load_lodes,
+        save_archived_lodes,
+        save_lodes,
+    )
+
+    add_project(str(git_dir))
+
+    # Create active lodes
+    active = [
+        {"id": "aaa", "project": "test-repo", "state": "running"},
+        {"id": "bbb", "project": "other", "state": "running"},
+    ]
+    save_lodes(active)
+
+    # Create archived lodes
+    archived = [
+        {"id": "ccc", "project": "test-repo", "state": "done"},
+    ]
+    save_archived_lodes(archived)
+
+    # Create backlog items
+    items = [
+        BacklogItem(id="d1", project="test-repo", description="task 1", created_at=1000),
+        BacklogItem(id="d2", project="other", description="task 2", created_at=2000),
+    ]
+    save_backlog(items)
+
+    rename_project_in_data("test-repo", "new-name")
+
+    # Verify active lodes updated
+    lodes = load_lodes()
+    assert lodes[0]["project"] == "new-name"
+    assert lodes[1]["project"] == "other"  # unchanged
+
+    # Verify archived lodes updated
+    arch = load_archived_lodes()
+    assert arch[0]["project"] == "new-name"
+
+    # Verify backlog updated
+    bl = load_backlog()
+    assert bl[0].project == "new-name"
+    assert bl[1].project == "other"  # unchanged
 
 
 # Tests for find_project
