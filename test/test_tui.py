@@ -832,13 +832,41 @@ async def test_archive_with_d(temp_config):
 
 
 @pytest.mark.asyncio
-async def test_quit_with_q():
-    """q should quit the app."""
+async def test_q_does_not_quit():
+    """q should not quit the app (it's now used for queue)."""
     app = HopperApp()
     async with app.run_test() as pilot:
         await pilot.press("q")
-        # App should be exiting
+        assert not app._exit
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_quits():
+    """Ctrl-C should quit the app."""
+    app = HopperApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+c")
         assert app._exit
+
+
+@pytest.mark.asyncio
+async def test_double_ctrl_d_quits():
+    """Double Ctrl-D should quit the app."""
+    app = HopperApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+d")
+        assert not app._exit
+        await pilot.press("ctrl+d")
+        assert app._exit
+
+
+@pytest.mark.asyncio
+async def test_single_ctrl_d_does_not_quit():
+    """Single Ctrl-D should not quit the app."""
+    app = HopperApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+d")
+        assert not app._exit
 
 
 @pytest.mark.asyncio
@@ -1713,6 +1741,51 @@ async def test_delete_backlog_item(temp_config):
         # Delete first item
         await pilot.press("d")
         assert server.events == [{"type": "backlog_remove", "item_id": "bl111111"}]
+
+
+@pytest.mark.asyncio
+async def test_queue_backlog_auto_assign():
+    """q on backlog item should auto-assign queue when one active lode matches project."""
+    from hopper.backlog import BacklogItem
+
+    sessions = [
+        {"id": "lode1234", "project": "proj", "active": True, "stage": "mill", "created_at": 1}
+    ]
+    items = [BacklogItem(id="bl111111", project="proj", description="Queue me", created_at=1000)]
+    server = MockServer(sessions, backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("tab")
+        await pilot.press("tab")
+        await pilot.press("q")
+        assert server.events == [
+            {"type": "backlog_set_queued", "item_id": "bl111111", "queued": "lode1234"}
+        ]
+
+
+@pytest.mark.asyncio
+async def test_queue_backlog_clear():
+    """q on already-queued backlog item should clear queue assignment."""
+    from hopper.backlog import BacklogItem
+
+    items = [
+        BacklogItem(
+            id="bl111111",
+            project="proj",
+            description="Queued already",
+            created_at=1000,
+            queued="lode1234",
+        )
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("tab")
+        await pilot.press("tab")
+        await pilot.press("q")
+        assert server.events == [
+            {"type": "backlog_set_queued", "item_id": "bl111111", "queued": None}
+        ]
 
 
 @pytest.mark.asyncio

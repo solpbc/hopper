@@ -10,6 +10,7 @@ from hopper.backlog import (
     load_backlog,
     remove_backlog_item,
     save_backlog,
+    set_backlog_queued,
     update_backlog_item,
 )
 
@@ -43,6 +44,48 @@ def test_backlog_item_no_lode_id():
     }
     item = BacklogItem.from_dict(data)
     assert item.lode_id is None
+
+
+def test_backlog_item_queued_field(tmp_path, monkeypatch):
+    """BacklogItem should support queued field."""
+    monkeypatch.setattr("hopper.backlog.config.hopper_dir", lambda: tmp_path)
+    items = []
+    item = add_backlog_item(items, "proj", "desc")
+    assert item.queued is None
+
+    # Set queued
+    updated = set_backlog_queued(items, item.id, "lode123")
+    assert updated.queued == "lode123"
+
+    # Roundtrip through dict
+    d = updated.to_dict()
+    assert d["queued"] == "lode123"
+    restored = BacklogItem.from_dict(d)
+    assert restored.queued == "lode123"
+
+    # Clear queued
+    cleared = set_backlog_queued(items, item.id, None)
+    assert cleared.queued is None
+
+
+def test_backlog_item_from_dict_missing_queued():
+    """from_dict should handle missing queued key (backward compat)."""
+    data = {
+        "id": "abc",
+        "project": "proj",
+        "description": "desc",
+        "created_at": 1000,
+    }
+    item = BacklogItem.from_dict(data)
+    assert item.queued is None
+
+
+def test_set_backlog_queued_not_found(tmp_path, monkeypatch):
+    """set_backlog_queued should return None for unknown item."""
+    monkeypatch.setattr("hopper.backlog.config.hopper_dir", lambda: tmp_path)
+    items = []
+    result = set_backlog_queued(items, "nonexistent", "lode123")
+    assert result is None
 
 
 def test_load_backlog_empty(temp_config):

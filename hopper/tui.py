@@ -5,6 +5,7 @@
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -239,6 +240,78 @@ class ProjectPickerScreen(ModalScreen[Project | None]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         project = self._projects[event.option_index]
         self.dismiss(project)
+
+
+class LodePickerScreen(ModalScreen[str | None]):
+    """Modal screen for picking a lode to queue behind."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "select", "Select"),
+    ]
+
+    CSS = """
+    LodePickerScreen {
+        align: center middle;
+        height: 100%;
+    }
+
+    #lode-picker-container {
+        width: 70;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+
+    #lode-picker-title {
+        text-align: center;
+        text-style: bold;
+        color: $text;
+        padding-bottom: 1;
+    }
+
+    #lode-list {
+        height: auto;
+        max-height: 20;
+        background: $surface;
+        border: none;
+    }
+    """
+
+    def __init__(self, lodes: list[dict], title: str = "Queue behind lode"):
+        super().__init__()
+        self._lodes = lodes
+        self._picker_title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="lode-picker-container"):
+            yield Static(self._picker_title, id="lode-picker-title")
+            options = []
+            for lode in self._lodes:
+                label = lode["id"]
+                title = lode.get("title", "")
+                if title:
+                    label += f" - {title}"
+                options.append(Option(label, id=lode["id"]))
+            yield OptionList(*options, id="lode-list")
+
+    def on_mount(self) -> None:
+        self.query_one("#lode-list", OptionList).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_select(self) -> None:
+        option_list = self.query_one("#lode-list", OptionList)
+        if option_list.highlighted is not None:
+            lode = self._lodes[option_list.highlighted]
+            self.dismiss(lode["id"])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        lode = self._lodes[event.option_index]
+        self.dismiss(lode["id"])
 
 
 class TextInputScreen(ModalScreen):
@@ -956,6 +1029,7 @@ class BacklogTable(DataTable):
     COL_PROJECT = "project"
     COL_DESCRIPTION = "description"
     COL_AGE = "age"
+    COL_QUEUED = "queued"
 
     def __init__(self, **kwargs):
         super().__init__(cursor_foreground_priority="renderable", **kwargs)
@@ -965,6 +1039,7 @@ class BacklogTable(DataTable):
         """Set up columns when mounted with explicit keys."""
         self.add_column("project", key=self.COL_PROJECT)
         self.add_column("added", key=self.COL_AGE)
+        self.add_column("queued", key=self.COL_QUEUED)
         self.add_column("description", key=self.COL_DESCRIPTION)
 
     def on_resize(self, event: events.Resize) -> None:
@@ -976,6 +1051,16 @@ class BacklogTable(DataTable):
         last = cols[-1]
         last.width = max(1, event.size.width - fixed_width - 2 * self.cell_padding)
         last.auto_width = False
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "q":
+            event.prevent_default()
+            event.stop()
+            row_key = self.cursor_row
+            if row_key is not None:
+                key = str(self.ordered_rows[row_key].key.value)
+                if key != HINT_BACKLOG:
+                    self.app.action_queue_backlog(key)
 
 
 class ShippedTable(DataTable):
@@ -1104,9 +1189,8 @@ class HopperApp(App):
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
-        Binding("ctrl+d", "quit", "Quit", show=False, priority=True),
+        Binding("ctrl+d", "ctrl_d", "Quit", show=False, priority=True),
         Binding("c", "new_lode", "Create"),
         Binding("b", "new_backlog", "Backlog"),
         Binding("d", "delete", "Delete"),
@@ -1126,6 +1210,7 @@ class HopperApp(App):
         self._git_hash: str = server.git_hash if server and server.git_hash else ""
         self._started_at: int | None = server.started_at if server else None
         self._update_sub_title()
+        self._last_ctrl_d: float = 0.0
 
     def compose(self) -> ComposeResult:
         """Create the UI layout."""
@@ -1313,17 +1398,18 @@ class HopperApp(App):
                 table.update_cell(item.id, BacklogTable.COL_PROJECT, item.project)
                 table.update_cell(item.id, BacklogTable.COL_DESCRIPTION, item.description)
                 table.update_cell(item.id, BacklogTable.COL_AGE, age)
+                table.update_cell(item.id, BacklogTable.COL_QUEUED, item.queued or "")
             else:
                 # Add new row (before hint if present)
                 if has_hint:
                     table.remove_row(HINT_BACKLOG)
                     has_hint = False
-                table.add_row(item.project, age, item.description, key=item.id)
+                table.add_row(item.project, age, item.queued or "", item.description, key=item.id)
 
         # Add hint row at the bottom if not already there
         if not has_hint:
             hint = Text("b to add to backlog", style="bright_black italic")
-            table.add_row("", "", hint, key=HINT_BACKLOG)
+            table.add_row("", "", "", hint, key=HINT_BACKLOG)
 
     def refresh_shipped(self) -> None:
         """Refresh the shipped table with recently shipped lodes."""
@@ -1404,6 +1490,69 @@ class HopperApp(App):
             self.notify("No projects configured. Use: hop project add <path>", severity="warning")
             return False
         return True
+
+    def action_ctrl_d(self) -> None:
+        """Handle Ctrl-D: quit on double-tap within 500ms."""
+        now = time.monotonic()
+        if now - self._last_ctrl_d < 0.5:
+            self.exit()
+        else:
+            self._last_ctrl_d = now
+            self.notify("Press Ctrl-D again to quit", timeout=2)
+
+    def action_queue_backlog(self, item_id: str) -> None:
+        """Toggle queue assignment for a backlog item."""
+        item = self._get_backlog_item(item_id)
+        if not item:
+            return
+
+        # If already queued, clear it
+        if item.queued:
+            if self.server:
+                self.server.enqueue(
+                    {
+                        "type": "backlog_set_queued",
+                        "item_id": item_id,
+                        "queued": None,
+                    }
+                )
+            return
+
+        # Find active lodes matching this item's project
+        active_lodes = [
+            lode
+            for lode in self._lodes
+            if lode.get("project") == item.project and lode.get("active", True)
+        ]
+
+        if not active_lodes:
+            self.notify(f"No active lodes for {item.project}", severity="warning")
+            return
+
+        # If exactly one match, auto-assign
+        if len(active_lodes) == 1:
+            if self.server:
+                self.server.enqueue(
+                    {
+                        "type": "backlog_set_queued",
+                        "item_id": item_id,
+                        "queued": active_lodes[0]["id"],
+                    }
+                )
+            return
+
+        # Multiple matches — open picker
+        def on_pick(lode_id: str | None) -> None:
+            if lode_id and self.server:
+                self.server.enqueue(
+                    {
+                        "type": "backlog_set_queued",
+                        "item_id": item_id,
+                        "queued": lode_id,
+                    }
+                )
+
+        self.push_screen(LodePickerScreen(active_lodes), on_pick)
 
     def action_new_lode(self) -> None:
         """Open project picker, then scope input, to create a lode or backlog item."""

@@ -21,6 +21,7 @@ class BacklogItem:
     description: str
     created_at: int  # milliseconds since epoch
     lode_id: str | None = None  # lode that added it
+    queued: str | None = None  # lode this item is queued behind
 
     def to_dict(self) -> dict:
         return {
@@ -29,6 +30,7 @@ class BacklogItem:
             "description": self.description,
             "created_at": self.created_at,
             "lode_id": self.lode_id,
+            "queued": self.queued,
         }
 
     @classmethod
@@ -39,6 +41,7 @@ class BacklogItem:
             description=data["description"],
             created_at=data["created_at"],
             lode_id=data.get("lode_id"),
+            queued=data.get("queued"),
         )
 
 
@@ -116,6 +119,18 @@ def update_backlog_item(
     for item in items:
         if item.id == item_id:
             item.description = description
+            save_backlog(items)
+            return item
+    return None
+
+
+def set_backlog_queued(
+    items: list[BacklogItem], item_id: str, queued: str | None
+) -> BacklogItem | None:
+    """Set the queued lode ID on a backlog item. Returns the updated item or None."""
+    for item in items:
+        if item.id == item_id:
+            item.queued = queued
             save_backlog(items)
             return item
     return None

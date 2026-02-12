@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hopper.backlog import BacklogItem
 from hopper.config import save_config
 from hopper.lodes import save_lodes
 from hopper.projects import Project, touch_project
@@ -75,6 +76,26 @@ def server(socket_path):
 
     srv.stop()
     thread.join(timeout=2)
+
+
+def _recv_messages_until(
+    client: socket.socket, expected_types: set[str], timeout: float = 2.0
+) -> list[dict]:
+    """Receive broadcast messages until expected types are observed or timeout."""
+    messages: list[dict] = []
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        seen_types = {msg.get("type") for msg in messages}
+        if expected_types.issubset(seen_types):
+            break
+        try:
+            data = client.recv(4096).decode("utf-8")
+        except socket.timeout:
+            continue
+        for line in data.strip().split("\n"):
+            if line:
+                messages.append(json.loads(line))
+    return messages
 
 
 def test_server_creates_socket(socket_path):
@@ -536,6 +557,134 @@ def test_server_handles_lode_set_branch(socket_path, server, temp_config, make_l
     assert server.lodes[0]["branch"] == "hopper-test-id-auth-flow"
 
     client.close()
+
+
+def test_server_handles_backlog_set_queued(socket_path, server):
+    """Server handles backlog_set_queued and broadcasts backlog_updated."""
+    item = BacklogItem(
+        id="bl111111",
+        project="myproj",
+        description="Queued item",
+        created_at=1000,
+    )
+    server.backlog = [item]
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    msg = {"type": "backlog_set_queued", "item_id": "bl111111", "queued": "lode1234"}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "backlog_updated"
+    assert response["item"]["id"] == "bl111111"
+    assert response["item"]["queued"] == "lode1234"
+    assert server.backlog[0].queued == "lode1234"
+
+    client.close()
+
+
+def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, make_lode):
+    """Shipping a lode auto-promotes the oldest queued backlog item for that project."""
+    lode = make_lode(id="lode1234", project="myproj", stage="ship")
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    server.backlog = [
+        BacklogItem(
+            id="bl111111",
+            project="myproj",
+            description="Promote me",
+            created_at=1000,
+            queued="lode1234",
+        )
+    ]
+
+    with patch("hopper.server.spawn_claude") as mock_spawn:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(socket_path))
+        client.settimeout(2.0)
+
+        for _ in range(50):
+            if len(server.clients) > 0:
+                break
+            time.sleep(0.1)
+
+        msg = {"type": "lode_set_stage", "lode_id": "lode1234", "stage": "shipped"}
+        client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+        messages = _recv_messages_until(client, {"lode_updated", "lode_created", "backlog_removed"})
+
+        updated = next(msg for msg in messages if msg.get("type") == "lode_updated")
+        created = next(msg for msg in messages if msg.get("type") == "lode_created")
+        removed = next(msg for msg in messages if msg.get("type") == "backlog_removed")
+
+        assert updated["lode"]["id"] == "lode1234"
+        assert updated["lode"]["stage"] == "shipped"
+        assert created["lode"]["project"] == "myproj"
+        assert removed["item"]["id"] == "bl111111"
+        assert server.lodes[0]["stage"] == "shipped"
+        assert len(server.backlog) == 0
+        mock_spawn.assert_called_once_with(created["lode"]["id"], None, foreground=False)
+
+        client.close()
+
+
+def test_auto_promote_backlog_on_ship_stage_uses_oldest(
+    socket_path, server, temp_config, make_lode
+):
+    """When multiple items are queued behind a shipped lode, only oldest is promoted."""
+    lode = make_lode(id="lode1234", project="myproj", stage="ship")
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    older = BacklogItem(
+        id="bl111111",
+        project="myproj",
+        description="Older",
+        created_at=1000,
+        queued="lode1234",
+    )
+    newer = BacklogItem(
+        id="bl222222",
+        project="myproj",
+        description="Newer",
+        created_at=2000,
+        queued="lode1234",
+    )
+    server.backlog = [newer, older]
+
+    with patch("hopper.server.spawn_claude") as mock_spawn:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(socket_path))
+        client.settimeout(2.0)
+
+        for _ in range(50):
+            if len(server.clients) > 0:
+                break
+            time.sleep(0.1)
+
+        msg = {"type": "lode_set_stage", "lode_id": "lode1234", "stage": "shipped"}
+        client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+        messages = _recv_messages_until(client, {"lode_updated", "lode_created", "backlog_removed"})
+
+        created_msgs = [msg for msg in messages if msg.get("type") == "lode_created"]
+        removed_msgs = [msg for msg in messages if msg.get("type") == "backlog_removed"]
+        assert len(created_msgs) == 1
+        assert len(removed_msgs) == 1
+        assert removed_msgs[0]["item"]["id"] == "bl111111"
+        assert len(server.backlog) == 1
+        assert server.backlog[0].id == "bl222222"
+        mock_spawn.assert_called_once_with(created_msgs[0]["lode"]["id"], None, foreground=False)
+
+        client.close()
 
 
 def test_server_connect_does_not_register_ownership(socket_path, server, temp_config, make_lode):

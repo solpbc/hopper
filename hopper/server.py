@@ -20,6 +20,7 @@ from hopper.backlog import (
     add_backlog_item,
     load_backlog,
     remove_backlog_item,
+    set_backlog_queued,
     update_backlog_item,
 )
 from hopper.backlog import (
@@ -373,6 +374,20 @@ class Server:
         elif msg_type == "archived_list":
             self._send_response(conn, {"type": "archived_list", "lodes": self.archived_lodes})
 
+    def _promote_backlog_item(self, item: BacklogItem, scope: str = "") -> dict:
+        """Promote a backlog item to a lode. Returns the new lode dict."""
+        lode = create_lode(self.lodes, item.project, scope)
+        lode["backlog"] = item.to_dict()
+        save_lodes(self.lodes)
+        logger.info(f"Lode {lode['id']} promoted from backlog {item.id}")
+        self.broadcast({"type": "lode_created", "lode": lode})
+        remove_backlog_item(self.backlog, item.id)
+        self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
+        proj = find_project(item.project)
+        project_path = proj.path if proj else None
+        spawn_claude(lode["id"], project_path, foreground=False)
+        return lode
+
     def _handle_mutation(self, message: dict, conn: socket.socket | None) -> None:
         """Handle a state-mutating message. Runs on the event loop thread."""
         msg_type = message.get("type")
@@ -415,6 +430,17 @@ class Server:
                 if lode:
                     logger.info(f"Lode {lode_id} stage={stage}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
+                    # Auto-promote oldest queued backlog item when a lode ships
+                    if stage == "shipped":
+                        lode_project = lode.get("project", "")
+                        candidates = [
+                            item
+                            for item in self.backlog
+                            if item.queued == lode_id and item.project == lode_project
+                        ]
+                        if candidates:
+                            oldest = min(candidates, key=lambda x: x.created_at)
+                            self._promote_backlog_item(oldest)
 
         elif msg_type == "lode_archive":
             lode_id = message.get("lode_id")
@@ -517,16 +543,7 @@ class Server:
             scope = message.get("scope", "")
             item = find_backlog_by_prefix(self.backlog, item_id)
             if item:
-                lode = create_lode(self.lodes, item.project, scope)
-                lode["backlog"] = item.to_dict()
-                save_lodes(self.lodes)
-                logger.info(f"Lode {lode['id']} promoted from backlog {item.id}")
-                self.broadcast({"type": "lode_created", "lode": lode})
-                remove_backlog_item(self.backlog, item.id)
-                self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
-                proj = find_project(item.project)
-                project_path = proj.path if proj else None
-                spawn_claude(lode["id"], project_path, foreground=False)
+                self._promote_backlog_item(item, scope)
 
         elif msg_type == "backlog_add":
             project = message.get("project", "")
@@ -543,6 +560,15 @@ class Server:
             if item_id and description:
                 update_backlog_item(self.backlog, item_id, description)
                 logger.info(f"Backlog {item_id} updated")
+
+        elif msg_type == "backlog_set_queued":
+            item_id = message.get("item_id", "")
+            queued = message.get("queued")
+            if item_id:
+                item = set_backlog_queued(self.backlog, item_id, queued)
+                if item:
+                    logger.info(f"Backlog {item_id} queued={queued}")
+                    self.broadcast({"type": "backlog_updated", "item": item.to_dict()})
 
         elif msg_type == "backlog_remove":
             item_id = message.get("item_id", "")
