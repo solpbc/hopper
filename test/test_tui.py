@@ -930,6 +930,37 @@ async def test_cursor_preserved_after_refresh():
 
 
 @pytest.mark.asyncio
+async def test_check_server_updates_resyncs_list_references():
+    """check_server_updates should pick up replaced list references from server."""
+    sessions = [
+        {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
+        {"id": "bbbb2222", "stage": "mill", "created_at": 2000},
+    ]
+    server = MockServer(sessions)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        table = app.query_one("#lode-table")
+        assert table.row_count == 3  # 2 lodes + hint
+
+        # Move cursor to row 1
+        await pilot.press("down")
+        assert table.cursor_row == 1
+
+        # Simulate projects_reload: server replaces lodes with a new list
+        new_lodes = list(sessions) + [
+            {"id": "cccc3333", "stage": "refine", "created_at": 3000},
+        ]
+        server.lodes = new_lodes
+
+        app.check_server_updates()
+
+        # TUI should see the new lode
+        assert table.row_count == 4  # 3 lodes + hint
+        # Cursor should be preserved
+        assert table.cursor_row == 1
+
+
+@pytest.mark.asyncio
 async def test_get_lode():
     """_get_lode should find session by ID."""
     sessions = [

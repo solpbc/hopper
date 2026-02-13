@@ -1244,12 +1244,15 @@ class HopperApp(App):
 
     def check_server_updates(self) -> None:
         """Poll server's lode list and refresh if needed."""
+        if self.server:
+            self._lodes = self.server.lodes
+            self._archived_lodes = self.server.archived_lodes
+            self._backlog = self.server.backlog
+            self._projects = list(self.server.projects)
         self._update_sub_title()
         self.refresh_table()
         self.refresh_backlog()
         self.refresh_shipped()
-        if self.server:
-            self._projects = list(self.server.projects)
 
     def _update_sub_title(self) -> None:
         """Update sub_title with git hash and uptime."""
