@@ -30,6 +30,8 @@ CLI (hop up)
 
 **Data flow:** User input -> TUI -> Lode mutation -> Server broadcast -> TUI re-render
 
+**Shared state:** The TUI holds direct references to the server's `lodes`, `archived_lodes`, and `backlog` lists. These are re-synced from the server each poll cycle in `check_server_updates()`. Server mutations that replace these lists (e.g. `projects_reload`) rather than mutating in-place will break the TUI's view unless it re-reads the references. Prefer in-place mutation for shared collections; if replacement is unavoidable, verify consumers re-sync.
+
 **Persistence:** JSONL files in the data directory (via platformdirs). See `hopper/config.py` for paths.
 
 ## Commands
