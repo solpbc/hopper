@@ -983,9 +983,9 @@ class LodeTable(DataTable):
     def on_mount(self) -> None:
         """Set up columns when mounted with explicit keys."""
         self.add_column("", key=self.COL_STATUS)
+        self.add_column("project", key=self.COL_PROJECT)
         self.add_column("stage", key=self.COL_STAGE)
         self.add_column("id", key=self.COL_ID)
-        self.add_column("project", key=self.COL_PROJECT)
         self.add_column("age", key=self.COL_AGE)
         self.add_column("last", key=self.COL_LAST)
         self.add_column("diff", key=self.COL_DIFF)
@@ -1394,9 +1394,9 @@ class HopperApp(App):
                     has_hint = False
                 table.add_row(
                     format_status_text(row.status),
+                    row.project,
                     format_stage_text(row.stage),
                     row.id,
-                    row.project,
                     row.age,
                     row.last,
                     format_diff_summary(diff),
