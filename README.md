@@ -1,11 +1,12 @@
 # hopper
 
-TUI for managing coding agents.
+Hopper pairs Claude Code and Codex for automated end-to-end feature delivery.
 
 ## What it does
-Hopper manages multiple Claude Code sessions ("lodes") through a terminal dashboard inside tmux.
-Each lode follows a three-stage workflow -- mill (scoping), refine (implementing), ship (merging back to main).
-A background server persists state over a Unix socket and broadcasts changes; the TUI renders from that state.
+Hopper runs a dual-agent workflow through a terminal dashboard inside tmux.
+Claude Code handles scoping in `mill` and merging in `ship` via `hop process`.
+Codex handles implementation in `refine` via `hop code`.
+Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a background server persisting state over a Unix socket and broadcasting updates to the TUI.
 
 ## Prerequisites
 - Python >= 3.11
@@ -76,5 +77,4 @@ make ci         # Auto-format and lint with ruff
 Single test: `pytest test/test_file.py::test_name`
 
 ## License
-AGPL-3.0-only. Copyright (c) 2026 sol pbc.
-
+AGPL-3.0-only. Copyright (c) 2026 [sol pbc](https://solpbc.org).
