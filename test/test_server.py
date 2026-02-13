@@ -629,6 +629,7 @@ def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, ma
         assert updated["lode"]["id"] == "lode1234"
         assert updated["lode"]["stage"] == "shipped"
         assert created["lode"]["project"] == "myproj"
+        assert created["lode"]["scope"] == "Promote me"
         assert removed["item"]["id"] == "bl111111"
         assert server.lodes[0]["stage"] == "shipped"
         assert len(server.backlog) == 0

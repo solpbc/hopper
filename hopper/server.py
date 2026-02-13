@@ -376,7 +376,7 @@ class Server:
 
     def _promote_backlog_item(self, item: BacklogItem, scope: str = "") -> dict:
         """Promote a backlog item to a lode. Returns the new lode dict."""
-        lode = create_lode(self.lodes, item.project, scope)
+        lode = create_lode(self.lodes, item.project, scope or item.description)
         lode["backlog"] = item.to_dict()
         save_lodes(self.lodes)
         logger.info(f"Lode {lode['id']} promoted from backlog {item.id}")
