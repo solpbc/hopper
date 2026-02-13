@@ -351,15 +351,20 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
     return lode
 
 
-def update_lode_stage(lodes: list[dict], lode_id: str, stage: str) -> dict | None:
-    """Update a lode's stage. Returns the updated lode or None if not found."""
+def _update_lode_field(lodes: list[dict], lode_id: str, field: str, value) -> dict | None:
+    """Find a lode by ID, set a single field, touch, and save."""
     for lode in lodes:
         if lode["id"] == lode_id:
-            lode["stage"] = stage
+            lode[field] = value
             touch(lode)
             save_lodes(lodes)
             return lode
     return None
+
+
+def update_lode_stage(lodes: list[dict], lode_id: str, stage: str) -> dict | None:
+    """Update a lode's stage. Returns the updated lode or None if not found."""
+    return _update_lode_field(lodes, lode_id, "stage", stage)
 
 
 def archive_lode(lodes: list[dict], lode_id: str) -> dict | None:
@@ -410,46 +415,22 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
 
 def update_lode_status(lodes: list[dict], lode_id: str, status: str) -> dict | None:
     """Update a lode's status text only. Returns the updated lode or None if not found."""
-    for lode in lodes:
-        if lode["id"] == lode_id:
-            lode["status"] = status
-            touch(lode)
-            save_lodes(lodes)
-            return lode
-    return None
+    return _update_lode_field(lodes, lode_id, "status", status)
 
 
 def update_lode_title(lodes: list[dict], lode_id: str, title: str) -> dict | None:
     """Update a lode's title only. Returns the updated lode or None if not found."""
-    for lode in lodes:
-        if lode["id"] == lode_id:
-            lode["title"] = title
-            touch(lode)
-            save_lodes(lodes)
-            return lode
-    return None
+    return _update_lode_field(lodes, lode_id, "title", title)
 
 
 def update_lode_branch(lodes: list[dict], lode_id: str, branch: str) -> dict | None:
     """Update a lode's branch only. Returns the updated lode or None if not found."""
-    for lode in lodes:
-        if lode["id"] == lode_id:
-            lode["branch"] = branch
-            touch(lode)
-            save_lodes(lodes)
-            return lode
-    return None
+    return _update_lode_field(lodes, lode_id, "branch", branch)
 
 
 def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: str) -> dict | None:
     """Update the codex thread ID on a lode."""
-    for lode in lodes:
-        if lode["id"] == lode_id:
-            lode["codex_thread_id"] = codex_thread_id
-            touch(lode)
-            save_lodes(lodes)
-            return lode
-    return None
+    return _update_lode_field(lodes, lode_id, "codex_thread_id", codex_thread_id)
 
 
 def set_lode_claude_started(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:
@@ -477,3 +458,32 @@ def reset_lode_claude_stage(lodes: list[dict], lode_id: str, claude_stage: str) 
             save_lodes(lodes)
             return lode
     return None
+
+
+# --- Status icon constants ---
+
+STATUS_RUNNING = "●"  # filled circle
+STATUS_STUCK = "◐"  # half-filled circle
+STATUS_NEW = "○"  # empty circle
+STATUS_ERROR = "✗"  # x mark
+STATUS_SHIPPED = "✓"
+STATUS_DISCONNECTED = "⊘"  # circled division slash — runner not connected
+
+
+def lode_icon(lode: dict) -> str:
+    """Derive the status icon for a lode based on its state, stage, and active flag."""
+    stage = lode.get("stage", "mill")
+    state = lode.get("state", "new")
+    if stage == "shipped":
+        icon = STATUS_SHIPPED
+    elif state == "new":
+        icon = STATUS_NEW
+    elif state == "error":
+        icon = STATUS_ERROR
+    elif state == "stuck":
+        icon = STATUS_STUCK
+    else:
+        icon = STATUS_RUNNING
+    if not lode.get("active", False) and stage != "shipped":
+        icon = STATUS_DISCONNECTED
+    return icon

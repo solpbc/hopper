@@ -35,12 +35,19 @@ from hopper.backlog import BacklogItem
 from hopper.claude import spawn_claude, switch_to_pane
 from hopper.git import get_diff_stat
 from hopper.lodes import (
+    STATUS_DISCONNECTED,
+    STATUS_ERROR,
+    STATUS_NEW,
+    STATUS_RUNNING,
+    STATUS_SHIPPED,
+    STATUS_STUCK,
     compute_runtime_ms,
     current_time_ms,
     format_age,
     format_duration_ms,
     format_uptime,
     get_lode_dir,
+    lode_icon,
     read_diff_totals,
 )
 from hopper.projects import Project, find_project, touch_project
@@ -65,14 +72,6 @@ CLAUDE_THEME = Theme(
         "footer-description-foreground": "#888888",  # Gray for descriptions
     },
 )
-
-# Status indicators (Unicode symbols, no emoji)
-STATUS_RUNNING = "●"  # filled circle
-STATUS_STUCK = "◐"  # half-filled circle
-STATUS_NEW = "○"  # empty circle
-STATUS_ERROR = "✗"  # x mark
-STATUS_SHIPPED = "✓"
-STATUS_DISCONNECTED = "⊘"  # circled division slash — runner not connected
 
 # Hint row keys (always present at bottom of each table)
 HINT_LODE = "_hint_lode"
@@ -109,21 +108,8 @@ class Row:
 
 def lode_to_row(lode: dict) -> Row:
     """Convert a lode dict to a display row."""
-    state = lode.get("state", "new")
-    if lode.get("stage") == "shipped":
-        status = STATUS_SHIPPED
-    elif state == "new":
-        status = STATUS_NEW
-    elif state == "error":
-        status = STATUS_ERROR
-    elif state == "stuck":
-        status = STATUS_STUCK
-    else:
-        status = STATUS_RUNNING
-
+    status = lode_icon(lode)
     stage = lode.get("stage", "mill")
-    if not lode.get("active", False) and stage != "shipped":
-        status = STATUS_DISCONNECTED
 
     return Row(
         id=lode["id"],

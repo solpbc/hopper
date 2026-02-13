@@ -10,6 +10,12 @@ from textual.app import App
 
 from hopper.backlog import BacklogItem
 from hopper.lodes import (
+    STATUS_DISCONNECTED,
+    STATUS_ERROR,
+    STATUS_NEW,
+    STATUS_RUNNING,
+    STATUS_SHIPPED,
+    STATUS_STUCK,
     format_age,
     parse_diff_numstat,
     parse_diff_numstat_totals,
@@ -18,12 +24,6 @@ from hopper.lodes import (
 from hopper.projects import Project
 from hopper.tui import (
     SHIPPED_24H_MS,
-    STATUS_DISCONNECTED,
-    STATUS_ERROR,
-    STATUS_NEW,
-    STATUS_RUNNING,
-    STATUS_SHIPPED,
-    STATUS_STUCK,
     BacklogInputScreen,
     FileViewerScreen,
     HopperApp,

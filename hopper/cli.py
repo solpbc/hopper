@@ -11,6 +11,7 @@ from pathlib import Path
 import setproctitle
 
 from hopper import __version__, config
+from hopper.lodes import lode_icon
 
 
 def _socket() -> Path:
@@ -792,32 +793,7 @@ def cmd_lode(args: list[str]) -> int:
     import hopper.client as client
     from hopper.projects import find_project
 
-    # Status icons — must match hopper/tui.py
-    STATUS_RUNNING = "●"
-    STATUS_STUCK = "◐"
-    STATUS_NEW = "○"
-    STATUS_ERROR = "✗"
-    STATUS_SHIPPED = "✓"
-    STATUS_DISCONNECTED = "⊘"
     STAGE_ORDER = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
-
-    def lode_icon(lode: dict) -> str:
-        """Derive status icon from lode dict. Matches tui.py lode_to_row logic."""
-        stage = lode.get("stage", "mill")
-        state = lode.get("state", "new")
-        if stage == "shipped":
-            icon = STATUS_SHIPPED
-        elif state == "new":
-            icon = STATUS_NEW
-        elif state == "error":
-            icon = STATUS_ERROR
-        elif state == "stuck":
-            icon = STATUS_STUCK
-        else:
-            icon = STATUS_RUNNING
-        if not lode.get("active", False) and stage != "shipped":
-            icon = STATUS_DISCONNECTED
-        return icon
 
     def format_lode_line(lode: dict) -> str:
         icon = lode_icon(lode)
