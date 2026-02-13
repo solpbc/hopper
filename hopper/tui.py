@@ -1197,6 +1197,7 @@ class HopperApp(App):
         Binding("l", "legend", "Legend"),
         Binding("v", "view_files", "View"),
         Binding("r", "reload", "Reload"),
+        Binding("f", "filter_project", "Filter"),
     ]
 
     def __init__(self, server=None):
@@ -1205,6 +1206,7 @@ class HopperApp(App):
         self._lodes: list[dict] = server.lodes if server else []
         self._archived_lodes = server.archived_lodes if server else []
         self._archive_view: bool = False
+        self._project_filter: str | None = None
         self._backlog: list[BacklogItem] = server.backlog if server else []
         self._projects: list[Project] = list(server.projects) if server else []
         self._git_hash: str = server.git_hash if server and server.git_hash else ""
@@ -1222,7 +1224,7 @@ class HopperApp(App):
             yield Static("shipped today", id="shipped_label", classes="section-label")
             yield ShippedTable(id="shipped-table")
         with Vertical(id="backlog-panel", classes="section"):
-            yield Static("backlog", classes="section-label")
+            yield Static("backlog", id="backlog_label", classes="section-label")
             yield BacklogTable(id="backlog-table")
         yield Footer()
 
@@ -1256,6 +1258,8 @@ class HopperApp(App):
             parts.append(self._git_hash)
         if self._started_at:
             parts.append(format_uptime(self._started_at))
+        if self._project_filter:
+            parts.append(self._project_filter)
         self.sub_title = " · ".join(parts)
 
     def set_archive_view(self, archived: bool) -> None:
@@ -1263,9 +1267,32 @@ class HopperApp(App):
         if self._archive_view == archived:
             return
         self._archive_view = archived
-        label = self.query_one("#lodes_label", Static)
-        label.update("lodes · archived" if archived else "lodes")
         self.refresh_table()
+
+    def action_filter_project(self) -> None:
+        """Toggle project filter, prompting for project when enabling."""
+        if self._project_filter is not None:
+            self._project_filter = None
+            self._refresh_all_tables()
+            self._update_sub_title()
+            return
+
+        if not self._require_projects():
+            return
+
+        def on_project_selected(project: Project | None) -> None:
+            if project is None:
+                return
+            self._project_filter = project.name
+            self._refresh_all_tables()
+            self._update_sub_title()
+
+        self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
+
+    def _refresh_all_tables(self) -> None:
+        self.refresh_table()
+        self.refresh_backlog()
+        self.refresh_shipped()
 
     def refresh_table(self) -> None:
         """Refresh the table using incremental updates to preserve cursor position.
@@ -1290,6 +1317,9 @@ class HopperApp(App):
                 self._lodes, key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 0)
             )
 
+        if self._project_filter:
+            lodes = [lode for lode in lodes if lode.get("project") == self._project_filter]
+
         # Build rows for the current view.
         rows = [
             lode_to_row(s) for s in lodes if self._archive_view or s.get("stage") in STAGE_ORDER
@@ -1303,10 +1333,18 @@ class HopperApp(App):
                 diff_data[row.id] = read_diff_totals(row.id)
             total_loc = sum(additions + deletions for additions, deletions in diff_data.values())
             lodes_label = self.query_one("#lodes_label", Static)
+            label_parts = ["lodes", "archived"]
             if total_loc > 0:
-                lodes_label.update(f"lodes · archived · {total_loc} lines")
-            else:
-                lodes_label.update("lodes · archived")
+                label_parts.append(f"{total_loc} lines")
+            if self._project_filter:
+                label_parts.append(self._project_filter)
+            lodes_label.update(" · ".join(label_parts))
+        else:
+            lodes_label = self.query_one("#lodes_label", Static)
+            label_parts = ["lodes"]
+            if self._project_filter:
+                label_parts.append(self._project_filter)
+            lodes_label.update(" · ".join(label_parts))
 
         # Get current row keys in table (excluding hint row)
         existing_keys: set[str] = set()
@@ -1378,6 +1416,14 @@ class HopperApp(App):
         table = self.query_one("#backlog-table", BacklogTable)
 
         items = self._backlog
+        if self._project_filter:
+            items = [item for item in items if item.project == self._project_filter]
+
+        backlog_label = self.query_one("#backlog_label", Static)
+        label_parts = ["backlog"]
+        if self._project_filter:
+            label_parts.append(self._project_filter)
+        backlog_label.update(" · ".join(label_parts))
 
         existing_keys: set[str] = set()
         for row_key in table.rows:
@@ -1428,16 +1474,21 @@ class HopperApp(App):
             reverse=True,
         )
 
+        if self._project_filter:
+            shipped = [lode for lode in shipped if lode.get("project") == self._project_filter]
+
         diff_data: dict[str, tuple[int, int]] = {}
         for lode in shipped:
             diff_data[lode["id"]] = read_diff_totals(lode["id"])
         total_loc = sum(additions + deletions for additions, deletions in diff_data.values())
 
         shipped_label = self.query_one("#shipped_label", Static)
+        label_parts = ["shipped today"]
         if total_loc > 0:
-            shipped_label.update(f"shipped today · {total_loc} lines")
-        else:
-            shipped_label.update("shipped today")
+            label_parts.append(f"{total_loc} lines")
+        if self._project_filter:
+            label_parts.append(self._project_filter)
+        shipped_label.update(" · ".join(label_parts))
 
         table.clear()
         for lode in shipped:

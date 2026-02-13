@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 from textual.app import App
 
+from hopper.backlog import BacklogItem
 from hopper.lodes import (
     format_age,
     parse_diff_numstat,
@@ -2766,3 +2767,180 @@ def test_file_viewer_screen_init(tmp_path):
     screen = FileViewerScreen(tmp_path, "test123")
     assert screen.lode_dir == tmp_path
     assert screen.lode_id == "test123"
+
+
+@pytest.mark.asyncio
+async def test_project_filter_toggle(make_lode):
+    """Setting filter then calling action_filter_project clears it."""
+    projects = [Project(name="alpha", path="/a")]
+    server = MockServer(
+        [make_lode(id="lode0001", project="alpha")],
+        projects=projects,
+    )
+    app = HopperApp(server=server)
+    async with app.run_test():
+        assert app._project_filter is None
+        # Set filter directly (simulating picker callback)
+        app._project_filter = "alpha"
+        app._refresh_all_tables()
+        app._update_sub_title()
+        assert app._project_filter == "alpha"
+        # Pressing f clears the filter
+        app.action_filter_project()
+        assert app._project_filter is None
+
+
+@pytest.mark.asyncio
+async def test_project_filter_lode_table(make_lode):
+    """Project filter should show only matching lodes."""
+    server = MockServer(
+        [
+            make_lode(id="alpha001", project="alpha"),
+            make_lode(id="beta0001", project="beta"),
+        ],
+    )
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#lode-table")
+        assert table.row_count == 3  # 2 lodes + hint
+        app._project_filter = "alpha"
+        app.refresh_table()
+        assert table.row_count == 2  # 1 lode + hint
+        row_keys = {str(k.value) for k in table.rows}
+        assert "alpha001" in row_keys
+        assert "beta0001" not in row_keys
+
+
+@pytest.mark.asyncio
+async def test_project_filter_backlog_table():
+    """Project filter should show only matching backlog items."""
+    items = [
+        BacklogItem(id="bl01", project="alpha", description="task 1", created_at=1000),
+        BacklogItem(id="bl02", project="beta", description="task 2", created_at=2000),
+    ]
+    server = MockServer(backlog=items)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        table = app.query_one("#backlog-table")
+        assert table.row_count == 3  # 2 items + hint
+        app._project_filter = "alpha"
+        app.refresh_backlog()
+        assert table.row_count == 2  # 1 item + hint
+
+
+@pytest.mark.asyncio
+async def test_project_filter_shipped_table(make_lode):
+    """Project filter should show only matching shipped lodes."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    archived = [
+        make_lode(id="ship0001", stage="shipped", project="alpha", updated_at=now),
+        make_lode(id="ship0002", stage="shipped", project="beta", updated_at=now),
+    ]
+    server = MockServer(archived_lodes=archived)
+    app = HopperApp(server=server)
+    with patch("hopper.tui.read_diff_totals", return_value=(0, 0)):
+        async with app.run_test():
+            table = app.query_one("#shipped-table")
+            assert table.row_count == 2  # 2 shipped
+            app._project_filter = "alpha"
+            app.refresh_shipped()
+            assert table.row_count == 1  # 1 shipped
+
+
+@pytest.mark.asyncio
+async def test_project_filter_with_archive_view(make_lode):
+    """Project filter should compose with archive view."""
+    archived = [
+        make_lode(id="arch0001", project="alpha", updated_at=1000),
+        make_lode(id="arch0002", project="beta", updated_at=2000),
+    ]
+    server = MockServer([], archived_lodes=archived)
+    app = HopperApp(server=server)
+    with patch("hopper.tui.read_diff_totals", return_value=(0, 0)):
+        async with app.run_test() as pilot:
+            # Enter archive view
+            await pilot.press("left")
+            table = app.query_one("#lode-table")
+            assert table.row_count == 3  # 2 archived + hint
+            # Apply filter
+            app._project_filter = "alpha"
+            app.refresh_table()
+            assert table.row_count == 2  # 1 archived + hint
+            row_keys = {str(k.value) for k in table.rows}
+            assert "arch0001" in row_keys
+            assert "arch0002" not in row_keys
+
+
+@pytest.mark.asyncio
+async def test_project_filter_sub_title():
+    """Sub_title should include project name when filter is active."""
+    server = MockServer([], git_hash="abc1234", started_at=None)
+    app = HopperApp(server=server)
+    async with app.run_test():
+        assert app.sub_title == "abc1234"
+        app._project_filter = "myproject"
+        app._update_sub_title()
+        assert app.sub_title == "abc1234 · myproject"
+        app._project_filter = None
+        app._update_sub_title()
+        assert app.sub_title == "abc1234"
+
+
+@pytest.mark.asyncio
+async def test_project_filter_section_labels(make_lode):
+    """Section labels should include project name when filter is active."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    items = [BacklogItem(id="bl01", project="alpha", description="t", created_at=1000)]
+    archived = [make_lode(id="ship01", stage="shipped", project="alpha", updated_at=now)]
+    server = MockServer(
+        [make_lode(id="lode01", project="alpha")],
+        archived_lodes=archived,
+        backlog=items,
+    )
+    app = HopperApp(server=server)
+    with patch("hopper.tui.read_diff_totals", return_value=(0, 0)):
+        async with app.run_test():
+            app._project_filter = "alpha"
+            app._refresh_all_tables()
+            lodes_label = app.query_one("#lodes_label")
+            assert lodes_label.content == "lodes · alpha"
+            shipped_label = app.query_one("#shipped_label")
+            assert shipped_label.content == "shipped today · alpha"
+            backlog_label = app.query_one("#backlog_label")
+            assert backlog_label.content == "backlog · alpha"
+
+
+@pytest.mark.asyncio
+async def test_project_filter_archive_label_with_loc(make_lode):
+    """Archive label with LOC and filter shows correct ordering."""
+    archived = [
+        make_lode(id="arch0001", project="alpha", updated_at=1000),
+        make_lode(id="arch0002", project="alpha", updated_at=2000),
+    ]
+    server = MockServer([], archived_lodes=archived)
+    app = HopperApp(server=server)
+    diff_totals = {"arch0001": (10, 2), "arch0002": (3, 5)}
+
+    with patch("hopper.tui.read_diff_totals", side_effect=lambda lid: diff_totals[lid]):
+        async with app.run_test() as pilot:
+            app._project_filter = "alpha"
+            await pilot.press("left")  # enter archive view, triggers refresh_table
+            label = app.query_one("#lodes_label")
+            assert label.content == "lodes · archived · 20 lines · alpha"
+
+
+@pytest.mark.asyncio
+async def test_project_filter_escape_no_filter():
+    """Dismissing the picker with escape should not set a filter."""
+    projects = [Project(name="alpha", path="/a")]
+    server = MockServer([], projects=projects)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("f")
+        # Picker should be open
+        await pilot.press("escape")
+        assert app._project_filter is None
