@@ -10,6 +10,7 @@ from hopper.lodes import (
     ID_ALPHABET,
     ID_LEN,
     archive_lode,
+    compute_runtime_ms,
     create_lode,
     current_time_ms,
     format_age,
@@ -667,3 +668,149 @@ def test_format_duration_ms_hours():
     """Durations 1+ hours return Xh."""
     assert format_duration_ms(60 * 60_000) == "1h"
     assert format_duration_ms(3 * 60 * 60_000) == "3h"
+
+
+def test_compute_runtime_ms_no_runs():
+    """compute_runtime_ms returns 0 when runs is empty."""
+    lode = {"runs": {}}
+    assert compute_runtime_ms(lode) == 0
+
+
+def test_compute_runtime_ms_missing_runs_key():
+    """compute_runtime_ms returns 0 when runs key is missing."""
+    lode = {}
+    assert compute_runtime_ms(lode) == 0
+
+
+def test_compute_runtime_ms_completed_stage():
+    """compute_runtime_ms sums completed stage duration."""
+    lode = {"runs": {"mill": {"started_at": 1000, "stopped_at": 6000}}}
+    assert compute_runtime_ms(lode) == 5000
+
+
+def test_compute_runtime_ms_running_stage():
+    """compute_runtime_ms uses now for running stage."""
+    lode = {"runs": {"refine": {"started_at": 1000}}}
+    assert compute_runtime_ms(lode, now=4000) == 3000
+
+
+def test_compute_runtime_ms_multiple_stages():
+    """compute_runtime_ms sums across multiple stages."""
+    lode = {
+        "runs": {
+            "mill": {"started_at": 1000, "stopped_at": 3000},
+            "refine": {"started_at": 5000, "stopped_at": 8000},
+        }
+    }
+    assert compute_runtime_ms(lode) == 5000
+
+
+def test_compute_runtime_ms_restart_clears_previous():
+    """Restarting a stage replaces started_at, clearing previous time."""
+    lode = {"runs": {"mill": {"started_at": 9000}}}
+    assert compute_runtime_ms(lode, now=10000) == 1000
+
+
+def test_compute_runtime_ms_empty_stage_run():
+    """compute_runtime_ms skips stages with no started_at."""
+    lode = {"runs": {"mill": {}}}
+    assert compute_runtime_ms(lode) == 0
+
+
+def test_update_lode_state_records_started_at(temp_config):
+    """update_lode_state records started_at when state becomes running."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "new",
+            "runs": {},
+        }
+    ]
+    save_lodes(lodes_list)
+    update_lode_state(lodes_list, "testid11", "running", "Claude running")
+    runs = lodes_list[0]["runs"]
+    assert "mill" in runs
+    assert "started_at" in runs["mill"]
+    assert "stopped_at" not in runs["mill"]
+
+
+def test_update_lode_state_records_stopped_at(temp_config):
+    """update_lode_state records stopped_at when state becomes ready."""
+    now = current_time_ms()
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "runs": {"mill": {"started_at": now - 5000}},
+        }
+    ]
+    save_lodes(lodes_list)
+    update_lode_state(lodes_list, "testid11", "ready", "Done")
+    runs = lodes_list[0]["runs"]
+    assert "stopped_at" in runs["mill"]
+    assert runs["mill"]["stopped_at"] >= runs["mill"]["started_at"]
+
+
+def test_update_lode_state_error_stops_timer(temp_config):
+    """update_lode_state records stopped_at when state becomes error."""
+    now = current_time_ms()
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "refine",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "runs": {"refine": {"started_at": now - 3000}},
+        }
+    ]
+    save_lodes(lodes_list)
+    update_lode_state(lodes_list, "testid11", "error", "Failed")
+    runs = lodes_list[0]["runs"]
+    assert "stopped_at" in runs["refine"]
+
+
+def test_update_lode_state_restart_resets_timer(temp_config):
+    """Restarting (running again) replaces started_at and clears stopped_at."""
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "ready",
+            "runs": {"mill": {"started_at": 1000, "stopped_at": 5000}},
+        }
+    ]
+    save_lodes(lodes_list)
+    update_lode_state(lodes_list, "testid11", "running", "Claude running")
+    runs = lodes_list[0]["runs"]
+    assert "started_at" in runs["mill"]
+    assert "stopped_at" not in runs["mill"]
+    assert runs["mill"]["started_at"] > 5000
+
+
+def test_update_lode_state_stuck_no_timing_change(temp_config):
+    """Stuck state does not affect timing."""
+    now = current_time_ms()
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "runs": {"mill": {"started_at": now - 5000}},
+        }
+    ]
+    save_lodes(lodes_list)
+    update_lode_state(lodes_list, "testid11", "stuck", "No output")
+    runs = lodes_list[0]["runs"]
+    assert "stopped_at" not in runs["mill"]
+    assert runs["mill"]["started_at"] == now - 5000

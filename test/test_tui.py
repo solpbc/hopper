@@ -57,35 +57,8 @@ def test_lode_to_row_new():
     assert row.id == "abcd1234"
     assert row.status == STATUS_NEW
     assert row.stage == "mill"
-    assert row.last == row.age
-
-
-def test_lode_to_row_last_uses_updated_at():
-    """last uses updated_at while age uses created_at."""
-    session = {
-        "id": "abcd1234",
-        "stage": "mill",
-        "created_at": 1000,
-        "updated_at": 2000,
-        "state": "new",
-        "active": True,
-    }
-    row = lode_to_row(session)
     assert row.age == format_age(1000)
-    assert row.last == format_age(2000)
-
-
-def test_lode_to_row_last_fallback_no_updated_at():
-    """last falls back to created_at when updated_at is missing."""
-    session = {
-        "id": "abcd1234",
-        "stage": "mill",
-        "created_at": 1000,
-        "state": "new",
-        "active": True,
-    }
-    row = lode_to_row(session)
-    assert row.last == row.age
+    assert row.run == "0s"
 
 
 def test_lode_to_row_running():
@@ -254,7 +227,7 @@ async def test_title_column_width_adjusts_to_content(make_lode):
                 id="ccc33333",
                 stage="mill",
                 age="",
-                last="",
+                run="",
                 status=STATUS_NEW,
                 title="B" * 40,
             )
@@ -454,7 +427,7 @@ def test_row_dataclass():
         id="test1234",
         stage="mill",
         age="1m",
-        last="5m",
+        run="5m",
         status=STATUS_RUNNING,
         project="proj",
         title="Auth Flow",
@@ -463,7 +436,7 @@ def test_row_dataclass():
     assert row.id == "test1234"
     assert row.stage == "mill"
     assert row.age == "1m"
-    assert row.last == "5m"
+    assert row.run == "5m"
     assert row.status == STATUS_RUNNING
     assert row.project == "proj"
     assert row.title == "Auth Flow"

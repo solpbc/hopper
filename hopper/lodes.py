@@ -19,6 +19,7 @@ Lodes are plain dicts with these fields:
 - pid: int | None - process ID of active runner (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - backlog: dict | None - original backlog item data if promoted (default None)
+- runs: dict - per-stage runtime tracking {"stage": {"started_at": ms, "stopped_at": ms}}
 - claude: dict - per-stage Claude session tracking:
     {"mill": {"session_id": "<uuid>", "started": false},
      "refine": {"session_id": "<uuid>", "started": false},
@@ -131,6 +132,23 @@ def format_duration_ms(duration_ms: int) -> str:
 
     hours = minutes // 60
     return f"{hours}h"
+
+
+def compute_runtime_ms(lode: dict, now: int | None = None) -> int:
+    """Sum runtime across all stages in a lode's runs dict."""
+    if now is None:
+        now = current_time_ms()
+    total = 0
+    for stage_run in lode.get("runs", {}).values():
+        started = stage_run.get("started_at")
+        if started is None:
+            continue
+        stopped = stage_run.get("stopped_at")
+        if stopped is not None:
+            total += stopped - started
+        else:
+            total += now - started
+    return max(0, total)
 
 
 def slugify(title: str) -> str:
@@ -324,6 +342,7 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "pid": None,
         "codex_thread_id": None,
         "backlog": None,
+        "runs": {},
         "claude": _make_claude_sessions(),
     }
     lodes.append(lode)
@@ -371,6 +390,18 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
         if lode["id"] == lode_id:
             lode["state"] = state
             lode["status"] = status
+            # Record run timing
+            stage = lode.get("stage", "")
+            if stage in ("mill", "refine", "ship"):
+                runs = lode.setdefault("runs", {})
+                now = current_time_ms()
+                if state == "running":
+                    runs[stage] = {"started_at": now}
+                elif state in ("error", "ready"):
+                    stage_run = runs.get(stage, {})
+                    if "started_at" in stage_run:
+                        stage_run["stopped_at"] = now
+                        runs[stage] = stage_run
             touch(lode)
             save_lodes(lodes)
             return lode

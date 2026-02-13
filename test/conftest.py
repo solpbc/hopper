@@ -53,6 +53,7 @@ def make_lode():
             "pid": None,
             "codex_thread_id": None,
             "backlog": None,
+            "runs": overrides.get("runs", {}),
             "claude": {
                 "mill": {"session_id": "00000000-0000-0000-0000-000000000001", "started": False},
                 "refine": {"session_id": "00000000-0000-0000-0000-000000000002", "started": False},

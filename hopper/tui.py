@@ -35,8 +35,10 @@ from hopper.backlog import BacklogItem
 from hopper.claude import spawn_claude, switch_to_pane
 from hopper.git import get_diff_stat
 from hopper.lodes import (
+    compute_runtime_ms,
     current_time_ms,
     format_age,
+    format_duration_ms,
     format_uptime,
     get_lode_dir,
     read_diff_totals,
@@ -97,7 +99,7 @@ class Row:
     id: str
     stage: str  # "mill", "refine", "ship", or "shipped"
     age: str  # formatted age string
-    last: str  # formatted time since last mutation
+    run: str  # formatted cumulative runtime
     # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR, STATUS_SHIPPED, STATUS_DISCONNECTED
     status: str
     project: str = ""  # Project name
@@ -127,7 +129,7 @@ def lode_to_row(lode: dict) -> Row:
         id=lode["id"],
         stage=stage,
         age=format_age(lode["created_at"]),
-        last=format_age(lode.get("updated_at", lode["created_at"])),
+        run=format_duration_ms(compute_runtime_ms(lode)),
         status=status,
         project=lode.get("project", ""),
         title=lode.get("title", ""),
@@ -969,7 +971,7 @@ class LodeTable(DataTable):
     COL_ID = "id"
     COL_PROJECT = "project"
     COL_AGE = "age"
-    COL_LAST = "last"
+    COL_RUN = "run"
     COL_DIFF = "diff"
     COL_TITLE = "title"
     COL_STATUS_TEXT = "status_text"
@@ -987,7 +989,7 @@ class LodeTable(DataTable):
         self.add_column("stage", key=self.COL_STAGE)
         self.add_column("id", key=self.COL_ID)
         self.add_column("age", key=self.COL_AGE)
-        self.add_column("last", key=self.COL_LAST)
+        self.add_column("run", key=self.COL_RUN)
         self.add_column("diff", key=self.COL_DIFF)
         self.add_column("title", key=self.COL_TITLE, width=self.MAX_TITLE_WIDTH)
         self.add_column("status", key=self.COL_STATUS_TEXT)
@@ -1379,7 +1381,7 @@ class HopperApp(App):
                 table.update_cell(row.id, LodeTable.COL_ID, row.id)
                 table.update_cell(row.id, LodeTable.COL_PROJECT, row.project)
                 table.update_cell(row.id, LodeTable.COL_AGE, row.age)
-                table.update_cell(row.id, LodeTable.COL_LAST, row.last)
+                table.update_cell(row.id, LodeTable.COL_RUN, row.run)
                 table.update_cell(row.id, LodeTable.COL_DIFF, format_diff_summary(diff))
                 table.update_cell(row.id, LodeTable.COL_TITLE, row.title)
                 table.update_cell(
@@ -1398,7 +1400,7 @@ class HopperApp(App):
                     format_stage_text(row.stage),
                     row.id,
                     row.age,
-                    row.last,
+                    row.run,
                     format_diff_summary(diff),
                     row.title,
                     format_status_label(row.status_text, row.status),
