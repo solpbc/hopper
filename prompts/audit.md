@@ -7,6 +7,7 @@ Review the area described below thoroughly. Trace through all logic paths until 
 - **Stale/outdated content** - docs, comments, naming that doesn't match current code
 - **Redundancy** - DRY violations, duplicate logic that should be consolidated
 - **Over-complexity** - anything that could be simplified while maintaining functionality
+- **Data flow gaps** - trace compound operations through all trigger paths (manual, automatic, CLI) and verify each path propagates complete data to shared functions. Watch for default parameters that silently degrade.
 - **Backwards Compatibility** - look for legacy/compatibility only things that can be cleaned up
 
 For each finding, note: what, where (file:line), and why it's an issue.

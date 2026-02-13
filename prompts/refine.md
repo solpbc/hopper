@@ -85,7 +85,7 @@ These are the standards you hold your junior engineer to:
 - **Clean breaks** - migrate data, update all callers, remove dead code. No backward-compatibility layers unless unavoidable.
 - **Consistency** - naming, patterns, and mechanisms should be uniform. One way to do things.
 - **Realistic validation** - tests should pass, but also verify against real behavior. Fixtures should reflect reality.
-- **Trace the whole system** - understand call sites, data flow, and invariants. No local-only fixes that miss the bigger picture.
+- **Trace the whole system** - understand call sites, data flow, and invariants. No local-only fixes that miss the bigger picture. When an operation has multiple trigger paths (user action, automation, CLI), verify each path carries complete data to the shared function.
 
 ---
 
