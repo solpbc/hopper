@@ -1588,6 +1588,33 @@ async def test_shipped_table_updates_dynamically(make_lode):
         assert str(top_key.row_key.value) == "ship0002"
 
 
+@pytest.mark.asyncio
+async def test_shipped_cursor_preserved_after_refresh(make_lode):
+    """Cursor position on shipped table should be preserved across refresh."""
+    from hopper.lodes import current_time_ms
+
+    now = current_time_ms()
+    shipped = [
+        make_lode(id="ship0001", stage="shipped", updated_at=now - 1000),
+        make_lode(id="ship0002", stage="shipped", updated_at=now - 2000),
+        make_lode(id="ship0003", stage="shipped", updated_at=now - 3000),
+    ]
+    server = MockServer([], archived_lodes=shipped)
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        # Focus the shipped table
+        await pilot.press("tab")  # lode -> shipped
+        table = app.query_one("#shipped-table", ShippedTable)
+        # Move to row 2
+        await pilot.press("down")
+        await pilot.press("down")
+        assert table.cursor_row == 2
+        # Refresh (simulates polling update)
+        app.refresh_shipped()
+        # Cursor should still be at row 2
+        assert table.cursor_row == 2
+
+
 def test_parse_diff_numstat_normal_input():
     """parse_diff_numstat sums additions and deletions across valid lines."""
     text = "10\t5\tfile.py\n20\t3\tother.py"

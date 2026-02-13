@@ -1490,15 +1490,47 @@ class HopperApp(App):
             label_parts.append(self._project_filter)
         shipped_label.update(" · ".join(label_parts))
 
-        table.clear()
+        existing_keys: set[str] = set()
+        for row_key in table.rows:
+            existing_keys.add(str(row_key.value))
+
+        desired_keys = {lode["id"] for lode in shipped}
+
+        for key in existing_keys - desired_keys:
+            table.remove_row(key)
+
+        row_data: dict[str, tuple[str, str, str, Text, str]] = {}
         for lode in shipped:
             lode_id = lode["id"]
             project = lode.get("project", "")
             age = format_age(lode.get("created_at", 0))
             additions, deletions = diff_data[lode_id]
             diff = f"+{additions} -{deletions}" if additions or deletions else ""
+            formatted_diff = format_diff_summary(diff)
             title = lode.get("title", "")
-            table.add_row(project, age, lode_id, format_diff_summary(diff), title, key=lode_id)
+            row_data[lode_id] = (project, age, lode_id, formatted_diff, title)
+            if lode_id in existing_keys:
+                table.update_cell(lode_id, ShippedTable.COL_PROJECT, project)
+                table.update_cell(lode_id, ShippedTable.COL_AGE, age)
+                table.update_cell(lode_id, ShippedTable.COL_ID, lode_id)
+                table.update_cell(lode_id, ShippedTable.COL_DIFF, formatted_diff)
+                table.update_cell(lode_id, ShippedTable.COL_TITLE, title)
+            else:
+                table.add_row(project, age, lode_id, formatted_diff, title, key=lode_id)
+
+        desired_order = [lode["id"] for lode in shipped]
+        current_order = [str(row_key.value) for row_key in table.rows]
+        if current_order != desired_order:
+            selected_key = self._get_selected_row_key(table)
+            for key in current_order:
+                table.remove_row(key)
+            for lode_id in desired_order:
+                table.add_row(*row_data[lode_id], key=lode_id)
+            if selected_key and selected_key in desired_keys:
+                for i, lode_id in enumerate(desired_order):
+                    if lode_id == selected_key:
+                        table.move_cursor(row=i)
+                        break
 
     def _get_selected_row_key(self, table: DataTable) -> str | None:
         """Get the row key of the selected row in a table."""
