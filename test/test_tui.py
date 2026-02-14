@@ -457,6 +457,7 @@ class MockServer:
         projects: list[Project] | None = None,
         git_hash: str | None = None,
         started_at: int | None = None,
+        tmux_location: dict | None = None,
     ):
         self.lodes = sessions if sessions is not None else []
         self.archived_lodes = archived_lodes if archived_lodes is not None else []
@@ -464,6 +465,7 @@ class MockServer:
         self.projects = projects if projects is not None else []
         self.git_hash = git_hash
         self.started_at = started_at
+        self.tmux_location = tmux_location
         self.broadcasts: list[dict] = []
         self.events: list[dict] = []
 
@@ -934,6 +936,72 @@ async def test_check_server_updates_resyncs_list_references():
         assert table.row_count == 4  # 3 lodes + hint
         # Cursor should be preserved
         assert table.cursor_row == 1
+
+
+def test_check_stuck_alert_sets_alert_when_error_lode_exists():
+    """_check_stuck_alert should set alert flag when an error lode exists."""
+    app = HopperApp()
+    app._lodes = [{"state": "error", "active": True, "stage": "mill"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is True
+
+
+def test_check_stuck_alert_clears_alert_when_all_healthy():
+    """_check_stuck_alert should clear alert flag when all lodes are healthy."""
+    app = HopperApp()
+    app._stuck_alert_active = True
+    app._lodes = [{"state": "running", "active": True, "stage": "refine"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+
+def test_check_stuck_alert_noop_when_state_unchanged(monkeypatch):
+    """_check_stuck_alert should not rename when alert state doesn't change."""
+    app = HopperApp()
+    app._stuck_alert_active = False
+    app._lodes = [{"state": "running", "active": True, "stage": "refine"}]
+    rename_calls: list[str] = []
+    monkeypatch.setattr(app, "_rename_tui_window", lambda name: rename_calls.append(name))
+    app._check_stuck_alert()
+    assert rename_calls == []
+
+
+def test_rename_tui_window_skips_when_no_server():
+    """_rename_tui_window should safely no-op when no server is set."""
+    app = HopperApp()
+    app._rename_tui_window("hop")
+
+
+def test_rename_tui_window_skips_when_no_tmux_location():
+    """_rename_tui_window should safely no-op when tmux location is missing."""
+    app = HopperApp(server=MockServer([], tmux_location=None))
+    app._rename_tui_window("hop")
+
+
+def test_disconnected_lode_triggers_alert():
+    """Inactive non-shipped and non-new lodes should trigger stuck alert."""
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "idle"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is True
+
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "shipped", "state": "idle"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "new"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+
+def test_stuck_state_triggers_alert():
+    """Lodes in stuck state should trigger stuck alert."""
+    app = HopperApp()
+    app._lodes = [{"state": "stuck", "active": True, "stage": "mill"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is True
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,7 @@ from hopper.lodes import (
     read_diff_totals,
 )
 from hopper.projects import Project, find_project, touch_project
+from hopper.tmux import rename_window
 
 # Claude Code-inspired theme
 # Colors derived from Claude Code's terminal UI (ANSI bright colors)
@@ -1294,6 +1295,7 @@ class HopperApp(App):
         self._started_at: int | None = server.started_at if server else None
         self._update_sub_title()
         self._last_ctrl_d: float = 0.0
+        self._stuck_alert_active: bool = False
 
     def compose(self) -> ComposeResult:
         """Create the UI layout."""
@@ -1322,6 +1324,11 @@ class HopperApp(App):
         self.set_interval(1.0, self.check_server_updates)
         # Focus the lode table
         self.query_one("#lode-table", LodeTable).focus()
+        self._rename_tui_window("hop")
+
+    def on_unmount(self) -> None:
+        """Restore window name on exit."""
+        self._rename_tui_window("hop")
 
     def check_server_updates(self) -> None:
         """Poll server's lode list and refresh if needed."""
@@ -1334,6 +1341,31 @@ class HopperApp(App):
         self.refresh_table()
         self.refresh_backlog()
         self.refresh_shipped()
+        self._check_stuck_alert()
+
+    def _rename_tui_window(self, name: str) -> None:
+        """Rename the TUI's own tmux window, guarding for missing tmux."""
+        if not self.server or not self.server.tmux_location:
+            return
+        rename_window(self.server.tmux_location["pane"], name)
+
+    def _check_stuck_alert(self) -> None:
+        """Rename TUI window to hop:STUCK if any lode needs attention."""
+        needs_attention = any(
+            lode.get("state") in ("error", "stuck")
+            or (
+                not lode.get("active", False)
+                and lode.get("stage", "mill") != "shipped"
+                and lode.get("state", "new") != "new"
+            )
+            for lode in self._lodes
+        )
+        if needs_attention and not self._stuck_alert_active:
+            self._rename_tui_window("hop:STUCK")
+            self._stuck_alert_active = True
+        elif not needs_attention and self._stuck_alert_active:
+            self._rename_tui_window("hop")
+            self._stuck_alert_active = False
 
     def _update_sub_title(self) -> None:
         """Update sub_title with git hash and uptime."""
