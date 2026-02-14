@@ -95,7 +95,7 @@ class TestMillStage:
         assert runner.connection is None
 
     def test_validates_stage(self):
-        """Mill runner rejects lode not in mill stage."""
+        """Mill stage mismatch emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
 
         with (
@@ -106,7 +106,7 @@ class TestMillStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -117,7 +117,7 @@ class TestMillStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_emits_error_on_nonzero_exit(self, capsys):
-        """Runner emits error state on non-zero exit."""
+        """Non-zero Claude exit emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
@@ -135,7 +135,7 @@ class TestMillStage:
             ),
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "Exited with code 1" in capsys.readouterr().out
         assert any(e[0] == "lode_set_state" and e[1]["state"] == "error" for e in emitted)
@@ -269,7 +269,7 @@ class TestMillStage:
         assert mock_popen.call_args[1]["cwd"] is None
 
     def test_fails_if_project_dir_missing(self, tmp_path):
-        """Runner returns 1 if project dir doesn't exist."""
+        """Missing project dir emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         mock_project = MagicMock(path=str(tmp_path / "nope"))
 
@@ -282,7 +282,7 @@ class TestMillStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -293,7 +293,7 @@ class TestMillStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_repo_dirty(self, tmp_path, capsys):
-        """Runner exits 1 if project repo has uncommitted changes."""
+        """Dirty repo emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         project_dir = tmp_path / "my-project"
         project_dir.mkdir()
@@ -309,7 +309,7 @@ class TestMillStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "uncommitted changes" in capsys.readouterr().out
         MockConn.return_value.emit.assert_any_call(
@@ -340,7 +340,7 @@ class TestMillStage:
         assert context["scope"] == "build the widget"
 
     def test_handles_missing_claude(self, capsys):
-        """Runner returns 127 if claude not found."""
+        """Missing claude emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
@@ -355,12 +355,12 @@ class TestMillStage:
             patch("subprocess.Popen", side_effect=FileNotFoundError),
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
-            assert runner.run() == 127
+            assert runner.run() == 0
 
         assert "command not found" in capsys.readouterr().out.lower()
 
     def test_prints_on_unexpected_exception(self, capsys):
-        """Runner prints and emits error on unexpected exception."""
+        """Unexpected exception emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
@@ -375,7 +375,7 @@ class TestMillStage:
             patch.object(runner, "_run_claude", side_effect=RuntimeError("disk full")),
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "disk full" in capsys.readouterr().out
         assert any(
@@ -674,7 +674,7 @@ class TestRefineStage:
         mock_status.assert_not_called()
 
     def test_validates_stage(self):
-        """Refine runner rejects lode not in refine stage."""
+        """Refine stage mismatch emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
 
         with (
@@ -685,7 +685,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -696,7 +696,7 @@ class TestRefineStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_no_project(self):
-        """Runner exits 1 if no project directory."""
+        """Missing project emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
 
         with (
@@ -707,7 +707,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -718,7 +718,7 @@ class TestRefineStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_project_dir_missing(self, tmp_path):
-        """Runner exits 1 if project dir doesn't exist."""
+        """Missing project dir emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         mock_project = MagicMock(path=str(tmp_path / "nope"))
 
@@ -731,7 +731,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -742,7 +742,7 @@ class TestRefineStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_worktree_creation_fails(self, tmp_path):
-        """Runner exits 1 if git worktree creation fails."""
+        """Worktree creation failure emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
 
@@ -757,7 +757,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -768,7 +768,7 @@ class TestRefineStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_input_missing_on_first_run(self, tmp_path):
-        """Runner exits 1 if mill_out.md missing on first run."""
+        """Missing mill input emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
 
@@ -783,7 +783,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -794,7 +794,7 @@ class TestRefineStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_bootstrap_failure_bails(self, tmp_path, capsys):
-        """Runner exits 1 if Codex bootstrap fails."""
+        """Codex bootstrap failure emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
         (session_dir / "mill_out.md").write_text("Build it")
@@ -812,7 +812,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "bootstrap failed" in capsys.readouterr().out
         MockConn.return_value.emit.assert_any_call(
@@ -977,7 +977,7 @@ class TestShipStage:
         assert "--resume" in cmd
 
     def test_validates_stage(self, capsys):
-        """Ship runner rejects lode not in ship stage."""
+        """Ship stage mismatch emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
 
         with (
@@ -988,7 +988,7 @@ class TestShipStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "not in ship stage" in capsys.readouterr().out
         MockConn.return_value.emit.assert_any_call(
@@ -1000,7 +1000,7 @@ class TestShipStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_no_project(self):
-        """Runner exits 1 if no project directory."""
+        """Missing project emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
 
         with (
@@ -1011,7 +1011,7 @@ class TestShipStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
@@ -1022,7 +1022,7 @@ class TestShipStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_worktree_missing(self, tmp_path, capsys):
-        """Runner exits 1 if worktree doesn't exist."""
+        """Missing worktree emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
         project_dir = tmp_path / "my-project"
         project_dir.mkdir()
@@ -1041,7 +1041,7 @@ class TestShipStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "Worktree not found" in capsys.readouterr().out
         MockConn.return_value.emit.assert_any_call(
@@ -1053,7 +1053,7 @@ class TestShipStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_repo_dirty(self, tmp_path, capsys):
-        """Runner exits 1 if project repo has uncommitted changes."""
+        """Dirty repo emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
         session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
 
@@ -1068,7 +1068,7 @@ class TestShipStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "uncommitted changes" in capsys.readouterr().out
         MockConn.return_value.emit.assert_any_call(
@@ -1080,7 +1080,7 @@ class TestShipStage:
         MockConn.return_value.stop.assert_called_once()
 
     def test_fails_if_not_on_main(self, tmp_path, capsys):
-        """Runner exits 1 if not on main or master."""
+        """Non-main branch emits error and exits 0."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
         session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
 
@@ -1096,7 +1096,7 @@ class TestShipStage:
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
-            assert runner.run() == 1
+            assert runner.run() == 0
 
         assert "feature-xyz" in capsys.readouterr().out
         MockConn.return_value.emit.assert_any_call(
@@ -1270,7 +1270,7 @@ class TestRunProcess:
         assert exit_code == 0
 
     def test_fails_on_unknown_stage(self, capsys):
-        """run_process fails for unknown stage."""
+        """Unknown stage emits error and exits 0."""
         with (
             patch(
                 "hopper.client.connect",
@@ -1278,7 +1278,7 @@ class TestRunProcess:
             ),
             patch("hopper.process.set_lode_state") as mock_set_state,
         ):
-            assert run_process("test-id", Path("/tmp/test.sock")) == 1
+            assert run_process("test-id", Path("/tmp/test.sock")) == 0
 
         assert "Unknown stage" in capsys.readouterr().out
         mock_set_state.assert_called_once_with(
@@ -1299,7 +1299,7 @@ class TestRunProcess:
             assert run_process("test-id", Path("/tmp/test.sock")) == 1
 
     def test_prints_on_unexpected_exception(self, capsys):
-        """run_process prints and sets error state on unexpected exception."""
+        """Unexpected exception emits error and exits 0."""
         with (
             patch(
                 "hopper.client.connect",
@@ -1308,7 +1308,7 @@ class TestRunProcess:
             patch.object(ProcessRunner, "run", side_effect=RuntimeError("unexpected crash")),
             patch("hopper.process.set_lode_state") as mock_set_state,
         ):
-            assert run_process("test-id", Path("/tmp/test.sock")) == 1
+            assert run_process("test-id", Path("/tmp/test.sock")) == 0
 
         assert "unexpected crash" in capsys.readouterr().out
         mock_set_state.assert_called_once_with(

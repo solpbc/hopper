@@ -139,8 +139,8 @@ class BaseRunner:
                 err = self._setup()
                 if err is not None:
                     logger.info(f"setup failed lode={self.lode_id}")
-                    self._emit_state("error", self._setup_error or "Setup failed")
-                    return err
+                    emitted = self._emit_state("error", self._setup_error or "Setup failed")
+                    return 0 if emitted else 1
                 logger.info(f"setup complete lode={self.lode_id}")
 
                 # Run Claude (blocking)
@@ -157,14 +157,16 @@ class BaseRunner:
                     )
                     msg = error_msg or "Command not found"
                     print(f"Error [{self.lode_id}]: {msg}")
-                    self._emit_state("error", msg)
+                    emitted = self._emit_state("error", msg)
+                    return 0 if emitted else 1
                 elif exit_code != 0 and exit_code != 130:
                     logger.error(
                         f"claude error lode={self.lode_id} exit_code={exit_code}: {error_msg}"
                     )
                     msg = error_msg or f"Exited with code {exit_code}"
                     print(f"Error [{self.lode_id}]: {msg}")
-                    self._emit_state("error", msg)
+                    emitted = self._emit_state("error", msg)
+                    return 0 if emitted else 1
                 elif exit_code == 0 and self._done.is_set():
                     logger.info(f"stage transition lode={self.lode_id}")
                     self._emit_state("ready", self._done_status)
@@ -175,11 +177,12 @@ class BaseRunner:
             except Exception as exc:
                 print(f"Error [{self.lode_id}]: {exc}")
                 logger.exception(f"unexpected error lode={self.lode_id}")
+                emitted = False
                 try:
-                    self._emit_state("error", str(exc))
+                    emitted = self._emit_state("error", str(exc))
                 except Exception:
                     pass
-                return 1
+                return 0 if emitted else 1
 
         finally:
             self._stop_monitor()
@@ -255,16 +258,18 @@ class BaseRunner:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
 
-    def _emit_state(self, state: str, status: str) -> None:
+    def _emit_state(self, state: str, status: str) -> bool:
         """Emit state change to server via persistent connection."""
         if self.connection:
-            self.connection.emit(
+            emitted = self.connection.emit(
                 "lode_set_state",
                 lode_id=self.lode_id,
                 state=state,
                 status=status,
             )
             logger.debug(f"Emitted state: {state}, status: {status}")
+            return emitted
+        return False
 
     def _emit_stage(self, stage: str) -> None:
         """Emit stage change to server via persistent connection."""

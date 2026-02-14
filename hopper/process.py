@@ -436,8 +436,8 @@ def run_process(lode_id: str, socket_path: Path) -> int:
         if stage not in STAGES:
             logger.error(f"unknown stage lode={lode_id} stage={stage}")
             print(f"Unknown stage: {stage}")
-            set_lode_state(socket_path, lode_id, "error", f"Unknown stage: {stage}")
-            return 1
+            emitted = set_lode_state(socket_path, lode_id, "error", f"Unknown stage: {stage}")
+            return 0 if emitted else 1
 
         runner = ProcessRunner(lode_id, socket_path, stage)
         try:
@@ -445,11 +445,12 @@ def run_process(lode_id: str, socket_path: Path) -> int:
         except Exception as exc:
             print(f"Error [{lode_id}]: {exc}")
             logger.exception(f"unexpected error lode={lode_id}")
+            emitted = False
             try:
-                set_lode_state(socket_path, lode_id, "error", str(exc))
+                emitted = set_lode_state(socket_path, lode_id, "error", str(exc))
             except Exception:
-                pass
-            return 1
+                logger.exception(f"failed to emit error state lode={lode_id}")
+            return 0 if emitted else 1
     finally:
         hopper_logger.removeHandler(handler)
         handler.close()
