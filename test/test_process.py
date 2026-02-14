@@ -292,6 +292,34 @@ class TestMillStage:
         )
         MockConn.return_value.stop.assert_called_once()
 
+    def test_fails_if_repo_dirty(self, tmp_path, capsys):
+        """Runner exits 1 if project repo has uncommitted changes."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        mock_project = MagicMock(path=str(project_dir))
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="mill", project="my-project"),
+            ),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.is_dirty", return_value=True),
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
+        ):
+            assert runner.run() == 1
+
+        assert "uncommitted changes" in capsys.readouterr().out
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Project repo has uncommitted changes: {project_dir}",
+        )
+        MockConn.return_value.stop.assert_called_once()
+
     def test_loads_scope_in_context(self):
         """Runner passes scope to prompt template."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")

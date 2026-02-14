@@ -144,11 +144,18 @@ class ProcessRunner(BaseRunner):
         return setup_method()
 
     def _setup_mill(self) -> int | None:
-        if self.project_dir and not Path(self.project_dir).is_dir():
-            self._setup_error = f"Project directory not found: {self.project_dir}"
-            print(self._setup_error)
-            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
-            return 1
+        if self.project_dir:
+            if not Path(self.project_dir).is_dir():
+                self._setup_error = f"Project directory not found: {self.project_dir}"
+                print(self._setup_error)
+                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+                return 1
+            if is_dirty(self.project_dir):
+                self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
+                print(self._setup_error)
+                print("Commit or stash changes before milling.")
+                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+                return 1
 
         self._cwd = self.project_dir if self.project_dir else None
         if self.is_first_run:
