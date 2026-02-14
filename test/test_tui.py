@@ -672,7 +672,7 @@ async def test_archive_view_guards_actions(make_lode):
             await pilot.press("left")
             assert app._archive_view is True
             await pilot.press("c")
-            await pilot.press("d")
+            await pilot.press("delete")
     mock_require_projects.assert_not_called()
     mock_selected_lode_id.assert_not_called()
     mock_get_lode.assert_not_called()
@@ -705,7 +705,7 @@ async def test_archive_view_opens_file_viewer(make_lode, key):
 async def test_archive_view_backlog_unaffected():
     """Backlog actions should still work while archive view is active."""
     from hopper.backlog import BacklogItem
-    from hopper.tui import BacklogTable
+    from hopper.tui import BacklogRemoveScreen, BacklogTable
 
     items = [
         BacklogItem(id="bl111111", project="proj", description="First", created_at=1000),
@@ -719,7 +719,10 @@ async def test_archive_view_backlog_unaffected():
         await pilot.press("tab")
         await pilot.press("tab")
         assert isinstance(app.focused, BacklogTable)
-        await pilot.press("d")
+        await pilot.press("delete")
+        assert isinstance(app.screen, BacklogRemoveScreen)
+        await pilot.press("right")
+        await pilot.press("enter")
         assert server.events == [{"type": "backlog_remove", "item_id": "bl111111"}]
         await pilot.press("right")
         assert app._archive_view is True
@@ -778,7 +781,7 @@ async def test_archive_confirm_modal_arrows_do_not_toggle_archive_view(temp_conf
     with patch("hopper.tui.get_diff_stat", return_value=" file.py | 1 +"):
         async with app.run_test() as pilot:
             assert app._archive_view is False
-            await pilot.press("d")
+            await pilot.press("delete")
             assert isinstance(app.screen, ArchiveConfirmScreen)
             assert app.screen.focused.id == "btn-cancel"
             await pilot.press("right")
@@ -790,8 +793,8 @@ async def test_archive_confirm_modal_arrows_do_not_toggle_archive_view(temp_conf
 
 
 @pytest.mark.asyncio
-async def test_archive_with_d(temp_config):
-    """d enqueues archive for selected lode when lode table is focused."""
+async def test_archive_with_delete(temp_config):
+    """Delete key enqueues archive for selected lode when lode table is focused."""
     sessions = [
         {"id": "aaaa1111", "stage": "mill", "created_at": 1000},
         {"id": "bbbb2222", "stage": "mill", "created_at": 2000},
@@ -799,7 +802,7 @@ async def test_archive_with_d(temp_config):
     server = MockServer(sessions)
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
-        await pilot.press("d")
+        await pilot.press("delete")
         assert len(server.events) == 1
         assert server.events[0]["type"] == "lode_archive"
         assert server.events[0]["lode_id"] == "aaaa1111"
@@ -1757,8 +1760,9 @@ async def test_arrow_navigation_in_backlog():
 
 @pytest.mark.asyncio
 async def test_delete_backlog_item(temp_config):
-    """d should enqueue backlog_remove when backlog is focused."""
+    """Delete key should enqueue backlog_remove when backlog is focused."""
     from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogRemoveScreen
 
     items = [
         BacklogItem(id="bl111111", project="proj", description="To delete", created_at=1000),
@@ -1770,8 +1774,11 @@ async def test_delete_backlog_item(temp_config):
         # Switch to backlog table
         await pilot.press("tab")
         await pilot.press("tab")
-        # Delete first item
-        await pilot.press("d")
+        # Delete first item and confirm modal
+        await pilot.press("delete")
+        assert isinstance(app.screen, BacklogRemoveScreen)
+        await pilot.press("right")
+        await pilot.press("enter")
         assert server.events == [{"type": "backlog_remove", "item_id": "bl111111"}]
 
 
@@ -1822,7 +1829,7 @@ async def test_queue_backlog_clear():
 
 @pytest.mark.asyncio
 async def test_delete_archives_on_session_table():
-    """d should enqueue lode_archive when session table is focused."""
+    """Delete key should enqueue lode_archive when session table is focused."""
     from hopper.backlog import BacklogItem
 
     items = [
@@ -1835,14 +1842,14 @@ async def test_delete_archives_on_session_table():
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         # Focus is on session table by default
-        # Press d - should enqueue archive and leave backlog unchanged
-        await pilot.press("d")
+        # Press Delete - should enqueue archive and leave backlog unchanged
+        await pilot.press("delete")
         assert server.events == [{"type": "lode_archive", "lode_id": "aaaa1111"}]
         assert len(app._backlog) == 1
 
 
 def test_action_delete_archives_lode():
-    """action_delete enqueues archive when lode table is focused."""
+    """Delete key enqueues archive when lode table is focused."""
     from hopper.tui import LodeTable
 
     sessions = [{"id": "aaaa1111", "stage": "mill", "created_at": 1000}]
@@ -1866,7 +1873,7 @@ def test_action_delete_archives_lode():
 
 
 def test_action_delete_shows_modal_for_unmerged_changes():
-    """action_delete shows confirmation modal when worktree has unmerged changes."""
+    """Delete key shows confirmation modal when worktree has unmerged changes."""
     from hopper.tui import ArchiveConfirmScreen, LodeTable
 
     sessions = [{"id": "aaaa1111", "stage": "refine", "created_at": 1000}]
@@ -1897,7 +1904,7 @@ def test_action_delete_shows_modal_for_unmerged_changes():
 
 
 def test_action_delete_archives_immediately_without_worktree():
-    """action_delete archives immediately when lode has no worktree directory."""
+    """Delete key archives immediately when lode has no worktree directory."""
     from hopper.tui import LodeTable
 
     sessions = [{"id": "aaaa1111", "stage": "mill", "created_at": 1000}]
@@ -1923,7 +1930,7 @@ def test_action_delete_archives_immediately_without_worktree():
 
 
 def test_action_delete_archives_immediately_with_empty_diff():
-    """action_delete archives immediately when worktree diff stat is empty (merged)."""
+    """Delete key archives immediately when worktree diff stat is empty (merged)."""
     from hopper.tui import LodeTable
 
     sessions = [{"id": "aaaa1111", "stage": "refine", "created_at": 1000}]
@@ -1981,7 +1988,31 @@ def test_action_delete_cancel_does_not_archive():
 
 
 def test_action_delete_removes_backlog():
-    """action_delete removes backlog item when backlog table is focused."""
+    """Delete key shows confirmation before removing backlog item."""
+    from hopper.backlog import BacklogItem
+    from hopper.tui import BacklogRemoveScreen, BacklogTable
+
+    items = [
+        BacklogItem(id="bl111111", project="proj", description="To delete", created_at=1000),
+    ]
+    server = MockServer([], backlog=items)
+    app = HopperApp(server=server)
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=BacklogTable()),
+        patch.object(app, "_get_selected_backlog_id", return_value="bl111111"),
+        patch.object(app, "push_screen") as mock_push,
+    ):
+        app.action_delete()
+        mock_push.assert_called_once()
+        screen_arg = mock_push.call_args.args[0]
+        assert isinstance(screen_arg, BacklogRemoveScreen)
+        callback = mock_push.call_args.args[1]
+        callback(True)
+    assert server.events == [{"type": "backlog_remove", "item_id": "bl111111"}]
+
+
+def test_action_delete_backlog_cancel_does_not_remove():
+    """Cancelling the backlog remove confirmation does not remove the item."""
     from hopper.backlog import BacklogItem
     from hopper.tui import BacklogTable
 
@@ -1993,13 +2024,16 @@ def test_action_delete_removes_backlog():
     with (
         patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=BacklogTable()),
         patch.object(app, "_get_selected_backlog_id", return_value="bl111111"),
+        patch.object(app, "push_screen") as mock_push,
     ):
         app.action_delete()
-    assert server.events == [{"type": "backlog_remove", "item_id": "bl111111"}]
+        callback = mock_push.call_args.args[1]
+        callback(None)
+    assert server.events == []
 
 
 def test_action_delete_noop_when_neither_focused():
-    """action_delete should noop when focus is not lode/backlog table."""
+    """Delete key should noop when focus is not lode/backlog table."""
     server = MockServer()
     app = HopperApp(server=server)
     with (

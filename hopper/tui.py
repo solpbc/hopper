@@ -708,6 +708,99 @@ class ArchiveConfirmScreen(ModalScreen[bool | None]):
             self.dismiss(True)
 
 
+class BacklogRemoveScreen(ModalScreen[bool | None]):
+    """Modal screen for confirming removal of a backlog item."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    CSS = """
+    BacklogRemoveScreen {
+        align: center middle;
+        height: 100%;
+    }
+
+    #backlog-remove-container {
+        width: 80;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+
+    #backlog-remove-title {
+        text-align: center;
+        text-style: bold;
+        color: $text;
+        padding-bottom: 1;
+    }
+
+    #backlog-remove-detail {
+        height: auto;
+        padding: 0 1;
+    }
+
+    #backlog-remove-buttons {
+        height: auto;
+        align: center middle;
+        padding-top: 1;
+    }
+
+    #backlog-remove-buttons Button {
+        margin: 0 1;
+    }
+
+    #backlog-remove-buttons Button:focus {
+        text-style: bold reverse;
+    }
+    """
+
+    def __init__(self, project: str, description: str):
+        super().__init__()
+        self._project = project
+        self._description = description
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="backlog-remove-container"):
+            yield Static("Remove backlog item?", id="backlog-remove-title")
+            yield Static(
+                f"{self._project}: {self._description}",
+                id="backlog-remove-detail",
+            )
+            with Horizontal(id="backlog-remove-buttons"):
+                yield Button("Cancel", id="btn-cancel", variant="default")
+                yield Button("Remove", id="btn-remove", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#btn-cancel").focus()
+
+    def on_key(self, event: events.Key) -> None:
+        focused = self.focused
+        buttons = list(self.query("#backlog-remove-buttons Button"))
+
+        if event.key == "right" and focused in buttons:
+            event.prevent_default()
+            event.stop()
+            idx = buttons.index(focused)
+            buttons[(idx + 1) % len(buttons)].focus()
+        elif event.key == "left" and focused in buttons:
+            event.prevent_default()
+            event.stop()
+            idx = buttons.index(focused)
+            buttons[(idx - 1) % len(buttons)].focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+        elif event.button.id == "btn-remove":
+            self.dismiss(True)
+
+
 class ShippedReviewScreen(ModalScreen[bool | None]):
     """Modal screen for reviewing ship output and archiving."""
 
@@ -1181,7 +1274,7 @@ class HopperApp(App):
         Binding("ctrl+d", "ctrl_d", "Quit", show=False, priority=True),
         Binding("c", "new_lode", "Create"),
         Binding("b", "new_backlog", "Backlog"),
-        Binding("d", "delete", "Delete"),
+        Binding("delete", "delete", "Delete"),
         Binding("l", "legend", "Legend"),
         Binding("v", "view_files", "View"),
         Binding("r", "reload", "Reload"),
@@ -1796,8 +1889,18 @@ class HopperApp(App):
             item_id = self._get_selected_backlog_id()
             if not item_id:
                 return
-            if self.server:
-                self.server.enqueue({"type": "backlog_remove", "item_id": item_id})
+            item = self._get_backlog_item(item_id)
+            if not item:
+                return
+
+            def on_confirm_remove(result: bool | None) -> None:
+                if result and self.server:
+                    self.server.enqueue({"type": "backlog_remove", "item_id": item_id})
+
+            self.push_screen(
+                BacklogRemoveScreen(project=item.project, description=item.description),
+                on_confirm_remove,
+            )
 
     def action_reload(self) -> None:
         """Reload the current stage with a fresh Claude session."""
