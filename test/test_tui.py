@@ -996,12 +996,46 @@ def test_disconnected_lode_triggers_alert():
     assert app._stuck_alert_active is False
 
 
+def test_ready_lode_does_not_trigger_alert():
+    """Lodes in ready state (stage complete, waiting for user) should not trigger alert."""
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "ready"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+
 def test_stuck_state_triggers_alert():
     """Lodes in stuck state should trigger stuck alert."""
     app = HopperApp()
     app._lodes = [{"state": "stuck", "active": True, "stage": "mill"}]
     app._check_stuck_alert()
     assert app._stuck_alert_active is True
+
+
+def test_alert_clears_when_triggering_lode_archived():
+    """Alert should clear when the lode that triggered it is removed."""
+    app = HopperApp()
+    app._lodes = [{"state": "error", "active": True, "stage": "mill"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is True
+
+    # Simulate archiving the lode
+    app._lodes.clear()
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+
+def test_alert_clears_when_lode_becomes_active():
+    """Alert should clear when a disconnected lode reconnects."""
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "running"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is True
+
+    # Runner reconnects
+    app._lodes[0]["active"] = True
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
 
 
 @pytest.mark.asyncio

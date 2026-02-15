@@ -1362,7 +1362,7 @@ class HopperApp(App):
             or (
                 not lode.get("active", False)
                 and lode.get("stage", "mill") != "shipped"
-                and lode.get("state", "new") != "new"
+                and lode.get("state", "new") not in ("new", "ready")
             )
             for lode in self._lodes
         )
