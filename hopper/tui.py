@@ -957,7 +957,7 @@ class LegendScreen(ModalScreen):
         t.append("Keys\n", style="bold")
         t.append("  r", style="bright_cyan")
         t.append("  reload stage\n", style="bright_black")
-        t.append("  d", style="bright_cyan")
+        t.append("  del", style="bright_cyan")
         t.append("  delete/archive", style="bright_black")
 
         return t
@@ -1276,6 +1276,7 @@ class HopperApp(App):
         Binding("c", "new_lode", "Create"),
         Binding("b", "new_backlog", "Backlog"),
         Binding("delete", "delete", "Delete"),
+        Binding("backspace", "delete", "Delete", show=False),
         Binding("l", "legend", "Legend"),
         Binding("v", "view_files", "View"),
         Binding("r", "reload", "Reload"),
