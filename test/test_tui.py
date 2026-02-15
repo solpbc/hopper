@@ -2902,6 +2902,42 @@ def test_file_viewer_screen_init(tmp_path):
     assert screen.lode_id == "test123"
 
 
+class FileViewerTestApp(App):
+    """Test app wrapper for FileViewerScreen."""
+
+    def __init__(self, lode_dir, lode_id="test123"):
+        super().__init__()
+        self._lode_dir = lode_dir
+        self._lode_id = lode_id
+
+    def on_mount(self) -> None:
+        self.push_screen(FileViewerScreen(self._lode_dir, self._lode_id))
+
+
+@pytest.mark.asyncio
+async def test_file_viewer_auto_selects_refine_out(tmp_path):
+    """FileViewerScreen auto-displays refine_out.md on mount."""
+    from textual.widgets import Static
+
+    refine_out = tmp_path / "refine_out.md"
+    refine_out.write_text("# Refinement Output\nHello world")
+    app = FileViewerTestApp(tmp_path)
+    async with app.run_test():
+        screen = app.screen
+        assert screen.path == str(refine_out)
+        code_view = screen.query_one("#code-view", Static)
+        assert "Hello world" in str(code_view.content)
+
+
+@pytest.mark.asyncio
+async def test_file_viewer_no_auto_select_without_refine_out(tmp_path):
+    """FileViewerScreen leaves path empty when refine_out.md is absent."""
+    app = FileViewerTestApp(tmp_path)
+    async with app.run_test():
+        screen = app.screen
+        assert screen.path == ""
+
+
 @pytest.mark.asyncio
 async def test_project_filter_toggle(make_lode):
     """Setting filter then calling action_filter_project clears it."""
