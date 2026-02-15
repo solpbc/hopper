@@ -1007,6 +1007,11 @@ class FileViewerScreen(Screen):
         with VerticalScroll():
             yield Static(id="code-view")
 
+    def on_mount(self) -> None:
+        refine_out = self.lode_dir / "refine_out.md"
+        if refine_out.exists():
+            self.path = str(refine_out)
+
     @property
     def sub_title(self) -> str:
         return f"lode {self.lode_id}"
