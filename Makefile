@@ -1,4 +1,4 @@
-.PHONY: install install-user test ci clean
+.PHONY: install install-user test ci clean timing
 
 install:
 	uv sync
@@ -19,6 +19,9 @@ test:
 ci:
 	ruff format .
 	ruff check --fix .
+
+timing:
+	python3 scripts/timing.py
 
 clean:
 	rm -rf build/ dist/ *.egg-info/ .pytest_cache/ .ruff_cache/
