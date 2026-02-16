@@ -467,6 +467,7 @@ STATUS_STUCK = "◐"  # half-filled circle
 STATUS_NEW = "○"  # empty circle
 STATUS_ERROR = "✗"  # x mark
 STATUS_SHIPPED = "✓"
+STATUS_GATED = "◇"  # open diamond — paused at gate, awaiting user review
 STATUS_DISCONNECTED = "⊘"  # circled division slash — runner not connected
 
 
@@ -480,10 +481,12 @@ def lode_icon(lode: dict) -> str:
         icon = STATUS_NEW
     elif state == "error":
         icon = STATUS_ERROR
+    elif state == "gated":
+        icon = STATUS_GATED
     elif state == "stuck":
         icon = STATUS_STUCK
     else:
         icon = STATUS_RUNNING
-    if not lode.get("active", False) and stage != "shipped":
+    if not lode.get("active", False) and stage != "shipped" and state != "gated":
         icon = STATUS_DISCONNECTED
     return icon

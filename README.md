@@ -39,6 +39,7 @@ hop --version
 | `hop screenshot` | Capture TUI window as ANSI text |
 | `hop processed` | Signal stage completion with output |
 | `hop code` | Run a stage prompt via Codex |
+| `hop gate` | Pause lode at a review gate |
 | `hop backlog` | Manage backlog items |
 | `hop ping` | Check if server is running |
 

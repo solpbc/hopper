@@ -641,6 +641,72 @@ def cmd_processed(args: list[str]) -> int:
     return 0
 
 
+@command("gate", "Pause lode at a review gate", group="lode")
+def cmd_gate(args: list[str]) -> int:
+    """Save gate review doc and pause lode for user review."""
+    from hopper.client import get_lode, set_lode_state
+    from hopper.lodes import get_lode_dir
+
+    parser = make_parser(
+        "gate",
+        "Pause at a review gate. Saves review doc from stdin and pauses lode. "
+        "Usage: hop gate <name> <<'EOF'\n<review doc>\nEOF",
+    )
+    parser.add_argument("name", help="Gate name (e.g. design)")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+
+    lode_id = get_hopper_lid()
+    if not lode_id:
+        print("HOPPER_LID not set. Run this from within a hopper lode.")
+        return 1
+
+    if err := validate_hopper_lid():
+        return err
+
+    # Validate lode is in refine stage
+    lode = get_lode(_socket(), lode_id)
+    if not lode:
+        print(f"Lode {lode_id} not found.")
+        return 1
+
+    stage = lode.get("stage", "")
+    if stage != "refine":
+        print(f"Lode {lode_id} is not in refine stage.")
+        return 1
+
+    # Read review doc from stdin
+    output = sys.stdin.read()
+    if not output.strip():
+        print("No input received. Use: hop gate <name> <<'EOF'\\n<review doc>\\nEOF")
+        return 1
+
+    # Save to lode directory as gate.md
+    lode_dir = get_lode_dir(lode_id)
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    gate_path = lode_dir / "gate.md"
+    tmp_path = gate_path.with_suffix(".md.tmp")
+    tmp_path.write_text(output)
+    os.replace(tmp_path, gate_path)
+
+    # Set lode state to gated
+    gate_name = parsed.name.capitalize()
+    set_lode_state(_socket(), lode_id, "gated", f"{gate_name} gate")
+
+    print(f"Gate set. Review saved to {gate_path}")
+    print("Session will be resumed after review.")
+    return 0
+
+
 @command("code", "Run a stage prompt via Codex", group="lode")
 def cmd_code(args: list[str]) -> int:
     """Run a stage prompt via Codex, resuming the lode's Codex thread."""

@@ -14,6 +14,7 @@ from hopper.cli import (
     cmd_backlog,
     cmd_code,
     cmd_config,
+    cmd_gate,
     cmd_lode,
     cmd_ping,
     cmd_process,
@@ -1671,6 +1672,108 @@ def test_processed_refine_stage(temp_config, capsys):
     assert sid == lode_id
     assert state == "completed"
     assert "Refine complete" in status
+
+
+# Tests for gate command
+
+
+def test_gate_help(capsys):
+    """gate --help shows help and returns 0."""
+    result = cmd_gate(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop gate" in captured.out
+
+
+def test_gate_missing_args(capsys):
+    """gate requires name argument."""
+    result = cmd_gate([])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.out
+
+
+def test_gate_no_server(capsys):
+    """gate returns error when server is not running."""
+    with patch("hopper.client.ping", return_value=False):
+        with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
+            result = cmd_gate(["design"])
+    assert result != 0
+
+
+def test_gate_no_hopper_lid(capsys):
+    """gate returns 1 when HOPPER_LID not set."""
+    env = os.environ.copy()
+    env.pop("HOPPER_LID", None)
+    with patch.dict(os.environ, env, clear=True):
+        with patch("hopper.cli.require_server", return_value=None):
+            result = cmd_gate(["design"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "HOPPER_LID not set" in captured.out
+
+
+def test_gate_wrong_stage(capsys):
+    """gate returns 1 when lode is not in refine stage."""
+    lode_data = {"id": "test-session", "stage": "mill"}
+    with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.lode_exists", return_value=True):
+                with patch("hopper.client.get_lode", return_value=lode_data):
+                    result = cmd_gate(["design"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "not in refine stage" in captured.out
+
+
+def test_gate_empty_stdin(capsys):
+    """gate returns 1 when stdin is empty."""
+    from io import StringIO
+
+    lode_data = {"id": "test-session", "stage": "refine"}
+    with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.lode_exists", return_value=True):
+                with patch("hopper.client.get_lode", return_value=lode_data):
+                    with patch("sys.stdin", StringIO("")):
+                        result = cmd_gate(["design"])
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "No input received" in captured.out
+
+
+def test_gate_saves_file_and_sets_state(temp_config, capsys):
+    """gate saves gate.md and sets lode state to gated."""
+    from io import StringIO
+
+    lode_id = "test-gate-1234"
+    review_text = "# Design Review\n\nLooks good.\n"
+    lode_data = {"id": lode_id, "stage": "refine"}
+
+    with patch.dict(os.environ, {"HOPPER_LID": lode_id}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.lode_exists", return_value=True):
+                with patch("hopper.client.get_lode", return_value=lode_data):
+                    with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
+                        with patch("sys.stdin", StringIO(review_text)):
+                            result = cmd_gate(["design"])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Gate set" in captured.out
+
+    # Verify file was written as gate.md
+    lode_dir = temp_config / "lodes" / lode_id
+    gate_path = lode_dir / "gate.md"
+    assert gate_path.exists()
+    assert gate_path.read_text() == review_text
+
+    # Verify state was set to gated
+    mock_set.assert_called_once()
+    _, sid, state, status = mock_set.call_args[0]
+    assert sid == lode_id
+    assert state == "gated"
+    assert "Design gate" in status
 
 
 # Tests for code command

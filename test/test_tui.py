@@ -12,6 +12,7 @@ from hopper.backlog import BacklogItem
 from hopper.lodes import (
     STATUS_DISCONNECTED,
     STATUS_ERROR,
+    STATUS_GATED,
     STATUS_NEW,
     STATUS_RUNNING,
     STATUS_SHIPPED,
@@ -293,6 +294,20 @@ def test_lode_to_row_shipped_inactive():
     }
     row = lode_to_row(lode)
     assert row.status == STATUS_SHIPPED
+
+
+def test_lode_to_row_gated_shows_gated_icon():
+    """Gated lode shows STATUS_GATED icon even when inactive."""
+    lode = {
+        "id": "abc",
+        "stage": "refine",
+        "state": "gated",
+        "active": False,
+        "created_at": 1000,
+        "updated_at": 1000,
+    }
+    row = lode_to_row(lode)
+    assert row.status == STATUS_GATED
 
 
 def test_lode_to_row_active_shows_state_icon():
@@ -1000,6 +1015,19 @@ def test_ready_lode_does_not_trigger_alert():
     """Lodes in ready state (stage complete, waiting for user) should not trigger alert."""
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "ready"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+
+def test_gated_lode_does_not_trigger_alert():
+    """Gated lodes (paused for review) should not trigger stuck alert."""
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "gated"}]
+    app._check_stuck_alert()
+    assert app._stuck_alert_active is False
+
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "gate_reviewed"}]
     app._check_stuck_alert()
     assert app._stuck_alert_active is False
 
@@ -2970,6 +2998,65 @@ async def test_file_viewer_no_auto_select_without_refine_out(tmp_path):
     async with app.run_test():
         screen = app.screen
         assert screen.path == ""
+
+
+@pytest.mark.asyncio
+async def test_file_viewer_initial_file(tmp_path):
+    """FileViewerScreen auto-selects initial_file when provided."""
+    from textual.app import App
+    from textual.widgets import Static
+
+    gate_doc = tmp_path / "gate.md"
+    gate_doc.write_text("# Design Review\nLooks good")
+
+    class TestApp(App):
+        def on_mount(self):
+            self.push_screen(FileViewerScreen(tmp_path, "test123", initial_file="gate.md"))
+
+    app = TestApp()
+    async with app.run_test():
+        screen = app.screen
+        assert screen.path == str(gate_doc)
+        code_view = screen.query_one("#code-view", Static)
+        assert "Looks good" in str(code_view.content)
+
+
+@pytest.mark.asyncio
+async def test_enter_on_gated_opens_file_viewer(temp_config):
+    """Enter on a gated lode opens FileViewerScreen with gate.md."""
+    from hopper.lodes import get_lode_dir
+
+    lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
+    lode_dir = get_lode_dir(lode["id"])
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
+
+    server = MockServer([lode])
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        assert isinstance(app.screen, FileViewerScreen)
+        assert app.screen._initial_file == "gate.md"
+
+
+@pytest.mark.asyncio
+async def test_enter_on_gate_reviewed_spawns_claude(monkeypatch, temp_config):
+    """Enter on gate_reviewed lode spawns Claude to resume."""
+    spawned = []
+    monkeypatch.setattr("hopper.tui.spawn_claude", lambda *a, **kw: spawned.append(a) or True)
+
+    lode = {
+        "id": "gate1234",
+        "stage": "refine",
+        "state": "gate_reviewed",
+        "created_at": 1000,
+    }
+    server = MockServer([lode])
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        assert len(spawned) == 1
+        assert spawned[0][0] == "gate1234"
 
 
 @pytest.mark.asyncio

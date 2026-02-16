@@ -79,6 +79,7 @@ class BaseRunner:
         self._pane_id: str | None = None
         # Completion tracking
         self._done = threading.Event()
+        self._gated = threading.Event()
         self._setup_error: str | None = None
 
     def run(self) -> int:
@@ -301,10 +302,14 @@ class BaseRunner:
         if lode.get("state") == "completed":
             self._done.set()
             logger.debug(f"{self._done_label} signal received")
+        elif lode.get("state") == "gated":
+            self._gated.set()
+            logger.debug(f"gate signal received lode={self.lode_id}")
 
     def _wait_and_dismiss_claude(self) -> None:
-        """Wait for completion, screen stability, then send Ctrl-D to exit Claude."""
-        while not self._done.wait(timeout=1.0):
+        """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude."""
+        while not self._done.is_set() and not self._gated.is_set():
+            self._done.wait(timeout=1.0)
             if self._monitor_stop.is_set():
                 return
 
@@ -362,8 +367,8 @@ class BaseRunner:
         if not self._pane_id:
             return
 
-        # Skip stuck detection once done — dismiss thread handles exit
-        if self._done.is_set():
+        # Skip stuck detection once done or gated — dismiss thread handles exit
+        if self._done.is_set() or self._gated.is_set():
             return
 
         snapshot = capture_pane(self._pane_id)

@@ -177,6 +177,23 @@ class TestBaseRunnerActivityMonitor:
 
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
 
+    def test_check_activity_skips_when_gated(self):
+        """Monitor skips stuck detection when gated event is set."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._gated.set()
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with patch("hopper.runner.capture_pane", return_value="Hello World"):
+            runner._check_activity()
+
+        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
+
 
 class TestBaseRunnerServerMessages:
     """Tests for BaseRunner server message handling."""
@@ -205,6 +222,19 @@ class TestBaseRunnerServerMessages:
 
         assert not runner._done.is_set()
 
+    def test_on_server_message_sets_gated(self):
+        """Callback sets _gated when gated state received."""
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+
+        msg = {
+            "type": "lode_updated",
+            "lode": {"id": "test-session", "state": "gated"},
+        }
+        runner._on_server_message(msg)
+
+        assert runner._gated.is_set()
+        assert not runner._done.is_set()
+
     def test_on_server_message_ignores_other_states(self):
         """Callback ignores non-completed states."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
@@ -216,6 +246,7 @@ class TestBaseRunnerServerMessages:
         runner._on_server_message(msg)
 
         assert not runner._done.is_set()
+        assert not runner._gated.is_set()
 
     def test_on_server_message_ignores_other_message_types(self):
         """Callback ignores non-lode-updated messages."""
@@ -238,6 +269,27 @@ class TestBaseRunnerDismiss:
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
         runner._done.set()
+
+        send_keys_calls = []
+
+        snapshots = iter(["content A", "content A"])
+        with (
+            patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
+            patch(
+                "hopper.runner.send_keys",
+                side_effect=lambda w, k: send_keys_calls.append((w, k)) or True,
+            ),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.01),
+        ):
+            runner._wait_and_dismiss_claude()
+
+        assert send_keys_calls == [("%1", "C-d"), ("%1", "C-d")]
+
+    def test_wait_and_dismiss_sends_ctrl_d_on_gated(self):
+        """Dismiss thread sends Ctrl-D when gated event is set."""
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._gated.set()
 
         send_keys_calls = []
 

@@ -37,6 +37,7 @@ from hopper.git import get_diff_stat
 from hopper.lodes import (
     STATUS_DISCONNECTED,
     STATUS_ERROR,
+    STATUS_GATED,
     STATUS_NEW,
     STATUS_RUNNING,
     STATUS_SHIPPED,
@@ -84,6 +85,7 @@ STATUS_COLORS = {
     STATUS_RUNNING: "bright_green",
     STATUS_STUCK: "bright_yellow",
     STATUS_ERROR: "bright_red",
+    STATUS_GATED: "bright_cyan",
     STATUS_NEW: "bright_black",
     STATUS_SHIPPED: "bright_green",
     STATUS_DISCONNECTED: "bright_red",
@@ -100,7 +102,8 @@ class Row:
     stage: str  # "mill", "refine", "ship", or "shipped"
     age: str  # formatted age string
     run: str  # formatted cumulative runtime
-    # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR, STATUS_SHIPPED, STATUS_DISCONNECTED
+    # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR, STATUS_GATED,
+    # STATUS_SHIPPED, STATUS_DISCONNECTED
     status: str
     project: str = ""  # Project name
     title: str = ""  # Short human-readable lode title
@@ -948,6 +951,8 @@ class LegendScreen(ModalScreen):
         t.append("  error\n", style="bright_black")
         t.append(f"  {STATUS_NEW}", style="bright_black")
         t.append("  new\n", style="bright_black")
+        t.append(f"  {STATUS_GATED}", style="bright_cyan")
+        t.append("  gated\n", style="bright_black")
         t.append(f"  {STATUS_SHIPPED}", style="bright_green")
         t.append("  shipped\n", style="bright_black")
         t.append(f"  {STATUS_DISCONNECTED}", style="bright_red")
@@ -997,10 +1002,11 @@ class FileViewerScreen(Screen):
 
     path: reactive[str] = reactive("")
 
-    def __init__(self, lode_dir: Path, lode_id: str) -> None:
+    def __init__(self, lode_dir: Path, lode_id: str, initial_file: str | None = None) -> None:
         super().__init__()
         self.lode_dir = lode_dir
         self.lode_id = lode_id
+        self._initial_file = initial_file
 
     def compose(self) -> ComposeResult:
         yield DirectoryTree(str(self.lode_dir))
@@ -1008,9 +1014,12 @@ class FileViewerScreen(Screen):
             yield Static(id="code-view")
 
     def on_mount(self) -> None:
-        refine_out = self.lode_dir / "refine_out.md"
-        if refine_out.exists():
-            self.path = str(refine_out)
+        if self._initial_file:
+            target = self.lode_dir / self._initial_file
+        else:
+            target = self.lode_dir / "refine_out.md"
+        if target.exists():
+            self.path = str(target)
 
     @property
     def sub_title(self) -> str:
@@ -1362,7 +1371,7 @@ class HopperApp(App):
             or (
                 not lode.get("active", False)
                 and lode.get("stage", "mill") != "shipped"
-                and lode.get("state", "new") not in ("new", "ready")
+                and lode.get("state", "new") not in ("new", "ready", "gated", "gate_reviewed")
             )
             for lode in self._lodes
         )
@@ -1884,6 +1893,9 @@ class HopperApp(App):
         elif lode.get("stage") == "refine" and lode.get("state") == "ready":
             # Mill complete, ready for refine - review before starting
             self._review_mill_output(lode, project_path)
+        elif lode.get("state") == "gated":
+            # Lode paused at gate - show review doc, next enter resumes
+            self._review_gate(lode)
         elif lode.get("stage") == "ship" and lode.get("state") == "ready":
             # Refine complete, ready to ship - review changes before shipping
             self._review_ship(lode, project_path)
@@ -2047,6 +2059,31 @@ class HopperApp(App):
             self.refresh_table()
 
         self.push_screen(MillReviewScreen(initial_text=mill_text), on_review_result)
+
+    def _review_gate(self, lode: dict) -> None:
+        """Open gate review doc for a gated lode. On dismiss, clear gate state."""
+        lode_dir = get_lode_dir(lode["id"])
+        gate_path = lode_dir / "gate.md"
+        if not gate_path.exists():
+            self.notify("Gate review doc not found", severity="error")
+            return
+
+        def on_dismiss(_result: None = None) -> None:
+            # Clear gated state so next enter spawns Claude to resume
+            if self.server:
+                self.server.enqueue(
+                    {
+                        "type": "lode_set_state",
+                        "lode_id": lode["id"],
+                        "state": "gate_reviewed",
+                        "status": "Gate reviewed",
+                    }
+                )
+
+        self.push_screen(
+            FileViewerScreen(lode_dir, lode["id"], initial_file="gate.md"),
+            on_dismiss,
+        )
 
     def _review_ship(self, lode: dict, project_path: str | None) -> None:
         """Open the ship review modal for a ship-ready lode."""
