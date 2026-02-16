@@ -264,7 +264,7 @@ class TestBaseRunnerServerMessages:
 class TestBaseRunnerDismiss:
     """Tests for BaseRunner auto-dismiss behavior."""
 
-    def test_wait_and_dismiss_sends_ctrl_d(self):
+    def test_wait_and_dismiss_sends_ctrl_c(self):
         """Dismiss thread sends two Ctrl-D after screen stabilizes."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
@@ -272,20 +272,24 @@ class TestBaseRunnerDismiss:
 
         send_keys_calls = []
 
+        def on_send_keys(w, k):
+            send_keys_calls.append((w, k))
+            # Simulate process exit after Ctrl-D pair
+            if len(send_keys_calls) == 2:
+                runner._monitor_stop.set()
+            return True
+
         snapshots = iter(["content A", "content A"])
         with (
             patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
-            patch(
-                "hopper.runner.send_keys",
-                side_effect=lambda w, k: send_keys_calls.append((w, k)) or True,
-            ),
+            patch("hopper.runner.send_keys", side_effect=on_send_keys),
             patch("hopper.runner.MONITOR_INTERVAL", 0.01),
         ):
             runner._wait_and_dismiss_claude()
 
-        assert send_keys_calls == [("%1", "C-d"), ("%1", "C-d")]
+        assert send_keys_calls == [("%1", "C-c"), ("%1", "C-c")]
 
-    def test_wait_and_dismiss_sends_ctrl_d_on_gated(self):
+    def test_wait_and_dismiss_sends_ctrl_c_on_gated(self):
         """Dismiss thread sends Ctrl-D when gated event is set."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
@@ -293,18 +297,63 @@ class TestBaseRunnerDismiss:
 
         send_keys_calls = []
 
+        def on_send_keys(w, k):
+            send_keys_calls.append((w, k))
+            if len(send_keys_calls) == 2:
+                runner._monitor_stop.set()
+            return True
+
         snapshots = iter(["content A", "content A"])
         with (
             patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
-            patch(
-                "hopper.runner.send_keys",
-                side_effect=lambda w, k: send_keys_calls.append((w, k)) or True,
-            ),
+            patch("hopper.runner.send_keys", side_effect=on_send_keys),
             patch("hopper.runner.MONITOR_INTERVAL", 0.01),
         ):
             runner._wait_and_dismiss_claude()
 
-        assert send_keys_calls == [("%1", "C-d"), ("%1", "C-d")]
+        assert send_keys_calls == [("%1", "C-c"), ("%1", "C-c")]
+
+    def test_wait_and_dismiss_retries_when_process_survives(self):
+        """Dismiss retries Ctrl-D if process doesn't exit after first attempt."""
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._done.set()
+
+        send_keys_calls = []
+
+        # First attempt: stable screen, Ctrl-D sent but process survives
+        # Screen changes (Claude still outputting), then stabilizes again
+        # Second attempt: Ctrl-D sent, process exits
+        snapshots = iter(
+            [
+                "prompt v1",
+                "prompt v1",  # first stability → Ctrl-D
+                "new output",  # screen changed, not stable
+                "prompt v2",
+                "prompt v2",  # second stability → Ctrl-D
+            ]
+        )
+
+        def on_send_keys(w, k):
+            send_keys_calls.append((w, k))
+            if len(send_keys_calls) == 4:
+                runner._monitor_stop.set()
+            return True
+
+        with (
+            patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
+            patch("hopper.runner.send_keys", side_effect=on_send_keys),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.01),
+        ):
+            runner._wait_and_dismiss_claude()
+
+        # Two Ctrl-D pairs: first attempt failed, second succeeded
+        assert send_keys_calls == [
+            ("%1", "C-c"),
+            ("%1", "C-c"),
+            ("%1", "C-c"),
+            ("%1", "C-c"),
+        ]
 
     def test_wait_and_dismiss_aborts_when_monitor_stops(self):
         """Dismiss thread aborts if monitor stop is set."""

@@ -307,7 +307,11 @@ class BaseRunner:
             logger.debug(f"gate signal received lode={self.lode_id}")
 
     def _wait_and_dismiss_claude(self) -> None:
-        """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude."""
+        """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude.
+
+        Retries if Claude doesn't exit after the first Ctrl-D (e.g. if it was
+        sent during output rather than at the interactive prompt).
+        """
         while not self._done.is_set() and not self._gated.is_set():
             self._done.wait(timeout=1.0)
             if self._monitor_stop.is_set():
@@ -316,24 +320,25 @@ class BaseRunner:
         if not self._pane_id:
             return
 
-        logger.debug(f"{self._done_label}, waiting for screen to stabilize")
-
-        last_snapshot = None
         while not self._monitor_stop.is_set():
-            self._monitor_stop.wait(MONITOR_INTERVAL)
-            snapshot = capture_pane(self._pane_id)
-            if snapshot is None:
+            logger.debug(f"{self._done_label}, waiting for screen to stabilize")
+
+            last_snapshot = None
+            while not self._monitor_stop.is_set():
+                self._monitor_stop.wait(MONITOR_INTERVAL)
+                snapshot = capture_pane(self._pane_id)
+                if snapshot is None:
+                    return
+                if snapshot == last_snapshot:
+                    break
+                last_snapshot = snapshot
+
+            if self._monitor_stop.is_set():
                 return
-            if snapshot == last_snapshot:
-                break
-            last_snapshot = snapshot
 
-        if self._monitor_stop.is_set():
-            return
-
-        logger.debug("Screen stable, sending Ctrl-D")
-        send_keys(self._pane_id, "C-d")
-        send_keys(self._pane_id, "C-d")
+            logger.debug("Screen stable, sending Ctrl-C")
+            send_keys(self._pane_id, "C-c")
+            send_keys(self._pane_id, "C-c")
 
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""
