@@ -33,6 +33,7 @@ Process you must follow:
 
 A) Parse $Name's task input
 - Extract: objective, constraints, explicit non-goals, "phase" hints (e.g., "phase 1 only"), any strong preferences ("no backward compat," "no tests," "out of scope," "use screenshot," etc.).
+- Detect review gate intent: if $Name asks for a review checkpoint, design-only scope, approval before implementation, or similar — note this as a gate requirement for the scoped prompt.
 - Translate vague intent into measurable outcomes (acceptance criteria) WITHOUT inventing new features.
 
 B) Repo reconnaissance (fact-finding only)
@@ -87,6 +88,13 @@ The prompt must include:
    - implement: explicit do's/don'ts (e.g., "no backward compat," "update all callers," "delete dead code")
    - audit: what to look for (cleanup, naming consistency, remove legacy, doc hygiene)
    - commit: commit expectations (formatting, tests, no stray files)
+   If $Name's task requires a review gate (detected in step A), include a gate instruction in the stage guidance telling the senior engineer to pause after the relevant stage (typically design) and submit a review doc for $Name's approval before continuing:
+   ```
+   hop gate <<'EOF'
+   <review doc summarizing the plan/findings for $Name to approve>
+   EOF
+   ```
+   The session will be paused until $Name reviews and resumes it.
 6. Acceptance Criteria (Definition of Done)
 7. Validation steps (commands, screenshots, spot check instructions)
 

@@ -650,11 +650,10 @@ def cmd_gate(args: list[str]) -> int:
     parser = make_parser(
         "gate",
         "Pause at a review gate. Saves review doc from stdin and pauses lode. "
-        "Usage: hop gate <name> <<'EOF'\n<review doc>\nEOF",
+        "Usage: hop gate <<'EOF'\n<review doc>\nEOF",
     )
-    parser.add_argument("name", help="Gate name (e.g. design)")
     try:
-        parsed = parse_args(parser, args)
+        parse_args(parser, args)
     except SystemExit:
         return 0
     except ArgumentError as e:
@@ -687,7 +686,7 @@ def cmd_gate(args: list[str]) -> int:
     # Read review doc from stdin
     output = sys.stdin.read()
     if not output.strip():
-        print("No input received. Use: hop gate <name> <<'EOF'\\n<review doc>\\nEOF")
+        print("No input received. Use: hop gate <<'EOF'\\n<review doc>\\nEOF")
         return 1
 
     # Save to lode directory as gate.md
@@ -699,8 +698,7 @@ def cmd_gate(args: list[str]) -> int:
     os.replace(tmp_path, gate_path)
 
     # Set lode state to gated
-    gate_name = parsed.name.capitalize()
-    set_lode_state(_socket(), lode_id, "gated", f"{gate_name} gate")
+    set_lode_state(_socket(), lode_id, "gated", "Gate")
 
     print(f"Gate set. Review saved to {gate_path}")
     print("Session will be resumed after review.")

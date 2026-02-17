@@ -28,11 +28,11 @@ DONE
 ```
 
 - `hop code <stage>` - Dispatch a stage prompt to a junior engineer; read directions from stdin via heredoc.
-- `hop gate <name>` - Pause at a review gate. Saves review doc from stdin and pauses lode for user review. Session resumes after review.
+- `hop gate` - Pause at a review gate. Saves review doc from stdin and pauses lode for user review. Session resumes after review.
 
 ```bash
-hop gate design <<'EOF'
-design review document
+hop gate <<'EOF'
+review document
 EOF
 ```
 

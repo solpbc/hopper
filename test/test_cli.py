@@ -1685,19 +1685,11 @@ def test_gate_help(capsys):
     assert "usage: hop gate" in captured.out
 
 
-def test_gate_missing_args(capsys):
-    """gate requires name argument."""
-    result = cmd_gate([])
-    assert result == 1
-    captured = capsys.readouterr()
-    assert "error:" in captured.out
-
-
 def test_gate_no_server(capsys):
     """gate returns error when server is not running."""
     with patch("hopper.client.ping", return_value=False):
         with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-            result = cmd_gate(["design"])
+            result = cmd_gate([])
     assert result != 0
 
 
@@ -1707,7 +1699,7 @@ def test_gate_no_hopper_lid(capsys):
     env.pop("HOPPER_LID", None)
     with patch.dict(os.environ, env, clear=True):
         with patch("hopper.cli.require_server", return_value=None):
-            result = cmd_gate(["design"])
+            result = cmd_gate([])
     assert result == 1
     captured = capsys.readouterr()
     assert "HOPPER_LID not set" in captured.out
@@ -1720,7 +1712,7 @@ def test_gate_wrong_stage(capsys):
         with patch("hopper.client.ping", return_value=True):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
-                    result = cmd_gate(["design"])
+                    result = cmd_gate([])
     assert result == 1
     captured = capsys.readouterr()
     assert "not in refine stage" in captured.out
@@ -1736,7 +1728,7 @@ def test_gate_empty_stdin(capsys):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("sys.stdin", StringIO("")):
-                        result = cmd_gate(["design"])
+                        result = cmd_gate([])
     assert result == 1
     captured = capsys.readouterr()
     assert "No input received" in captured.out
@@ -1756,7 +1748,7 @@ def test_gate_saves_file_and_sets_state(temp_config, capsys):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
                         with patch("sys.stdin", StringIO(review_text)):
-                            result = cmd_gate(["design"])
+                            result = cmd_gate([])
 
     assert result == 0
     captured = capsys.readouterr()
@@ -1773,7 +1765,7 @@ def test_gate_saves_file_and_sets_state(temp_config, capsys):
     _, sid, state, status = mock_set.call_args[0]
     assert sid == lode_id
     assert state == "gated"
-    assert "Design gate" in status
+    assert status == "Gate"
 
 
 # Tests for code command
