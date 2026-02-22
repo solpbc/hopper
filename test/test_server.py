@@ -217,6 +217,62 @@ def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode
             thread.join(timeout=2)
 
 
+def test_cleanup_worktree_runs_make_sail(socket_path, temp_config, make_lode):
+    """Cleanup runs make sail after worktree and branch cleanup."""
+    lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        project="myproject",
+        branch="hopper-test-id",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+
+    with (
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.remove_worktree") as mock_remove_worktree,
+        patch("hopper.server.delete_branch") as mock_delete_branch,
+        patch("hopper.server.subprocess.run") as mock_subprocess_run,
+    ):
+        srv = Server(socket_path)
+        srv._cleanup_worktree(lode)
+
+        mock_remove_worktree.assert_called_once_with("/fake/repo", str(worktree_dir))
+        mock_delete_branch.assert_called_once_with("/fake/repo", lode["branch"])
+        mock_subprocess_run.assert_any_call(["make", "sail"], cwd="/fake/repo", capture_output=True)
+
+
+def test_cleanup_worktree_make_sail_failure_silenced(socket_path, temp_config, make_lode):
+    """Cleanup ignores make sail failures."""
+    lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        project="myproject",
+        branch="hopper-test-id",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+
+    with (
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.remove_worktree") as mock_remove_worktree,
+        patch("hopper.server.delete_branch") as mock_delete_branch,
+        patch(
+            "hopper.server.subprocess.run", side_effect=FileNotFoundError("make not found")
+        ) as mock_subprocess_run,
+    ):
+        srv = Server(socket_path)
+        srv._cleanup_worktree(lode)
+
+        mock_remove_worktree.assert_called_once_with("/fake/repo", str(worktree_dir))
+        mock_delete_branch.assert_called_once_with("/fake/repo", lode["branch"])
+        mock_subprocess_run.assert_any_call(["make", "sail"], cwd="/fake/repo", capture_output=True)
+
+
 def test_cleanup_skipped_without_worktree_dir(socket_path, temp_config, make_lode):
     """Cleanup is skipped when archived lode has no worktree directory."""
     shipped_lode = make_lode(id="test-id", stage="shipped", project="myproject")

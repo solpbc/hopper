@@ -149,18 +149,18 @@ def main():
     total_raw = [m + r + s for m, r, s in zip(raw["mill"], raw["refine"], raw["ship"])]
     total_filtered = iqr_filter(total_raw)
 
-    print(f"\n  Lode Timing Report")
+    print("\n  Lode Timing Report")
     print(f"  {'=' * 76}")
     print(f"  {len(raw['mill'])} completed lodes, {dropped} outlier values removed (IQR 1.5x)")
 
-    print(f"\n  Stages")
+    print("\n  Stages")
     print(f"  {'-' * 76}")
     print_stats("mill", filtered["mill"])
     print_stats("refine", filtered["refine"])
     print_stats("ship", filtered["ship"])
     print_stats("TOTAL", total_filtered)
 
-    print(f"\n  Refine sub-phases")
+    print("\n  Refine sub-phases")
     print(f"  {'-' * 76}")
     print_stats("prep", filtered["prep"])
     print_stats("design", filtered["design"])

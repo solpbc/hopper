@@ -286,7 +286,7 @@ class Server:
                 self._cleanup_worktree(archived)
 
     def _cleanup_worktree(self, lode: dict) -> None:
-        """Remove git worktree and branch for an archived lode."""
+        """Remove git worktree and branch for an archived lode, then run make sail."""
         lode_id = lode["id"]
         worktree_path = get_lode_dir(lode_id) / "worktree"
         if not worktree_path.is_dir():
@@ -301,6 +301,10 @@ class Server:
         remove_worktree(project.path, str(worktree_path))
         branch = lode.get("branch", "") or f"hopper-{lode_id}"
         delete_branch(project.path, branch)
+        try:
+            subprocess.run(["make", "sail"], cwd=project.path, capture_output=True)
+        except Exception:
+            pass
 
     def _register_lode_client(
         self,
