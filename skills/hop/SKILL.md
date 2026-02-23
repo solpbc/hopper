@@ -17,22 +17,19 @@ description: Reference card for the hop CLI in hopper covering lode management, 
 - `hop screenshot` - Capture TUI window content as ANSI text.
 - `hop ping` - Check server connectivity and show tmux/lode info.
 
-## Stage completion
+## Implementation request
 
-- `hop processed` - Read output from stdin, save as `<stage>_out.md`, then signal completion.
+Request new implementation work from outside your current lode:
 
 ```bash
-hop processed <<'DONE'
-summary of work completed
-DONE
+hop implement myproject Fix login timeout
 ```
 
-- `hop code <stage>` - Dispatch a stage prompt to a junior engineer; read directions from stdin via heredoc.
-- `hop gate` - Pause at a review gate. Saves review doc from stdin and pauses lode for user review. Session resumes after review.
+Or provide scope via stdin:
 
 ```bash
-hop gate <<'EOF'
-review document
+hop implement myproject <<'EOF'
+Fix login timeout and add regression coverage
 EOF
 ```
 
@@ -44,4 +41,4 @@ EOF
 
 ## Important note
 
-- `hop lode create` is **blocked inside a lode**. Use `hop backlog add` to queue future work instead.
+- `hop implement` (and `hop lode create`) is **blocked inside a lode**. Use `hop backlog add` to queue future work instead.

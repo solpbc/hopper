@@ -15,16 +15,21 @@ hop lode list -a
 
 Use `-a` or `--archived` to show archived lodes.
 
-Create a new lode with required `project` and optional `scope` args:
+Create a new lode with required `project` and optional `scope` args (`hop implement` is an alias for `hop lode create`):
 
 ```bash
 hop lode create myproject Fix login timeout
+hop implement myproject Fix login timeout
 ```
 
 If `scope` is omitted, provide it on stdin:
 
 ```bash
 hop lode create myproject <<'EOF'
+Fix login timeout and add regression coverage
+EOF
+
+hop implement myproject <<'EOF'
 Fix login timeout and add regression coverage
 EOF
 ```
@@ -44,7 +49,7 @@ hop lode watch abc123
 Practical create + watch workflow:
 
 ```bash
-hop lode create myproject Improve retry logic
+hop implement myproject Improve retry logic
 # note the new lode ID from output
 hop lode watch <lode_id>
 ```

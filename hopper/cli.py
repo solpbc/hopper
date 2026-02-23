@@ -1025,6 +1025,12 @@ def cmd_lode(args: list[str]) -> int:
     return 0
 
 
+@command("implement", "Create a lode for an implementation request")
+def cmd_implement(args: list[str]) -> int:
+    """Alias for hop lode create."""
+    return cmd_lode(["create"] + args)
+
+
 @command("ping", "Check if server is running")
 def cmd_ping(args: list[str]) -> int:
     """Ping the server."""

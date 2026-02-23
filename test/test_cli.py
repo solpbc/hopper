@@ -15,6 +15,7 @@ from hopper.cli import (
     cmd_code,
     cmd_config,
     cmd_gate,
+    cmd_implement,
     cmd_lode,
     cmd_ping,
     cmd_process,
@@ -878,6 +879,45 @@ def test_lode_create_invalid_project(capsys):
         assert cmd_lode(["create", "badproj", "some scope"]) == 1
     out = capsys.readouterr().out
     assert "not found" in out.lower()
+
+
+def test_implement_delegates_to_lode_create(capsys):
+    """hop implement delegates to hop lode create."""
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.projects.find_project", return_value=object()):
+            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                assert cmd_implement(["myproj", "fix", "the", "bug"]) == 0
+                mock_create.assert_called_once()
+                assert mock_create.call_args.kwargs["spawn"] is True
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+    assert "myproj" in out
+
+
+def test_implement_rejects_inside_lode(monkeypatch, capsys):
+    """hop implement rejects when inside a lode."""
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    rc = cmd_implement(["proj", "scope"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Cannot run this command inside lode test-lode-123." in out
+    assert "hop backlog add" in out
+
+
+def test_implement_reads_stdin(capsys):
+    """hop implement reads scope from stdin when omitted."""
+    from io import StringIO
+
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.projects.find_project", return_value=object()):
+            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                with patch("sys.stdin", StringIO("stdin scope")):
+                    assert cmd_implement(["myproj"]) == 0
+                mock_create.assert_called_once()
+                assert mock_create.call_args.args[2] == "stdin scope"
 
 
 def test_lode_restart_happy(capsys):
