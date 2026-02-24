@@ -730,7 +730,9 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
         msg = {"type": "lode_set_stage", "lode_id": "lode1234", "stage": "shipped"}
         client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
 
-        messages = _recv_messages_until(client, {"lode_updated", "lode_created", "backlog_removed"})
+        messages = _recv_messages_until(
+            client, {"lode_updated", "lode_created", "backlog_removed", "backlog_updated"}
+        )
 
         created_msgs = [msg for msg in messages if msg.get("type") == "lode_created"]
         removed_msgs = [msg for msg in messages if msg.get("type") == "backlog_removed"]
@@ -739,8 +741,94 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
         assert removed_msgs[0]["item"]["id"] == "bl111111"
         assert len(server.backlog) == 1
         assert server.backlog[0].id == "bl222222"
+        # Remaining item re-queued behind the new lode
+        assert server.backlog[0].queued == created_msgs[0]["lode"]["id"]
+        updated_msgs = [msg for msg in messages if msg.get("type") == "backlog_updated"]
+        assert len(updated_msgs) == 1
+        assert updated_msgs[0]["item"]["id"] == "bl222222"
+        assert updated_msgs[0]["item"]["queued"] == created_msgs[0]["lode"]["id"]
         mock_spawn.assert_called_once_with(created_msgs[0]["lode"]["id"], None, foreground=False)
 
+        client.close()
+
+
+def test_auto_promote_chains_multiple_queued_items(socket_path, server, temp_config, make_lode):
+    """When 3 items are queued behind a shipped lode, oldest is promoted and
+    remaining 2 re-queue behind the new lode.
+    """
+    lode = make_lode(id="lode1234", project="myproj", stage="ship")
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    item_a = BacklogItem(
+        id="bl_aaaaaa",
+        project="myproj",
+        description="A oldest",
+        created_at=1000,
+        queued="lode1234",
+    )
+    item_b = BacklogItem(
+        id="bl_bbbbbb",
+        project="myproj",
+        description="B middle",
+        created_at=2000,
+        queued="lode1234",
+    )
+    item_c = BacklogItem(
+        id="bl_cccccc",
+        project="myproj",
+        description="C newest",
+        created_at=3000,
+        queued="lode1234",
+    )
+    server.backlog = [item_c, item_b, item_a]  # intentionally out of order
+
+    with patch("hopper.server.spawn_claude") as mock_spawn:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(socket_path))
+        client.settimeout(2.0)
+
+        for _ in range(50):
+            if len(server.clients) > 0:
+                break
+            time.sleep(0.1)
+
+        msg = {"type": "lode_set_stage", "lode_id": "lode1234", "stage": "shipped"}
+        client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+        messages = _recv_messages_until(
+            client, {"lode_updated", "lode_created", "backlog_removed", "backlog_updated"}
+        )
+        client.settimeout(0.1)
+        drain_deadline = time.time() + 1.0
+        while time.time() < drain_deadline:
+            try:
+                data = client.recv(4096).decode("utf-8")
+            except socket.timeout:
+                break
+            for line in data.strip().split("\n"):
+                if line:
+                    messages.append(json.loads(line))
+        client.settimeout(2.0)
+
+        created_msgs = [msg for msg in messages if msg.get("type") == "lode_created"]
+        removed_msgs = [msg for msg in messages if msg.get("type") == "backlog_removed"]
+        updated_msgs = [msg for msg in messages if msg.get("type") == "backlog_updated"]
+
+        # Oldest promoted
+        assert len(created_msgs) == 1
+        assert len(removed_msgs) == 1
+        assert removed_msgs[0]["item"]["id"] == "bl_aaaaaa"
+
+        # Two remaining items re-queued behind the new lode
+        new_lode_id = created_msgs[0]["lode"]["id"]
+        assert len(server.backlog) == 2
+        assert len(updated_msgs) == 2
+        for item in server.backlog:
+            assert item.queued == new_lode_id
+        for umsg in updated_msgs:
+            assert umsg["item"]["queued"] == new_lode_id
+
+        mock_spawn.assert_called_once()
         client.close()
 
 

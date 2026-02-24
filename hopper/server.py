@@ -20,6 +20,7 @@ from hopper.backlog import (
     add_backlog_item,
     load_backlog,
     remove_backlog_item,
+    save_backlog,
     set_backlog_queued,
     update_backlog_item,
 )
@@ -444,7 +445,19 @@ class Server:
                         ]
                         if candidates:
                             oldest = min(candidates, key=lambda x: x.created_at)
-                            self._promote_backlog_item(oldest)
+                            new_lode = self._promote_backlog_item(oldest)
+                            # Re-queue remaining items behind the new lode
+                            remaining = [item for item in self.backlog if item.queued == lode_id]
+                            for item in remaining:
+                                item.queued = new_lode["id"]
+                                self.broadcast({"type": "backlog_updated", "item": item.to_dict()})
+                            if remaining:
+                                save_backlog(self.backlog)
+                                logger.info(
+                                    "Re-queued %d backlog items behind %s",
+                                    len(remaining),
+                                    new_lode["id"],
+                                )
 
         elif msg_type == "lode_archive":
             lode_id = message.get("lode_id")
