@@ -953,31 +953,31 @@ async def test_check_server_updates_resyncs_list_references():
         assert table.cursor_row == 1
 
 
-def test_check_stuck_alert_sets_alert_when_error_lode_exists():
-    """_check_stuck_alert should set alert flag when an error lode exists."""
+def test_update_window_title_sets_jam_when_error_lode():
+    """_update_window_title should set hopJAM when an error lode exists."""
     app = HopperApp()
     app._lodes = [{"state": "error", "active": True, "stage": "mill"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is True
+    app._update_window_title()
+    assert app._window_title == "hopJAM"
 
 
-def test_check_stuck_alert_clears_alert_when_all_healthy():
-    """_check_stuck_alert should clear alert flag when all lodes are healthy."""
+def test_update_window_title_clears_jam_when_all_healthy():
+    """_update_window_title should clear hopJAM when all lodes are healthy."""
     app = HopperApp()
-    app._stuck_alert_active = True
+    app._window_title = "hopJAM"
     app._lodes = [{"state": "running", "active": True, "stage": "refine"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopping"
 
 
-def test_check_stuck_alert_noop_when_state_unchanged(monkeypatch):
-    """_check_stuck_alert should not rename when alert state doesn't change."""
+def test_update_window_title_noop_when_title_unchanged(monkeypatch):
+    """_update_window_title should not rename when title doesn't change."""
     app = HopperApp()
-    app._stuck_alert_active = False
+    app._window_title = "hopping"
     app._lodes = [{"state": "running", "active": True, "stage": "refine"}]
     rename_calls: list[str] = []
     monkeypatch.setattr(app, "_rename_tui_window", lambda name: rename_calls.append(name))
-    app._check_stuck_alert()
+    app._update_window_title()
     assert rename_calls == []
 
 
@@ -993,77 +993,104 @@ def test_rename_tui_window_skips_when_no_tmux_location():
     app._rename_tui_window("hop")
 
 
-def test_disconnected_lode_triggers_alert():
-    """Inactive non-shipped and non-new lodes should trigger stuck alert."""
+def test_disconnected_lode_triggers_jam():
+    """Inactive non-shipped and non-new lodes should trigger hopJAM."""
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "idle"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is True
+    app._update_window_title()
+    assert app._window_title == "hopJAM"
 
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "shipped", "state": "idle"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopper"
 
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "new"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopper"
 
 
-def test_ready_lode_does_not_trigger_alert():
-    """Lodes in ready state (stage complete, waiting for user) should not trigger alert."""
+def test_ready_lode_does_not_trigger_jam():
+    """Lodes in ready state (stage complete, waiting for user) should not trigger hopJAM."""
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "ready"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopper"
 
 
-def test_gated_lode_does_not_trigger_alert():
-    """Gated lodes (paused for review) should not trigger stuck alert."""
+def test_gated_lode_does_not_trigger_jam():
+    """Gated lodes (paused for review) should not trigger hopJAM."""
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "gated"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopper"
 
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "gate_reviewed"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopper"
 
 
-def test_stuck_state_triggers_alert():
-    """Lodes in stuck state should trigger stuck alert."""
+def test_stuck_state_triggers_jam():
+    """Lodes in stuck state should trigger hopJAM."""
     app = HopperApp()
     app._lodes = [{"state": "stuck", "active": True, "stage": "mill"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is True
+    app._update_window_title()
+    assert app._window_title == "hopJAM"
 
 
-def test_alert_clears_when_triggering_lode_archived():
-    """Alert should clear when the lode that triggered it is removed."""
+def test_jam_clears_when_triggering_lode_archived():
+    """hopJAM should clear when the lode that triggered it is removed."""
     app = HopperApp()
     app._lodes = [{"state": "error", "active": True, "stage": "mill"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is True
+    app._update_window_title()
+    assert app._window_title == "hopJAM"
 
     # Simulate archiving the lode
     app._lodes.clear()
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopper"
 
 
-def test_alert_clears_when_lode_becomes_active():
-    """Alert should clear when a disconnected lode reconnects."""
+def test_jam_clears_when_lode_becomes_active():
+    """hopJAM should clear when a disconnected lode reconnects."""
     app = HopperApp()
     app._lodes = [{"active": False, "stage": "refine", "state": "running"}]
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is True
+    app._update_window_title()
+    assert app._window_title == "hopJAM"
 
     # Runner reconnects
     app._lodes[0]["active"] = True
-    app._check_stuck_alert()
-    assert app._stuck_alert_active is False
+    app._update_window_title()
+    assert app._window_title == "hopping"
+
+
+def test_active_lode_sets_hopping():
+    """Active non-shipped lode should set title to hopping."""
+    app = HopperApp()
+    app._lodes = [{"state": "running", "active": True, "stage": "refine"}]
+    app._update_window_title()
+    assert app._window_title == "hopping"
+
+
+def test_shipped_active_lode_stays_hopper():
+    """Active shipped lode should not trigger hopping."""
+    app = HopperApp()
+    app._lodes = [{"state": "idle", "active": True, "stage": "shipped"}]
+    app._update_window_title()
+    assert app._window_title == "hopper"
+
+
+def test_jam_takes_priority_over_hopping():
+    """hopJAM should win when both error and active healthy lodes exist."""
+    app = HopperApp()
+    app._lodes = [
+        {"state": "running", "active": True, "stage": "refine"},
+        {"state": "error", "active": True, "stage": "mill"},
+    ]
+    app._update_window_title()
+    assert app._window_title == "hopJAM"
 
 
 @pytest.mark.asyncio
