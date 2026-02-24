@@ -75,6 +75,8 @@ This must be **empty**. If it shows commits, the branch has work that wasn't inc
 
 Look for a Makefile, CI config, or test setup in the project. Run whatever validation is available (tests, linting, type checks). If tests fail due to your merge resolution, fix the issues.
 
+Do not use `git stash` to isolate or hide test failures. If tests were already failing before your merge, investigate and fix the root cause. Every ship should leave the codebase better than it was found.
+
 ### 6. Push to remote
 
 Push the merged main branch to the remote:
