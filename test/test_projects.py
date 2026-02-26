@@ -20,7 +20,13 @@ from hopper.projects import (
     save_projects,
     touch_project,
     validate_git_dir,
+    validate_makefile_install,
 )
+
+
+def _write_install_makefile(path):
+    """Write a minimal Makefile with install target for test repos."""
+    (path / "Makefile").write_text(".PHONY: install\ninstall:\n\t@true\n")
 
 
 @pytest.fixture
@@ -35,6 +41,7 @@ def git_dir(tmp_path):
     repo_path = tmp_path / "test-repo"
     repo_path.mkdir()
     subprocess.run(["git", "init"], cwd=repo_path, capture_output=True, check=True)
+    (repo_path / "Makefile").write_text(".PHONY: install\ninstall:\n\t@true\n")
     return repo_path
 
 
@@ -156,6 +163,7 @@ def test_add_project_duplicate_name(mock_config, git_dir, tmp_path):
     other_repo = tmp_path / "other" / "test-repo"
     other_repo.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=other_repo, capture_output=True, check=True)
+    _write_install_makefile(other_repo)
 
     with pytest.raises(ValueError, match="already exists"):
         add_project(str(other_repo))
@@ -171,9 +179,32 @@ def test_add_project_duplicate_includes_disabled(mock_config, git_dir, tmp_path)
     other_repo = tmp_path / "other" / "test-repo"
     other_repo.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=other_repo, capture_output=True, check=True)
+    _write_install_makefile(other_repo)
 
     with pytest.raises(ValueError, match="already exists"):
         add_project(str(other_repo))
+
+
+def test_add_project_no_makefile(mock_config, tmp_path):
+    """add_project raises ValueError when directory has no Makefile."""
+    repo = tmp_path / "no-makefile"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+
+    with pytest.raises(ValueError, match="No Makefile with 'install' target"):
+        add_project(str(repo))
+
+
+def test_add_project_makefile_no_install_target(mock_config, tmp_path):
+    """add_project raises ValueError when Makefile has no install target."""
+    repo = tmp_path / "no-install"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    (repo / "Makefile").write_text(".PHONY: test\ntest:\n\t@true\n")
+    assert validate_makefile_install(str(repo)) is False
+
+    with pytest.raises(ValueError, match="No Makefile with 'install' target"):
+        add_project(str(repo))
 
 
 # Tests for remove_project
@@ -231,9 +262,11 @@ def test_rename_project_duplicate_new_name(mock_config, tmp_path):
     repo1 = tmp_path / "repo1"
     repo1.mkdir()
     subprocess.run(["git", "init"], cwd=repo1, capture_output=True, check=True)
+    _write_install_makefile(repo1)
     repo2 = tmp_path / "repo2"
     repo2.mkdir()
     subprocess.run(["git", "init"], cwd=repo2, capture_output=True, check=True)
+    _write_install_makefile(repo2)
     add_project(str(repo1))
     add_project(str(repo2))
     with pytest.raises(ValueError, match="already exists"):
@@ -326,6 +359,7 @@ def test_get_active_projects_filters_disabled(mock_config, git_dir, tmp_path):
     other_repo = tmp_path / "other-repo"
     other_repo.mkdir()
     subprocess.run(["git", "init"], cwd=other_repo, capture_output=True, check=True)
+    _write_install_makefile(other_repo)
 
     add_project(str(git_dir))
     add_project(str(other_repo))
@@ -368,6 +402,7 @@ def test_get_active_projects_sorted_by_last_used(mock_config, tmp_path):
         repo = tmp_path / name
         repo.mkdir()
         subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+        _write_install_makefile(repo)
         add_project(str(repo))
 
     # Set different last_used_at timestamps
