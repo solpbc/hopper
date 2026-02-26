@@ -560,7 +560,9 @@ class Server:
             scope = message.get("scope", "")
             item = find_backlog_by_prefix(self.backlog, item_id)
             if item:
-                self._promote_backlog_item(item, scope)
+                lode = self._promote_backlog_item(item, scope)
+                if conn:
+                    self._send_response(conn, {"type": "lode_promoted", "lode": lode})
 
         elif msg_type == "backlog_add":
             project = message.get("project", "")

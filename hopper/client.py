@@ -540,6 +540,45 @@ def remove_backlog(socket_path: Path, item_id: str, timeout: float = 2.0) -> boo
     return _fire_and_forget(socket_path, msg, timeout)
 
 
+def promote_backlog(
+    socket_path: Path,
+    item_id: str,
+    scope: str = "",
+    timeout: float = 5.0,
+) -> dict | None:
+    """Promote a backlog item to a lode via the server. Returns the created lode dict or None."""
+    msg: dict = {
+        "type": "lode_promote_backlog",
+        "item_id": item_id,
+        "ts": current_time_ms(),
+    }
+    if scope:
+        msg["scope"] = scope
+    response = send_message(socket_path, msg, timeout=timeout, wait_for_response=True)
+    if response and response.get("type") == "lode_promoted":
+        return response.get("lode")
+    return None
+
+
+def set_backlog_queued(
+    socket_path: Path,
+    item_id: str,
+    queued: str | None,
+    timeout: float = 2.0,
+) -> bool:
+    """Set or clear queued assignment for a backlog item. Fire-and-forget."""
+    return _fire_and_forget(
+        socket_path,
+        {
+            "type": "backlog_set_queued",
+            "item_id": item_id,
+            "queued": queued,
+            "ts": current_time_ms(),
+        },
+        timeout,
+    )
+
+
 def reload_projects(socket_path: Path, timeout: float = 2.0) -> bool:
     """Ask server to reload projects from disk (fire-and-forget).
 

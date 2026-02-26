@@ -692,6 +692,127 @@ def test_backlog_add_requires_description_or_stdin(capsys):
     assert "Use: hop backlog add [-p project] <text...>" in out
 
 
+def _mock_backlog_item(id="abc123", project="myproj", description="Fix bug"):
+    item = MagicMock()
+    item.id = id
+    item.project = project
+    item.description = description
+    return item
+
+
+def test_backlog_promote_success(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.promote_backlog",
+                        return_value={"id": "newlode1"},
+                    ) as mock_promote:
+                        assert cmd_backlog(["promote", "abc"]) == 0
+
+    mock_promote.assert_called_once_with(socket_path, "abc123", scope="")
+    out = capsys.readouterr().out
+    assert "Promoted: newlode1" in out
+
+
+def test_backlog_promote_with_scope(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.promote_backlog",
+                        return_value={"id": "newlode1"},
+                    ) as mock_promote:
+                        assert cmd_backlog(["promote", "abc", "custom", "scope"]) == 0
+
+    mock_promote.assert_called_once_with(socket_path, "abc123", scope="custom scope")
+    out = capsys.readouterr().out
+    assert "custom scope" in out
+
+
+def test_backlog_promote_not_found(capsys):
+    with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.backlog.load_backlog", return_value=[]):
+            with patch("hopper.backlog.find_by_prefix", return_value=None):
+                assert cmd_backlog(["promote", "abc"]) == 1
+
+    out = capsys.readouterr().out
+    assert "No unique backlog item matching" in out
+
+
+def test_backlog_promote_requires_server(capsys):
+    with patch("hopper.client.ping", return_value=False):
+        assert cmd_backlog(["promote", "abc"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Server not running" in out
+
+
+def test_backlog_queue_success(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch("hopper.client.set_backlog_queued", return_value=True):
+                        assert cmd_backlog(["queue", "abc", "lode42"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Queued:" in out
+    assert "→ lode42" in out
+
+
+def test_backlog_queue_clear(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.set_backlog_queued",
+                        return_value=True,
+                    ) as mock_set_queued:
+                        assert cmd_backlog(["queue", "abc", "--clear"]) == 0
+
+    mock_set_queued.assert_called_once_with(socket_path, "abc123", None)
+    out = capsys.readouterr().out
+    assert "Cleared queue for:" in out
+
+
+def test_backlog_queue_not_found(capsys):
+    with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.backlog.load_backlog", return_value=[]):
+            with patch("hopper.backlog.find_by_prefix", return_value=None):
+                assert cmd_backlog(["queue", "abc", "lode42"]) == 1
+
+    out = capsys.readouterr().out
+    assert "No unique backlog item matching" in out
+
+
+def test_backlog_queue_missing_lode_id(capsys):
+    item = _mock_backlog_item()
+
+    with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.backlog.load_backlog", return_value=[item]):
+            with patch("hopper.backlog.find_by_prefix", return_value=item):
+                assert cmd_backlog(["queue", "abc"]) == 1
+
+    out = capsys.readouterr().out
+    assert "lode ID required" in out
+
+
 # --- cmd_lode tests ---
 
 

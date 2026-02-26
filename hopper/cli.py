@@ -743,14 +743,21 @@ def cmd_code(args: list[str]) -> int:
 
 @command("backlog", "Manage backlog items")
 def cmd_backlog(args: list[str]) -> int:
-    """Manage backlog items (list, add, remove)."""
+    """Manage backlog items (list, add, remove, promote, queue)."""
     from hopper.backlog import (
         add_backlog_item,
         find_by_prefix,
         load_backlog,
         remove_backlog_item,
     )
-    from hopper.client import add_backlog, get_lode, ping, remove_backlog
+    from hopper.client import (
+        add_backlog,
+        get_lode,
+        ping,
+        promote_backlog,
+        remove_backlog,
+        set_backlog_queued,
+    )
     from hopper.lodes import format_age
 
     parser = make_parser(
@@ -760,12 +767,19 @@ def cmd_backlog(args: list[str]) -> int:
     parser.add_argument(
         "action",
         nargs="?",
-        choices=["add", "remove", "list"],
+        choices=["list", "add", "remove", "promote", "queue"],
         default="list",
         help="Action to perform (default: list)",
     )
-    parser.add_argument("text", nargs="*", help="Description (for add) or ID prefix (for remove)")
+    parser.add_argument(
+        "text", nargs="*", help="Description (add) or ID prefix (remove/promote/queue)"
+    )
     parser.add_argument("--project", "-p", help="Project name (required if no active lode)")
+    parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear queued assignment (for queue action)",
+    )
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -846,6 +860,62 @@ def cmd_backlog(args: list[str]) -> int:
             remove_backlog_item(items, item.id)
 
         print(f"Removed: {item.id} [{item.project}] {item.description}")
+        return 0
+
+    if parsed.action == "promote":
+        if not parsed.text:
+            print("error: ID prefix required for promote")
+            parser.print_usage()
+            return 1
+
+        if err := require_server():
+            return err
+
+        prefix = parsed.text[0]
+        items = load_backlog()
+        item = find_by_prefix(items, prefix)
+        if not item:
+            print(f"No unique backlog item matching '{prefix}'")
+            return 1
+
+        scope = " ".join(parsed.text[1:]) if len(parsed.text) > 1 else ""
+        lode = promote_backlog(_socket(), item.id, scope=scope)
+        if lode:
+            print(f"Promoted: {lode['id']} [{item.project}] {scope or item.description}")
+            return 0
+
+        print("error: promote failed")
+        return 1
+
+    if parsed.action == "queue":
+        if not parsed.text:
+            print("error: ID prefix required for queue")
+            parser.print_usage()
+            return 1
+
+        prefix = parsed.text[0]
+
+        if err := require_server():
+            return err
+
+        items = load_backlog()
+        item = find_by_prefix(items, prefix)
+        if not item:
+            print(f"No unique backlog item matching '{prefix}'")
+            return 1
+
+        if parsed.clear:
+            set_backlog_queued(_socket(), item.id, None)
+            print(f"Cleared queue for: {item.id} [{item.project}] {item.description}")
+            return 0
+
+        if len(parsed.text) < 2:
+            print("error: lode ID required for queue (or use --clear)")
+            return 1
+
+        lode_id = parsed.text[1]
+        set_backlog_queued(_socket(), item.id, lode_id)
+        print(f"Queued: {item.id} [{item.project}] {item.description} → {lode_id}")
         return 0
 
     return 0
