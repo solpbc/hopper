@@ -25,6 +25,7 @@ COMMANDS: dict[str, tuple[Callable[[list[str]], int], str, str]] = {}
 
 HELP_GROUPS = [
     ("commands", "Commands"),
+    ("aliases", "Aliases"),
     ("lode", "Inside a lode"),
 ]
 
@@ -290,8 +291,24 @@ def cmd_status(args: list[str]) -> int:
 
     lode_id = get_hopper_lid()
     if not lode_id:
-        print("HOPPER_LID not set. Run this from within a hopper lode.")
-        return 1
+        # Outside a lode — look up a specific lode by ID
+        if parsed.title is not None:
+            print("Cannot set title from outside a lode.")
+            return 1
+        if not parsed.text:
+            print("HOPPER_LID not set. Run this from within a hopper lode.")
+            return 1
+        # First arg is the lode ID
+        lookup_id = parsed.text[0]
+        if len(parsed.text) > 1:
+            print("Too many arguments. Usage: hop status <lode-id>")
+            return 1
+        lode = get_lode(_socket(), lookup_id)
+        if not lode:
+            print(f"Lode {lookup_id} not found.")
+            return 1
+        print(format_lode_line(lode))
+        return 0
 
     if err := validate_hopper_lid():
         return err
@@ -760,6 +777,10 @@ def cmd_backlog(args: list[str]) -> int:
     )
     from hopper.lodes import format_age
 
+    # Normalize 'ls' alias to 'list'
+    if args and args[0] == "ls":
+        args = ["list"] + args[1:]
+
     parser = make_parser(
         "backlog",
         "Manage backlog items. Items track future work for projects.",
@@ -921,6 +942,34 @@ def cmd_backlog(args: list[str]) -> int:
     return 0
 
 
+def format_lode_line(lode: dict) -> str:
+    icon = lode_icon(lode)
+    stage = lode.get("stage", "mill")
+    lid = lode["id"]
+    project = lode.get("project", "")
+    title = lode.get("title", "")
+    status_text = lode.get("status", "")
+    return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
+
+
+def _add_create_args(parser):
+    """Add lode create arguments to a parser."""
+    parser.add_argument("project", help="Project name")
+    parser.add_argument("scope", nargs="*", help="Task scope description")
+
+
+def _create_alias_help(cmd_name: str, description: str, args: list[str]) -> int | None:
+    """Show help for a create alias when -h/--help is present, else return None."""
+    if "-h" in args or "--help" in args:
+        p = make_parser(cmd_name, description)
+        _add_create_args(p)
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return None
+
+
 @command("lode", "Manage lodes")
 def cmd_lode(args: list[str]) -> int:
     """Manage lodes — list, create, restart, watch, wait."""
@@ -928,15 +977,6 @@ def cmd_lode(args: list[str]) -> int:
     from hopper.projects import find_project
 
     STAGE_ORDER = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
-
-    def format_lode_line(lode: dict) -> str:
-        icon = lode_icon(lode)
-        stage = lode.get("stage", "mill")
-        lid = lode["id"]
-        project = lode.get("project", "")
-        title = lode.get("title", "")
-        status_text = lode.get("status", "")
-        return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
 
     def format_watch_line(lode: dict) -> str:
         icon = lode_icon(lode)
@@ -948,12 +988,13 @@ def cmd_lode(args: list[str]) -> int:
     parser = make_parser("lode", "Manage lodes")
     subs = parser.add_subparsers(dest="subcommand")
 
-    list_p = subs.add_parser("list", help="List lodes (default)", exit_on_error=False)
+    list_p = subs.add_parser(
+        "list", aliases=["ls"], help="List lodes (default)", exit_on_error=False
+    )
     list_p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
 
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
-    create_p.add_argument("project", help="Project name")
-    create_p.add_argument("scope", nargs="*", help="Task scope description")
+    _add_create_args(create_p)
 
     restart_p = subs.add_parser("restart", help="Restart an inactive lode", exit_on_error=False)
     restart_p.add_argument("lode_id", help="Lode ID to restart")
@@ -963,6 +1004,10 @@ def cmd_lode(args: list[str]) -> int:
     wait_p = subs.add_parser("wait", help="Wait for lode to ship", exit_on_error=False)
     wait_p.add_argument("lode_id", help="Lode ID to wait for")
     wait_p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
+    status_p = subs.add_parser("status", help="Show a lode's status", exit_on_error=False)
+    status_p.add_argument("lode_id", help="Lode ID to show")
+    show_p = subs.add_parser("show", help="Show a lode's status", exit_on_error=False)
+    show_p.add_argument("lode_id", help="Lode ID to show")
 
     try:
         parsed = parse_args(parser, args)
@@ -975,7 +1020,7 @@ def cmd_lode(args: list[str]) -> int:
     subcommand = parsed.subcommand or "list"
     socket_path = _socket()
 
-    if subcommand == "list":
+    if subcommand in ("list", "ls"):
         err = require_server()
         if err:
             return err
@@ -1143,13 +1188,63 @@ def cmd_lode(args: list[str]) -> int:
             conn.stop()
         return result[0]
 
+    if subcommand in ("status", "show"):
+        err = require_server()
+        if err:
+            return err
+        lode = client.get_lode(socket_path, parsed.lode_id)
+        if not lode:
+            print(f"Lode {parsed.lode_id} not found.")
+            return 1
+        print(format_lode_line(lode))
+        return 0
+
     return 0
 
 
 @command("implement", "Create a lode for an implementation request")
 def cmd_implement(args: list[str]) -> int:
     """Alias for hop lode create."""
+    if (
+        rc := _create_alias_help("implement", "Create a lode for an implementation request", args)
+    ) is not None:
+        return rc
     return cmd_lode(["create"] + args)
+
+
+@command("submit", "Create a lode (alias for implement)", group="aliases")
+def cmd_submit(args: list[str]) -> int:
+    """Alias for hop lode create."""
+    if (
+        rc := _create_alias_help("submit", "Create a lode (alias for implement)", args)
+    ) is not None:
+        return rc
+    return cmd_lode(["create"] + args)
+
+
+@command("list", "List lodes (alias for lode list)", group="aliases")
+def cmd_list(args: list[str]) -> int:
+    """Alias for hop lode list."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("list", "List lodes (alias for lode list)")
+        p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["list"] + args)
+
+
+@command("projects", "List projects (alias for project list)", group="aliases")
+def cmd_projects(args: list[str]) -> int:
+    """Alias for hop project list."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("projects", "List projects (alias for project list)")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_project(args)
 
 
 @command("ping", "Check if server is running")

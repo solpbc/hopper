@@ -16,14 +16,18 @@ from hopper.cli import (
     cmd_config,
     cmd_gate,
     cmd_implement,
+    cmd_list,
     cmd_lode,
     cmd_ping,
     cmd_process,
     cmd_processed,
+    cmd_projects,
     cmd_screenshot,
     cmd_status,
+    cmd_submit,
     cmd_up,
     detect_coding_agent,
+    format_lode_line,
     get_hopper_lid,
     main,
     require_config_name,
@@ -2152,3 +2156,292 @@ def test_code_dispatches_to_run_code(capsys):
     assert args[0] == "test-1234"  # lode_id from env
     assert args[2] == "audit"  # stage_name
     assert args[3] == "my directions"  # request from stdin
+
+
+# Tests for CLI aliases
+
+
+def test_status_outside_lode_lookup(capsys):
+    """hop status <lode-id> outside a lode shows lode info."""
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "project": "myproj",
+        "title": "My Title",
+        "status": "Working",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            result = cmd_status(["abc12345"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+    assert "refine" in out
+    assert "myproj" in out
+
+
+def test_status_outside_lode_not_found(capsys):
+    """hop status <lode-id> outside a lode errors when lode not found."""
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=None):
+            result = cmd_status(["bad_id"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "not found" in out.lower()
+
+
+def test_status_outside_lode_title_rejected(capsys):
+    """hop status -t outside a lode is rejected."""
+    with patch("hopper.cli.require_server", return_value=None):
+        result = cmd_status(["-t", "newtitle", "abc12345"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "Cannot set title from outside a lode" in out
+
+
+def test_status_outside_lode_bare(capsys):
+    """hop status bare (no args, no HOPPER_LID) shows HOPPER_LID error."""
+    with patch("hopper.cli.require_server", return_value=None):
+        result = cmd_status([])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "HOPPER_LID not set" in out
+
+
+def test_status_outside_lode_too_many_args(capsys):
+    """hop status <id> <extra> outside a lode errors."""
+    with patch("hopper.cli.require_server", return_value=None):
+        result = cmd_status(["abc12345", "extra"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "Too many arguments" in out
+
+
+def test_status_inside_lode_unchanged(capsys):
+    """hop status inside a lode (with HOPPER_LID) still works."""
+    lode = {"id": "test123", "title": "Title", "status": "Working"}
+    with patch.dict(os.environ, {"HOPPER_LID": "test123"}):
+        with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.lode_exists", return_value=True):
+                with patch("hopper.client.get_lode", return_value=lode):
+                    result = cmd_status([])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "Title: Title" in out
+    assert "Working" in out
+
+
+def test_implement_help_shows_implement(capsys):
+    """hop implement --help shows 'hop implement' in usage."""
+    result = cmd_implement(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop implement" in out
+    assert "hop lode" not in out
+
+
+def test_submit_help_shows_submit(capsys):
+    """hop submit --help shows 'hop submit' in usage."""
+    result = cmd_submit(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop submit" in out
+
+
+def test_submit_delegates_to_lode_create(capsys):
+    """hop submit delegates to hop lode create."""
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.projects.find_project", return_value=object()):
+            with patch("hopper.client.create_lode", return_value=created_lode):
+                assert cmd_submit(["myproj", "fix", "the", "bug"]) == 0
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+
+
+def test_list_delegates_to_lode_list(capsys):
+    """hop list delegates to hop lode list."""
+    lodes = [
+        {
+            "id": "abc123",
+            "stage": "mill",
+            "state": "running",
+            "active": True,
+            "project": "p",
+            "title": "t",
+            "status": "s",
+        }
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=lodes):
+            assert cmd_list([]) == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+
+
+def test_list_help_shows_list(capsys):
+    """hop list --help shows 'hop list' in usage."""
+    result = cmd_list(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop list" in out
+
+
+def test_list_archived_flag(capsys):
+    """hop list -a forwards archived flag."""
+    lodes = [
+        {
+            "id": "old001",
+            "stage": "shipped",
+            "state": "shipped",
+            "active": False,
+            "project": "p",
+            "title": "t",
+            "status": "s",
+            "updated_at": 100,
+        }
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_archived_lodes", return_value=lodes):
+            assert cmd_list(["-a"]) == 0
+    out = capsys.readouterr().out
+    assert "old001" in out
+
+
+def test_projects_delegates_to_project_list(capsys):
+    """hop projects delegates to hop project list."""
+    from hopper.projects import Project
+
+    projects = [Project(path="/path/to/foo", name="foo")]
+    with patch("hopper.projects.load_projects", return_value=projects):
+        assert cmd_projects([]) == 0
+    out = capsys.readouterr().out
+    assert "foo" in out
+
+
+def test_projects_help_shows_projects(capsys):
+    """hop projects --help shows 'hop projects' in usage."""
+    result = cmd_projects(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop projects" in out
+
+
+def test_lode_ls_alias(capsys):
+    """hop lode ls works like hop lode list."""
+    lodes = [
+        {
+            "id": "abc123",
+            "stage": "mill",
+            "state": "running",
+            "active": True,
+            "project": "p",
+            "title": "t",
+            "status": "s",
+        }
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=lodes):
+            assert cmd_lode(["ls"]) == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+
+
+def test_lode_status_subcommand(capsys):
+    """hop lode status <id> shows lode info."""
+    lode = {
+        "id": "abc12345",
+        "stage": "mill",
+        "project": "proj",
+        "title": "Title",
+        "status": "Working",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            result = cmd_lode(["status", "abc12345"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+    assert "mill" in out
+
+
+def test_lode_show_subcommand(capsys):
+    """hop lode show <id> shows lode info."""
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "project": "proj",
+        "title": "Title",
+        "status": "Working",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            result = cmd_lode(["show", "abc12345"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+    assert "refine" in out
+
+
+def test_lode_status_not_found(capsys):
+    """hop lode status <id> errors when not found."""
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=None):
+            result = cmd_lode(["status", "bad_id"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "not found" in out.lower()
+
+
+def test_backlog_ls_alias(capsys):
+    """hop backlog ls works like hop backlog list."""
+    from hopper.backlog import BacklogItem
+
+    items = [BacklogItem(id="abc123", project="proj", description="Do thing", created_at=1000)]
+    with patch("hopper.backlog.load_backlog", return_value=items):
+        assert cmd_backlog(["ls"]) == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+    assert "Do thing" in out
+
+
+def test_backlog_ls_with_flags(capsys):
+    """hop backlog ls -p proj is accepted."""
+    # backlog ls with -p should normalize to list and still work
+    # The -p flag is only used for add action, but list doesn't error on it
+    # Actually -p is parsed globally, so list just ignores it
+    from hopper.backlog import BacklogItem
+
+    items = [BacklogItem(id="abc123", project="proj", description="Do thing", created_at=1000)]
+    with patch("hopper.backlog.load_backlog", return_value=items):
+        assert cmd_backlog(["ls", "-p", "proj"]) == 0
+
+
+def test_help_shows_aliases_group(capsys):
+    """hop --help shows the Aliases group."""
+    with patch.object(sys, "argv", ["hopper", "--help"]):
+        result = main()
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "Aliases:" in out
+    assert "list" in out
+    assert "submit" in out
+    assert "projects" in out
+
+
+def test_format_lode_line_basic():
+    """format_lode_line returns expected format."""
+    lode = {
+        "id": "abc12345",
+        "stage": "mill",
+        "state": "running",
+        "project": "myproj",
+        "title": "My Title",
+        "status": "Working",
+    }
+    line = format_lode_line(lode)
+    assert "abc12345" in line
+    assert "mill" in line
+    assert "myproj" in line
+    assert "My Title" in line
+    assert "Working" in line
