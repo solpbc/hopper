@@ -460,6 +460,19 @@ def reset_lode_claude_stage(lodes: list[dict], lode_id: str, claude_stage: str) 
     return None
 
 
+def find_lodes_by_prefix(lodes: list[dict], prefix: str) -> list[dict]:
+    """Find all lodes matching an ID prefix."""
+    return [lode for lode in lodes if lode["id"].startswith(prefix)]
+
+
+def find_lode_by_prefix(lodes: list[dict], prefix: str) -> dict | None:
+    """Find a lode by ID prefix. Returns None if not found or ambiguous."""
+    matches = find_lodes_by_prefix(lodes, prefix)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 # --- Status icon constants ---
 
 STATUS_RUNNING = "●"  # filled circle

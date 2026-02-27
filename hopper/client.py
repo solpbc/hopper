@@ -557,6 +557,8 @@ def promote_backlog(
     response = send_message(socket_path, msg, timeout=timeout, wait_for_response=True)
     if response and response.get("type") == "lode_promoted":
         return response.get("lode")
+    if response and response.get("type") == "promote_error":
+        logger.warning(f"promote_backlog failed: {response.get('error', 'unknown error')}")
     return None
 
 

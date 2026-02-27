@@ -943,6 +943,90 @@ def test_lode_list_archived_sorted(capsys):
     assert "old00001" in lines[1]
 
 
+def test_lode_list_project_filter(capsys):
+    """List -p filters active lodes by project."""
+    lodes = [
+        {
+            "id": "hop00001",
+            "stage": "mill",
+            "state": "new",
+            "active": False,
+            "project": "hopper",
+            "title": "",
+            "status": "",
+        },
+        {
+            "id": "oth00001",
+            "stage": "refine",
+            "state": "running",
+            "active": True,
+            "project": "other",
+            "title": "",
+            "status": "",
+        },
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=lodes):
+            assert cmd_lode(["list", "-p", "hopper"]) == 0
+    out = capsys.readouterr().out
+    assert "hop00001" in out
+    assert "oth00001" not in out
+
+
+def test_lode_list_project_filter_no_match(capsys):
+    """List -p with no matches prints the standard empty message."""
+    lodes = [
+        {
+            "id": "oth00001",
+            "stage": "refine",
+            "state": "running",
+            "active": True,
+            "project": "other",
+            "title": "",
+            "status": "",
+        },
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=lodes):
+            assert cmd_lode(["list", "-p", "nonexistent"]) == 0
+    out = capsys.readouterr().out
+    assert "No active lodes" in out
+
+
+def test_lode_list_archived_project_filter(capsys):
+    """List -a -p filters archived lodes by project."""
+    lodes = [
+        {
+            "id": "hop00001",
+            "stage": "shipped",
+            "state": "ready",
+            "active": False,
+            "project": "hopper",
+            "title": "",
+            "status": "",
+            "updated_at": 2000,
+            "created_at": 1900,
+        },
+        {
+            "id": "oth00001",
+            "stage": "shipped",
+            "state": "ready",
+            "active": False,
+            "project": "other",
+            "title": "",
+            "status": "",
+            "updated_at": 1000,
+            "created_at": 900,
+        },
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_archived_lodes", return_value=lodes):
+            assert cmd_lode(["list", "-a", "-p", "hopper"]) == 0
+    out = capsys.readouterr().out
+    assert "hop00001" in out
+    assert "oth00001" not in out
+
+
 def test_lode_create_happy(capsys):
     """Create sends correct message and prints confirmation."""
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
@@ -1271,27 +1355,96 @@ def test_lode_wait_shipped(capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_lode_wait_archived(capsys):
-    """wait exits 0 silently when lode is archived."""
+def test_lode_wait_already_shipped(capsys):
+    """wait exits 0 and prints detail when lode is already shipped."""
     lode = {
         "id": "abc123",
         "stage": "shipped",
         "state": "ready",
         "status": "Shipped",
-        "active": True,
+        "active": False,
+        "project": "proj",
+        "title": "Done",
+        "created_at": 1000,
+        "updated_at": 2000,
     }
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=lode):
-            mock_conn = MagicMock()
-
-            def fake_start(callback, on_connect=None):
-                callback({"type": "lode_archived", "lode": {**lode, "active": False}})
-
-            mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "abc123"])
+            result = cmd_lode(["wait", "abc123"])
     assert result == 0
-    assert capsys.readouterr().out == ""
+    out = capsys.readouterr().out
+    assert "abc123" in out
+    assert "stage:    shipped" in out
+
+
+def test_lode_wait_archived_lode(capsys):
+    """wait exits 0 and prints detail for archived lodes found via lookup."""
+    archived = {
+        "id": "arc12345",
+        "stage": "shipped",
+        "state": "ready",
+        "status": "Done",
+        "active": False,
+        "project": "proj",
+        "created_at": 1000,
+        "updated_at": 2000,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_lodes", return_value=[]):
+                with patch("hopper.client.list_archived_lodes", return_value=[archived]):
+                    result = cmd_lode(["wait", "arc12345"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "arc12345" in out
+    assert "stage:    shipped" in out
+
+
+def test_lode_wait_prefix_match(capsys):
+    """wait resolves prefix to an active lode ID and waits on that lode."""
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_lodes", return_value=[lode]):
+                with patch("hopper.client.list_archived_lodes", return_value=[]):
+                    mock_conn = MagicMock()
+
+                    def fake_start(callback, on_connect=None):
+                        callback(
+                            {
+                                "type": "lode_updated",
+                                "lode": {**lode, "stage": "shipped", "status": "Done"},
+                            }
+                        )
+
+                    mock_conn.start = fake_start
+                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                        result = cmd_lode(["wait", "abc"])
+    assert result == 0
+
+
+def test_lode_wait_prefix_not_active(capsys):
+    """wait with prefix fails when matched lode is inactive and not shipped."""
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "state": "new",
+        "status": "",
+        "active": False,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_lodes", return_value=[lode]):
+                with patch("hopper.client.list_archived_lodes", return_value=[]):
+                    result = cmd_lode(["wait", "abc"])
+    assert result == 1
+    assert "not active" in capsys.readouterr().out
 
 
 def test_lode_wait_error(capsys):
@@ -1323,7 +1476,9 @@ def test_lode_wait_not_found(capsys):
     """wait fails when lode not found."""
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=None):
-            result = cmd_lode(["wait", "bogus"])
+            with patch("hopper.client.list_lodes", return_value=[]):
+                with patch("hopper.client.list_archived_lodes", return_value=[]):
+                    result = cmd_lode(["wait", "bogus"])
     assert result == 1
     assert "not found" in capsys.readouterr().out
 
@@ -2161,29 +2316,37 @@ def test_code_dispatches_to_run_code(capsys):
 # Tests for CLI aliases
 
 
-def test_status_outside_lode_lookup(capsys):
-    """hop status <lode-id> outside a lode shows lode info."""
+def test_status_outside_lode_detail(capsys):
+    """hop status <lode-id> outside a lode shows detailed lode info."""
     lode = {
         "id": "abc12345",
         "stage": "refine",
         "project": "myproj",
         "title": "My Title",
         "status": "Working",
+        "state": "running",
+        "scope": "Fix login",
+        "branch": "hopper-abc12345-fix-login",
+        "active": True,
+        "created_at": 1000,
+        "updated_at": 2000,
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.cli._lookup_lode", return_value=(lode, None)):
             result = cmd_status(["abc12345"])
     assert result == 0
     out = capsys.readouterr().out
     assert "abc12345" in out
-    assert "refine" in out
-    assert "myproj" in out
+    assert "project:  myproj" in out
+    assert "stage:    refine" in out
+    assert "scope:    Fix login" in out
+    assert "active:   yes" in out
 
 
 def test_status_outside_lode_not_found(capsys):
     """hop status <lode-id> outside a lode errors when lode not found."""
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=None):
+        with patch("hopper.cli._lookup_lode", return_value=(None, "Lode 'bad_id' not found.")):
             result = cmd_status(["bad_id"])
     assert result == 1
     out = capsys.readouterr().out
@@ -2285,6 +2448,7 @@ def test_list_help_shows_list(capsys):
     assert result == 0
     out = capsys.readouterr().out
     assert "hop list" in out
+    assert "--project" in out
 
 
 def test_list_archived_flag(capsys):
@@ -2348,45 +2512,147 @@ def test_lode_ls_alias(capsys):
 
 
 def test_lode_status_subcommand(capsys):
-    """hop lode status <id> shows lode info."""
+    """hop lode status <id> shows detailed lode info."""
     lode = {
         "id": "abc12345",
         "stage": "mill",
         "project": "proj",
         "title": "Title",
         "status": "Working",
+        "state": "running",
+        "active": True,
+        "created_at": 1000,
+        "updated_at": 2000,
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.cli._lookup_lode", return_value=(lode, None)):
             result = cmd_lode(["status", "abc12345"])
     assert result == 0
     out = capsys.readouterr().out
     assert "abc12345" in out
-    assert "mill" in out
+    assert "stage:    mill" in out
 
 
-def test_lode_show_subcommand(capsys):
-    """hop lode show <id> shows lode info."""
+def test_lode_show_detail(capsys):
+    """hop lode show <id> prints multiline lode detail."""
     lode = {
         "id": "abc12345",
         "stage": "refine",
         "project": "proj",
         "title": "Title",
         "status": "Working",
+        "state": "running",
+        "scope": "Fix login bug",
+        "branch": "hopper-abc12345-fix-login",
+        "active": True,
+        "created_at": 1000,
+        "updated_at": 2000,
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.list_lodes", return_value=[lode]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                result = cmd_lode(["show", "abc12345"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+    assert "project:  proj" in out
+    assert "scope:    Fix login bug" in out
+    assert "branch:   hopper-abc12345-fix-login" in out
+
+
+def test_lode_show_prefix(capsys):
+    """hop lode show resolves lode ID prefix."""
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "project": "proj",
+        "state": "running",
+        "active": True,
+        "created_at": 1000,
+        "updated_at": 2000,
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[lode]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                result = cmd_lode(["show", "abc"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc12345" in out
+
+
+def test_lode_show_archived(capsys):
+    """hop lode show finds lodes in archived data."""
+    lode = {
+        "id": "arc12345",
+        "stage": "shipped",
+        "project": "proj",
+        "state": "ready",
+        "active": False,
+        "created_at": 1000,
+        "updated_at": 2000,
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[]):
+            with patch("hopper.client.list_archived_lodes", return_value=[lode]):
+                result = cmd_lode(["show", "arc"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "arc12345" in out
+    assert "stage:    shipped" in out
+
+
+def test_lode_show_ambiguous_prefix(capsys):
+    """hop lode show reports all matching IDs when prefix is ambiguous."""
+    lodes = [
+        {"id": "abc12345", "stage": "mill", "project": "proj"},
+        {"id": "abc99999", "stage": "refine", "project": "proj"},
+    ]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=lodes):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                result = cmd_lode(["show", "abc"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "Ambiguous prefix 'abc'" in out
+    assert "abc12345" in out
+    assert "abc99999" in out
+
+
+def test_lode_show_not_found(capsys):
+    """hop lode show reports not found for unknown IDs/prefixes."""
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                result = cmd_lode(["show", "bad_id"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "not found" in out.lower()
+
+
+def test_lode_show_subcommand(capsys):
+    """Backward-compat coverage: hop lode show <id> still succeeds."""
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "project": "proj",
+        "state": "running",
+        "active": True,
+        "created_at": 1000,
+        "updated_at": 2000,
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.cli._lookup_lode", return_value=(lode, None)):
             result = cmd_lode(["show", "abc12345"])
     assert result == 0
     out = capsys.readouterr().out
     assert "abc12345" in out
-    assert "refine" in out
+    assert "stage:    refine" in out
 
 
 def test_lode_status_not_found(capsys):
     """hop lode status <id> errors when not found."""
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=None):
+        with patch("hopper.cli._lookup_lode", return_value=(None, "Lode 'bad_id' not found.")):
             result = cmd_lode(["status", "bad_id"])
     assert result == 1
     out = capsys.readouterr().out

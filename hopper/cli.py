@@ -11,7 +11,7 @@ from pathlib import Path
 import setproctitle
 
 from hopper import __version__, config
-from hopper.lodes import lode_icon
+from hopper.lodes import find_lode_by_prefix, find_lodes_by_prefix, format_age, lode_icon
 
 
 def _socket() -> Path:
@@ -291,23 +291,23 @@ def cmd_status(args: list[str]) -> int:
 
     lode_id = get_hopper_lid()
     if not lode_id:
-        # Outside a lode — look up a specific lode by ID
+        # Outside a lode — look up a specific lode by ID/prefix
         if parsed.title is not None:
             print("Cannot set title from outside a lode.")
             return 1
         if not parsed.text:
             print("HOPPER_LID not set. Run this from within a hopper lode.")
             return 1
-        # First arg is the lode ID
+        # First arg is the lode ID/prefix
         lookup_id = parsed.text[0]
         if len(parsed.text) > 1:
             print("Too many arguments. Usage: hop status <lode-id>")
             return 1
-        lode = get_lode(_socket(), lookup_id)
-        if not lode:
-            print(f"Lode {lookup_id} not found.")
+        lode, error = _lookup_lode(_socket(), lookup_id)
+        if error:
+            print(error)
             return 1
-        print(format_lode_line(lode))
+        print(format_lode_detail(lode))
         return 0
 
     if err := validate_hopper_lid():
@@ -952,6 +952,58 @@ def format_lode_line(lode: dict) -> str:
     return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
 
 
+def format_lode_detail(lode: dict) -> str:
+    """Format a lode as a multi-line detailed view."""
+    lines = [format_lode_line(lode)]
+    lines.append(f"  id:       {lode.get('id', '')}")
+    lines.append(f"  project:  {lode.get('project', '')}")
+    lines.append(f"  stage:    {lode.get('stage', '')}")
+    lines.append(f"  state:    {lode.get('state', '')}")
+
+    status_text = lode.get("status", "")
+    if status_text:
+        lines.append(f"  status:   {status_text}")
+
+    title = lode.get("title", "")
+    if title:
+        lines.append(f"  title:    {title}")
+
+    scope_text = (lode.get("scope", "") or "").strip()
+    if scope_text:
+        lines.append(f"  scope:    {scope_text.splitlines()[0]}")
+
+    branch = lode.get("branch", "")
+    if branch:
+        lines.append(f"  branch:   {branch}")
+
+    created_age = format_age(lode.get("created_at", 0))
+    updated_at = lode.get("updated_at", 0) or lode.get("created_at", 0)
+    updated_age = format_age(updated_at)
+    lines.append(f"  created:  {created_age} ago")
+    lines.append(f"  updated:  {updated_age} ago")
+    lines.append(f"  active:   {'yes' if lode.get('active') else 'no'}")
+    return "\n".join(lines)
+
+
+def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
+    """Look up a lode by ID prefix across active and archived lodes."""
+    import hopper.client as client
+
+    active_lodes = client.list_lodes(socket_path)
+    archived_lodes = client.list_archived_lodes(socket_path)
+    all_lodes = active_lodes + archived_lodes
+
+    lode = find_lode_by_prefix(all_lodes, prefix)
+    if lode:
+        return lode, None
+
+    matches = find_lodes_by_prefix(all_lodes, prefix)
+    if len(matches) > 1:
+        ids = ", ".join(match["id"] for match in matches)
+        return None, f"Ambiguous prefix '{prefix}', matches: {ids}"
+    return None, f"Lode '{prefix}' not found."
+
+
 def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
@@ -992,6 +1044,7 @@ def cmd_lode(args: list[str]) -> int:
         "list", aliases=["ls"], help="List lodes (default)", exit_on_error=False
     )
     list_p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
+    list_p.add_argument("-p", "--project", help="Filter by project name")
 
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
     _add_create_args(create_p)
@@ -1028,6 +1081,9 @@ def cmd_lode(args: list[str]) -> int:
         if archived:
             lodes = client.list_archived_lodes(socket_path)
             lodes.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
+            project_filter = getattr(parsed, "project", None)
+            if project_filter:
+                lodes = [lode for lode in lodes if lode.get("project") == project_filter]
             if not lodes:
                 print("No archived lodes")
                 return 0
@@ -1035,6 +1091,9 @@ def cmd_lode(args: list[str]) -> int:
             lodes = client.list_lodes(socket_path)
             lodes = [lode for lode in lodes if lode.get("stage") in STAGE_ORDER]
             lodes.sort(key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 99))
+            project_filter = getattr(parsed, "project", None)
+            if project_filter:
+                lodes = [lode for lode in lodes if lode.get("project") == project_filter]
             if not lodes:
                 print("No active lodes")
                 return 0
@@ -1146,13 +1205,31 @@ def cmd_lode(args: list[str]) -> int:
         lode_id = parsed.lode_id
         if require_server():
             return 1
+
+        # Try active lode first (exact match via connect)
         lode = client.get_lode(socket_path, lode_id)
-        if not lode:
-            print(f"Lode '{lode_id}' not found")
-            return 1
-        if not lode.get("active"):
-            print(f"Lode '{lode_id}' is not active")
-            return 1
+        if lode:
+            if lode.get("stage") == "shipped":
+                print(format_lode_detail(lode))
+                return 0
+            if not lode.get("active"):
+                print(f"Lode '{lode_id}' is not active")
+                return 1
+        else:
+            # Try prefix match across active + archived
+            lode, error = _lookup_lode(socket_path, lode_id)
+            if not lode:
+                print(error or f"Lode '{lode_id}' not found")
+                return 1
+            # Found shipped lode via prefix — already done
+            if lode.get("stage") == "shipped":
+                print(format_lode_detail(lode))
+                return 0
+            if not lode.get("active"):
+                print(f"Lode '{lode['id']}' is not active")
+                return 1
+            # Found active lode via prefix — update lode_id for the wait
+            lode_id = lode["id"]
 
         done = threading.Event()
         result = [0]
@@ -1192,11 +1269,11 @@ def cmd_lode(args: list[str]) -> int:
         err = require_server()
         if err:
             return err
-        lode = client.get_lode(socket_path, parsed.lode_id)
-        if not lode:
-            print(f"Lode {parsed.lode_id} not found.")
+        lode, error = _lookup_lode(socket_path, parsed.lode_id)
+        if error:
+            print(error)
             return 1
-        print(format_lode_line(lode))
+        print(format_lode_detail(lode))
         return 0
 
     return 0
@@ -1228,6 +1305,7 @@ def cmd_list(args: list[str]) -> int:
     if "-h" in args or "--help" in args:
         p = make_parser("list", "List lodes (alias for lode list)")
         p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
+        p.add_argument("-p", "--project", help="Filter by project name")
         try:
             parse_args(p, args)
         except SystemExit:

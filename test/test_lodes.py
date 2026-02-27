@@ -13,6 +13,8 @@ from hopper.lodes import (
     compute_runtime_ms,
     create_lode,
     current_time_ms,
+    find_lode_by_prefix,
+    find_lodes_by_prefix,
     format_age,
     format_duration_ms,
     format_uptime,
@@ -268,6 +270,26 @@ def test_get_lode_dir(temp_config):
     """Test lode directory path."""
     path = get_lode_dir("my-lode-id")
     assert path == temp_config / "lodes" / "my-lode-id"
+
+
+def test_find_lode_prefix_helpers():
+    """Prefix lookup helpers return unique, ambiguous, and empty results correctly."""
+    lodes = [
+        {"id": "abc12345"},
+        {"id": "abc99999"},
+        {"id": "def11111"},
+    ]
+
+    matches = find_lodes_by_prefix(lodes, "abc")
+    assert len(matches) == 2
+    assert [lode["id"] for lode in matches] == ["abc12345", "abc99999"]
+
+    unique = find_lode_by_prefix(lodes, "def")
+    assert unique is not None
+    assert unique["id"] == "def11111"
+
+    assert find_lode_by_prefix(lodes, "abc") is None
+    assert find_lode_by_prefix(lodes, "zzz") is None
 
 
 # Tests for format_age

@@ -559,10 +559,23 @@ class Server:
             item_id = message.get("item_id", "")
             scope = message.get("scope", "")
             item = find_backlog_by_prefix(self.backlog, item_id)
-            if item:
-                lode = self._promote_backlog_item(item, scope)
+            if not item:
                 if conn:
-                    self._send_response(conn, {"type": "lode_promoted", "lode": lode})
+                    self._send_response(
+                        conn,
+                        {"type": "promote_error", "error": f"Backlog item '{item_id}' not found"},
+                    )
+            else:
+                try:
+                    lode = self._promote_backlog_item(item, scope)
+                    if conn:
+                        self._send_response(conn, {"type": "lode_promoted", "lode": lode})
+                except Exception:
+                    logger.exception(f"Promote failed for backlog item {item_id}")
+                    if conn:
+                        self._send_response(
+                            conn, {"type": "promote_error", "error": "Promote failed unexpectedly"}
+                        )
 
         elif msg_type == "backlog_add":
             project = message.get("project", "")
