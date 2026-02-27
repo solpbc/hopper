@@ -923,7 +923,7 @@ def cmd_backlog(args: list[str]) -> int:
 
 @command("lode", "Manage lodes")
 def cmd_lode(args: list[str]) -> int:
-    """Manage lodes — list, create, restart, watch."""
+    """Manage lodes — list, create, restart, watch, wait."""
     import hopper.client as client
     from hopper.projects import find_project
 
@@ -960,6 +960,9 @@ def cmd_lode(args: list[str]) -> int:
 
     watch_p = subs.add_parser("watch", help="Watch lode status events", exit_on_error=False)
     watch_p.add_argument("lode_id", help="Lode ID to watch")
+    wait_p = subs.add_parser("wait", help="Wait for lode to ship", exit_on_error=False)
+    wait_p.add_argument("lode_id", help="Lode ID to wait for")
+    wait_p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
 
     try:
         parsed = parse_args(parser, args)
@@ -1086,6 +1089,54 @@ def cmd_lode(args: list[str]) -> int:
         try:
             conn.start(callback=on_message)
             done.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            conn.stop()
+        return result[0]
+
+    if subcommand == "wait":
+        if (rc := require_not_inside_lode()) is not None:
+            return rc
+        lode_id = parsed.lode_id
+        if require_server():
+            return 1
+        lode = client.get_lode(socket_path, lode_id)
+        if not lode:
+            print(f"Lode '{lode_id}' not found")
+            return 1
+        if not lode.get("active"):
+            print(f"Lode '{lode_id}' is not active")
+            return 1
+
+        done = threading.Event()
+        result = [0]
+
+        def on_message(message: dict) -> None:
+            msg_type = message.get("type")
+            if msg_type not in ("lode_updated", "lode_archived"):
+                return
+            msg_lode = message.get("lode", {})
+            if msg_lode.get("id") != lode_id:
+                return
+            if msg_type == "lode_archived":
+                done.set()
+            elif msg_lode.get("state") == "error":
+                result[0] = 1
+                done.set()
+            elif msg_lode.get("stage") == "shipped":
+                done.set()
+
+        conn = client.HopperConnection(socket_path)
+        try:
+            conn.start(callback=on_message)
+            timeout = parsed.timeout or None
+            completed = done.wait(timeout=timeout)
+            if not completed:
+                print(f"Timed out waiting for lode '{lode_id}'")
+                result[0] = 2
+            elif result[0] == 1:
+                print(f"Lode '{lode_id}' entered error state")
         except KeyboardInterrupt:
             pass
         finally:

@@ -1242,6 +1242,156 @@ def test_lode_watch_initial_state(capsys):
     assert "shipped" in lines[-1]  # final state
 
 
+def test_lode_wait_shipped(capsys):
+    """wait exits 0 silently when lode reaches shipped stage."""
+    lode = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working...",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "stage": "shipped", "status": "Done"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_lode_wait_archived(capsys):
+    """wait exits 0 silently when lode is archived."""
+    lode = {
+        "id": "abc123",
+        "stage": "shipped",
+        "state": "ready",
+        "status": "Shipped",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback({"type": "lode_archived", "lode": {**lode, "active": False}})
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_lode_wait_error(capsys):
+    """wait exits 1 with message when lode enters error state."""
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "state": "error", "status": "Failed"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 1
+    assert "entered error state" in capsys.readouterr().out
+
+
+def test_lode_wait_not_found(capsys):
+    """wait fails when lode not found."""
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=None):
+            result = cmd_lode(["wait", "bogus"])
+    assert result == 1
+    assert "not found" in capsys.readouterr().out
+
+
+def test_lode_wait_not_active(capsys):
+    """wait fails when lode is not active."""
+    lode = {"id": "abc123", "active": False, "stage": "mill", "state": "new", "status": ""}
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            result = cmd_lode(["wait", "abc123"])
+    assert result == 1
+    assert "not active" in capsys.readouterr().out
+
+
+def test_lode_wait_timeout(capsys):
+    """wait exits 2 with timeout message when no terminal event arrives."""
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                return None
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123", "--timeout", "0.01"])
+    assert result == 2
+    assert "Timed out" in capsys.readouterr().out
+
+
+def test_lode_wait_silent_on_success(capsys):
+    """wait prints nothing when terminal condition is successful."""
+    lode = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working...",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "stage": "shipped", "status": "Done"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_lode_wait_rejects_inside_lode(monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    rc = cmd_lode(["wait", "some-id"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Cannot run this command inside lode test-lode-123." in out
+    assert "hop backlog add" in out
+
+
 # Tests for config command
 
 
