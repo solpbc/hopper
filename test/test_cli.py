@@ -22,10 +22,14 @@ from hopper.cli import (
     cmd_process,
     cmd_processed,
     cmd_projects,
+    cmd_restart,
     cmd_screenshot,
+    cmd_show,
     cmd_status,
     cmd_submit,
     cmd_up,
+    cmd_wait,
+    cmd_watch,
     detect_coding_agent,
     format_lode_line,
     get_hopper_lid,
@@ -2491,6 +2495,99 @@ def test_projects_help_shows_projects(capsys):
     assert "hop projects" in out
 
 
+def test_wait_help_shows_wait(capsys):
+    """hop wait --help shows 'hop wait' in usage."""
+    result = cmd_wait(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop wait" in out
+    assert "--timeout" in out
+
+
+def test_show_help_shows_show(capsys):
+    """hop show --help shows 'hop show' in usage."""
+    result = cmd_show(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop show" in out
+
+
+def test_watch_help_shows_watch(capsys):
+    """hop watch --help shows 'hop watch' in usage."""
+    result = cmd_watch(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop watch" in out
+
+
+def test_restart_help_shows_restart(capsys):
+    """hop restart --help shows 'hop restart' in usage."""
+    result = cmd_restart(["--help"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "hop restart" in out
+
+
+def test_show_delegates_to_lode_show(capsys):
+    """hop show delegates to hop lode show."""
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "running",
+        "active": True,
+        "project": "p",
+        "title": "t",
+        "status": "s",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.cli._lookup_lode", return_value=(lode, None)):
+            result = cmd_show(["abc123"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+
+
+def test_restart_delegates_to_lode_restart(capsys):
+    """hop restart delegates to hop lode restart."""
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "idle",
+        "active": False,
+        "project": "p",
+        "title": "t",
+        "status": "s",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.cli.require_not_inside_lode", return_value=None):
+            with patch("hopper.client.get_lode", return_value=lode):
+                with patch("hopper.client.restart_lode"):
+                    assert cmd_restart(["abc123"]) == 0
+    out = capsys.readouterr().out
+    assert "Restarting" in out
+    assert "abc123" in out
+
+
+def test_wait_delegates_to_lode_wait(capsys):
+    """hop wait delegates to hop lode wait."""
+    lode = {
+        "id": "abc123",
+        "stage": "shipped",
+        "state": "shipped",
+        "active": False,
+        "project": "p",
+        "title": "t",
+        "status": "s",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.cli.require_not_inside_lode", return_value=None):
+            with patch("hopper.client.get_lode", return_value=lode):
+                result = cmd_wait(["abc123"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+
+
 def test_lode_ls_alias(capsys):
     """hop lode ls works like hop lode list."""
     lodes = [
@@ -2693,6 +2790,10 @@ def test_help_shows_aliases_group(capsys):
     assert "list" in out
     assert "submit" in out
     assert "projects" in out
+    assert "wait" in out
+    assert "show" in out
+    assert "watch" in out
+    assert "restart" in out
 
 
 def test_format_lode_line_basic():

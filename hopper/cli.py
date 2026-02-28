@@ -1325,6 +1325,59 @@ def cmd_projects(args: list[str]) -> int:
     return cmd_project(args)
 
 
+@command("wait", "Wait for a lode to ship (alias for lode wait)", group="aliases")
+def cmd_wait(args: list[str]) -> int:
+    """Alias for hop lode wait."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("wait", "Wait for a lode to ship (alias for lode wait)")
+        p.add_argument("lode_id", help="Lode ID to wait for")
+        p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["wait"] + args)
+
+
+@command("show", "Show lode details (alias for lode show)", group="aliases")
+def cmd_show(args: list[str]) -> int:
+    """Alias for hop lode show."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("show", "Show lode details (alias for lode show)")
+        p.add_argument("lode_id", help="Lode ID to show")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["show"] + args)
+
+
+@command("watch", "Watch lode status events (alias for lode watch)", group="aliases")
+def cmd_watch(args: list[str]) -> int:
+    """Alias for hop lode watch."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("watch", "Watch lode status events (alias for lode watch)")
+        p.add_argument("lode_id", help="Lode ID to watch")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["watch"] + args)
+
+
+@command("restart", "Restart an inactive lode (alias for lode restart)", group="aliases")
+def cmd_restart(args: list[str]) -> int:
+    """Alias for hop lode restart."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("restart", "Restart an inactive lode (alias for lode restart)")
+        p.add_argument("lode_id", help="Lode ID to restart")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["restart"] + args)
+
+
 @command("ping", "Check if server is running")
 def cmd_ping(args: list[str]) -> int:
     """Ping the server."""
