@@ -3,6 +3,7 @@
 
 """Tests for the codex wrapper module."""
 
+import subprocess
 from unittest.mock import MagicMock, patch
 
 from hopper.codex import _parse_thread_id, bootstrap_codex, run_codex
@@ -51,7 +52,8 @@ class TestBootstrapCodex:
             "hello",
         ]
         assert mock_run.call_args[1]["cwd"] == "/tmp/work"
-        assert mock_run.call_args[1]["capture_output"] is True
+        assert mock_run.call_args[1]["stdout"] == subprocess.PIPE
+        assert "stderr" not in mock_run.call_args[1]
 
     def test_returns_none_thread_id_on_parse_failure(self):
         """Returns None thread_id when output has no thread.started event."""

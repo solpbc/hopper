@@ -32,15 +32,12 @@ def bootstrap_codex(prompt: str, cwd: str, env: dict | None = None) -> tuple[int
     logger.debug(f"Bootstrapping codex session in {cwd}")
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+        result = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, text=True)
     except FileNotFoundError:
         logger.error("codex command not found")
         return 127, None
     except KeyboardInterrupt:
         return 130, None
-
-    if result.returncode != 0 and result.stderr:
-        logger.error(f"Codex bootstrap failed: {result.stderr.strip()}")
 
     thread_id = _parse_thread_id(result.stdout)
     if result.returncode == 0 and not thread_id:

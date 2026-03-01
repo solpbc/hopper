@@ -30,7 +30,6 @@ class TestCreateWorktree:
         mock_run.assert_called_once_with(
             ["git", "worktree", "add", str(worktree_path), "-b", "hopper-abc12345"],
             cwd="/repo",
-            capture_output=True,
             text=True,
         )
 

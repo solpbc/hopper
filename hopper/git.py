@@ -25,11 +25,10 @@ def create_worktree(repo_dir: str, worktree_path: Path, branch_name: str) -> boo
         result = subprocess.run(
             ["git", "worktree", "add", str(worktree_path), "-b", branch_name],
             cwd=repo_dir,
-            capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            logger.error(f"git worktree add failed: {result.stderr.strip()}")
+            logger.error(f"git worktree add failed (exit {result.returncode})")
             return False
         return True
     except FileNotFoundError:
