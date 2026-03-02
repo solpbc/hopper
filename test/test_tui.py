@@ -2607,7 +2607,7 @@ async def test_mill_review_process_spawns_refine(monkeypatch, temp_config):
     spawned = []
     monkeypatch.setattr(
         "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=True: spawned.append(
+        lambda sid, path, foreground=False: spawned.append(
             {"sid": sid, "path": path, "fg": foreground}
         ),
     )
@@ -2642,7 +2642,7 @@ async def test_enter_on_non_ready_refine_spawns_directly(monkeypatch, temp_confi
     spawned = []
     monkeypatch.setattr(
         "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=True: spawned.append({"sid": sid}),
+        lambda sid, path, foreground=False: spawned.append({"sid": sid}),
     )
     monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
 
@@ -2861,7 +2861,7 @@ async def test_ship_review_ship_spawns_ship(monkeypatch, temp_config):
     spawned = []
     monkeypatch.setattr(
         "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=True: spawned.append(
+        lambda sid, path, foreground=False: spawned.append(
             {"sid": sid, "path": path, "fg": foreground}
         ),
     )
@@ -2902,7 +2902,7 @@ async def test_ship_review_refine_changes_stage_and_spawns(monkeypatch, temp_con
     spawned = []
     monkeypatch.setattr(
         "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=True: spawned.append(
+        lambda sid, path, foreground=False: spawned.append(
             {"sid": sid, "path": path, "fg": foreground}
         ),
     )

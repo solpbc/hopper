@@ -12,14 +12,14 @@ from hopper.tmux import new_window, select_window
 def spawn_claude(
     lode_id: str,
     project_path: str | None = None,
-    foreground: bool = True,
+    foreground: bool = False,
 ) -> str | None:
     """Spawn Claude via hopper in a new tmux window.
 
     Args:
         lode_id: The hopper lode ID.
         project_path: Working directory for the Claude session.
-        foreground: If True, switch to the new window. If False, stay in current window.
+        foreground: If True, switch to the new window. Defaults to staying in current window.
 
     Returns:
         The tmux pane ID on success, None on failure.
