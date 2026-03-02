@@ -1008,17 +1008,33 @@ def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
     parser.add_argument("scope", nargs="*", help="Task scope description")
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    prog = parser.prog
+    parser.epilog = (
+        "input methods:\n"
+        f'  {prog} <project> "scope text here"       inline string\n'
+        f"  {prog} <project> scope text here          multi-word (joined)\n"
+        f'  echo "scope" | {prog} <project> -         pipe with stdin marker\n'
+        f"  {prog} <project> - <<'EOF'                heredoc with stdin marker\n"
+        "    scope text here\n"
+        "  EOF\n"
+        "\n"
+        "scope must be at least 42 characters."
+    )
 
 
 def _create_alias_help(cmd_name: str, description: str, args: list[str]) -> int | None:
-    """Show help for a create alias when -h/--help is present, else return None."""
-    if "-h" in args or "--help" in args:
-        p = make_parser(cmd_name, description)
-        _add_create_args(p)
-        try:
-            parse_args(p, args)
-        except SystemExit:
-            return 0
+    """Show help or handle parse errors for a create alias."""
+    p = make_parser(cmd_name, description)
+    _add_create_args(p)
+    try:
+        parse_args(p, args)
+    except ArgumentError as e:
+        print(f"error: {e}\n")
+        p.print_help()
+        return 1
+    except SystemExit:
+        return 0
     return None
 
 
@@ -1065,7 +1081,11 @@ def cmd_lode(args: list[str]) -> int:
     try:
         parsed = parse_args(parser, args)
     except ArgumentError as e:
-        print(e)
+        print(f"error: {e}\n")
+        if args and args[0] == "create":
+            create_p.print_help()
+        else:
+            parser.print_help()
         return 1
     except SystemExit:
         return 0
@@ -1105,18 +1125,20 @@ def cmd_lode(args: list[str]) -> int:
         if (rc := require_not_inside_lode()) is not None:
             return rc
         project_name = parsed.project
-        if parsed.scope:
+        if parsed.scope == ["-"]:
+            scope = sys.stdin.read().strip()
+        elif parsed.scope:
             scope = " ".join(parsed.scope)
         else:
             scope = sys.stdin.read().strip()
-            if not scope:
-                print(
-                    "Error: no scope provided\n"
-                    "Use: hop lode create <project> <scope...>\n"
-                    " or: hop lode create <project> <<'EOF'\n"
-                    "<scope>\nEOF"
-                )
-                return 1
+        if not scope:
+            print("error: no scope provided\n")
+            create_p.print_help()
+            return 1
+        if len(scope) < 42:
+            print(f"error: scope too short ({len(scope)} chars, minimum 42)\n")
+            create_p.print_help()
+            return 1
         project = find_project(project_name)
         if not project:
             print(f"Project not found: {project_name}")
