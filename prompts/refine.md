@@ -86,6 +86,7 @@ These are the standards you hold your junior engineer to:
 - **Consistency** - naming, patterns, and mechanisms should be uniform. One way to do things.
 - **Realistic validation** - tests should pass, but also verify against real behavior. Fixtures should reflect reality.
 - **Trace the whole system** - understand call sites, data flow, and invariants. No local-only fixes that miss the bigger picture. When an operation has multiple trigger paths (user action, automation, CLI), verify each path carries complete data to the shared function.
+- **Safe defaults** - destructive operations (delete, cleanup, overwrite) default to preserving user data. When in doubt, refuse and explain rather than proceed and destroy. `--force` is an escape hatch, not the default path.
 
 ---
 
