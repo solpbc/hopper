@@ -1007,15 +1007,13 @@ def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
 def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
-    parser.add_argument("scope", nargs="*", help="Task scope description")
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     prog = parser.prog
     parser.epilog = (
-        "input methods:\n"
-        f'  {prog} <project> "scope text here"       inline string\n'
-        f"  {prog} <project> scope text here          multi-word (joined)\n"
-        f'  echo "scope" | {prog} <project> -         pipe with stdin marker\n'
-        f"  {prog} <project> - <<'EOF'                heredoc with stdin marker\n"
+        "scope is read from stdin:\n"
+        f'  echo "scope text" | {prog} <project>\n'
+        f"  cat scope.md | {prog} <project>\n"
+        f"  {prog} <project> <<'EOF'\n"
         "    scope text here\n"
         "  EOF\n"
         "\n"
@@ -1125,14 +1123,13 @@ def cmd_lode(args: list[str]) -> int:
         if (rc := require_not_inside_lode()) is not None:
             return rc
         project_name = parsed.project
-        if parsed.scope == ["-"]:
-            scope = sys.stdin.read().strip()
-        elif parsed.scope:
-            scope = " ".join(parsed.scope)
-        else:
-            scope = sys.stdin.read().strip()
+        if sys.stdin.isatty():
+            print("error: scope must be provided via stdin\n")
+            create_p.print_help()
+            return 1
+        scope = sys.stdin.read().strip()
         if not scope:
-            print("error: no scope provided\n")
+            print("error: no scope provided (stdin was empty)\n")
             create_p.print_help()
             return 1
         if len(scope) < 42:

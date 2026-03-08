@@ -1034,31 +1034,15 @@ def test_lode_list_archived_project_filter(capsys):
 
 
 def test_lode_create_happy(capsys):
-    """Create sends correct message and prints confirmation."""
+    """Create reads scope from stdin, sends correct message, prints confirmation."""
+    from io import StringIO
+
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=object()):
             with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                assert (
-                    cmd_lode(
-                        [
-                            "create",
-                            "myproj",
-                            "fix",
-                            "the",
-                            "bug",
-                            "that",
-                            "causes",
-                            "the",
-                            "server",
-                            "to",
-                            "crash",
-                            "on",
-                            "startup",
-                        ]
-                    )
-                    == 0
-                )
+                with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                    assert cmd_lode(["create", "myproj"]) == 0
                 mock_create.assert_called_once()
                 assert mock_create.call_args.kwargs["spawn"] is True
     out = capsys.readouterr().out
@@ -1067,9 +1051,12 @@ def test_lode_create_happy(capsys):
 
 
 def test_lode_create_rejects_inside_lode(monkeypatch, capsys):
+    from io import StringIO
+
     monkeypatch.setenv("HOPPER_LID", "test-lode-123")
 
-    rc = cmd_lode(["create", "proj", "scope"])
+    with patch("sys.stdin", StringIO(LONG_SCOPE)):
+        rc = cmd_lode(["create", "proj"])
     assert rc == 1
     out = capsys.readouterr().out
     assert "Cannot run this command inside lode test-lode-123." in out
@@ -1082,7 +1069,7 @@ def test_lode_create_missing_project(capsys):
     out = capsys.readouterr().out
     assert "error:" in out
     assert "required" in out
-    assert "input methods:" in out
+    assert "scope is read from stdin" in out
 
 
 def test_lode_create_reads_scope_from_stdin(capsys):
@@ -1103,90 +1090,32 @@ def test_lode_create_reads_scope_from_stdin(capsys):
 
 
 def test_lode_create_missing_scope(capsys):
-    """Create with no positional scope and empty stdin returns a helpful error."""
+    """Create with empty stdin returns a helpful error."""
     from io import StringIO
 
     with patch("sys.stdin", StringIO("")):
         assert cmd_lode(["create", "myproj"]) == 1
     out = capsys.readouterr().out
-    assert "error: no scope provided" in out
+    assert "no scope provided" in out
 
 
 def test_lode_create_invalid_project(capsys):
     """Create with unknown project prints error."""
+    from io import StringIO
+
     with patch("hopper.projects.find_project", return_value=None):
-        assert (
-            cmd_lode(
-                [
-                    "create",
-                    "badproj",
-                    "fix",
-                    "the",
-                    "bug",
-                    "that",
-                    "causes",
-                    "the",
-                    "server",
-                    "to",
-                    "crash",
-                    "on",
-                    "startup",
-                ]
-            )
-            == 1
-        )
+        with patch("sys.stdin", StringIO(LONG_SCOPE)):
+            assert cmd_lode(["create", "badproj"]) == 1
     out = capsys.readouterr().out
     assert "not found" in out.lower()
 
 
-def test_lode_create_stdin_marker(capsys):
-    """Create with '-' as scope reads from stdin."""
+def test_lode_create_scope_too_short(capsys):
+    """Create with scope shorter than 42 chars from stdin shows error."""
     from io import StringIO
 
-    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                with patch("sys.stdin", StringIO(LONG_SCOPE)):
-                    assert cmd_lode(["create", "myproj", "-"]) == 0
-                mock_create.assert_called_once()
-                assert mock_create.call_args.args[2] == LONG_SCOPE
-
-
-def test_lode_create_dash_in_scope_is_literal(capsys):
-    """Dash within multi-word scope is treated as literal, not stdin marker."""
-    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                assert (
-                    cmd_lode(
-                        [
-                            "create",
-                            "myproj",
-                            "fix",
-                            "-",
-                            "bug",
-                            "that",
-                            "causes",
-                            "server",
-                            "to",
-                            "crash",
-                            "on",
-                            "startup",
-                            "every",
-                            "time",
-                        ]
-                    )
-                    == 0
-                )
-                scope = mock_create.call_args.args[2]
-                assert "-" in scope
-
-
-def test_lode_create_scope_too_short(capsys):
-    """Create with scope shorter than 42 chars shows error with char count."""
-    assert cmd_lode(["create", "myproj", "short", "scope"]) == 1
+    with patch("sys.stdin", StringIO("short scope")):
+        assert cmd_lode(["create", "myproj"]) == 1
     out = capsys.readouterr().out
     assert "scope too short" in out
     assert "11 chars" in out
@@ -1203,41 +1132,28 @@ def test_lode_create_scope_too_short_stdin(capsys):
     assert "scope too short" in out
 
 
-def test_lode_create_stdin_marker_empty(capsys):
-    """Create with '-' and empty stdin shows no-scope error."""
+def test_lode_create_requires_stdin(capsys):
+    """Create on a TTY (no stdin pipe) shows a helpful error."""
     from io import StringIO
 
-    with patch("sys.stdin", StringIO("")):
-        assert cmd_lode(["create", "myproj", "-"]) == 1
+    tty_stdin = StringIO("")
+    tty_stdin.isatty = lambda: True
+    with patch("sys.stdin", tty_stdin):
+        assert cmd_lode(["create", "myproj"]) == 1
     out = capsys.readouterr().out
-    assert "no scope provided" in out
+    assert "scope must be provided via stdin" in out
 
 
 def test_implement_delegates_to_lode_create(capsys):
     """hop implement delegates to hop lode create."""
+    from io import StringIO
+
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=object()):
             with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                assert (
-                    cmd_implement(
-                        [
-                            "myproj",
-                            "fix",
-                            "the",
-                            "bug",
-                            "that",
-                            "causes",
-                            "the",
-                            "server",
-                            "to",
-                            "crash",
-                            "on",
-                            "startup",
-                        ]
-                    )
-                    == 0
-                )
+                with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                    assert cmd_implement(["myproj"]) == 0
                 mock_create.assert_called_once()
                 assert mock_create.call_args.kwargs["spawn"] is True
     out = capsys.readouterr().out
@@ -1247,9 +1163,12 @@ def test_implement_delegates_to_lode_create(capsys):
 
 def test_implement_rejects_inside_lode(monkeypatch, capsys):
     """hop implement rejects when inside a lode."""
+    from io import StringIO
+
     monkeypatch.setenv("HOPPER_LID", "test-lode-123")
 
-    rc = cmd_implement(["proj", "scope"])
+    with patch("sys.stdin", StringIO(LONG_SCOPE)):
+        rc = cmd_implement(["proj"])
     assert rc == 1
     out = capsys.readouterr().out
     assert "Cannot run this command inside lode test-lode-123." in out
@@ -1278,44 +1197,45 @@ def test_implement_no_args_shows_help(capsys):
     assert cmd_implement([]) == 1
     out = capsys.readouterr().out
     assert "hop implement" in out
-    assert "input methods:" in out
+    assert "scope is read from stdin" in out
 
 
 def test_implement_scope_too_short(capsys):
-    """hop implement with short scope shows error."""
-    assert cmd_implement(["myproj", "short"]) == 1
+    """hop implement with short scope from stdin shows error."""
+    from io import StringIO
+
+    with patch("sys.stdin", StringIO("short")):
+        assert cmd_implement(["myproj"]) == 1
     out = capsys.readouterr().out
     assert "scope too short" in out
 
 
 def test_implement_help_shows_epilog(capsys):
-    """hop implement --help includes input method epilog."""
+    """hop implement --help includes stdin usage epilog."""
     assert cmd_implement(["--help"]) == 0
     out = capsys.readouterr().out
-    assert "input methods:" in out
+    assert "scope is read from stdin" in out
     assert "42 characters" in out
     assert "hop implement" in out
 
 
-def test_implement_stdin_marker(capsys):
-    """hop implement with '-' reads from stdin."""
+def test_implement_requires_stdin(capsys):
+    """hop implement on a TTY (no stdin pipe) shows a helpful error."""
     from io import StringIO
 
-    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                with patch("sys.stdin", StringIO(LONG_SCOPE)):
-                    assert cmd_implement(["myproj", "-"]) == 0
-                mock_create.assert_called_once()
-                assert mock_create.call_args.args[2] == LONG_SCOPE
+    tty_stdin = StringIO("")
+    tty_stdin.isatty = lambda: True
+    with patch("sys.stdin", tty_stdin):
+        assert cmd_implement(["myproj"]) == 1
+    out = capsys.readouterr().out
+    assert "scope must be provided via stdin" in out
 
 
 def test_lode_create_help_shows_epilog(capsys):
-    """hop lode create --help includes input method epilog."""
+    """hop lode create --help includes stdin usage epilog."""
     assert cmd_lode(["create", "--help"]) == 0
     out = capsys.readouterr().out
-    assert "input methods:" in out
+    assert "scope is read from stdin" in out
     assert "42 characters" in out
 
 
@@ -2603,29 +2523,14 @@ def test_submit_help_shows_submit(capsys):
 
 def test_submit_delegates_to_lode_create(capsys):
     """hop submit delegates to hop lode create."""
+    from io import StringIO
+
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=object()):
             with patch("hopper.client.create_lode", return_value=created_lode):
-                assert (
-                    cmd_submit(
-                        [
-                            "myproj",
-                            "fix",
-                            "the",
-                            "bug",
-                            "that",
-                            "causes",
-                            "the",
-                            "server",
-                            "to",
-                            "crash",
-                            "on",
-                            "startup",
-                        ]
-                    )
-                    == 0
-                )
+                with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                    assert cmd_submit(["myproj"]) == 0
     out = capsys.readouterr().out
     assert "abc12345" in out
 
