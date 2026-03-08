@@ -15,23 +15,16 @@ hop lode list -a
 
 Use `-a` or `--archived` to show archived lodes.
 
-Create a new lode with required `project` and optional `scope` args (`hop implement` is an alias for `hop lode create`):
+Create a new lode with required `project` arg and scope from stdin (`hop implement` is an alias for `hop lode create`):
 
 ```bash
-hop lode create myproject Fix login timeout
-hop implement myproject Fix login timeout
-```
-
-If `scope` is omitted, provide it on stdin:
-
-```bash
-hop lode create myproject <<'EOF'
-Fix login timeout and add regression coverage
-EOF
+cat scope.md | hop implement myproject
 
 hop implement myproject <<'EOF'
 Fix login timeout and add regression coverage
 EOF
+
+cat scope.md | hop lode create myproject
 ```
 
 Restart an inactive lode by ID (only valid for inactive lodes in `mill`, `refine`, or `ship`):
@@ -49,7 +42,7 @@ hop lode watch abc123
 Practical create + watch workflow:
 
 ```bash
-hop implement myproject Improve retry logic
+echo "Improve retry logic for the auth service when upstream returns 503" | hop implement myproject
 # note the new lode ID from output
 hop lode watch <lode_id>
 ```

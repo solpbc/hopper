@@ -19,15 +19,11 @@ description: Reference card for the hop CLI in hopper covering lode management, 
 
 ## Implementation request
 
-Request new implementation work from outside your current lode:
+Request new implementation work from outside your current lode. Scope is always provided via stdin:
 
 ```bash
-hop implement myproject Fix login timeout
-```
+cat scope.md | hop implement myproject
 
-Or provide scope via stdin:
-
-```bash
 hop implement myproject <<'EOF'
 Fix login timeout and add regression coverage
 EOF
