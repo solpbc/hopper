@@ -11,7 +11,14 @@ from pathlib import Path
 import setproctitle
 
 from hopper import __version__, config
-from hopper.lodes import find_lode_by_prefix, find_lodes_by_prefix, format_age, lode_icon
+from hopper.lodes import (
+    STATUS_ERROR,
+    STATUS_SHIPPED,
+    find_lode_by_prefix,
+    find_lodes_by_prefix,
+    format_age,
+    lode_icon,
+)
 
 
 def _socket() -> Path:
@@ -1089,7 +1096,7 @@ def cmd_lode(args: list[str]) -> int:
     watch_p = subs.add_parser("watch", help="Watch lode status events", exit_on_error=False)
     watch_p.add_argument("lode_id", help="Lode ID to watch")
     wait_p = subs.add_parser("wait", help="Wait for lode to ship", exit_on_error=False)
-    wait_p.add_argument("lode_id", help="Lode ID to wait for")
+    wait_p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
     wait_p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
     status_p = subs.add_parser("status", help="Show a lode's status", exit_on_error=False)
     status_p.add_argument("lode_id", help="Lode ID to show")
@@ -1261,40 +1268,60 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand == "wait":
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        lode_id = parsed.lode_id
+        lode_ids = parsed.lode_id
         if require_server():
             return 1
 
-        # Try active lode first (exact match via connect)
-        lode = client.get_lode(socket_path, lode_id)
-        if lode:
-            if lode.get("state") == "error":
-                print(_format_lode_error(lode))
-                return 1
-            if lode.get("stage") == "shipped":
-                print(format_lode_detail(lode))
-                return 0
-            if not lode.get("active"):
-                print(f"Lode '{lode_id}' is not active")
-                return 1
-        else:
-            # Try prefix match across active + archived
-            lode, error = _lookup_lode(socket_path, lode_id)
-            if not lode:
-                print(error or f"Lode '{lode_id}' not found")
-                return 1
-            if lode.get("state") == "error":
-                print(_format_lode_error(lode))
-                return 1
-            # Found shipped lode via prefix — already done
-            if lode.get("stage") == "shipped":
-                print(format_lode_detail(lode))
-                return 0
-            if not lode.get("active"):
-                print(f"Lode '{lode['id']}' is not active")
-                return 1
-            # Found active lode via prefix — update lode_id for the wait
-            lode_id = lode["id"]
+        def _shipped_line(lid: str, title: str) -> str:
+            if title:
+                return f"{STATUS_SHIPPED} {lid} shipped ({title})"
+            return f"{STATUS_SHIPPED} {lid} shipped"
+
+        def _error_line(lid: str, status: str) -> str:
+            return f"{STATUS_ERROR} {lid} error: {status}"
+
+        resolved: dict[str, dict] = {}
+        pending: set[str] = set()
+
+        for raw_id in lode_ids:
+            lode = client.get_lode(socket_path, raw_id)
+            if lode:
+                lid = lode["id"]
+                if lode.get("state") == "error":
+                    print(_format_lode_error(lode))
+                    return 1
+                if lode.get("stage") == "shipped":
+                    resolved[lid] = lode
+                elif not lode.get("active"):
+                    print(f"Lode '{raw_id}' is not active")
+                    return 1
+                else:
+                    resolved[lid] = lode
+                    pending.add(lid)
+            else:
+                lode, error = _lookup_lode(socket_path, raw_id)
+                if not lode:
+                    print(error or f"Lode '{raw_id}' not found")
+                    return 1
+                lid = lode["id"]
+                if lode.get("state") == "error":
+                    print(_format_lode_error(lode))
+                    return 1
+                if lode.get("stage") == "shipped":
+                    resolved[lid] = lode
+                elif not lode.get("active"):
+                    print(f"Lode '{lid}' is not active")
+                    return 1
+                else:
+                    resolved[lid] = lode
+                    pending.add(lid)
+
+        for lid, lode in resolved.items():
+            if lid not in pending:
+                print(_shipped_line(lid, lode.get("title", "")))
+
+        if not pending:
+            return 0
 
         done = threading.Event()
         result = [0]
@@ -1304,15 +1331,18 @@ def cmd_lode(args: list[str]) -> int:
             if msg_type not in ("lode_updated", "lode_archived"):
                 return
             msg_lode = message.get("lode", {})
-            if msg_lode.get("id") != lode_id:
+            lid = msg_lode.get("id")
+            if lid not in pending:
                 return
-            if msg_type == "lode_archived":
-                done.set()
-            elif msg_lode.get("state") == "error":
+            if msg_lode.get("state") == "error":
+                print(_error_line(lid, msg_lode.get("status", "")))
                 result[0] = 1
                 done.set()
-            elif msg_lode.get("stage") == "shipped":
-                done.set()
+            elif msg_lode.get("stage") == "shipped" or msg_type == "lode_archived":
+                pending.discard(lid)
+                print(_shipped_line(lid, msg_lode.get("title", "")))
+                if not pending:
+                    done.set()
 
         conn = client.HopperConnection(socket_path)
         try:
@@ -1320,14 +1350,9 @@ def cmd_lode(args: list[str]) -> int:
             timeout = parsed.timeout or None
             completed = done.wait(timeout=timeout)
             if not completed:
-                print(f"Timed out waiting for lode '{lode_id}'")
+                remaining = ", ".join(sorted(pending))
+                print(f"Timed out waiting for lode(s): {remaining}")
                 result[0] = 2
-            elif result[0] == 1:
-                err_lode = client.get_lode(socket_path, lode_id)
-                if err_lode:
-                    print(_format_lode_error(err_lode))
-                else:
-                    print(f"Lode '{lode_id}' entered error state")
         except KeyboardInterrupt:
             pass
         finally:
@@ -1399,7 +1424,7 @@ def cmd_wait(args: list[str]) -> int:
     """Alias for hop lode wait."""
     if "-h" in args or "--help" in args:
         p = make_parser("wait", "Wait for a lode to ship (alias for lode wait)")
-        p.add_argument("lode_id", help="Lode ID to wait for")
+        p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
         p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
         try:
             parse_args(p, args)
