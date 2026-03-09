@@ -9,6 +9,7 @@ from hopper.git import (
     create_worktree,
     current_branch,
     delete_branch,
+    dirty_status,
     get_diff_numstat,
     get_diff_stat,
     is_dirty,
@@ -76,6 +77,24 @@ class TestIsDirty:
         """Returns True (assumes dirty) when git is not found."""
         with patch("subprocess.run", side_effect=FileNotFoundError):
             assert is_dirty("/repo") is True
+
+
+class TestDirtyStatus:
+    def test_clean(self):
+        mock_result = MagicMock()
+        mock_result.stdout = ""
+        with patch("subprocess.run", return_value=mock_result):
+            assert dirty_status("/fake/repo") == ""
+
+    def test_dirty(self):
+        mock_result = MagicMock()
+        mock_result.stdout = " M file.py\n M other.py\n"
+        with patch("subprocess.run", return_value=mock_result):
+            assert dirty_status("/fake/repo") == "M file.py\n M other.py"
+
+    def test_git_not_found(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert dirty_status("/fake/repo") == ""
 
 
 class TestCurrentBranch:

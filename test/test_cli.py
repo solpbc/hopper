@@ -40,6 +40,7 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
+from hopper.projects import Project
 
 LONG_SCOPE = "this is a stdin scope that is long enough to pass the minimum character validation"
 
@@ -1038,16 +1039,51 @@ def test_lode_create_happy(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                with patch("sys.stdin", StringIO(LONG_SCOPE)):
-                    assert cmd_lode(["create", "myproj"]) == 0
-                mock_create.assert_called_once()
-                assert mock_create.call_args.kwargs["spawn"] is True
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=""):
+                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                    with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                        assert cmd_lode(["create", "myproj"]) == 0
+                    mock_create.assert_called_once()
+                    assert mock_create.call_args.kwargs["spawn"] is True
     out = capsys.readouterr().out
     assert "abc12345" in out
     assert "myproj" in out
+
+
+def test_lode_create_dirty_repo_rejected(capsys):
+    from io import StringIO
+
+    project = Project(path="/fake/repo", name="myproj")
+    with patch("hopper.cli.require_not_inside_lode", return_value=None):
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=" M file.py"):
+                with patch("sys.stdin", StringIO("A" * 50)):
+                    rc = cmd_lode(["create", "myproj"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "uncommitted changes" in out
+    assert "use --force to override" in out
+
+
+def test_lode_create_dirty_repo_force_override(capsys):
+    from io import StringIO
+
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
+    with patch("hopper.cli.require_not_inside_lode", return_value=None):
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=" M file.py"):
+                with patch("hopper.cli.require_server", return_value=None):
+                    with patch(
+                        "hopper.client.create_lode", return_value=created_lode
+                    ) as mock_create:
+                        with patch("sys.stdin", StringIO("A" * 50)):
+                            rc = cmd_lode(["create", "--force", "myproj"])
+    assert rc == 0
+    mock_create.assert_called_once()
 
 
 def test_lode_create_rejects_inside_lode(monkeypatch, capsys):
@@ -1077,16 +1113,18 @@ def test_lode_create_reads_scope_from_stdin(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                with patch(
-                    "sys.stdin",
-                    StringIO(LONG_SCOPE),
-                ):
-                    assert cmd_lode(["create", "myproj"]) == 0
-                mock_create.assert_called_once()
-                assert mock_create.call_args.args[2] == LONG_SCOPE
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=""):
+                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                    with patch(
+                        "sys.stdin",
+                        StringIO(LONG_SCOPE),
+                    ):
+                        assert cmd_lode(["create", "myproj"]) == 0
+                    mock_create.assert_called_once()
+                    assert mock_create.call_args.args[2] == LONG_SCOPE
 
 
 def test_lode_create_missing_scope(capsys):
@@ -1149,13 +1187,15 @@ def test_implement_delegates_to_lode_create(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                with patch("sys.stdin", StringIO(LONG_SCOPE)):
-                    assert cmd_implement(["myproj"]) == 0
-                mock_create.assert_called_once()
-                assert mock_create.call_args.kwargs["spawn"] is True
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=""):
+                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                    with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                        assert cmd_implement(["myproj"]) == 0
+                    mock_create.assert_called_once()
+                    assert mock_create.call_args.kwargs["spawn"] is True
     out = capsys.readouterr().out
     assert "abc12345" in out
     assert "myproj" in out
@@ -1180,16 +1220,18 @@ def test_implement_reads_stdin(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
-                with patch(
-                    "sys.stdin",
-                    StringIO(LONG_SCOPE),
-                ):
-                    assert cmd_implement(["myproj"]) == 0
-                mock_create.assert_called_once()
-                assert mock_create.call_args.args[2] == LONG_SCOPE
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=""):
+                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                    with patch(
+                        "sys.stdin",
+                        StringIO(LONG_SCOPE),
+                    ):
+                        assert cmd_implement(["myproj"]) == 0
+                    mock_create.assert_called_once()
+                    assert mock_create.call_args.args[2] == LONG_SCOPE
 
 
 def test_implement_no_args_shows_help(capsys):
@@ -1412,6 +1454,24 @@ def test_lode_watch_not_active(capsys):
     assert "not active" in capsys.readouterr().out
 
 
+def test_lode_watch_error_state_at_start(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "error",
+        "status": "Something failed",
+    }
+    with patch("hopper.cli.require_not_inside_lode", return_value=None):
+        with patch("hopper.cli.require_server", return_value=None):
+            with patch("hopper.client.get_lode", return_value=lode):
+                result = cmd_lode(["watch", "abc123"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "error state" in out
+    assert "hop lode restart abc123" in out
+
+
 def test_lode_watch_initial_state(capsys):
     """watch prints initial lode state before streaming."""
     lode = {
@@ -1579,7 +1639,27 @@ def test_lode_wait_error(capsys):
             with patch("hopper.client.HopperConnection", return_value=mock_conn):
                 result = cmd_lode(["wait", "abc123"])
     assert result == 1
-    assert "entered error state" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "error state" in out
+    assert "hop lode restart abc123" in out
+
+
+def test_lode_wait_error_state_at_start(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "error",
+        "status": "Something failed",
+    }
+    with patch("hopper.cli.require_not_inside_lode", return_value=None):
+        with patch("hopper.cli.require_server", return_value=None):
+            with patch("hopper.client.get_lode", return_value=lode):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "error state" in out
+    assert "hop lode restart abc123" in out
 
 
 def test_lode_wait_not_found(capsys):
@@ -2526,11 +2606,13 @@ def test_submit_delegates_to_lode_create(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.projects.find_project", return_value=object()):
-            with patch("hopper.client.create_lode", return_value=created_lode):
-                with patch("sys.stdin", StringIO(LONG_SCOPE)):
-                    assert cmd_submit(["myproj"]) == 0
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=""):
+                with patch("hopper.client.create_lode", return_value=created_lode):
+                    with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                        assert cmd_submit(["myproj"]) == 0
     out = capsys.readouterr().out
     assert "abc12345" in out
 
@@ -2737,6 +2819,27 @@ def test_lode_status_subcommand(capsys):
     out = capsys.readouterr().out
     assert "abc12345" in out
     assert "stage:    mill" in out
+
+
+def test_lode_status_error_emphasized(capsys):
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "project": "proj",
+        "title": "Title",
+        "status": "Something failed",
+        "state": "error",
+        "active": True,
+        "created_at": 1000,
+        "updated_at": 2000,
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.cli._lookup_lode", return_value=(lode, None)):
+            result = cmd_lode(["status", "abc123"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "error state" in out
+    assert "hop lode restart abc123" in out
 
 
 def test_lode_show_detail(capsys):

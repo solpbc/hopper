@@ -57,6 +57,27 @@ def is_dirty(repo_dir: str) -> bool:
         return True  # Assume dirty if we can't check
 
 
+def dirty_status(repo_dir: str) -> str:
+    """Get the porcelain status output for a git repo.
+
+    Args:
+        repo_dir: Path to the git repository.
+
+    Returns:
+        Porcelain output string if dirty, empty string if clean or on error.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""  # Fail open - process runner's is_dirty() is the safety net
+
+
 def current_branch(repo_dir: str) -> str | None:
     """Get the current branch name of a git repo.
 

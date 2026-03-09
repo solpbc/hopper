@@ -952,9 +952,28 @@ def format_lode_line(lode: dict) -> str:
     return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
 
 
+def _format_lode_error(lode: dict) -> str:
+    """Format error state output for a lode."""
+    lode_id = lode.get("id", "")
+    lines = [f"error: lode {lode_id} is in error state"]
+    stage = lode.get("stage", "")
+    if stage:
+        lines.append(f"  stage: {stage}")
+    status = lode.get("status", "")
+    if status:
+        lines.append(f"  status: {status}")
+    lines.append("")
+    lines.append(f"to retry: hop lode restart {lode_id}")
+    return "\n".join(lines)
+
+
 def format_lode_detail(lode: dict) -> str:
     """Format a lode as a multi-line detailed view."""
     lines = [format_lode_line(lode)]
+    if lode.get("state") == "error":
+        lines.append("")
+        lines.append(_format_lode_error(lode))
+        lines.append("")
     lines.append(f"  id:       {lode.get('id', '')}")
     lines.append(f"  project:  {lode.get('project', '')}")
     lines.append(f"  stage:    {lode.get('stage', '')}")
@@ -1007,6 +1026,7 @@ def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
 def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
+    parser.add_argument("-f", "--force", action="store_true", help="Override dirty-repo check")
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     prog = parser.prog
     parser.epilog = (
@@ -1140,6 +1160,17 @@ def cmd_lode(args: list[str]) -> int:
         if not project:
             print(f"Project not found: {project_name}")
             return 1
+        if not parsed.force:
+            from hopper.git import dirty_status
+
+            status = dirty_status(project.path)
+            if status:
+                print(f"error: project repo has uncommitted changes: {project.path}")
+                for line in status.splitlines():
+                    print(f"  {line}")
+                print()
+                print("commit or stash changes before submitting. use --force to override.")
+                return 1
         err = require_server()
         if err:
             return err
@@ -1182,6 +1213,9 @@ def cmd_lode(args: list[str]) -> int:
         if not lode:
             print(f"Lode '{lode_id}' not found")
             return 1
+        if lode.get("state") == "error":
+            print(_format_lode_error(lode))
+            return 1
         if not lode.get("active"):
             print(f"Lode '{lode_id}' is not active")
             return 1
@@ -1216,6 +1250,12 @@ def cmd_lode(args: list[str]) -> int:
             pass
         finally:
             conn.stop()
+        if result[0] == 1:
+            err_lode = client.get_lode(socket_path, lode_id)
+            if err_lode:
+                print(_format_lode_error(err_lode))
+            else:
+                print(f"Lode '{lode_id}' entered error state")
         return result[0]
 
     if subcommand == "wait":
@@ -1228,6 +1268,9 @@ def cmd_lode(args: list[str]) -> int:
         # Try active lode first (exact match via connect)
         lode = client.get_lode(socket_path, lode_id)
         if lode:
+            if lode.get("state") == "error":
+                print(_format_lode_error(lode))
+                return 1
             if lode.get("stage") == "shipped":
                 print(format_lode_detail(lode))
                 return 0
@@ -1239,6 +1282,9 @@ def cmd_lode(args: list[str]) -> int:
             lode, error = _lookup_lode(socket_path, lode_id)
             if not lode:
                 print(error or f"Lode '{lode_id}' not found")
+                return 1
+            if lode.get("state") == "error":
+                print(_format_lode_error(lode))
                 return 1
             # Found shipped lode via prefix — already done
             if lode.get("stage") == "shipped":
@@ -1277,7 +1323,11 @@ def cmd_lode(args: list[str]) -> int:
                 print(f"Timed out waiting for lode '{lode_id}'")
                 result[0] = 2
             elif result[0] == 1:
-                print(f"Lode '{lode_id}' entered error state")
+                err_lode = client.get_lode(socket_path, lode_id)
+                if err_lode:
+                    print(_format_lode_error(err_lode))
+                else:
+                    print(f"Lode '{lode_id}' entered error state")
         except KeyboardInterrupt:
             pass
         finally:
