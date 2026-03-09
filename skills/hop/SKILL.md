@@ -1,25 +1,19 @@
 ---
 name: hop
-description: Reference card for the hop CLI in hopper covering lode management, backlog items, and status updates inside a lode.
+description: Complete CLI reference for hopper — lode management, backlog, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage.
 ---
 
-# hop Command Reference
+# hop CLI Reference
 
 ## Context
 
-- `HOPPER_LID` is set automatically when Claude runs inside a hopper lode.
-- All commands below require the hopper server to be running.
+- `HOPPER_LID` is set when Claude runs inside a hopper lode.
+- All commands require the hopper server to be running (`hop ping` to check).
+- Commands marked **(outside lode only)** are blocked when `HOPPER_LID` is set.
 
-## Status reporting
+## Creating work
 
-- `hop status` - Show current status and title.
-- `hop status [-t TITLE] <text...>` - Update status text, optionally set title.
-- `hop screenshot` - Capture TUI window content as ANSI text.
-- `hop ping` - Check server connectivity and show tmux/lode info.
-
-## Implementation request
-
-Request new implementation work from outside your current lode. Scope is always provided via stdin:
+Submit scope for immediate implementation **(outside lode only)**. Scope is always provided via stdin:
 
 ```bash
 cat scope.md | hop implement myproject
@@ -29,12 +23,80 @@ Fix login timeout and add regression coverage
 EOF
 ```
 
+`hop implement` is an alias for `hop lode create`. Use `--force` to override dirty-repo checks.
+
+Inside a lode, use `hop backlog add` to queue future work instead.
+
+## Waiting and monitoring
+
+Block until one or more lodes ship **(outside lode only)**:
+
+```bash
+hop wait <lode-id>
+hop wait <id1> <id2> <id3>
+hop wait <lode-id> --timeout 300
+```
+
+Prints a status line as each lode resolves. Exit 0 if all shipped, 1 on error, 2 on timeout.
+
+Watch live status events for a lode **(outside lode only)**:
+
+```bash
+hop lode watch <lode-id>
+```
+
+Practical create + wait workflow:
+
+```bash
+cat scope.md | hop implement myproject
+# note the lode ID from output
+hop wait <lode-id>
+```
+
+## Lode management
+
+List active lodes (`hop lode` defaults to `list`):
+
+```bash
+hop lode
+hop lode list
+hop lode list -a          # include archived
+```
+
+Show detailed status for a lode:
+
+```bash
+hop lode status <lode-id>
+hop lode show <lode-id>   # alias for status
+```
+
+Restart an inactive lode (error, stuck, or failed ship):
+
+```bash
+hop lode restart <lode-id>
+```
+
 ## Backlog management
 
-- `hop backlog list` - List backlog items with ID, project, description, and age.
-- `hop backlog add [-p project] <text...>` - Add a backlog item; if `-p` is omitted, project resolves from the current lode. Can also read description from stdin.
-- `hop backlog remove <id-prefix>` - Remove a backlog item by ID prefix.
+```bash
+hop backlog list                              # list all items
+hop backlog add -p myproject Fix the thing    # add item (inline)
+hop backlog add -p myproject < scope.md       # add item (stdin)
+hop backlog remove <id-prefix>                # remove by ID prefix
+```
 
-## Important note
+Inside a lode, `-p` can be omitted — project resolves from the current lode.
 
-- `hop implement` (and `hop lode create`) is **blocked inside a lode**. Use `hop backlog add` to queue future work instead.
+## Status reporting (inside a lode)
+
+```bash
+hop status                          # show current status and title
+hop status [-t TITLE] <text...>     # update status text, optionally set title
+```
+
+## Diagnostics
+
+```bash
+hop ping                            # check server connectivity
+hop screenshot                      # capture TUI window as ANSI text
+```
