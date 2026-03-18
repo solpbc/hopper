@@ -1138,14 +1138,20 @@ def test_lode_create_missing_scope(capsys):
 
 
 def test_lode_create_invalid_project(capsys):
-    """Create with unknown project prints error."""
+    """Create with unknown project prints error with project list."""
     from io import StringIO
+    from unittest.mock import MagicMock
+
+    fake_proj = MagicMock()
+    fake_proj.name = "proj-a"
 
     with patch("hopper.projects.find_project", return_value=None):
-        with patch("sys.stdin", StringIO(LONG_SCOPE)):
-            assert cmd_lode(["create", "badproj"]) == 1
+        with patch("hopper.projects.get_active_projects", return_value=[fake_proj]):
+            with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                assert cmd_lode(["create", "badproj"]) == 1
     out = capsys.readouterr().out
-    assert "not found" in out.lower()
+    assert "Project 'badproj' not found." in out
+    assert "Registered projects: proj-a" in out
 
 
 def test_lode_create_scope_too_short(capsys):
@@ -3196,15 +3202,34 @@ def test_backlog_ls_alias(capsys):
 
 
 def test_backlog_ls_with_flags(capsys):
-    """hop backlog ls -p proj is accepted."""
-    # backlog ls with -p should normalize to list and still work
-    # The -p flag is only used for add action, but list doesn't error on it
-    # Actually -p is parsed globally, so list just ignores it
+    """hop backlog list -p filters by project."""
+    from hopper.backlog import BacklogItem
+
+    items = [
+        BacklogItem(id="abc123", project="proj", description="Do thing", created_at=1000),
+        BacklogItem(
+            id="def456",
+            project="other",
+            description="Other thing",
+            created_at=2000,
+        ),
+    ]
+    with patch("hopper.backlog.load_backlog", return_value=items):
+        assert cmd_backlog(["list", "-p", "proj"]) == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out
+    assert "def456" not in out
+
+
+def test_backlog_ls_project_not_found(capsys):
+    """hop backlog list -p nonexistent prints specific message and exits 0."""
     from hopper.backlog import BacklogItem
 
     items = [BacklogItem(id="abc123", project="proj", description="Do thing", created_at=1000)]
     with patch("hopper.backlog.load_backlog", return_value=items):
-        assert cmd_backlog(["ls", "-p", "proj"]) == 0
+        assert cmd_backlog(["list", "-p", "noexist"]) == 0
+    out = capsys.readouterr().out
+    assert "No backlog items for project: noexist" in out
 
 
 def test_help_shows_aliases_group(capsys):
