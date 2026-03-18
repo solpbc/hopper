@@ -1,6 +1,6 @@
 ---
 name: hop
-description: Complete CLI reference for hopper — lode management, backlog, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage. TRIGGER: submitting new work to hopper — hop implement, creating a lode, writing or submitting a scope, managing backlog items (add, promote).
+description: Complete CLI reference for hopper — lode management, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage. TRIGGER: submitting new work to hopper — hop implement, creating a lode, writing or submitting a scope.
 ---
 
 # hop CLI Reference
@@ -24,8 +24,6 @@ EOF
 ```
 
 `hop implement` is an alias for `hop lode create`. Use `--force` to override dirty-repo checks.
-
-Inside a lode, use `hop backlog add` to queue future work instead.
 
 ## Waiting and monitoring
 
@@ -75,17 +73,6 @@ Restart an inactive lode (error, stuck, or failed ship):
 ```bash
 hop lode restart <lode-id>
 ```
-
-## Backlog management
-
-```bash
-hop backlog list                              # list all items
-hop backlog add -p myproject Fix the thing    # add item (inline)
-hop backlog add -p myproject < scope.md       # add item (stdin)
-hop backlog remove <id-prefix>                # remove by ID prefix
-```
-
-Inside a lode, `-p` can be omitted — project resolves from the current lode.
 
 ## Status reporting (inside a lode)
 
