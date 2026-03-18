@@ -1,6 +1,6 @@
 ---
 name: hop
-description: Complete CLI reference for hopper — lode management, backlog, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage.
+description: Complete CLI reference for hopper — lode management, backlog, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage. TRIGGER: submitting new work to hopper — hop implement, creating a lode, writing or submitting a scope, managing backlog items (add, promote).
 ---
 
 # hop CLI Reference
