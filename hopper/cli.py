@@ -819,6 +819,11 @@ def cmd_backlog(args: list[str]) -> int:
 
     if parsed.action == "list":
         items = load_backlog()
+        if parsed.project:
+            items = [i for i in items if i.project == parsed.project]
+            if not items:
+                print(f"No backlog items for project: {parsed.project}")
+                return 0
         if not items:
             print("No backlog items. Use: hop backlog add <description>")
             return 0
@@ -1165,7 +1170,11 @@ def cmd_lode(args: list[str]) -> int:
             return 1
         project = find_project(project_name)
         if not project:
-            print(f"Project not found: {project_name}")
+            from hopper.projects import get_active_projects
+
+            names = ", ".join(p.name for p in get_active_projects())
+            print(f"Project '{project_name}' not found.")
+            print(f"Registered projects: {names}")
             return 1
         if not parsed.force:
             from hopper.git import dirty_status
