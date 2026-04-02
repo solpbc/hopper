@@ -14,7 +14,7 @@ install-user: install
 	@echo "Symlinked ~/.claude/skills/hop → $(CURDIR)/skills/hop"
 
 test:
-	pytest
+	uv run pytest
 
 ci:
 	ruff format .
