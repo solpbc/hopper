@@ -40,6 +40,7 @@ from hopper.lodes import (
     save_lodes,
     set_lode_claude_started,
     touch,
+    unarchive_lode,
     update_lode_branch,
     update_lode_codex_thread,
     update_lode_stage,
@@ -467,6 +468,14 @@ class Server:
                     self.archived_lodes.append(lode)
                     logger.info(f"Lode {lode_id} archived")
                     self.broadcast({"type": "lode_archived", "lode": lode})
+
+        elif msg_type == "lode_unarchive":
+            lode_id = message.get("lode_id")
+            if lode_id:
+                lode = unarchive_lode(self.archived_lodes, self.lodes, lode_id)
+                if lode:
+                    logger.info(f"Lode {lode_id} unarchived")
+                    self.broadcast({"type": "lode_unarchived", "lode": lode})
 
         elif msg_type == "lode_set_state":
             lode_id = message.get("lode_id")

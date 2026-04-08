@@ -19,12 +19,15 @@ from hopper.lodes import (
     format_duration_ms,
     format_uptime,
     get_lode_dir,
+    load_archived_lodes,
     load_lodes,
     reset_lode_claude_stage,
+    save_archived_lodes,
     save_lodes,
     set_lode_claude_started,
     slugify,
     touch,
+    unarchive_lode,
     update_lode_branch,
     update_lode_codex_thread,
     update_lode_stage,
@@ -248,6 +251,74 @@ def test_archive_appends(temp_config):
     with open(archived_file) as f:
         lines = f.readlines()
     assert len(lines) == 2
+
+
+def test_archive_lode_sets_archived_at(temp_config):
+    """Test that archiving a lode sets archived_at timestamp."""
+    lodes_list = [
+        {"id": "archivid", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
+    ]
+    save_lodes(lodes_list)
+
+    archived = archive_lode(lodes_list, "archivid")
+
+    assert archived is not None
+    assert "archived_at" in archived
+    assert isinstance(archived["archived_at"], int)
+    assert archived["archived_at"] > 0
+
+    # Verify it's persisted in the archived file
+    archived_file = temp_config / "archived.jsonl"
+    data = json.loads(archived_file.read_text().strip())
+    assert "archived_at" in data
+
+
+def test_unarchive_lode(temp_config):
+    """Test unarchiving a lode moves it from archived to active."""
+    archived_lodes = [
+        {
+            "id": "restorId",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "new",
+            "archived_at": 5000,
+        },
+    ]
+    active_lodes = [
+        {
+            "id": "activeid",
+            "stage": "refine",
+            "created_at": 2000,
+            "updated_at": 2000,
+            "state": "new",
+        },
+    ]
+    save_archived_lodes(archived_lodes)
+    save_lodes(active_lodes)
+
+    restored = unarchive_lode(archived_lodes, active_lodes, "restorId")
+
+    assert restored is not None
+    assert restored["id"] == "restorId"
+    assert "archived_at" not in restored
+    assert len(archived_lodes) == 0
+    assert len(active_lodes) == 2
+    assert active_lodes[1]["id"] == "restorId"
+
+    # Verify persistence
+    loaded_active = load_lodes()
+    assert len(loaded_active) == 2
+    loaded_archived = load_archived_lodes()
+    assert len(loaded_archived) == 0
+
+
+def test_unarchive_lode_not_found(temp_config):
+    """Test unarchiving non-existent lode."""
+    archived_lodes = []
+    active_lodes = []
+    result = unarchive_lode(archived_lodes, active_lodes, "nonexistent")
+    assert result is None
 
 
 def test_atomic_save(temp_config):

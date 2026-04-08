@@ -13,7 +13,7 @@ import pytest
 
 from hopper.backlog import BacklogItem
 from hopper.config import save_config
-from hopper.lodes import save_lodes
+from hopper.lodes import save_archived_lodes, save_lodes
 from hopper.projects import Project, touch_project
 from hopper.server import Server, get_git_hash
 
@@ -161,6 +161,7 @@ def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
         assert srv.lodes == []
         assert len(srv.archived_lodes) == 1
         assert srv.archived_lodes[0]["id"] == "test-id"
+        assert "archived_at" in srv.archived_lodes[0]
 
         archived_file = temp_config / "archived.jsonl"
         assert archived_file.exists()
@@ -169,6 +170,7 @@ def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
         ]
         assert len(archived_entries) == 1
         assert archived_entries[0]["id"] == "test-id"
+        assert "archived_at" in archived_entries[0]
     finally:
         srv.stop()
         thread.join(timeout=2)
@@ -1091,6 +1093,7 @@ def test_auto_archive_shipped_on_disconnect(socket_path, server, temp_config, ma
     assert server.lodes == []
     assert len(server.archived_lodes) == 1
     assert server.archived_lodes[0]["id"] == "test-id"
+    assert "archived_at" in server.archived_lodes[0]
 
     archived_file = temp_config / "archived.jsonl"
     assert archived_file.exists()
@@ -1099,6 +1102,34 @@ def test_auto_archive_shipped_on_disconnect(socket_path, server, temp_config, ma
     ]
     assert len(archived_entries) == 1
     assert archived_entries[0]["id"] == "test-id"
+    assert "archived_at" in archived_entries[0]
+
+
+def test_lode_unarchive(socket_path, server, temp_config, make_lode):
+    """Unarchive moves lode from archived to active and broadcasts."""
+    lode = make_lode(id="test-id", stage="mill", state="new")
+    lode["archived_at"] = 5000
+    server.archived_lodes = [lode]
+    save_archived_lodes(server.archived_lodes)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    msg = {"type": "lode_unarchive", "lode_id": "test-id"}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    for _ in range(50):
+        if server.lodes:
+            break
+        time.sleep(0.1)
+
+    assert len(server.lodes) == 1
+    assert server.lodes[0]["id"] == "test-id"
+    assert "archived_at" not in server.lodes[0]
+    assert server.archived_lodes == []
+
+    client.close()
 
 
 def test_cleanup_worktree_on_disconnect_archive(socket_path, server, temp_config, make_lode):

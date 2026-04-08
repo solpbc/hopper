@@ -19,6 +19,8 @@ Lodes are plain dicts with these fields:
 - pid: int | None - process ID of active runner (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - backlog: dict | None - original backlog item data if promoted (default None)
+- archived_at: int | None - milliseconds since epoch when archived
+  (default None, set by archive_lode)
 - runs: dict - per-stage runtime tracking {"stage": {"started_at": ms, "stopped_at": ms}}
 - claude: dict - per-stage Claude session tracking:
     {"mill": {"session_id": "<uuid>", "started": false},
@@ -377,6 +379,7 @@ def archive_lode(lodes: list[dict], lode_id: str) -> dict | None:
     for i, lode in enumerate(lodes):
         if lode["id"] == lode_id:
             archived = lodes.pop(i)
+            archived["archived_at"] = current_time_ms()
 
             # Append to archive file
             archived_file = config.hopper_dir() / "archived.jsonl"
@@ -386,6 +389,25 @@ def archive_lode(lodes: list[dict], lode_id: str) -> dict | None:
 
             save_lodes(lodes)
             return archived
+    return None
+
+
+def unarchive_lode(
+    archived_lodes: list[dict], active_lodes: list[dict], lode_id: str
+) -> dict | None:
+    """Unarchive a lode: move from archived list back to active list.
+
+    Returns the unarchived lode or None if not found.
+    """
+    for i, lode in enumerate(archived_lodes):
+        if lode["id"] == lode_id:
+            restored = archived_lodes.pop(i)
+            restored.pop("archived_at", None)
+            active_lodes.append(restored)
+
+            save_archived_lodes(archived_lodes)
+            save_lodes(active_lodes)
+            return restored
     return None
 
 

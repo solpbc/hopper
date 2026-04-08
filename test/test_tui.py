@@ -669,7 +669,7 @@ async def test_archive_view_hint_row():
         await pilot.press("left")
         table = app.query_one("#lode-table")
         hint_row = table.get_row("_hint_lode")
-        assert str(hint_row[-1]) == "← back to active lodes"
+        assert str(hint_row[-1]) == "enter to restore · ← back to active lodes"
 
 
 @pytest.mark.asyncio
@@ -698,9 +698,27 @@ async def test_archive_view_guards_actions(make_lode):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key", ["enter", "v"])
-async def test_archive_view_opens_file_viewer(make_lode, key):
-    """Enter and v should open the file viewer in archive view."""
+async def test_archive_view_enter_unarchives_and_spawns(make_lode):
+    """Enter should unarchive the selected lode and spawn its runner."""
+    server = MockServer(
+        [make_lode(id="active01")],
+        archived_lodes=[make_lode(id="arch0001")],
+    )
+    app = HopperApp(server=server)
+    with patch("hopper.tui.spawn_claude", return_value=True) as mock_spawn:
+        async with app.run_test() as pilot:
+            await pilot.press("left")
+            assert app._archive_view is True
+            await pilot.press("enter")
+
+    assert server.events == [{"type": "lode_unarchive", "lode_id": "arch0001"}]
+    mock_spawn.assert_called_once_with("arch0001", None)
+    assert app._archive_view is False
+
+
+@pytest.mark.asyncio
+async def test_archive_view_v_opens_file_viewer(make_lode):
+    """v should still open the file viewer in archive view."""
     server = MockServer(
         [make_lode(id="active01")],
         archived_lodes=[make_lode(id="arch0001")],
@@ -710,7 +728,7 @@ async def test_archive_view_opens_file_viewer(make_lode, key):
         async with app.run_test() as pilot:
             await pilot.press("left")
             assert app._archive_view is True
-            await pilot.press(key)
+            await pilot.press("v")
 
     mock_push.assert_called_once()
     screen = mock_push.call_args.args[0]

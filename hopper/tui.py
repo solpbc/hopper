@@ -1440,6 +1440,9 @@ class HopperApp(App):
         table = self.query_one("#lode-table", LodeTable)
 
         def archived_sort_key(lode: dict) -> int:
+            archived_at = lode.get("archived_at")
+            if isinstance(archived_at, int):
+                return archived_at
             updated_at = lode.get("updated_at")
             return updated_at if isinstance(updated_at, int) else 0
 
@@ -1539,7 +1542,11 @@ class HopperApp(App):
                     key=row.id,
                 )
 
-        hint_text = "← back to active lodes" if self._archive_view else "c to create new lode"
+        hint_text = (
+            "enter to restore · ← back to active lodes"
+            if self._archive_view
+            else "c to create new lode"
+        )
         hint = Text(hint_text, style="bright_black italic")
 
         # Keep hint row text in sync with active/archive mode.
@@ -1858,8 +1865,21 @@ class HopperApp(App):
             lode_id = self._get_selected_lode_id()
             if lode_id is None:
                 return
-            lode_dir = get_lode_dir(lode_id)
-            self.push_screen(FileViewerScreen(lode_dir, lode_id))
+            lode = None
+            for al in self._archived_lodes:
+                if al["id"] == lode_id:
+                    lode = al
+                    break
+            if not lode:
+                return
+            lode_project = lode.get("project", "")
+            project = find_project(lode_project) if lode_project else None
+            project_path = project.path if project else None
+            if self.server:
+                self.server.enqueue({"type": "lode_unarchive", "lode_id": lode_id})
+            if not spawn_claude(lode_id, project_path):
+                self.notify("Failed to spawn tmux window", severity="error")
+            self.set_archive_view(False)
             return
         key = str(event.row_key.value)
 
