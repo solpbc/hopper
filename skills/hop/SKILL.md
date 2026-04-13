@@ -1,6 +1,6 @@
 ---
 name: hop
-description: Complete CLI reference for hopper — lode management, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage. TRIGGER: submitting new work to hopper — hop implement, creating a lode, writing or submitting a scope.
+description: Complete CLI reference for hopper — lode management, waiting, diagnostics, and status reporting. Covers both external coordination and in-lode usage. TRIGGER: submitting new work to hopper — hop implement, creating a lode, writing or submitting a scope, managing backlogs, listing projects, checking lode status, waiting for lodes, backlog management, configuring hopper, hop wait, hop lode, hop backlog, hop project, reviewing lode output, hop submit, hop list, hop config.
 ---
 
 # hop CLI Reference
@@ -23,7 +23,7 @@ Fix login timeout and add regression coverage
 EOF
 ```
 
-`hop implement` is an alias for `hop lode create`. Use `--force` to override dirty-repo checks.
+`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters.
 
 ## Waiting and monitoring
 
@@ -59,6 +59,8 @@ List active lodes (`hop lode` defaults to `list`):
 hop lode
 hop lode list
 hop lode list -a          # include archived
+hop lode list -p PROJECT  # filter by project name
+hop list                  # alias for lode list (same flags)
 ```
 
 Show detailed status for a lode:
@@ -74,11 +76,70 @@ Restart an inactive lode (error, stuck, or failed ship):
 hop lode restart <lode-id>
 ```
 
+## Backlog management
+
+Manage backlog items for a project. Items track future work:
+
+```bash
+hop backlog                           # list items (default action)
+hop backlog list -p PROJECT           # list items for a specific project
+hop backlog add -p PROJECT "desc"     # add an item
+hop backlog remove PREFIX             # remove by ID prefix
+hop backlog promote PREFIX            # promote item to a lode
+hop backlog queue PREFIX              # assign item to queue for next pickup
+hop backlog queue PREFIX --clear      # clear queued assignment
+```
+
+`-p PROJECT` is required when not inside a lode. Inside a lode, project is inferred from context.
+
+## Project management
+
+Manage hopper projects. Projects are git directories where lodes run:
+
+```bash
+hop project                           # list projects (default action)
+hop project list
+hop projects                          # alias for project list
+hop project add /path/to/repo         # register a project
+hop project remove NAME               # unregister a project
+hop project rename NAME NEW_NAME      # rename a project
+```
+
+## Configuration
+
+Get or set hopper config values. Config values are available as `$variables` in prompts:
+
+```bash
+hop config                            # list all config (default action)
+hop config list
+hop config get KEY                    # get a specific value
+hop config set KEY VALUE              # set a value
+hop config delete KEY                 # remove a value
+hop config json                       # dump config as JSON
+hop config path                       # show config file path
+```
+
 ## Status reporting (inside a lode)
 
 ```bash
 hop status                          # show current status and title
 hop status [-t TITLE] <text...>     # update status text, optionally set title
+```
+
+## Internal lode commands (inside a lode only)
+
+These commands only work when `HOPPER_LID` is set (i.e., inside a running lode):
+
+```bash
+hop processed <<'EOF'                 # signal stage completion with output
+<stage output>
+EOF
+
+hop gate <<'EOF'                      # pause lode at a review gate
+<review document>
+EOF
+
+hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
 
 ## Diagnostics
