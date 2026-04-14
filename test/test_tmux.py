@@ -12,6 +12,7 @@ from hopper.tmux import (
     get_tmux_sessions,
     is_inside_tmux,
     is_tmux_server_running,
+    kill_pane,
     rename_window,
     send_keys,
 )
@@ -147,6 +148,29 @@ class TestCapturePane:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = capture_pane("@0")
             assert result is None
+
+
+class TestKillPane:
+    def test_kill_pane_success(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+
+            result = kill_pane("%1")
+
+        assert result is True
+        mock_run.assert_called_once_with(
+            ["tmux", "kill-pane", "-t", "%1"],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_kill_pane_failure(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+
+            result = kill_pane("%1")
+
+        assert result is False
 
 
 class TestRenameWindow:

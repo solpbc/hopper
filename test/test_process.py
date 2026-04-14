@@ -311,7 +311,9 @@ class TestMillStage:
         ):
             assert runner.run() == 0
 
-        assert "uncommitted changes" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "uncommitted changes" in out
+        assert "hint: after fixing, restart with: hop restart test-id" in out
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
             lode_id="test-id",
@@ -1070,7 +1072,9 @@ class TestShipStage:
         ):
             assert runner.run() == 0
 
-        assert "uncommitted changes" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "uncommitted changes" in out
+        assert "hint: after fixing, restart with: hop restart test-id" in out
         MockConn.return_value.emit.assert_any_call(
             "lode_set_state",
             lode_id="test-id",

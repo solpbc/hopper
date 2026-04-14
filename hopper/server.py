@@ -6,6 +6,7 @@
 import atexit
 import json
 import logging
+import os
 import queue
 import signal
 import socket
@@ -468,6 +469,38 @@ class Server:
                     self.archived_lodes.append(lode)
                     logger.info(f"Lode {lode_id} archived")
                     self.broadcast({"type": "lode_archived", "lode": lode})
+
+        elif msg_type == "lode_kill":
+            lode_id = message.get("lode_id")
+            if lode_id:
+                lode = self._find_lode(lode_id)
+                if lode:
+                    pid = lode.get("pid")
+                    if pid:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                    tmux_pane = lode.get("tmux_pane")
+                    if tmux_pane:
+                        from hopper.tmux import kill_pane
+
+                        kill_pane(tmux_pane)
+                    lode["state"] = "error"
+                    lode["status"] = "Killed by user"
+                    lode["active"] = False
+                    lode["tmux_pane"] = None
+                    lode["pid"] = None
+                    touch(lode)
+                    save_lodes(self.lodes)
+                    logger.info(f"Lode {lode_id} killed by user")
+                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    archived = archive_lode(self.lodes, lode_id)
+                    if archived:
+                        self.archived_lodes.append(archived)
+                        logger.info(f"Lode {lode_id} archived after kill")
+                        self.broadcast({"type": "lode_archived", "lode": archived})
+                        self._cleanup_worktree(archived)
 
         elif msg_type == "lode_unarchive":
             lode_id = message.get("lode_id")

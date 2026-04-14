@@ -1107,6 +1107,13 @@ def cmd_lode(args: list[str]) -> int:
     status_p.add_argument("lode_id", help="Lode ID to show")
     show_p = subs.add_parser("show", help="Show a lode's status", exit_on_error=False)
     show_p.add_argument("lode_id", help="Lode ID to show")
+    log_p = subs.add_parser("log", help="Show activity log for a lode", exit_on_error=False)
+    log_p.add_argument("lode_id", help="Lode ID (or prefix)")
+    log_p.add_argument("-n", "--tail", type=int, default=0, help="Show last N entries")
+    log_p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
+    kill_p = subs.add_parser("kill", help="Kill a running lode", exit_on_error=False)
+    kill_p.add_argument("lode_id", help="Lode ID to kill")
+    kill_p.add_argument("-f", "--force", action="store_true", help="Force kill (no confirmation)")
 
     try:
         parsed = parse_args(parser, args)
@@ -1182,10 +1189,10 @@ def cmd_lode(args: list[str]) -> int:
             status = dirty_status(project.path)
             if status:
                 print(f"error: project repo has uncommitted changes: {project.path}")
+                print("hint: commit or stash changes first, or use --force to override.")
+                print()
                 for line in status.splitlines():
                     print(f"  {line}")
-                print()
-                print("commit or stash changes before submitting. use --force to override.")
                 return 1
         err = require_server()
         if err:
@@ -1368,6 +1375,72 @@ def cmd_lode(args: list[str]) -> int:
             conn.stop()
         return result[0]
 
+    if subcommand == "log":
+        import json as json_mod
+
+        from hopper.config import hopper_dir
+
+        lode_id = parsed.lode_id
+        log_file = hopper_dir() / "activity.log"
+        if not log_file.exists():
+            print("No activity log found.")
+            return 1
+
+        text = log_file.read_text()
+        matches = []
+        for line in text.splitlines():
+            if f"Lode {lode_id}" in line or f"lode={lode_id}" in line:
+                matches.append(line)
+
+        if not matches:
+            print(f"No log entries found for lode {lode_id}")
+            return 0
+
+        tail = getattr(parsed, "tail", 0)
+        if tail > 0:
+            matches = matches[-tail:]
+
+        if getattr(parsed, "json_output", False):
+            entries = []
+            for line in matches:
+                parts = line.split(None, 4)
+                if len(parts) >= 5:
+                    entries.append(
+                        {
+                            "timestamp": f"{parts[0]} {parts[1]}",
+                            "level": parts[3],
+                            "message": parts[4],
+                        }
+                    )
+                else:
+                    entries.append({"timestamp": "", "level": "", "message": line})
+            print(json_mod.dumps(entries, indent=2))
+        else:
+            for line in matches:
+                print(line)
+        return 0
+
+    if subcommand == "kill":
+        err = require_server()
+        if err:
+            return err
+        lode_id = parsed.lode_id
+        lode = client.get_lode(socket_path, lode_id)
+        if not lode:
+            archived = client.list_archived_lodes(socket_path)
+            found = find_lode_by_prefix(archived, lode_id)
+            if found:
+                print(f"Lode {found['id']} is already archived.")
+                return 0
+            print(f"Lode not found: {lode_id}")
+            return 1
+        if lode.get("stage") == "shipped":
+            print(f"Lode {lode['id']} has already shipped.")
+            return 0
+        client.kill_lode(socket_path, lode["id"])
+        print(f"Killed lode {lode['id']}")
+        return 0
+
     if subcommand in ("status", "show"):
         err = require_server()
         if err:
@@ -1479,6 +1552,35 @@ def cmd_restart(args: list[str]) -> int:
         except SystemExit:
             return 0
     return cmd_lode(["restart"] + args)
+
+
+@command("log", "Show lode activity log (alias for lode log)", group="aliases")
+def cmd_log(args: list[str]) -> int:
+    """Alias for hop lode log."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("log", "Show lode activity log (alias for lode log)")
+        p.add_argument("lode_id", help="Lode ID (or prefix)")
+        p.add_argument("-n", "--tail", type=int, default=0, help="Show last N entries")
+        p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["log"] + args)
+
+
+@command("kill", "Kill a running lode (alias for lode kill)", group="aliases")
+def cmd_kill(args: list[str]) -> int:
+    """Alias for hop lode kill."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("kill", "Kill a running lode (alias for lode kill)")
+        p.add_argument("lode_id", help="Lode ID to kill")
+        p.add_argument("-f", "--force", action="store_true", help="Force kill (no confirmation)")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return cmd_lode(["kill"] + args)
 
 
 @command("ping", "Check if server is running")

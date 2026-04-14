@@ -371,6 +371,15 @@ def restart_lode(socket_path: Path, lode_id: str, stage: str, timeout: float = 2
     )
 
 
+def kill_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> bool:
+    """Kill a running lode. Fire-and-forget."""
+    return _fire_and_forget(
+        socket_path,
+        {"type": "lode_kill", "lode_id": lode_id},
+        timeout=timeout,
+    )
+
+
 def _fire_and_forget(socket_path: Path, msg: dict, timeout: float = 2.0) -> bool:
     """Send a message to the server without waiting for a response."""
     try:

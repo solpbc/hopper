@@ -195,3 +195,23 @@ def capture_pane(target: str) -> str | None:
         return result.stdout
     except FileNotFoundError:
         return None
+
+
+def kill_pane(target: str) -> bool:
+    """Kill a tmux pane.
+
+    Args:
+        target: The tmux target (pane ID like "%1").
+
+    Returns:
+        True if the command succeeded, False otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "kill-pane", "-t", target],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False

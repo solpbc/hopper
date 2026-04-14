@@ -154,6 +154,7 @@ class ProcessRunner(BaseRunner):
                 self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
                 print(self._setup_error)
                 print("Commit or stash changes before milling.")
+                print(f"hint: after fixing, restart with: hop restart {self.lode_id}")
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
 
@@ -266,6 +267,7 @@ class ProcessRunner(BaseRunner):
             self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
             print(self._setup_error)
             print("Commit or stash changes before shipping.")
+            print(f"hint: after fixing, restart with: hop restart {self.lode_id}")
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 

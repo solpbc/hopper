@@ -3,6 +3,7 @@
 
 """Tests for the hopper CLI."""
 
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -1068,6 +1069,22 @@ def test_lode_create_dirty_repo_rejected(capsys):
     assert "use --force to override" in out
 
 
+def test_lode_create_dirty_hint_before_files(capsys):
+    from io import StringIO
+
+    project = Project(path="/fake/repo", name="myproj")
+    with patch("hopper.cli.require_not_inside_lode", return_value=None):
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=" M file.py\n?? new.txt"):
+                with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                    rc = cmd_lode(["create", "myproj"])
+    assert rc == 1
+    lines = capsys.readouterr().out.splitlines()
+    hint_index = lines.index("hint: commit or stash changes first, or use --force to override.")
+    file_index = lines.index("   M file.py")
+    assert hint_index < file_index
+
+
 def test_lode_create_dirty_repo_force_override(capsys):
     from io import StringIO
 
@@ -1342,6 +1359,147 @@ def test_lode_restart_shipped(capsys):
 def test_lode_restart_missing_id(capsys):
     """Restart with no lode ID reports missing required argument."""
     assert cmd_lode(["restart"]) == 1
+    out = capsys.readouterr().out
+    assert "required" in out
+
+
+def test_lode_log_happy(temp_config, capsys):
+    log_file = temp_config / "activity.log"
+    log_file.write_text(
+        "\n".join(
+            [
+                "2026-01-01 12:00:00.123 hopper.server INFO Lode test1234 created project=myproj",
+                "2026-01-01 12:00:01.123 hopper.server INFO lode=test1234 state=running",
+                "2026-01-01 12:00:02.123 hopper.server INFO Lode other999 ignored",
+            ]
+        )
+        + "\n"
+    )
+
+    rc = cmd_lode(["log", "test1234"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Lode test1234 created" in out
+    assert "lode=test1234 state=running" in out
+    assert "other999" not in out
+
+
+def test_lode_log_json(temp_config, capsys):
+    log_file = temp_config / "activity.log"
+    log_file.write_text(
+        "2026-01-01 12:00:00.123 hopper.server INFO Lode test1234 created project=myproj\n"
+    )
+
+    rc = cmd_lode(["log", "test1234", "--json"])
+
+    assert rc == 0
+    entries = json.loads(capsys.readouterr().out)
+    assert len(entries) == 1
+    assert set(entries[0]) == {"timestamp", "level", "message"}
+    assert entries[0]["timestamp"] == "2026-01-01 12:00:00.123"
+    assert entries[0]["level"] == "INFO"
+    assert "Lode test1234 created project=myproj" in entries[0]["message"]
+
+
+def test_lode_log_tail(temp_config, capsys):
+    log_file = temp_config / "activity.log"
+    log_file.write_text(
+        "\n".join(
+            [
+                f"2026-01-01 12:00:{index:02d}.123 hopper.server INFO lode=test1234 step={index}"
+                for index in range(10)
+            ]
+        )
+        + "\n"
+    )
+
+    rc = cmd_lode(["log", "test1234", "-n", "3"])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 3
+    assert "step=7" in lines[0]
+    assert "step=9" in lines[-1]
+
+
+def test_lode_log_no_matches(temp_config, capsys):
+    (temp_config / "activity.log").write_text(
+        "2026-01-01 12:00:00.123 hopper.server INFO Lode other999 created\n"
+    )
+
+    rc = cmd_lode(["log", "test1234"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No log entries found for lode test1234" in out
+
+
+def test_lode_log_no_file(capsys):
+    rc = cmd_lode(["log", "test1234"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "No activity log found." in out
+
+
+def test_lode_log_missing_id(capsys):
+    assert cmd_lode(["log"]) == 1
+    out = capsys.readouterr().out
+    assert "required" in out
+
+
+def test_lode_kill_happy(capsys):
+    lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.kill_lode", return_value=True) as mock_kill:
+                rc = cmd_lode(["kill", "test1234"])
+
+    assert rc == 0
+    mock_kill.assert_called_once()
+    out = capsys.readouterr().out
+    assert "Killed lode test1234" in out
+
+
+def test_lode_kill_shipped(capsys):
+    lode = {"id": "test1234", "stage": "shipped", "state": "shipped", "active": False}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.kill_lode") as mock_kill:
+                rc = cmd_lode(["kill", "test1234"])
+
+    assert rc == 0
+    mock_kill.assert_not_called()
+    out = capsys.readouterr().out
+    assert "already shipped" in out
+
+
+def test_lode_kill_archived(capsys):
+    archived = [{"id": "test1234", "stage": "mill", "state": "error", "active": False}]
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_archived_lodes", return_value=archived):
+                rc = cmd_lode(["kill", "test1234"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "already archived" in out
+
+
+def test_lode_kill_not_found(capsys):
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                rc = cmd_lode(["kill", "missing"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Lode not found: missing" in out
+
+
+def test_lode_kill_missing_id(capsys):
+    assert cmd_lode(["kill"]) == 1
     out = capsys.readouterr().out
     assert "required" in out
 

@@ -4,6 +4,7 @@
 """Tests for the hopper server."""
 
 import json
+import signal
 import socket
 import threading
 import time
@@ -615,6 +616,68 @@ def test_server_handles_lode_set_branch(socket_path, server, temp_config, make_l
     assert server.lodes[0]["branch"] == "hopper-test-id-auth-flow"
 
     client.close()
+
+
+def test_server_handles_lode_kill(socket_path, temp_config, make_lode):
+    """lode_kill terminates the process, kills the pane, and archives the lode."""
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        stage="mill",
+        state="running",
+        status="Working",
+        active=True,
+        tmux_pane="%1",
+        pid=12345,
+        project="myproject",
+        branch="hopper-test-id",
+    )
+    srv.lodes = [lode]
+    save_lodes(srv.lodes)
+
+    with (
+        patch("hopper.server.os.kill") as mock_os_kill,
+        patch("hopper.tmux.kill_pane", return_value=True) as mock_kill_pane,
+        patch.object(srv, "broadcast") as mock_broadcast,
+        patch.object(srv, "_cleanup_worktree") as mock_cleanup,
+    ):
+        srv._handle_mutation({"type": "lode_kill", "lode_id": "test-id"}, None)
+
+    mock_os_kill.assert_called_once_with(12345, signal.SIGTERM)
+    mock_kill_pane.assert_called_once_with("%1")
+    assert srv.lodes == []
+    assert len(srv.archived_lodes) == 1
+    archived = srv.archived_lodes[0]
+    assert archived["id"] == "test-id"
+    assert archived["state"] == "error"
+    assert archived["status"] == "Killed by user"
+    assert archived["active"] is False
+    assert archived["tmux_pane"] is None
+    assert archived["pid"] is None
+    mock_broadcast.assert_any_call({"type": "lode_updated", "lode": archived})
+    mock_broadcast.assert_any_call({"type": "lode_archived", "lode": archived})
+    mock_cleanup.assert_called_once_with(archived)
+
+
+def test_server_handles_lode_kill_missing_process(socket_path, temp_config, make_lode):
+    """lode_kill ignores already-dead processes and still archives the lode."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state="running", active=True, tmux_pane="%1", pid=12345)
+    srv.lodes = [lode]
+    save_lodes(srv.lodes)
+
+    with (
+        patch("hopper.server.os.kill", side_effect=ProcessLookupError) as mock_os_kill,
+        patch("hopper.tmux.kill_pane", return_value=True) as mock_kill_pane,
+        patch.object(srv, "broadcast"),
+        patch.object(srv, "_cleanup_worktree"),
+    ):
+        srv._handle_mutation({"type": "lode_kill", "lode_id": "test-id"}, None)
+
+    mock_os_kill.assert_called_once_with(12345, signal.SIGTERM)
+    mock_kill_pane.assert_called_once_with("%1")
+    assert srv.lodes == []
+    assert len(srv.archived_lodes) == 1
 
 
 def test_server_handles_backlog_set_queued(socket_path, server):
