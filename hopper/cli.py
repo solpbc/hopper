@@ -1013,6 +1013,8 @@ def format_lode_detail(lode: dict) -> str:
     lines.append(f"  created:  {created_age} ago")
     lines.append(f"  updated:  {updated_age} ago")
     lines.append(f"  active:   {'yes' if lode.get('active') else 'no'}")
+    if lode.get("active") and lode.get("tmux_pane"):
+        lines.append(f"  pane:     {lode['tmux_pane']}")
     return "\n".join(lines)
 
 

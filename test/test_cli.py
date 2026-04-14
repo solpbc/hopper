@@ -32,6 +32,7 @@ from hopper.cli import (
     cmd_wait,
     cmd_watch,
     detect_coding_agent,
+    format_lode_detail,
     format_lode_line,
     get_hopper_lid,
     main,
@@ -3422,3 +3423,28 @@ def test_format_lode_line_basic():
     assert "myproj" in line
     assert "My Title" in line
     assert "Working" in line
+
+
+def test_format_lode_detail_pane_active(make_lode):
+    """Active lode with tmux_pane shows pane line."""
+    lode = make_lode(active=True, tmux_pane="%123")
+    output = format_lode_detail(lode)
+    assert "  pane:     %123" in output
+    lines = output.split("\n")
+    active_idx = next(i for i, line in enumerate(lines) if "active:" in line)
+    pane_idx = next(i for i, line in enumerate(lines) if "pane:" in line)
+    assert pane_idx == active_idx + 1
+
+
+def test_format_lode_detail_pane_inactive(make_lode):
+    """Inactive lode with tmux_pane does NOT show pane line."""
+    lode = make_lode(active=False, tmux_pane="%123")
+    output = format_lode_detail(lode)
+    assert "pane:" not in output
+
+
+def test_format_lode_detail_pane_none(make_lode):
+    """Active lode with no tmux_pane does NOT show pane line."""
+    lode = make_lode(active=True, tmux_pane=None)
+    output = format_lode_detail(lode)
+    assert "pane:" not in output

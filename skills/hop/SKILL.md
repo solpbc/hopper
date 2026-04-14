@@ -148,3 +148,21 @@ hop code <stage>                      # run prompts/<stage>.md via Codex
 hop ping                            # check server connectivity
 hop screenshot                      # capture TUI window as ANSI text
 ```
+
+### Stuck lodes
+
+When `hop lode status` shows a lode in `stuck` state, the `pane:` field tells
+you where to look. Capture the pane to see what's happening:
+
+    tmux capture-pane -t <pane> -p -S -50
+
+Common causes: permission prompt waiting for input, process hung, or waiting for
+human approval.
+
+If the action is safe (e.g. a routine permission prompt, a test confirmation),
+use send-keys to unblock it:
+
+    tmux send-keys -t <pane> '1' Enter
+
+If the pane shows something you're not comfortable resolving (destructive action,
+ambiguous approval, sensitive operation), leave it for the founder to resolve.
