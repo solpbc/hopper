@@ -11,7 +11,7 @@ from pathlib import Path
 from hopper import config, prompt
 from hopper.client import set_codex_thread_id, set_lode_branch, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
-from hopper.git import create_worktree, current_branch, get_diff_numstat, is_dirty
+from hopper.git import create_worktree, get_diff_numstat, is_dirty
 from hopper.lodes import get_lode_dir, slugify
 from hopper.runner import BaseRunner
 
@@ -262,6 +262,10 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
+        # Activate worktree env if project has tooling (already installed by refine)
+        if _has_makefile(self.worktree_path):
+            self.use_env = True
+
         # Pre-flight: project repo must be clean
         if is_dirty(self.project_dir):
             self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
@@ -271,18 +275,7 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
-        # Pre-flight: project repo must be on main or master
-        branch = current_branch(self.project_dir)
-        if branch not in ("main", "master"):
-            self._setup_error = (
-                f"Project repo is on branch '{branch}', expected 'main' or 'master'."
-            )
-            print(self._setup_error)
-            print("Switch to the main branch before shipping.")
-            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
-            return 1
-
-        self._cwd = self.project_dir
+        self._cwd = str(self.worktree_path)
 
         if self.is_first_run:
             # Load input from previous stage

@@ -931,7 +931,6 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="main"),
             patch("hopper.process.prompt.load", return_value="loaded prompt") as mock_load,
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
@@ -945,7 +944,7 @@ class TestShipStage:
         assert context["branch"] == "hopper-test-id"
         assert context["worktree"] == str(session_dir / "worktree")
         assert context["input"] == "Refine summary"
-        assert mock_popen.call_args[1]["cwd"] == str(project_dir)
+        assert mock_popen.call_args[1]["cwd"] == str(session_dir / "worktree")
 
     def test_resume_uses_resume_flag(self, tmp_path):
         """Resume uses --resume."""
@@ -966,7 +965,6 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="main"),
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
             ) as mock_popen,
@@ -977,6 +975,7 @@ class TestShipStage:
         assert exit_code == 0
         cmd = mock_popen.call_args[0][0]
         assert "--resume" in cmd
+        assert mock_popen.call_args[1]["cwd"] == str(session_dir / "worktree")
 
     def test_validates_stage(self, capsys):
         """Ship stage mismatch emits error and exits 0."""
@@ -1083,56 +1082,6 @@ class TestShipStage:
         )
         MockConn.return_value.stop.assert_called_once()
 
-    def test_fails_if_not_on_main(self, tmp_path, capsys):
-        """Non-main branch emits error and exits 0."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
-        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
-
-        with (
-            patch(
-                "hopper.runner.connect",
-                return_value=_mock_response(stage="ship", project="my-project"),
-            ),
-            patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="feature-xyz"),
-            patch("hopper.runner.HopperConnection") as MockConn,
-            patch("hopper.runner.get_current_pane_id", return_value="%0"),
-        ):
-            assert runner.run() == 0
-
-        assert "feature-xyz" in capsys.readouterr().out
-        MockConn.return_value.emit.assert_any_call(
-            "lode_set_state",
-            lode_id="test-id",
-            state="error",
-            status="Project repo is on branch 'feature-xyz', expected 'main' or 'master'.",
-        )
-        MockConn.return_value.stop.assert_called_once()
-
-    def test_accepts_master_branch(self, tmp_path):
-        """Runner accepts 'master' as the main branch."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
-        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
-        (session_dir / "refine_out.md").write_text("done")
-
-        with (
-            patch(
-                "hopper.runner.connect",
-                return_value=_mock_response(stage="ship", project="my-project"),
-            ),
-            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
-            patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="master"),
-            patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
-            patch("hopper.runner.get_current_pane_id", return_value=None),
-        ):
-            assert runner.run() == 0
-
     def test_emits_shipped_stage_transition_on_completion(self, tmp_path):
         """Ship emits a stage transition to shipped after completion."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
@@ -1149,7 +1098,6 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="main"),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),
@@ -1164,6 +1112,56 @@ class TestShipStage:
             for e in emitted
         )
         assert any(e[0] == "lode_set_stage" and e[1]["stage"] == "shipped" for e in emitted)
+
+    def test_ship_activates_worktree_env(self, tmp_path):
+        """Ship activates worktree env when Makefile is present."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
+        (session_dir / "refine_out.md").write_text("Refine summary")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="ship", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.is_dirty", return_value=False),
+            patch("hopper.process._has_makefile", return_value=True),
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        assert runner.use_env is True
+
+    def test_ship_no_env_without_makefile(self, tmp_path):
+        """Ship does not activate worktree env without Makefile."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
+        (session_dir / "refine_out.md").write_text("Refine summary")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="ship", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.is_dirty", return_value=False),
+            patch("hopper.process._has_makefile", return_value=False),
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        assert runner.use_env is False
 
     def test_first_run_writes_diff_txt(self, tmp_path):
         """First run captures diff numstat to diff.txt."""
@@ -1180,7 +1178,6 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="main"),
             patch("hopper.process.get_diff_numstat", return_value="10\t5\tfile.py"),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
@@ -1208,7 +1205,6 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="main"),
             patch("hopper.process.get_diff_numstat", return_value=""),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
@@ -1234,7 +1230,6 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.current_branch", return_value="main"),
             patch("hopper.process.get_diff_numstat", side_effect=Exception("git broke")),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
