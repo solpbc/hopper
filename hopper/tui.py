@@ -114,6 +114,10 @@ def lode_to_row(lode: dict) -> Row:
     """Convert a lode dict to a display row."""
     status = lode_icon(lode)
     stage = lode.get("stage", "mill")
+    status_text = lode.get("status", "")
+    progress_text = lode.get("last_progress_summary", "")
+    if lode.get("active") and progress_text:
+        status_text = progress_text
 
     return Row(
         id=lode["id"],
@@ -123,7 +127,7 @@ def lode_to_row(lode: dict) -> Row:
         status=status,
         project=lode.get("project", ""),
         title=lode.get("title", ""),
-        status_text=lode.get("status", ""),
+        status_text=status_text,
     )
 
 

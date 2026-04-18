@@ -9,12 +9,37 @@ import os
 from pathlib import Path
 
 from hopper import prompt
-from hopper.client import connect, set_lode_state
+from hopper.client import connect, set_lode_progress, set_lode_state
 from hopper.codex import run_codex
 from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
 from hopper.projects import find_project
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_event(event: dict) -> str:
+    """Summarize a Codex JSON event into a short progress label."""
+    if not isinstance(event, dict):
+        return ""
+    event_type = event.get("type") or "event"
+    if event_type == "thread.started":
+        return "codex session started"
+    if event_type == "turn.started":
+        return "codex thinking"
+    if event_type == "item.completed":
+        item = event.get("item", {})
+        item_type = item.get("type") or ""
+        if item_type == "agent_message":
+            text = item.get("text") or ""
+            return f"codex: message ({len(text)} chars)"
+        if "tool" in item_type.lower():
+            return f"codex: {item.get('tool_name') or item_type}"
+    if event_type == "turn.completed":
+        try:
+            return f"codex turn done ({event['usage']['output_tokens']} tok)"
+        except Exception:
+            return "codex turn done"
+    return f"codex: {event_type}"
 
 
 def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> int:
@@ -105,7 +130,22 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     # Run codex (resume existing thread)
     output_path = lode_dir / f"{suffix}.out.md"
     started_at = current_time_ms()
-    exit_code, cmd = run_codex(prompt_text, str(cwd), str(output_path), codex_thread_id)
+
+    def _on_event(event):
+        try:
+            summary = _summarize_event(event)
+            if summary:
+                set_lode_progress(socket_path, lode_id, summary)
+        except Exception:
+            logger.debug("progress heartbeat failed", exc_info=True)
+
+    exit_code, cmd = run_codex(
+        prompt_text,
+        str(cwd),
+        str(output_path),
+        codex_thread_id,
+        on_event=_on_event,
+    )
     finished_at = current_time_ms()
 
     # Save run metadata

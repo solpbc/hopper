@@ -994,6 +994,9 @@ def format_lode_detail(lode: dict) -> str:
     status_text = lode.get("status", "")
     if status_text:
         lines.append(f"  status:   {status_text}")
+    progress_text = lode.get("last_progress_summary", "")
+    if progress_text:
+        lines.append(f"  progress: {progress_text}")
 
     title = lode.get("title", "")
     if title:

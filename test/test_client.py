@@ -16,6 +16,7 @@ from hopper.client import (
     ping,
     send_message,
     set_lode_branch,
+    set_lode_progress,
     set_lode_state,
     set_lode_title,
 )
@@ -185,6 +186,26 @@ def test_set_lode_state_sends_message(server, socket_path):
     # Lode should be updated
     assert server.lodes[0]["state"] == "running"
     assert server.lodes[0]["status"] == "Claude running"
+
+
+def test_set_lode_progress_sends_message(server, socket_path):
+    """set_lode_progress updates heartbeat fields through the server."""
+    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    server.lodes = [session]
+
+    result = set_lode_progress(socket_path, "test-id", "codex thinking")
+    assert result is True
+
+    time.sleep(0.1)
+
+    assert server.lodes[0]["last_progress_summary"] == "codex thinking"
+    assert server.lodes[0]["last_progress_at"] is not None
+
+
+def test_set_lode_progress_bogus_socket_returns_false():
+    """set_lode_progress swallows send errors and returns False."""
+    result = set_lode_progress(Path("/tmp/does-not-exist.sock"), "test-id", "codex thinking")
+    assert result is False
 
 
 def test_set_lode_title_no_server(socket_path):

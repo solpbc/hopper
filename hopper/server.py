@@ -520,6 +520,19 @@ class Server:
                     logger.info(f"Lode {lode_id} state={state} status={status}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
+        elif msg_type == "lode_set_progress":
+            lode_id = message.get("lode_id")
+            if lode_id:
+                lode = self._find_lode(lode_id)
+                if lode:
+                    summary = message.get("summary", "")
+                    lode["last_progress_at"] = current_time_ms()
+                    lode["last_progress_summary"] = (summary or "")[:120]
+                    touch(lode)
+                    save_lodes(self.lodes)
+                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    logger.info(f"Lode {lode_id} progress: {lode['last_progress_summary']}")
+
         elif msg_type == "lode_set_status":
             lode_id = message.get("lode_id")
             status = message.get("status", "")

@@ -130,6 +130,8 @@ def test_create_lode(temp_config):
     assert lode["stage"] == "mill"
     assert lode["project"] == "test-project"
     assert lode["branch"] == ""
+    assert lode["last_progress_at"] is None
+    assert lode["last_progress_summary"] == ""
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode

@@ -52,6 +52,8 @@ def make_lode():
             "tmux_pane": None,
             "pid": None,
             "codex_thread_id": None,
+            "last_progress_at": None,
+            "last_progress_summary": "",
             "backlog": None,
             "runs": overrides.get("runs", {}),
             "claude": {

@@ -6,6 +6,7 @@
 import json
 import logging
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,12 @@ def bootstrap_codex(prompt: str, cwd: str, env: dict | None = None) -> tuple[int
 
 
 def run_codex(
-    prompt: str, cwd: str, output_file: str, thread_id: str, env: dict | None = None
+    prompt: str,
+    cwd: str,
+    output_file: str,
+    thread_id: str,
+    env: dict | None = None,
+    on_event=None,
 ) -> tuple[int, list[str]]:
     """Run Codex by resuming an existing session.
 
@@ -57,6 +63,7 @@ def run_codex(
         output_file: Path to write the final agent message.
         thread_id: Codex thread ID to resume.
         env: Optional environment dict. Uses inherited env if None.
+        on_event: Optional callback for each parsed JSON event.
 
     Returns:
         (exit_code, cmd) tuple. Exit code is 127 if codex not found,
@@ -66,6 +73,7 @@ def run_codex(
         "codex",
         "exec",
         CODEX_FLAGS,
+        "--json",
         "-o",
         output_file,
         "resume",
@@ -74,14 +82,48 @@ def run_codex(
     ]
 
     logger.debug(f"Running: codex exec resume {thread_id[:8]}... in {cwd}")
+    proc = None
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, env=env)
-        return result.returncode, cmd
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        events_path = Path(output_file).with_name(
+            Path(output_file).name.replace(".out.md", ".events.jsonl")
+        )
+        with events_path.open("a") as events_file:
+            stdout = proc.stdout
+            if stdout is not None:
+                for line in stdout:
+                    raw_line = line.rstrip("\n")
+                    events_file.write(raw_line + "\n")
+                    events_file.flush()
+                    try:
+                        event = json.loads(raw_line)
+                        if on_event:
+                            on_event(event)
+                    except Exception:
+                        logger.debug("Failed to process Codex event", exc_info=True)
+            proc.wait()
+        return proc.returncode, cmd
     except FileNotFoundError:
         logger.error("codex command not found")
         return 127, cmd
     except KeyboardInterrupt:
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:
+            logger.debug("Failed to clean up codex process after interrupt", exc_info=True)
         return 130, cmd
 
 

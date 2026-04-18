@@ -435,6 +435,22 @@ def set_lode_status(socket_path: Path, lode_id: str, status: str, timeout: float
     return _fire_and_forget(socket_path, msg, timeout)
 
 
+def set_lode_progress(socket_path: Path, lode_id: str, summary: str, timeout: float = 1.0) -> bool:
+    """Set a lode's best-effort progress heartbeat."""
+    try:
+        if not socket_path.exists():
+            return False
+    except Exception:
+        return False
+    msg = {
+        "type": "lode_set_progress",
+        "lode_id": lode_id,
+        "summary": summary,
+        "ts": current_time_ms(),
+    }
+    return _fire_and_forget(socket_path, msg, timeout)
+
+
 def set_lode_title(socket_path: Path, lode_id: str, title: str, timeout: float = 2.0) -> bool:
     """Set a lode's title only (fire-and-forget).
 

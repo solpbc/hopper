@@ -554,6 +554,38 @@ def test_server_handles_lode_set_state(socket_path, server, temp_config, make_lo
     client.close()
 
 
+def test_server_handles_lode_set_progress(socket_path, server, temp_config, make_lode):
+    """Server stores truncated progress heartbeats and broadcasts lode_updated."""
+    lode = make_lode(id="test-id")
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    summary = "x" * 200
+    msg = {"type": "lode_set_progress", "lode_id": "test-id", "summary": summary}
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["type"] == "lode_updated"
+    assert response["lode"]["id"] == "test-id"
+    assert response["lode"]["last_progress_summary"] == "x" * 120
+    assert response["lode"]["last_progress_at"] is not None
+    assert server.lodes[0]["last_progress_summary"] == "x" * 120
+    assert server.lodes[0]["last_progress_at"] is not None
+
+    client.close()
+
+
 def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_title message."""
     lode = make_lode(id="test-id")

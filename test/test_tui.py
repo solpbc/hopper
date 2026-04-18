@@ -78,6 +78,22 @@ def test_lode_to_row_running():
     assert row.stage == "mill"
 
 
+def test_lode_to_row_uses_progress_summary_when_active():
+    """Active lodes prefer last_progress_summary for the status text."""
+    session = {
+        "id": "abcd1234",
+        "stage": "refine",
+        "created_at": 1000,
+        "updated_at": 1000,
+        "state": "running",
+        "status": "Working",
+        "last_progress_summary": "codex thinking",
+        "active": True,
+    }
+    row = lode_to_row(session)
+    assert row.status_text == "codex thinking"
+
+
 def test_lode_to_row_stuck():
     """Stuck session has stuck status indicator."""
     session = {

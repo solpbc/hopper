@@ -18,6 +18,8 @@ Lodes are plain dicts with these fields:
 - tmux_pane: str | None - tmux pane ID (default None)
 - pid: int | None - process ID of active runner (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
+- last_progress_at: int | None - timestamp of most recent progress heartbeat
+- last_progress_summary: str - short progress summary for UI display
 - backlog: dict | None - original backlog item data if promoted (default None)
 - archived_at: int | None - milliseconds since epoch when archived
   (default None, set by archive_lode)
@@ -343,6 +345,8 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "tmux_pane": None,
         "pid": None,
         "codex_thread_id": None,
+        "last_progress_at": None,
+        "last_progress_summary": "",
         "backlog": None,
         "runs": {},
         "claude": _make_claude_sessions(),

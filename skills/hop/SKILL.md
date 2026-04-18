@@ -159,6 +159,10 @@ you where to look. Capture the pane to see what's happening:
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
 
+For Codex refine runs, recent JSON heartbeat progress can keep a lode in
+`running` even if the tmux pane text has not changed yet. Pane-diff remains the
+primary stuck signal for the senior Claude-driven mill/refine/ship runners.
+
 If the action is safe (e.g. a routine permission prompt, a test confirmation),
 use send-keys to unblock it:
 

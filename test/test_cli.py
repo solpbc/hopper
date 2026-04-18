@@ -3448,3 +3448,11 @@ def test_format_lode_detail_pane_none(make_lode):
     lode = make_lode(active=True, tmux_pane=None)
     output = format_lode_detail(lode)
     assert "pane:" not in output
+
+
+def test_format_lode_detail_progress_line(make_lode):
+    """Detailed output shows progress when a progress summary is present."""
+    lode = make_lode(status="Working", last_progress_summary="codex thinking")
+    output = format_lode_detail(lode)
+    assert "  status:   Working" in output
+    assert "  progress: codex thinking" in output

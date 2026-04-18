@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 ERROR_LINES = 5  # Number of stderr lines to capture on error
 MONITOR_INTERVAL = 5.0  # Seconds between activity checks
 MONITOR_INTERVAL_MS = int(MONITOR_INTERVAL * 1000)
+PROGRESS_STALENESS_MS = 2 * MONITOR_INTERVAL_MS
 
 
 def extract_error_message(stderr_bytes: bytes) -> str | None:
@@ -383,6 +384,22 @@ class BaseRunner:
             return
 
         if snapshot == self._last_snapshot:
+            try:
+                response = connect(self.socket_path, lode_id=self.lode_id)
+                lode = response.get("lode") if response else None
+                last_progress_at = lode.get("last_progress_at") if lode else None
+                if (
+                    isinstance(last_progress_at, int)
+                    and current_time_ms() - last_progress_at <= PROGRESS_STALENESS_MS
+                ):
+                    if self._stuck_since is not None:
+                        self._emit_state(
+                            "running", lode.get("last_progress_summary", "Claude running")
+                        )
+                    self._stuck_since = None
+                    return
+            except Exception:
+                logger.debug("Failed to load lode progress heartbeat", exc_info=True)
             now = current_time_ms()
             if self._stuck_since is None:
                 self._stuck_since = now - MONITOR_INTERVAL_MS

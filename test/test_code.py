@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from hopper.code import _next_version, run_code
+from hopper.code import _next_version, _summarize_event, run_code
 
 MOCK_CMD = [
     "codex",
@@ -120,13 +120,19 @@ class TestRunCode:
         monkeypatch.chdir(worktree)
 
         state_calls = []
+        progress = MagicMock(return_value=True)
 
         def mock_set_state(sock, sid, state, status):
             state_calls.append((state, status))
             return True
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id):
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
             assert thread_id == THREAD_ID
+            if on_event:
+                on_event({"type": "thread.started"})
+                on_event(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "hello"}}
+                )
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -139,6 +145,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=mock_project),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", side_effect=mock_set_state),
+            patch("hopper.code.set_lode_progress", progress),
             patch("hopper.code.run_codex", side_effect=mock_run_codex),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
@@ -167,6 +174,7 @@ class TestRunCode:
         assert meta["cmd"] == MOCK_CMD
         assert meta["duration_ms"] >= 0
         assert meta["started_at"] <= meta["finished_at"]
+        assert progress.called
 
     def test_restores_state_on_failure(self, tmp_path, monkeypatch):
         """Restores state and writes metadata even when codex fails."""
@@ -250,7 +258,7 @@ class TestRunCode:
 
         input_existed = []
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id):
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
             # Check that input was already written when codex starts
             input_existed.append((session_dir / "audit.in.md").exists())
             return 0, MOCK_CMD
@@ -275,7 +283,7 @@ class TestRunCode:
         worktree.mkdir(parents=True)
         monkeypatch.chdir(worktree)
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id):
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -305,7 +313,7 @@ class TestRunCode:
         original_content = "existing output\n"
         (session_dir / "audit.out.md").write_text(original_content)
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id):
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -335,7 +343,7 @@ class TestRunCode:
         (session_dir / "audit.out.md").write_text("existing output\n")
         (session_dir / "audit_1.out.md").write_text("existing output 1\n")
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id):
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -370,3 +378,43 @@ class TestNextVersion:
         (tmp_path / "audit.out.md").write_text("existing output\n")
         (tmp_path / "audit_1.out.md").write_text("existing output 1\n")
         assert _next_version(tmp_path, "audit") == 2
+
+
+class TestSummarizeEvent:
+    def test_turn_completed_missing_usage(self):
+        assert _summarize_event({"type": "turn.completed"}) == "codex turn done"
+
+    def test_turn_completed_with_output_tokens(self):
+        assert (
+            _summarize_event({"type": "turn.completed", "usage": {"output_tokens": 123}})
+            == "codex turn done (123 tok)"
+        )
+
+    def test_tool_item_with_tool_name(self):
+        assert (
+            _summarize_event(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "tool_use", "tool_name": "shell"},
+                }
+            )
+            == "codex: shell"
+        )
+
+    def test_tool_item_without_tool_name(self):
+        assert (
+            _summarize_event({"type": "item.completed", "item": {"type": "tool_use"}})
+            == "codex: tool_use"
+        )
+
+    def test_item_completed_with_other_type(self):
+        assert (
+            _summarize_event({"type": "item.completed", "item": {"type": "something_else"}})
+            == "codex: item.completed"
+        )
+
+    def test_unknown_event_type(self):
+        assert _summarize_event({"type": "custom.event"}) == "codex: custom.event"
+
+    def test_non_dict_input(self):
+        assert _summarize_event("not a dict") == ""
