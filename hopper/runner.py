@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 ERROR_LINES = 5  # Number of stderr lines to capture on error
 MONITOR_INTERVAL = 5.0  # Seconds between activity checks
-MONITOR_INTERVAL_MS = int(MONITOR_INTERVAL * 1000)
-PROGRESS_STALENESS_MS = 2 * MONITOR_INTERVAL_MS
+MONITOR_INTERVAL_MS = 5000
+IDLE_THRESHOLD_MS = 50_000
 
 
 def extract_error_message(stderr_bytes: bytes) -> str | None:
@@ -77,6 +77,7 @@ class BaseRunner:
         self._monitor_stop = threading.Event()
         self._last_snapshot: str | None = None
         self._stuck_since: int | None = None
+        self._last_pane_activity_ms: int | None = None
         self._pane_id: str | None = None
         # Completion tracking
         self._done = threading.Event()
@@ -349,6 +350,7 @@ class BaseRunner:
             return
 
         rename_window(self._pane_id, self.lode_id)
+        self._last_pane_activity_ms = current_time_ms()
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop, name="activity-monitor", daemon=True
@@ -383,30 +385,31 @@ class BaseRunner:
             self._monitor_stop.set()
             return
 
-        if snapshot == self._last_snapshot:
-            try:
-                response = connect(self.socket_path, lode_id=self.lode_id)
-                lode = response.get("lode") if response else None
-                last_progress_at = lode.get("last_progress_at") if lode else None
-                if (
-                    isinstance(last_progress_at, int)
-                    and current_time_ms() - last_progress_at <= PROGRESS_STALENESS_MS
-                ):
-                    if self._stuck_since is not None:
-                        self._emit_state(
-                            "running", lode.get("last_progress_summary", "Claude running")
-                        )
-                    self._stuck_since = None
-                    return
-            except Exception:
-                logger.debug("Failed to load lode progress heartbeat", exc_info=True)
-            now = current_time_ms()
+        now = current_time_ms()
+        if snapshot != self._last_snapshot:
+            self._last_snapshot = snapshot
+            self._last_pane_activity_ms = now
+
+        response = connect(self.socket_path, lode_id=self.lode_id)
+        lode = response.get("lode") if response else None
+        last_progress_at = lode.get("last_progress_at") if lode else None
+        last_progress_summary = lode.get("last_progress_summary") if lode else None
+
+        pane_activity = self._last_pane_activity_ms or 0
+        heartbeat = last_progress_at or 0
+        last_activity = max(pane_activity, heartbeat)
+
+        if now - last_activity > IDLE_THRESHOLD_MS:
             if self._stuck_since is None:
-                self._stuck_since = now - MONITOR_INTERVAL_MS
-            duration_sec = (now - self._stuck_since) // 1000
+                self._stuck_since = now
+            duration_sec = (now - last_activity) // 1000
             self._emit_state("stuck", f"No output for {duration_sec}s")
         else:
             if self._stuck_since is not None:
-                self._emit_state("running", "Claude running")
+                status = (
+                    last_progress_summary
+                    if heartbeat > pane_activity and last_progress_summary
+                    else "Claude running"
+                )
+                self._emit_state("running", status)
             self._stuck_since = None
-            self._last_snapshot = snapshot

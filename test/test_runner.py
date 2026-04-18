@@ -69,8 +69,12 @@ class TestBaseRunnerActivityMonitor:
         runner.connection = mock_conn
 
         runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = current_time_ms() - 60_000
 
-        with patch("hopper.runner.capture_pane", return_value="Hello World"):
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch("hopper.runner.connect", return_value=None),
+        ):
             runner._check_activity()
 
         assert runner._stuck_since is not None
@@ -78,7 +82,8 @@ class TestBaseRunnerActivityMonitor:
             e for e in emitted if e[0] == "lode_set_state" and e[1]["state"] == "stuck"
         ]
         assert len(stuck_emissions) == 1
-        assert "5s" in stuck_emissions[0][1]["status"]
+        assert "No output for " in stuck_emissions[0][1]["status"]
+        assert "s" in stuck_emissions[0][1]["status"]
 
     def test_check_activity_detects_running(self):
         """Monitor detects running state when pane content changes."""
@@ -92,7 +97,10 @@ class TestBaseRunnerActivityMonitor:
 
         runner._last_snapshot = "Hello World"
 
-        with patch("hopper.runner.capture_pane", return_value="Hello World 2"):
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World 2"),
+            patch("hopper.runner.connect", return_value=None),
+        ):
             runner._check_activity()
 
         assert runner._stuck_since is None
@@ -112,7 +120,10 @@ class TestBaseRunnerActivityMonitor:
         runner._last_snapshot = "Hello World"
         runner._stuck_since = 1000
 
-        with patch("hopper.runner.capture_pane", return_value="New content"):
+        with (
+            patch("hopper.runner.capture_pane", return_value="New content"),
+            patch("hopper.runner.connect", return_value=None),
+        ):
             runner._check_activity()
 
         assert runner._stuck_since is None
@@ -129,6 +140,7 @@ class TestBaseRunnerActivityMonitor:
         runner._pane_id = "%1"
         runner._last_snapshot = "Hello World"
         runner._stuck_since = 1000
+        runner._last_pane_activity_ms = current_time_ms() - 60_000
 
         emitted = []
         mock_conn = MagicMock()
@@ -159,10 +171,11 @@ class TestBaseRunnerActivityMonitor:
 
     def test_stuck_when_heartbeat_stale_or_missing(self):
         """Stale or missing progress heartbeats fall back to normal stuck detection."""
-        for last_progress_at in (current_time_ms() - 20000, None):
+        for last_progress_at in (current_time_ms() - 60_000, None):
             runner = self._make_runner()
             runner._pane_id = "%1"
             runner._last_snapshot = "Hello World"
+            runner._last_pane_activity_ms = current_time_ms() - 60_000
 
             emitted = []
             mock_conn = MagicMock()
@@ -186,13 +199,182 @@ class TestBaseRunnerActivityMonitor:
             assert runner._stuck_since is not None
             assert any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
 
+    def test_claude_only_stuck_after_threshold(self, monkeypatch):
+        """Unchanged pane without heartbeats only becomes stuck after the idle threshold."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = current_time_ms()
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
+            ),
+        ):
+            runner._check_activity()
+            assert runner._stuck_since is None
+            assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
+            runner._last_pane_activity_ms = current_time_ms() - 1200
+            runner._check_activity()
+
+        assert runner._stuck_since is not None
+        stuck_emissions = [
+            e for e in emitted if e[0] == "lode_set_state" and e[1]["state"] == "stuck"
+        ]
+        assert len(stuck_emissions) == 1
+        assert stuck_emissions[0][1]["status"].startswith("No output for ")
+        assert stuck_emissions[0][1]["status"].endswith("s")
+
+    def test_codex_only_running_never_stuck(self, monkeypatch):
+        """Fresh progress heartbeats keep an unchanged pane running across ticks."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = current_time_ms() - 1200
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                side_effect=lambda *args, **kwargs: {
+                    "lode": {
+                        "last_progress_at": current_time_ms() - 10,
+                        "last_progress_summary": "codex thinking",
+                    }
+                },
+            ),
+        ):
+            runner._check_activity()
+            runner._check_activity()
+            runner._check_activity()
+
+        assert runner._stuck_since is None
+        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
+        running_emissions = [
+            e for e in emitted if e[0] == "lode_set_state" and e[1]["state"] == "running"
+        ]
+        assert not running_emissions or all(
+            emission[1]["status"] == "codex thinking" for emission in running_emissions
+        )
+
+    def test_parent_claude_idle_with_fresh_codex(self):
+        """Fresh heartbeats keep the runner active even when the pane is older than 10 seconds."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = current_time_ms() - 30_000
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={
+                    "lode": {
+                        "last_progress_at": current_time_ms() - 3000,
+                        "last_progress_summary": "codex thinking",
+                    }
+                },
+            ),
+        ):
+            runner._check_activity()
+
+        assert runner._stuck_since is None
+        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
+
+    def test_clean_handoff_from_codex_to_claude(self):
+        """Pane activity cleanly takes over from stale heartbeats."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Old content"
+        runner._last_pane_activity_ms = current_time_ms() - 10
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="New content"),
+            patch(
+                "hopper.runner.connect",
+                return_value={
+                    "lode": {
+                        "last_progress_at": current_time_ms() - 60_000,
+                        "last_progress_summary": "codex thinking",
+                    }
+                },
+            ),
+        ):
+            runner._check_activity()
+
+        assert runner._stuck_since is None
+        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
+        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "running" for e in emitted)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Old content"
+        runner._stuck_since = 1000
+        runner._last_pane_activity_ms = current_time_ms() - 60_000
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="New content"),
+            patch(
+                "hopper.runner.connect",
+                return_value={
+                    "lode": {
+                        "last_progress_at": current_time_ms() - 60_000,
+                        "last_progress_summary": "codex thinking",
+                    }
+                },
+            ),
+        ):
+            runner._check_activity()
+
+        assert runner._stuck_since is None
+        assert any(
+            e[0] == "lode_set_state"
+            and e[1]["state"] == "running"
+            and e[1]["status"] == "Claude running"
+            for e in emitted
+        )
+
     def test_check_activity_stops_on_capture_failure(self):
         """Monitor stops when pane capture fails."""
         runner = self._make_runner()
         runner._pane_id = "%1"
         runner._monitor_stop.clear()
 
-        with patch("hopper.runner.capture_pane", return_value=None):
+        with (
+            patch("hopper.runner.capture_pane", return_value=None),
+            patch("hopper.runner.connect", return_value=None),
+        ):
             runner._check_activity()
 
         assert runner._monitor_stop.is_set()
@@ -209,6 +391,7 @@ class TestBaseRunnerActivityMonitor:
             runner._stop_monitor()
 
         mock_rename.assert_called_once_with("%5", "test-session")
+        assert runner._last_pane_activity_ms is not None
 
     def test_start_monitor_skips_without_tmux(self):
         """Monitor doesn't start when not in tmux."""
@@ -236,7 +419,10 @@ class TestBaseRunnerActivityMonitor:
         mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
         runner.connection = mock_conn
 
-        with patch("hopper.runner.capture_pane", return_value="Hello World"):
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch("hopper.runner.connect", return_value=None),
+        ):
             runner._check_activity()
 
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
@@ -253,7 +439,10 @@ class TestBaseRunnerActivityMonitor:
         mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
         runner.connection = mock_conn
 
-        with patch("hopper.runner.capture_pane", return_value="Hello World"):
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch("hopper.runner.connect", return_value=None),
+        ):
             runner._check_activity()
 
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
