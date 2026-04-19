@@ -99,6 +99,12 @@ def _recv_messages_until(
     return messages
 
 
+def _decode_mock_response(conn: MagicMock) -> dict:
+    """Decode the last JSON response sent through a mocked socket."""
+    payload = conn.sendall.call_args.args[0].decode("utf-8").strip()
+    return json.loads(payload)
+
+
 def test_server_creates_socket(socket_path):
     """Server creates socket file on start."""
     srv = Server(socket_path)
@@ -1511,6 +1517,128 @@ def test_server_handles_lode_reset_claude_stage(socket_path, server, temp_config
     assert server.lodes[0]["claude"]["refine"]["started"] is False
 
     client.close()
+
+
+def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
+    """Alive pane feedback sends text plus Enter and resumes running state."""
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
+    conn = MagicMock()
+
+    with (
+        patch("hopper.server.capture_pane", return_value="prompt ready"),
+        patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
+    ):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Looks good"},
+            conn,
+        )
+
+    assert [call.args for call in mock_send_keys.call_args_list] == [
+        ("%1", "Looks good"),
+        ("%1", "Enter"),
+    ]
+    assert srv.lodes[0]["state"] == "running"
+    assert srv.lodes[0]["status"] == "Feedback sent"
+    broadcast = srv.broadcast_queue.get_nowait()
+    assert broadcast["type"] == "lode_updated"
+    response = _decode_mock_response(conn)
+    assert response["type"] == "feedback_sent"
+    assert response["lode_id"] == "test-id"
+    assert response["tmux_pane"] == "%1"
+
+
+def test_lode_send_feedback_dead_pane_respawns(socket_path, make_lode):
+    """Dead pane feedback respawns Claude and sends feedback to the new pane."""
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="gated",
+        project="proj",
+        tmux_pane="%dead",
+    )
+    srv.lodes = [lode]
+    conn = MagicMock()
+
+    def fake_spawn(_lode_id, _project_path, foreground=False):
+        assert foreground is False
+        lode["active"] = True
+        lode["tmux_pane"] = "%2"
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/fake/repo", name="proj"),
+        ),
+        patch("hopper.server.capture_pane", return_value=None),
+        patch("hopper.server.spawn_claude", side_effect=fake_spawn) as mock_spawn,
+        patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
+        patch("hopper.server.time.sleep"),
+    ):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Please revise"},
+            conn,
+        )
+
+    mock_spawn.assert_called_once_with("test-id", "/fake/repo", foreground=False)
+    assert [call.args for call in mock_send_keys.call_args_list] == [
+        ("%2", "Please revise"),
+        ("%2", "Enter"),
+    ]
+    response = _decode_mock_response(conn)
+    assert response["type"] == "feedback_sent"
+    assert response["tmux_pane"] == "%2"
+
+
+def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
+    """Respawn failure returns an error response without sending keys."""
+    srv = Server(socket_path)
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            stage="refine",
+            state="gated",
+            project="proj",
+            tmux_pane="%dead",
+        )
+    ]
+    conn = MagicMock()
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/fake/repo", name="proj"),
+        ),
+        patch("hopper.server.capture_pane", return_value=None),
+        patch("hopper.server.spawn_claude"),
+        patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
+        patch("hopper.server.time.sleep"),
+    ):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Please revise"},
+            conn,
+        )
+
+    mock_send_keys.assert_not_called()
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert response["error"] == "failed to respawn claude pane"
+
+
+def test_lode_send_feedback_missing_lode(socket_path):
+    """Missing lode feedback request returns an error response."""
+    srv = Server(socket_path)
+    conn = MagicMock()
+
+    srv._handle_mutation(
+        {"type": "lode_send_feedback", "lode_id": "missing", "text": "feedback"},
+        conn,
+    )
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert response["error"] == "lode missing not found"
 
 
 class TestActivityLog:

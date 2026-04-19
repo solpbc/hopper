@@ -427,25 +427,39 @@ class TestBaseRunnerActivityMonitor:
 
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
 
-    def test_check_activity_skips_when_gated(self):
-        """Monitor skips stuck detection when gated event is set."""
+    def test_check_activity_while_gated_emits_running_on_pane_change(self):
+        """Gated monitor emits running and clears gate when pane changes."""
         runner = self._make_runner()
         runner._pane_id = "%1"
         runner._last_snapshot = "Hello World"
-        runner._gated.set()
-
-        emitted = []
-        mock_conn = MagicMock()
-        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
-        runner.connection = mock_conn
 
         with (
-            patch("hopper.runner.capture_pane", return_value="Hello World"),
-            patch("hopper.runner.connect", return_value=None),
+            patch.object(runner._gated, "is_set", return_value=True),
+            patch.object(runner._gated, "clear") as mock_clear,
+            patch("hopper.runner.capture_pane", return_value="Hello World 2"),
+            patch("hopper.runner.current_time_ms", return_value=12345),
+            patch.object(runner, "_emit_state", return_value=True) as mock_emit,
         ):
             runner._check_activity()
 
-        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
+        mock_emit.assert_called_once_with("running", "Gate resumed")
+        mock_clear.assert_called_once_with()
+        assert runner._last_snapshot == "Hello World 2"
+        assert runner._last_pane_activity_ms == 12345
+
+    def test_check_activity_while_gated_dead_pane_sets_monitor_stop(self):
+        """Gated monitor stops if pane capture fails."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._monitor_stop.clear()
+
+        with (
+            patch.object(runner._gated, "is_set", return_value=True),
+            patch("hopper.runner.capture_pane", return_value=None),
+        ):
+            runner._check_activity()
+
+        assert runner._monitor_stop.is_set()
 
 
 class TestBaseRunnerServerMessages:
@@ -486,6 +500,20 @@ class TestBaseRunnerServerMessages:
         runner._on_server_message(msg)
 
         assert runner._gated.is_set()
+        assert not runner._done.is_set()
+
+    def test_on_server_message_running_clears_gated(self):
+        """Callback clears _gated when running state received."""
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._gated.set()
+
+        msg = {
+            "type": "lode_updated",
+            "lode": {"id": "test-session", "state": "running"},
+        }
+        runner._on_server_message(msg)
+
+        assert not runner._gated.is_set()
         assert not runner._done.is_set()
 
     def test_on_server_message_ignores_other_states(self):
@@ -542,29 +570,33 @@ class TestBaseRunnerDismiss:
 
         assert send_keys_calls == [("%1", "C-c"), ("%1", "C-c")]
 
-    def test_wait_and_dismiss_sends_ctrl_c_on_gated(self):
-        """Dismiss thread sends Ctrl-D when gated event is set."""
+    def test_wait_and_dismiss_no_longer_exits_on_gate(self):
+        """Dismiss loop still waits for completion even when gated."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
         runner._gated.set()
 
-        send_keys_calls = []
+        wait_calls = []
 
-        def on_send_keys(w, k):
-            send_keys_calls.append((w, k))
-            if len(send_keys_calls) == 2:
-                runner._monitor_stop.set()
-            return True
+        def on_wait(timeout):
+            wait_calls.append(timeout)
+            raise RuntimeError("waited")
 
-        snapshots = iter(["content A", "content A"])
-        with (
-            patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
-            patch("hopper.runner.send_keys", side_effect=on_send_keys),
-            patch("hopper.runner.MONITOR_INTERVAL", 0.01),
-        ):
-            runner._wait_and_dismiss_claude()
+        try:
+            with (
+                patch.object(runner._done, "wait", side_effect=on_wait),
+                patch("hopper.runner.capture_pane") as mock_capture,
+                patch("hopper.runner.send_keys") as mock_send_keys,
+            ):
+                runner._wait_and_dismiss_claude()
+        except RuntimeError as exc:
+            assert str(exc) == "waited"
+        else:
+            raise AssertionError("Expected wait to be called")
 
-        assert send_keys_calls == [("%1", "C-c"), ("%1", "C-c")]
+        assert wait_calls == [1.0]
+        mock_capture.assert_not_called()
+        mock_send_keys.assert_not_called()
 
     def test_wait_and_dismiss_retries_when_process_survives(self):
         """Dismiss retries Ctrl-D if process doesn't exit after first attempt."""

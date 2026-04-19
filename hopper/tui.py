@@ -1375,7 +1375,7 @@ class HopperApp(App):
             or (
                 not lode.get("active", False)
                 and lode.get("stage", "mill") != "shipped"
-                and lode.get("state", "new") not in ("new", "ready", "gated", "gate_reviewed")
+                and lode.get("state", "new") not in ("new", "ready", "gated")
             )
             for lode in self._lodes
         )
@@ -2091,29 +2091,14 @@ class HopperApp(App):
         self.push_screen(MillReviewScreen(initial_text=mill_text), on_review_result)
 
     def _review_gate(self, lode: dict) -> None:
-        """Open gate review doc for a gated lode. On dismiss, clear gate state."""
+        """Open gate review doc for a gated lode."""
         lode_dir = get_lode_dir(lode["id"])
         gate_path = lode_dir / "gate.md"
         if not gate_path.exists():
             self.notify("Gate review doc not found", severity="error")
             return
 
-        def on_dismiss(_result: None = None) -> None:
-            # Clear gated state so next enter spawns Claude to resume
-            if self.server:
-                self.server.enqueue(
-                    {
-                        "type": "lode_set_state",
-                        "lode_id": lode["id"],
-                        "state": "gate_reviewed",
-                        "status": "Gate reviewed",
-                    }
-                )
-
-        self.push_screen(
-            FileViewerScreen(lode_dir, lode["id"], initial_file="gate.md"),
-            on_dismiss,
-        )
+        self.push_screen(FileViewerScreen(lode_dir, lode["id"], initial_file="gate.md"))
 
     def _review_ship(self, lode: dict, project_path: str | None) -> None:
         """Open the ship review modal for a ship-ready lode."""

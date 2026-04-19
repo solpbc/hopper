@@ -15,6 +15,7 @@ from hopper.cli import (
     cmd_backlog,
     cmd_code,
     cmd_config,
+    cmd_feedback,
     cmd_gate,
     cmd_implement,
     cmd_list,
@@ -1364,6 +1365,47 @@ def test_lode_restart_missing_id(capsys):
     assert "required" in out
 
 
+def test_lode_restart_refuses_when_started(capsys):
+    """Restart requires --force once the stage Claude session has started."""
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "new",
+        "active": False,
+        "claude": {"mill": {"started": True}},
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.restart_lode") as mock_restart:
+                result = cmd_lode(["restart", "test1234"])
+    assert result == 1
+    mock_restart.assert_not_called()
+    assert (
+        capsys.readouterr().out == "Lode test1234 has been started (claude[mill].started=True).\n"
+        "Restarting discards in-progress work.\n"
+        "Pass --force to override:\n"
+        "  hop lode restart test1234 --force\n"
+    )
+
+
+def test_lode_restart_force_proceeds_when_started(capsys):
+    """Restart --force bypasses the started guard."""
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "new",
+        "active": False,
+        "claude": {"mill": {"started": True}},
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
+                result = cmd_lode(["restart", "test1234", "--force"])
+    assert result == 0
+    mock_restart.assert_called_once()
+    assert "Restarting mill for test1234" in capsys.readouterr().out
+
+
 def test_lode_log_happy(temp_config, capsys):
     log_file = temp_config / "activity.log"
     log_file.write_text(
@@ -1665,6 +1707,42 @@ def test_lode_watch_initial_state(capsys):
     assert "shipped" in lines[-1]  # final state
 
 
+def test_watch_prints_banner_on_gate_in_and_out(capsys):
+    """watch prints gate enter/exit banners without exiting early."""
+    lode = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "state": "gated", "status": "Gate"}}
+                )
+                callback(
+                    {
+                        "type": "lode_updated",
+                        "lode": {**lode, "state": "running", "status": "Resumed"},
+                    }
+                )
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "stage": "shipped", "status": "Done"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["watch", "abc123"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "Lode abc123 is gated. Review with: hop gate show abc123" in out
+    assert "Lode abc123 gate resumed." in out
+
+
 def test_lode_wait_shipped(capsys):
     """wait exits 0 and prints shipped status when lode reaches shipped stage."""
     lode = {
@@ -1844,6 +1922,31 @@ def test_lode_wait_error(capsys):
                 result = cmd_lode(["wait", "abc123"])
     assert result == 1
     assert "✗ abc123 error: Failed" in capsys.readouterr().out
+
+
+def test_wait_exits_2_on_gate_transition(capsys):
+    """wait exits 2 and prints the gate review banner when a lode gates."""
+    lode = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            mock_conn = MagicMock()
+
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {"type": "lode_updated", "lode": {**lode, "state": "gated", "status": "Gate"}}
+                )
+
+            mock_conn.start = fake_start
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 2
+    assert "Lode abc123 is gated. Review with: hop gate show abc123" in capsys.readouterr().out
 
 
 def test_lode_wait_error_state_at_start(capsys):
@@ -2725,6 +2828,61 @@ def test_gate_help(capsys):
     assert "usage: hop gate" in captured.out
 
 
+def test_gate_show_prints_verbatim_format(capsys):
+    """gate show prints the expected header, contents, and response hint."""
+    gate_data = {
+        "lode": {"id": "gate1234", "stage": "refine", "state": "gated"},
+        "gate": "# Design Review\nLooks good",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_gate", return_value=gate_data):
+            result = cmd_gate(["show", "gate1234"])
+    assert result == 0
+    assert (
+        capsys.readouterr().out == "Lode: gate1234\n"
+        "Stage: refine\n"
+        "State: gated\n\n"
+        "--- gate.md ---\n"
+        "# Design Review\n"
+        "Looks good\n"
+        "---\n\n"
+        'Respond with: hop gate feedback gate1234 "<your response>"\n'
+    )
+
+
+def test_gate_feedback_with_text_arg_calls_client(capsys):
+    """gate feedback sends inline feedback text to the client helper."""
+    response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+            result = cmd_gate(["feedback", "gate1234", "Needs work"])
+    assert result == 0
+    mock_send.assert_called_once()
+    assert mock_send.call_args.args[1:] == ("gate1234", "Needs work")
+    assert "Feedback sent to gate1234 (pane %9)" in capsys.readouterr().out
+
+
+def test_gate_feedback_reads_stdin_when_no_text_arg(capsys):
+    """gate feedback falls back to stdin when text is omitted."""
+    from io import StringIO
+
+    response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+            with patch("sys.stdin", StringIO("Needs more tests")):
+                result = cmd_gate(["feedback", "gate1234"])
+    assert result == 0
+    mock_send.assert_called_once()
+    assert mock_send.call_args.args[1:] == ("gate1234", "Needs more tests")
+
+
+def test_feedback_alias_dispatches_to_gate_feedback():
+    """feedback alias delegates directly to gate feedback handler."""
+    with patch("hopper.cli._cmd_gate_feedback", return_value=0) as mock_feedback:
+        assert cmd_feedback(["gate1234", "Looks good"]) == 0
+    mock_feedback.assert_called_once_with(["gate1234", "Looks good"])
+
+
 def test_gate_no_server(capsys):
     """gate returns error when server is not running."""
     with patch("hopper.client.ping", return_value=False):
@@ -3456,3 +3614,17 @@ def test_format_lode_detail_progress_line(make_lode):
     output = format_lode_detail(lode)
     assert "  status:   Working" in output
     assert "  progress: codex thinking" in output
+
+
+def test_format_lode_detail_appends_gate_hint_when_gated(make_lode):
+    """Detailed output includes the gate review hint for gated lodes."""
+    lode = make_lode(id="gate1234", state="gated")
+    output = format_lode_detail(lode)
+    assert "Gate blocked. Review with: hop gate show gate1234" in output
+
+
+def test_format_lode_detail_no_hint_when_not_gated(make_lode):
+    """Detailed output omits the gate review hint for non-gated lodes."""
+    lode = make_lode(id="gate1234", state="running")
+    output = format_lode_detail(lode)
+    assert "Gate blocked. Review with: hop gate show gate1234" not in output

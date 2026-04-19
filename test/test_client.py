@@ -6,14 +6,17 @@
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from hopper.client import (
     HopperConnection,
     connect,
+    get_gate,
     lode_exists,
     ping,
+    send_gate_feedback,
     send_message,
     set_lode_branch,
     set_lode_progress,
@@ -137,6 +140,50 @@ def test_send_message_connection_failure():
         {"type": "test"},
         timeout=0.5,
     )
+    assert result is None
+
+
+def test_send_gate_feedback_sends_message(socket_path):
+    """send_gate_feedback sends the expected request and returns the response."""
+    response = {"type": "feedback_sent", "lode_id": "test-id", "tmux_pane": "%1"}
+    with patch("hopper.client.send_message", return_value=response) as mock_send_message:
+        result = send_gate_feedback(socket_path, "test-id", "Looks good")
+
+    assert result == response
+    mock_send_message.assert_called_once_with(
+        socket_path,
+        {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Looks good"},
+        timeout=15.0,
+        wait_for_response=True,
+    )
+
+
+def test_get_gate_returns_lode_and_doc(socket_path, temp_config):
+    """get_gate returns the lode plus the current gate.md text."""
+    from hopper.lodes import get_lode_dir
+
+    lode = {"id": "test-id", "stage": "refine", "state": "gated"}
+    gate_path = get_lode_dir("test-id") / "gate.md"
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    gate_path.write_text("# Gate\n\nLooks good.")
+
+    with patch(
+        "hopper.client.connect",
+        return_value={"type": "connected", "lode_found": True, "lode": lode},
+    ):
+        result = get_gate(socket_path, "test-id")
+
+    assert result == {"lode": lode, "gate": "# Gate\n\nLooks good."}
+
+
+def test_get_gate_missing_lode_returns_none(socket_path):
+    """get_gate returns None when the lode lookup fails."""
+    with patch(
+        "hopper.client.connect",
+        return_value={"type": "connected", "lode_found": False, "lode": None},
+    ):
+        result = get_gate(socket_path, "missing")
+
     assert result is None
 
 

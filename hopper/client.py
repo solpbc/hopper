@@ -357,6 +357,35 @@ def create_lode(
     return None
 
 
+def send_gate_feedback(
+    socket_path: Path, lode_id: str, text: str, timeout: float = 15.0
+) -> dict | None:
+    """Send feedback to a gated lode's pane. Returns the server response dict."""
+    return send_message(
+        socket_path,
+        {"type": "lode_send_feedback", "lode_id": lode_id, "text": text},
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
+def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
+    """Look up a lode and read its gate.md. Returns None if the lode doesn't exist."""
+    from hopper.lodes import get_lode_dir
+
+    response = connect(socket_path, lode_id=lode_id, timeout=timeout)
+    if response is None or not response.get("lode_found"):
+        return None
+
+    lode = response.get("lode")
+    if not lode:
+        return None
+
+    gate_path = get_lode_dir(lode_id) / "gate.md"
+    gate_text = gate_path.read_text() if gate_path.exists() else ""
+    return {"lode": lode, "gate": gate_text}
+
+
 def restart_lode(socket_path: Path, lode_id: str, stage: str, timeout: float = 2.0) -> bool:
     """Restart a lode's current stage session. Fire-and-forget."""
     return _fire_and_forget(

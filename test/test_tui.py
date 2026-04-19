@@ -1060,11 +1060,6 @@ def test_gated_lode_does_not_trigger_jam():
     app._update_window_title()
     assert app._window_title == "hopper"
 
-    app = HopperApp()
-    app._lodes = [{"active": False, "stage": "refine", "state": "gate_reviewed"}]
-    app._update_window_title()
-    assert app._window_title == "hopper"
-
 
 def test_stuck_state_triggers_jam():
     """Lodes in stuck state should trigger hopJAM."""
@@ -3100,24 +3095,23 @@ async def test_enter_on_gated_opens_file_viewer(temp_config):
         assert app.screen._initial_file == "gate.md"
 
 
-@pytest.mark.asyncio
-async def test_enter_on_gate_reviewed_spawns_claude(monkeypatch, temp_config):
-    """Enter on gate_reviewed lode spawns Claude to resume."""
-    spawned = []
-    monkeypatch.setattr("hopper.tui.spawn_claude", lambda *a, **kw: spawned.append(a) or True)
+def test_review_gate_on_dismiss_noop(temp_config):
+    """Reviewing a gate should not enqueue any state mutation on dismiss."""
+    from hopper.lodes import get_lode_dir
 
-    lode = {
-        "id": "gate1234",
-        "stage": "refine",
-        "state": "gate_reviewed",
-        "created_at": 1000,
-    }
+    lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
+    lode_dir = get_lode_dir(lode["id"])
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
+
     server = MockServer([lode])
     app = HopperApp(server=server)
-    async with app.run_test() as pilot:
-        await pilot.press("enter")
-        assert len(spawned) == 1
-        assert spawned[0][0] == "gate1234"
+    with patch.object(app, "push_screen") as mock_push:
+        app._review_gate(lode)
+
+    assert server.events == []
+    assert len(mock_push.call_args.args) == 1
+    assert isinstance(mock_push.call_args.args[0], FileViewerScreen)
 
 
 @pytest.mark.asyncio

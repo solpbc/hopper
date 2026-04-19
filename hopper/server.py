@@ -51,6 +51,7 @@ from hopper.lodes import (
 )
 from hopper.process import STAGES
 from hopper.projects import Project, find_project, get_active_projects
+from hopper.tmux import capture_pane, send_keys
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +609,64 @@ class Server:
                     proj = find_project(lode.get("project", ""))
                     project_path = proj.path if proj else None
                     spawn_claude(lode_id, project_path, foreground=False)
+
+        elif msg_type == "lode_send_feedback":
+            lode_id = message.get("lode_id")
+            text = message.get("text", "")
+            if not lode_id:
+                if conn:
+                    self._send_response(conn, {"type": "error", "error": "missing lode_id"})
+                return
+
+            lode = self._find_lode(lode_id)
+            if not lode:
+                if conn:
+                    self._send_response(
+                        conn, {"type": "error", "error": f"lode {lode_id} not found"}
+                    )
+                return
+
+            pane_id = lode.get("tmux_pane")
+            pane_alive = bool(pane_id and capture_pane(pane_id) is not None)
+            if not pane_alive:
+                project = find_project(lode.get("project", ""))
+                if not project:
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": f"project {lode.get('project', '')} not found",
+                            },
+                        )
+                    return
+
+                spawn_claude(lode_id, project.path, foreground=False)
+                pane_id = None
+                for _ in range(10):
+                    time.sleep(1)
+                    fresh = self._find_lode(lode_id)
+                    if fresh and fresh.get("active") and fresh.get("tmux_pane"):
+                        pane_id = fresh["tmux_pane"]
+                        break
+                if not pane_id:
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {"type": "error", "error": "failed to respawn claude pane"},
+                        )
+                    return
+
+            send_keys(pane_id, text)
+            send_keys(pane_id, "Enter")
+            updated = update_lode_state(self.lodes, lode_id, "running", "Feedback sent")
+            if updated:
+                self.broadcast({"type": "lode_updated", "lode": updated})
+            if conn:
+                self._send_response(
+                    conn,
+                    {"type": "feedback_sent", "lode_id": lode_id, "tmux_pane": pane_id},
+                )
 
         elif msg_type == "lode_promote_backlog":
             # Compound: create lode from backlog item, remove backlog item

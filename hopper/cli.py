@@ -665,9 +665,88 @@ def cmd_processed(args: list[str]) -> int:
     return 0
 
 
+def _cmd_gate_show(args: list[str]) -> int:
+    """Show a lode's gate.md review doc."""
+    import hopper.client as client
+
+    parser = make_parser("gate show", "Show gate review details")
+    parser.add_argument("lode_id", help="Lode ID to show")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+
+    gate_data = client.get_gate(_socket(), parsed.lode_id)
+    if not gate_data:
+        print(f"Error: lode {parsed.lode_id} not found")
+        return 1
+
+    lode = gate_data["lode"]
+    gate_text = gate_data.get("gate", "").rstrip("\n")
+    print(
+        f"Lode: {lode.get('id', '')}\n"
+        f"Stage: {lode.get('stage', '')}\n"
+        f"State: {lode.get('state', '')}\n\n"
+        f"--- gate.md ---\n{gate_text}\n---\n\n"
+        f'Respond with: hop gate feedback {lode.get("id", "")} "<your response>"'
+    )
+    return 0
+
+
+def _cmd_gate_feedback(args: list[str]) -> int:
+    """Send feedback to a gated lode."""
+    import hopper.client as client
+
+    parser = make_parser(
+        "gate feedback",
+        'Send feedback to a gated lode. Usage: hop gate feedback <lode_id> "<your response>"',
+    )
+    parser.add_argument("lode_id", help="Lode ID to send feedback to")
+    parser.add_argument("text", nargs="?", help="Feedback text")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+
+    text = parsed.text if parsed.text is not None else sys.stdin.read()
+    if not text.strip():
+        print("Error: no feedback provided")
+        return 1
+
+    response = client.send_gate_feedback(_socket(), parsed.lode_id, text)
+    if response and response.get("type") == "feedback_sent":
+        print(f"Feedback sent to {parsed.lode_id} (pane {response.get('tmux_pane', '')})")
+        return 0
+
+    error = (
+        response.get("error", "failed to send feedback") if response else "failed to send feedback"
+    )
+    print(f"Error: {error}")
+    return 1
+
+
 @command("gate", "Pause lode at a review gate", group="lode")
 def cmd_gate(args: list[str]) -> int:
     """Save gate review doc and pause lode for user review."""
+    if args and args[0] == "show":
+        return _cmd_gate_show(args[1:])
+    if args and args[0] == "feedback":
+        return _cmd_gate_feedback(args[1:])
+
     from hopper.client import get_lode, set_lode_state
     from hopper.lodes import get_lode_dir
 
@@ -1018,6 +1097,9 @@ def format_lode_detail(lode: dict) -> str:
     lines.append(f"  active:   {'yes' if lode.get('active') else 'no'}")
     if lode.get("active") and lode.get("tmux_pane"):
         lines.append(f"  pane:     {lode['tmux_pane']}")
+    if lode.get("state") == "gated":
+        lines.append("")
+        lines.append(f"Gate blocked. Review with: hop gate show {lode.get('id', '')}")
     return "\n".join(lines)
 
 
@@ -1102,6 +1184,12 @@ def cmd_lode(args: list[str]) -> int:
 
     restart_p = subs.add_parser("restart", help="Restart an inactive lode", exit_on_error=False)
     restart_p.add_argument("lode_id", help="Lode ID to restart")
+    restart_p.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Restart even if Claude has already started for this stage",
+    )
 
     watch_p = subs.add_parser("watch", help="Watch lode status events", exit_on_error=False)
     watch_p.add_argument("lode_id", help="Lode ID to watch")
@@ -1227,6 +1315,13 @@ def cmd_lode(args: list[str]) -> int:
         if stage not in ("mill", "refine", "ship"):
             print(f"Cannot restart: lode {lode_id} stage is {stage}")
             return 1
+        started = bool(lode.get("claude", {}).get(stage, {}).get("started"))
+        if started and not parsed.force:
+            print(f"Lode {lode_id} has been started (claude[{stage}].started=True).")
+            print("Restarting discards in-progress work.")
+            print("Pass --force to override:")
+            print(f"  hop lode restart {lode_id} --force")
+            return 1
         client.restart_lode(socket_path, lode_id, stage)
         print(f"Restarting {stage} for {lode_id}")
         return 0
@@ -1253,15 +1348,25 @@ def cmd_lode(args: list[str]) -> int:
 
         done = threading.Event()
         result = [0]
+        prior_states: dict[str, str] = {lode_id: lode.get("state")}
 
         def on_message(message: dict) -> None:
             msg_type = message.get("type")
             if msg_type not in ("lode_updated", "lode_archived"):
                 return
             msg_lode = message.get("lode", {})
-            if msg_lode.get("id") != lode_id:
+            msg_lode_id = msg_lode.get("id")
+            if msg_lode_id != lode_id:
                 return
             print(format_watch_line(msg_lode))
+            old_state = prior_states.get(msg_lode_id)
+            new_state = msg_lode.get("state")
+            if old_state != new_state:
+                if new_state == "gated":
+                    print(f"Lode {msg_lode_id} is gated. Review with: hop gate show {msg_lode_id}")
+                elif old_state == "gated":
+                    print(f"Lode {msg_lode_id} gate resumed.")
+                prior_states[msg_lode_id] = new_state
             if msg_type == "lode_archived":
                 done.set()
             elif msg_lode.get("state") == "error":
@@ -1358,6 +1463,10 @@ def cmd_lode(args: list[str]) -> int:
             if msg_lode.get("state") == "error":
                 print(_error_line(lid, msg_lode.get("status", "")))
                 result[0] = 1
+                done.set()
+            elif msg_lode.get("state") == "gated":
+                print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
+                result[0] = 2
                 done.set()
             elif msg_lode.get("stage") == "shipped" or msg_type == "lode_archived":
                 pending.discard(lid)
@@ -1480,6 +1589,20 @@ def cmd_submit(args: list[str]) -> int:
     return cmd_lode(["create"] + args)
 
 
+@command("feedback", "Send feedback to a gated lode (alias for gate feedback)", group="aliases")
+def cmd_feedback(args: list[str]) -> int:
+    """Alias for hop gate feedback."""
+    if "-h" in args or "--help" in args:
+        p = make_parser("feedback", "Send feedback to a gated lode (alias for gate feedback)")
+        p.add_argument("lode_id", help="Lode ID to send feedback to")
+        p.add_argument("text", nargs="?", help="Feedback text")
+        try:
+            parse_args(p, args)
+        except SystemExit:
+            return 0
+    return _cmd_gate_feedback(args)
+
+
 @command("list", "List lodes (alias for lode list)", group="aliases")
 def cmd_list(args: list[str]) -> int:
     """Alias for hop lode list."""
@@ -1552,6 +1675,12 @@ def cmd_restart(args: list[str]) -> int:
     if "-h" in args or "--help" in args:
         p = make_parser("restart", "Restart an inactive lode (alias for lode restart)")
         p.add_argument("lode_id", help="Lode ID to restart")
+        p.add_argument(
+            "-f",
+            "--force",
+            action="store_true",
+            help="Restart even if Claude has already started for this stage",
+        )
         try:
             parse_args(p, args)
         except SystemExit:

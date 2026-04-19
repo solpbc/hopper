@@ -307,6 +307,8 @@ class BaseRunner:
         elif lode.get("state") == "gated":
             self._gated.set()
             logger.debug(f"gate signal received lode={self.lode_id}")
+        elif lode.get("state") == "running":
+            self._gated.clear()
 
     def _wait_and_dismiss_claude(self) -> None:
         """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude.
@@ -314,7 +316,7 @@ class BaseRunner:
         Retries if Claude doesn't exit after the first Ctrl-D (e.g. if it was
         sent during output rather than at the interactive prompt).
         """
-        while not self._done.is_set() and not self._gated.is_set():
+        while not self._done.is_set():
             self._done.wait(timeout=1.0)
             if self._monitor_stop.is_set():
                 return
@@ -375,8 +377,20 @@ class BaseRunner:
         if not self._pane_id:
             return
 
-        # Skip stuck detection once done or gated — dismiss thread handles exit
-        if self._done.is_set() or self._gated.is_set():
+        if self._done.is_set():
+            return
+
+        if self._gated.is_set():
+            snapshot = capture_pane(self._pane_id)
+            if snapshot is None:
+                logger.debug("Failed to capture pane, stopping monitor")
+                self._monitor_stop.set()
+                return
+            if snapshot != self._last_snapshot:
+                self._emit_state("running", "Gate resumed")
+                self._last_snapshot = snapshot
+                self._last_pane_activity_ms = current_time_ms()
+                self._gated.clear()
             return
 
         snapshot = capture_pane(self._pane_id)
