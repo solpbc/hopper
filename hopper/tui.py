@@ -52,7 +52,7 @@ from hopper.lodes import (
     read_diff_totals,
 )
 from hopper.projects import Project, find_project, touch_project
-from hopper.tmux import rename_window
+from hopper.tmux import capture_pane, rename_window
 
 # Claude Code-inspired theme
 # Colors derived from Claude Code's terminal UI (ANSI bright colors)
@@ -619,6 +619,103 @@ class ShipReviewScreen(ModalScreen[str | None]):
             self.dismiss("refine")
         elif event.button.id == "btn-ship":
             self.dismiss("ship")
+
+
+class GateReviewScreen(ModalScreen[str | None]):
+    """Modal: show gate.md and offer Switch (live pane) or Reopen (dead pane)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    CSS = """
+    GateReviewScreen {
+        align: center middle;
+        height: 100%;
+    }
+
+    #gate-container {
+        width: 80;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+
+    #gate-title {
+        text-align: center;
+        text-style: bold;
+        color: $text;
+        padding-bottom: 1;
+    }
+
+    #gate-content {
+        height: auto;
+        max-height: 20;
+        padding: 0 1;
+        overflow-y: auto;
+    }
+
+    #gate-buttons {
+        height: auto;
+        align: center middle;
+        padding-top: 1;
+    }
+
+    #gate-buttons Button {
+        margin: 0 1;
+    }
+
+    #gate-buttons Button:focus {
+        text-style: bold reverse;
+    }
+    """
+
+    def __init__(self, gate_text: str, pane_alive: bool) -> None:
+        super().__init__()
+        self._gate_text = gate_text
+        self._pane_alive = pane_alive
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gate-container"):
+            yield Static("Gate Review", id="gate-title")
+            yield Static(self._gate_text, id="gate-content")
+            with Horizontal(id="gate-buttons"):
+                yield Button("Cancel", id="btn-cancel", variant="default")
+                if self._pane_alive:
+                    yield Button("Switch to Session", id="btn-switch", variant="primary")
+                else:
+                    yield Button("Reopen Session", id="btn-reopen", variant="primary")
+
+    def on_mount(self) -> None:
+        if self._pane_alive:
+            self.query_one("#btn-switch").focus()
+        else:
+            self.query_one("#btn-reopen").focus()
+
+    def on_key(self, event: events.Key) -> None:
+        focused = self.focused
+        buttons = list(self.query("#gate-buttons Button"))
+        if event.key == "right" and focused in buttons:
+            event.prevent_default()
+            event.stop()
+            idx = buttons.index(focused)
+            buttons[(idx + 1) % len(buttons)].focus()
+        elif event.key == "left" and focused in buttons:
+            event.prevent_default()
+            event.stop()
+            idx = buttons.index(focused)
+            buttons[(idx - 1) % len(buttons)].focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+        elif event.button.id == "btn-switch":
+            self.dismiss("switch")
+        elif event.button.id == "btn-reopen":
+            self.dismiss("reopen")
 
 
 class ArchiveConfirmScreen(ModalScreen[bool | None]):
@@ -1924,7 +2021,7 @@ class HopperApp(App):
             # Mill complete, ready for refine - review before starting
             self._review_mill_output(lode, project_path)
         elif lode.get("state") == "gated":
-            # Lode paused at gate - show review doc, next enter resumes
+            # Lode paused at gate - show gate review modal
             self._review_gate(lode)
         elif lode.get("stage") == "ship" and lode.get("state") == "ready":
             # Refine complete, ready to ship - review changes before shipping
@@ -2091,14 +2188,30 @@ class HopperApp(App):
         self.push_screen(MillReviewScreen(initial_text=mill_text), on_review_result)
 
     def _review_gate(self, lode: dict) -> None:
-        """Open gate review doc for a gated lode."""
+        """Open gate review modal for a gated lode."""
         lode_dir = get_lode_dir(lode["id"])
         gate_path = lode_dir / "gate.md"
         if not gate_path.exists():
             self.notify("Gate review doc not found", severity="error")
             return
 
-        self.push_screen(FileViewerScreen(lode_dir, lode["id"], initial_file="gate.md"))
+        gate_text = gate_path.read_text()
+        pane_id = lode.get("tmux_pane")
+        pane_alive = bool(pane_id and capture_pane(pane_id) is not None)
+
+        def on_review_result(result: str | None) -> None:
+            if result is None:
+                return
+            if result == "switch":
+                if not switch_to_pane(pane_id):
+                    self.notify("Failed to switch to pane", severity="error")
+            elif result == "reopen":
+                project = find_project(lode.get("project", ""))
+                project_path = project.path if project else None
+                if not spawn_claude(lode["id"], project_path, foreground=True):
+                    self.notify("Failed to respawn Claude pane", severity="error")
+
+        self.push_screen(GateReviewScreen(gate_text, pane_alive), on_review_result)
 
     def _review_ship(self, lode: dict, project_path: str | None) -> None:
         """Open the ship review modal for a ship-ready lode."""

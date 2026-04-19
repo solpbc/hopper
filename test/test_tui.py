@@ -2746,6 +2746,27 @@ class ShipReviewTestApp(App):
         self.push_screen(ShipReviewScreen(diff_stat=self._diff_stat), capture_result)
 
 
+class GateReviewTestApp(App):
+    """Test app wrapper for GateReviewScreen."""
+
+    def __init__(self, gate_text: str = "", pane_alive: bool = True):
+        super().__init__()
+        self.review_result = "not_set"  # sentinel value
+        self._gate_text = gate_text
+        self._pane_alive = pane_alive
+
+    def on_mount(self) -> None:
+        from hopper.tui import GateReviewScreen
+
+        def capture_result(r):
+            self.review_result = r
+
+        self.push_screen(
+            GateReviewScreen(gate_text=self._gate_text, pane_alive=self._pane_alive),
+            capture_result,
+        )
+
+
 class ShippedReviewTestApp(App):
     """Test app wrapper for ShippedReviewScreen."""
 
@@ -3077,27 +3098,10 @@ async def test_file_viewer_initial_file(tmp_path):
         assert "Looks good" in str(code_view.content)
 
 
-@pytest.mark.asyncio
-async def test_enter_on_gated_opens_file_viewer(temp_config):
-    """Enter on a gated lode opens FileViewerScreen with gate.md."""
-    from hopper.lodes import get_lode_dir
-
-    lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
-    lode_dir = get_lode_dir(lode["id"])
-    lode_dir.mkdir(parents=True, exist_ok=True)
-    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
-
-    server = MockServer([lode])
-    app = HopperApp(server=server)
-    async with app.run_test() as pilot:
-        await pilot.press("enter")
-        assert isinstance(app.screen, FileViewerScreen)
-        assert app.screen._initial_file == "gate.md"
-
-
 def test_review_gate_on_dismiss_noop(temp_config):
     """Reviewing a gate should not enqueue any state mutation on dismiss."""
     from hopper.lodes import get_lode_dir
+    from hopper.tui import GateReviewScreen
 
     lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
     lode_dir = get_lode_dir(lode["id"])
@@ -3108,10 +3112,88 @@ def test_review_gate_on_dismiss_noop(temp_config):
     app = HopperApp(server=server)
     with patch.object(app, "push_screen") as mock_push:
         app._review_gate(lode)
+        callback = mock_push.call_args.args[1]
+        callback(None)
 
     assert server.events == []
-    assert len(mock_push.call_args.args) == 1
-    assert isinstance(mock_push.call_args.args[0], FileViewerScreen)
+    assert isinstance(mock_push.call_args.args[0], GateReviewScreen)
+
+
+@pytest.mark.asyncio
+async def test_gate_review_switch_button():
+    """GateReviewScreen should return switch when pane is alive."""
+    app = GateReviewTestApp(gate_text="# Design Review\nPlan summary", pane_alive=True)
+    async with app.run_test() as pilot:
+        assert app.screen.focused.id == "btn-switch"
+        await pilot.press("enter")
+        assert app.review_result == "switch"
+
+
+@pytest.mark.asyncio
+async def test_gate_review_reopen_when_pane_dead():
+    """GateReviewScreen should offer reopen when pane capture fails."""
+    app = GateReviewTestApp(gate_text="# Design Review\nPlan summary", pane_alive=False)
+    async with app.run_test() as pilot:
+        assert list(app.screen.query("#btn-switch")) == []
+        assert app.screen.focused.id == "btn-reopen"
+        await pilot.press("enter")
+        assert app.review_result == "reopen"
+
+
+@pytest.mark.asyncio
+async def test_gate_review_cancel_escape():
+    """GateReviewScreen should dismiss with None on escape or cancel."""
+    app = GateReviewTestApp(gate_text="# Design Review\nPlan summary", pane_alive=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        assert app.review_result is None
+
+    app = GateReviewTestApp(gate_text="# Design Review\nPlan summary", pane_alive=True)
+    async with app.run_test() as pilot:
+        await pilot.press("left")
+        await pilot.press("enter")
+        assert app.review_result is None
+
+
+@pytest.mark.asyncio
+async def test_enter_on_gated_opens_gate_review(monkeypatch, temp_config):
+    """Enter on a gated lode opens GateReviewScreen."""
+    from hopper.lodes import get_lode_dir
+    from hopper.tui import GateReviewScreen
+
+    lode = {
+        "id": "gate1234",
+        "stage": "refine",
+        "state": "gated",
+        "created_at": 1000,
+        "tmux_pane": "%9",
+    }
+    lode_dir = get_lode_dir(lode["id"])
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
+
+    monkeypatch.setattr("hopper.tui.capture_pane", lambda _id: "alive")
+
+    server = MockServer([lode])
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        assert isinstance(app.screen, GateReviewScreen)
+
+
+@pytest.mark.asyncio
+async def test_gate_review_missing_gate_md(temp_config):
+    """Missing gate.md should notify and leave the main screen active."""
+    lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
+    server = MockServer([lode])
+    app = HopperApp(server=server)
+    async with app.run_test() as pilot:
+        initial_screen = app.screen
+        with patch.object(app, "notify") as mock_notify:
+            await pilot.press("enter")
+        assert app.screen is initial_screen
+        mock_notify.assert_called_once_with("Gate review doc not found", severity="error")
+    assert server.events == []
 
 
 @pytest.mark.asyncio
