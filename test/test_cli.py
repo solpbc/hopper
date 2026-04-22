@@ -2876,11 +2876,39 @@ def test_gate_feedback_reads_stdin_when_no_text_arg(capsys):
     assert mock_send.call_args.args[1:] == ("gate1234", "Needs more tests")
 
 
+def test_gate_feedback_treats_dash_as_stdin_sentinel(capsys):
+    """gate feedback reads stdin when the text arg is a dash sentinel."""
+    from io import StringIO
+
+    response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+            with patch("sys.stdin", StringIO("approved, ship it")):
+                result = cmd_gate(["feedback", "gate1234", "-"])
+    assert result == 0
+    mock_send.assert_called_once()
+    assert mock_send.call_args.args[1:] == ("gate1234", "approved, ship it")
+
+
 def test_feedback_alias_dispatches_to_gate_feedback():
     """feedback alias delegates directly to gate feedback handler."""
     with patch("hopper.cli._cmd_gate_feedback", return_value=0) as mock_feedback:
         assert cmd_feedback(["gate1234", "Looks good"]) == 0
     mock_feedback.assert_called_once_with(["gate1234", "Looks good"])
+
+
+def test_feedback_alias_treats_dash_as_stdin_sentinel(capsys):
+    """feedback alias reads stdin when the text arg is a dash sentinel."""
+    from io import StringIO
+
+    response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+            with patch("sys.stdin", StringIO("approved, ship it")):
+                result = cmd_feedback(["gate1234", "-"])
+    assert result == 0
+    mock_send.assert_called_once()
+    assert mock_send.call_args.args[1:] == ("gate1234", "approved, ship it")
 
 
 def test_gate_no_server(capsys):

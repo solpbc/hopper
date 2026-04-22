@@ -142,6 +142,24 @@ EOF
 hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
 
+## Responding to a gate
+
+- Use these after a lode prints a gate banner and waits for your reply.
+- `hop feedback <lode-id>` is an alias and accepts the same inline and stdin forms.
+
+```bash
+hop gate show <lode-id>                        # view the gate prompt
+hop gate feedback <lode-id> "approved, ship it"
+hop gate feedback <lode-id> < feedback.md
+hop gate feedback <lode-id> - < feedback.md
+cat feedback.md | hop gate feedback <lode-id> -
+
+hop feedback <lode-id> "approved, ship it"
+hop feedback <lode-id> < feedback.md
+hop feedback <lode-id> - < feedback.md
+cat feedback.md | hop feedback <lode-id> -
+```
+
 ## Diagnostics
 
 ```bash
