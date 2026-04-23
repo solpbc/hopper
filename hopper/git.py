@@ -4,6 +4,7 @@
 """Git utilities for hopper."""
 
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -154,27 +155,91 @@ def get_diff_numstat(worktree_path: str) -> str:
 def remove_worktree(repo_dir: str, worktree_path: str) -> bool:
     """Remove a git worktree.
 
+    Forces removal with ``git worktree remove --force`` and falls back to
+    ``shutil.rmtree()`` plus ``git worktree prune`` if git leaves an on-disk
+    orphan.
+
     Args:
         repo_dir: Path to the main git repository.
         worktree_path: Path to worktree to remove.
 
     Returns:
-        True on success, False on failure.
+        True when cleanup succeeds. This is idempotent and returns True without
+        invoking git if the path is already missing. Returns False if the git
+        binary is missing (no shutil fallback is attempted) or if both git
+        removal and the shutil fallback fail.
     """
+    if not Path(worktree_path).exists():
+        return True
+
     try:
         result = subprocess.run(
-            ["git", "worktree", "remove", worktree_path],
+            ["git", "worktree", "remove", "--force", worktree_path],
             cwd=repo_dir,
             capture_output=True,
             text=True,
         )
-        if result.returncode != 0:
-            logger.warning(f"git worktree remove failed: {result.stderr.strip()}")
-            return False
-        return True
     except FileNotFoundError:
         logger.warning("git command not found")
         return False
+
+    git_err = result.stderr.strip()
+    git_failed = result.returncode != 0
+
+    if not Path(worktree_path).exists():
+        if git_failed:
+            try:
+                prune_result = subprocess.run(
+                    ["git", "worktree", "prune"],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                if prune_result.returncode != 0:
+                    logger.warning(f"git worktree prune failed: {prune_result.stderr.strip()}")
+            except FileNotFoundError:
+                logger.warning("git command not found")
+        return True
+
+    try:
+        shutil.rmtree(worktree_path)
+        shutil_err = None
+    except OSError as err:
+        shutil_err = str(err)
+
+    if shutil_err is not None:
+        if git_failed:
+            logger.warning(
+                f"git worktree remove failed: {git_err}; shutil.rmtree failed: {shutil_err}"
+            )
+        else:
+            logger.warning(f"shutil.rmtree failed: {shutil_err}")
+        return False
+
+    prune_err: str | None = None
+    try:
+        prune_result = subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if prune_result.returncode != 0:
+            prune_err = prune_result.stderr.strip()
+    except FileNotFoundError:
+        prune_err = "git command not found"
+
+    if git_failed and prune_err:
+        logger.warning(
+            f"git worktree remove failed: {git_err}; "
+            f"recovered via shutil.rmtree; git worktree prune failed: {prune_err}"
+        )
+    elif git_failed:
+        logger.warning(f"git worktree remove failed: {git_err}; recovered via shutil.rmtree")
+    elif prune_err:
+        logger.warning(f"git worktree prune failed: {prune_err}")
+
+    return True
 
 
 def delete_branch(repo_dir: str, branch_name: str) -> bool:
