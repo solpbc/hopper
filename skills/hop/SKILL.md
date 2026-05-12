@@ -42,6 +42,8 @@ hop wait <lode-id> --timeout 300
 
 Prints a status line as each lode resolves. Exit 0 if all shipped, 1 on error, 2 on timeout.
 
+**For waits expected to run past a few minutes, set `run_in_background: true` on the Bash call** and use Monitor to tail stdout for the "shipped" line. Claude Code's Bash tool caps foreground calls at 10 minutes; any lode that runs longer triggers a timeout → retry loop that wastes wake cycles and re-replays the conversation past the 5-minute prompt cache TTL. Background + Monitor stays in-process for the full lode duration, no matter how long.
+
 Watch live status events for a lode **(outside lode only)**:
 
 ```bash
