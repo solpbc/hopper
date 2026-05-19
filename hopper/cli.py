@@ -19,6 +19,9 @@ from hopper.lodes import (
     format_age,
     lode_icon,
 )
+from hopper.tmux import capture_pane
+
+STUCK_GRACE_MS = 120_000
 
 
 def _socket() -> Path:
@@ -1419,8 +1422,29 @@ def cmd_lode(args: list[str]) -> int:
         def _error_line(lid: str, status: str) -> str:
             return f"{STATUS_ERROR} {lid} error: {status}"
 
+        def _stuck_diagnostic(lid: str, status: str, tmux_pane: str | None) -> str:
+            if status:
+                lines = [f"{STATUS_ERROR} {lid} stuck: {status}"]
+            else:
+                lines = [f"{STATUS_ERROR} {lid} stuck"]
+            if not tmux_pane:
+                lines.append("  pane: <unknown>")
+                return "\n".join(lines)
+
+            lines.append(f"  pane: {tmux_pane}")
+            lines.append("  --- last 50 lines of pane ---")
+            pane_capture = capture_pane(tmux_pane)
+            if pane_capture:
+                pane_lines = pane_capture.split("\n")[-50:]
+                lines.extend(f"  {line}" for line in pane_lines)
+            else:
+                lines.append("  <pane capture failed>")
+            lines.append("  --- end pane ---")
+            return "\n".join(lines)
+
         resolved: dict[str, dict] = {}
         pending: set[str] = set()
+        stuck_timers: dict[str, threading.Timer] = {}
 
         for raw_id in lode_ids:
             lode = client.get_lode(socket_path, raw_id)
@@ -1429,6 +1453,9 @@ def cmd_lode(args: list[str]) -> int:
                 if lode.get("state") == "error":
                     print(_format_lode_error(lode))
                     return 1
+                if lode.get("state") == "stuck":
+                    print(_stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")))
+                    return 3
                 if lode.get("stage") == "shipped":
                     resolved[lid] = lode
                 elif not lode.get("active"):
@@ -1446,6 +1473,9 @@ def cmd_lode(args: list[str]) -> int:
                 if lode.get("state") == "error":
                     print(_format_lode_error(lode))
                     return 1
+                if lode.get("state") == "stuck":
+                    print(_stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")))
+                    return 3
                 if lode.get("stage") == "shipped":
                     resolved[lid] = lode
                 elif not lode.get("active"):
@@ -1465,6 +1495,24 @@ def cmd_lode(args: list[str]) -> int:
         done = threading.Event()
         result = [0]
 
+        def _cancel_stuck_timer(lid: str) -> None:
+            timer = stuck_timers.pop(lid, None)
+            if timer is not None:
+                timer.cancel()
+
+        def _on_grace_expired(lid: str) -> None:
+            if done.is_set():
+                return
+            try:
+                current = client.get_lode(socket_path, lid)
+            except Exception:
+                return
+            if not current or current.get("state") != "stuck":
+                return
+            print(_stuck_diagnostic(lid, current.get("status", ""), current.get("tmux_pane")))
+            result[0] = 3
+            done.set()
+
         def on_message(message: dict) -> None:
             msg_type = message.get("type")
             if msg_type not in ("lode_updated", "lode_archived"):
@@ -1473,6 +1521,15 @@ def cmd_lode(args: list[str]) -> int:
             lid = msg_lode.get("id")
             if lid not in pending:
                 return
+            state = msg_lode.get("state")
+            if msg_type == "lode_updated" and state == "stuck":
+                if lid not in stuck_timers:
+                    timer = threading.Timer(STUCK_GRACE_MS / 1000.0, _on_grace_expired, args=[lid])
+                    timer.daemon = True
+                    timer.start()
+                    stuck_timers[lid] = timer
+                return
+            _cancel_stuck_timer(lid)
             if msg_lode.get("state") == "error":
                 print(_error_line(lid, msg_lode.get("status", "")))
                 result[0] = 1
@@ -1499,6 +1556,9 @@ def cmd_lode(args: list[str]) -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            for timer in list(stuck_timers.values()):
+                timer.cancel()
+            stuck_timers.clear()
             conn.stop()
         return result[0]
 

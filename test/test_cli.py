@@ -6,6 +6,7 @@
 import json
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1965,6 +1966,258 @@ def test_lode_wait_error_state_at_start(capsys):
     out = capsys.readouterr().out
     assert "error state" in out
     assert "hop lode restart abc123" in out
+
+
+def test_wait_stuck_at_start(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": "hopper:7",
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.cli.capture_pane", return_value="line1\nline2\nline3"):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert "✗ abc123 stuck: No output for 60s" in out
+    assert "  pane: hopper:7" in out
+    assert "  --- last 50 lines of pane ---" in out
+    assert "  line1\n  line2\n  line3" in out
+    assert "  --- end pane ---" in out
+
+
+def test_wait_stuck_at_start_no_pane(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": None,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.cli.capture_pane") as mock_capture:
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert "  pane: <unknown>" in out
+    assert "  --- last 50 lines of pane ---" not in out
+    mock_capture.assert_not_called()
+
+
+def test_wait_stuck_at_start_capture_fails(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": "hopper:7",
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.cli.capture_pane", return_value=None):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert "  --- last 50 lines of pane ---" in out
+    assert "  <pane capture failed>" in out
+    assert "  --- end pane ---" in out
+
+
+def test_wait_stuck_at_start_empty_status(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "stuck",
+        "status": "",
+        "tmux_pane": None,
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            result = cmd_lode(["wait", "abc123"])
+    assert result == 3
+    first_line = capsys.readouterr().out.splitlines()[0]
+    assert first_line == "✗ abc123 stuck"
+
+
+def test_wait_stuck_at_start_pane_truncated_to_50(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": "hopper:7",
+    }
+    pane_capture = "\n".join(f"line{i}" for i in range(75))
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.cli.capture_pane", return_value=pane_capture):
+                result = cmd_lode(["wait", "abc123"])
+    assert result == 3
+    out_lines = capsys.readouterr().out.splitlines()
+    start = out_lines.index("  --- last 50 lines of pane ---") + 1
+    end = out_lines.index("  --- end pane ---")
+    assert out_lines[start:end] == [f"  line{i}" for i in range(25, 75)]
+
+
+def test_wait_stuck_transition_grace_expires(capsys):
+    initial_lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+    }
+    stuck_lode = {
+        **initial_lode,
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": "hopper:7",
+    }
+    with patch("hopper.cli.STUCK_GRACE_MS", 50):
+        with patch("hopper.cli.require_server", return_value=0):
+            with patch("hopper.client.get_lode", side_effect=[initial_lode, stuck_lode]):
+                with patch("hopper.cli.capture_pane", return_value="line1"):
+                    mock_conn = MagicMock()
+
+                    def fake_start(callback, on_connect=None):
+                        callback({"type": "lode_updated", "lode": stuck_lode})
+                        time.sleep(0.15)
+
+                    mock_conn.start = fake_start
+                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                        result = cmd_lode(["wait", "abc123", "--timeout", "1"])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert "✗ abc123 stuck: No output for 60s" in out
+    assert "  line1" in out
+
+
+def test_wait_stuck_transition_recovers_within_grace(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+    }
+    stuck_lode = {**lode, "state": "stuck", "status": "No output for 60s"}
+    running_lode = {**lode, "state": "running", "status": "Claude running"}
+    shipped_lode = {**lode, "stage": "shipped", "status": "Done"}
+    with patch("hopper.cli.STUCK_GRACE_MS", 200):
+        with patch("hopper.cli.require_server", return_value=0):
+            with patch("hopper.client.get_lode", return_value=lode):
+                mock_conn = MagicMock()
+
+                def fake_start(callback, on_connect=None):
+                    callback({"type": "lode_updated", "lode": stuck_lode})
+                    time.sleep(0.05)
+                    callback({"type": "lode_updated", "lode": running_lode})
+                    time.sleep(0.05)
+                    callback({"type": "lode_updated", "lode": shipped_lode})
+
+                mock_conn.start = fake_start
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc123"])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "stuck:" not in out
+    assert "  --- last 50 lines of pane ---" not in out
+    assert "✓ abc123 shipped" in out
+
+
+def test_wait_stuck_flap_rearms(capsys):
+    initial_lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+    }
+    stuck_lode = {
+        **initial_lode,
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": "hopper:7",
+    }
+    running_lode = {**initial_lode, "state": "running", "status": "Claude running"}
+    with patch("hopper.cli.STUCK_GRACE_MS", 100):
+        with patch("hopper.cli.require_server", return_value=0):
+            with patch("hopper.client.get_lode", side_effect=[initial_lode, stuck_lode]):
+                with patch("hopper.cli.capture_pane", return_value="line1"):
+                    mock_conn = MagicMock()
+
+                    def fake_start(callback, on_connect=None):
+                        callback({"type": "lode_updated", "lode": stuck_lode})
+                        time.sleep(0.03)
+                        callback({"type": "lode_updated", "lode": running_lode})
+                        time.sleep(0.03)
+                        callback({"type": "lode_updated", "lode": stuck_lode})
+                        time.sleep(0.12)
+
+                    mock_conn.start = fake_start
+                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                        result = cmd_lode(["wait", "abc123", "--timeout", "1"])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert out.count("✗ abc123 stuck: No output for 60s") == 1
+    assert out.count("  --- last 50 lines of pane ---") == 1
+
+
+def test_wait_stuck_multi_lode_first_wins(capsys):
+    stuck_lode = {
+        "id": "aaa111",
+        "active": True,
+        "stage": "mill",
+        "state": "stuck",
+        "status": "No output for 60s",
+        "tmux_pane": "hopper:7",
+    }
+    with patch("hopper.cli.require_server", return_value=0):
+        with patch("hopper.client.get_lode", return_value=stuck_lode) as mock_get_lode:
+            with patch("hopper.cli.capture_pane", return_value="line1"):
+                with patch("hopper.client.HopperConnection") as mock_conn_cls:
+                    result = cmd_lode(["wait", "aaa111", "bbb222"])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert "✗ aaa111 stuck: No output for 60s" in out
+    assert "bbb222" not in out
+    assert mock_get_lode.call_count == 1
+    mock_conn_cls.assert_not_called()
+
+
+def test_wait_timeout_shorter_than_grace(capsys):
+    lode = {
+        "id": "abc123",
+        "active": True,
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+    }
+    stuck_lode = {**lode, "state": "stuck", "status": "No output for 60s"}
+    with patch("hopper.cli.STUCK_GRACE_MS", 200):
+        with patch("hopper.cli.require_server", return_value=0):
+            with patch("hopper.client.get_lode", return_value=lode):
+                mock_conn = MagicMock()
+
+                def fake_start(callback, on_connect=None):
+                    callback({"type": "lode_updated", "lode": stuck_lode})
+
+                mock_conn.start = fake_start
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc123", "--timeout", "0.05"])
+    assert result == 2
+    out = capsys.readouterr().out
+    assert "Timed out waiting for lode(s): abc123" in out
+    assert "✗ abc123 stuck" not in out
 
 
 def test_lode_wait_not_found(capsys):
