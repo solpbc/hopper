@@ -47,8 +47,10 @@ pytest test/test_file.py::test_name  # Run a single test
 
 - **Simple code** - Prefer plain functions over classes. Use dicts, lists, and simple data containers. Only use classes when managing stateful lifecycle (server, TUI widgets, runners).
 - **DRY, KISS** - Extract common logic, prefer simple solutions.
+- **YAGNI** - Don't build for hypothetical futures; no speculative options, fallbacks, or abstractions. No backwards-compatibility shims — update call sites directly.
 - **Atomic writes** - Write to `.tmp` then `os.replace()` for persistence.
-- **Fail fast** - Validate external state early (tmux presence, server running). Clear error messages.
+- **Fail fast, never silently** - Validate external state early (tmux presence, server running). Clear, specific error messages via `logging`, not `print`. Never swallow an exception and report success on a degraded result. Coordinate subsystems by durable facts, not imperative pokes — and fix concurrency bugs at the daemon layer, never with a prompt-level or per-session mitigation.
+- **Verify before you claim** - Recall is a hypothesis, not evidence. Verify a library/SDK behavior or API shape against source before it lands; exercise the real serialization boundary in tests, not a mock of both sides.
 - **Test everything, mock everything** - All new code paths need tests. Tests must never read real user config, files, or system state. Use fixtures and monkeypatch to isolate completely.
 
 ## File Headers
