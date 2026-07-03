@@ -5,7 +5,9 @@
 
 import logging
 import os
+import signal
 import subprocess
+import tempfile
 from pathlib import Path
 
 from hopper import config, prompt
@@ -17,29 +19,111 @@ from hopper.runner import BaseRunner
 
 logger = logging.getLogger(__name__)
 
+SETUP_COMMAND_TIMEOUT_SEC = 20 * 60
+SETUP_OUTPUT_TAIL_BYTES = 64 * 1024
+SETUP_OUTPUT_TAIL_LINES = 20
+
 
 def _has_makefile(worktree_path: Path) -> bool:
     """Check if worktree has a Makefile."""
     return (worktree_path / "Makefile").exists()
 
 
-def _run_make_install(worktree_path: Path) -> bool:
+def _run_make_install(
+    worktree_path: Path, timeout_sec: float = SETUP_COMMAND_TIMEOUT_SEC
+) -> tuple[bool, str | None]:
     """Run 'make install' in the worktree to set up project tooling.
 
-    Returns True on success, False on failure.
+    Returns (ok, detail). detail is a tail of command output on failure.
     """
+    ok, detail = _run_setup_command(["make", "install"], worktree_path, timeout_sec=timeout_sec)
+    if not ok:
+        logger.error(f"make install failed: {detail or 'unknown error'}")
+    return ok, detail
+
+
+def _run_setup_command(
+    command: list[str],
+    cwd: Path,
+    *,
+    timeout_sec: float,
+    env: dict | None = None,
+) -> tuple[bool, str | None]:
+    """Run a setup command with a timeout and bounded captured output."""
     try:
-        result = subprocess.run(
-            ["make", "install"],
-            cwd=str(worktree_path),
-        )
-        if result.returncode != 0:
-            logger.error(f"make install failed (exit code {result.returncode})")
-            return False
-        return True
-    except (FileNotFoundError, subprocess.SubprocessError) as e:
-        logger.error(f"make install failed: {e}")
-        return False
+        with tempfile.TemporaryFile() as output:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                return_code = proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                _terminate_process_group(proc)
+                tail = _read_output_tail(output)
+                detail = f"Timed out after {int(timeout_sec)}s."
+                if tail:
+                    detail = f"{detail}\n{tail}"
+                return False, detail
+
+            if return_code != 0:
+                tail = _read_output_tail(output)
+                detail = f"Exited with code {return_code}."
+                if tail:
+                    detail = f"{detail}\n{tail}"
+                return False, detail
+
+            return True, None
+    except FileNotFoundError as e:
+        return False, f"Command not found: {e.filename or command[0]}"
+    except subprocess.SubprocessError as e:
+        return False, str(e)
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess group, then hard-kill if it ignores SIGTERM."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        logger.debug("Failed to terminate process group; terminating proc", exc_info=True)
+        proc.terminate()
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except Exception:
+            logger.debug("Failed to kill process group; killing proc", exc_info=True)
+            proc.kill()
+
+
+def _read_output_tail(output) -> str | None:
+    """Read a bounded tail from a temporary output file."""
+    try:
+        size = output.tell()
+        output.seek(max(0, size - SETUP_OUTPUT_TAIL_BYTES))
+        text = output.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        logger.debug("Failed to read setup output tail", exc_info=True)
+        return None
+
+    if not text:
+        return None
+
+    lines = text.splitlines()
+    tail = "\n".join(lines[-SETUP_OUTPUT_TAIL_LINES:])
+    if size > SETUP_OUTPUT_TAIL_BYTES:
+        return f"...\n{tail}"
+    return tail
 
 
 def _get_worktree_env(worktree_path: Path, base_env: dict | None = None) -> dict:
@@ -211,8 +295,14 @@ class ProcessRunner(BaseRunner):
                 set_lode_status(self.socket_path, self.lode_id, "Running make install...")
                 logger.debug(f"make install start lode={self.lode_id}")
                 print(f"Running make install for {self.lode_id}...")
-            if needs_install and not _run_make_install(self.worktree_path):
+            if needs_install:
+                install_ok, install_detail = _run_make_install(self.worktree_path)
+            else:
+                install_ok, install_detail = True, None
+            if not install_ok:
                 self._setup_error = "Failed to run make install."
+                if install_detail:
+                    self._setup_error = f"{self._setup_error}\n{install_detail}"
                 print(self._setup_error)
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
@@ -376,6 +466,11 @@ class ProcessRunner(BaseRunner):
 
         if exit_code == 127:
             self._setup_error = "codex command not found. Install codex to use code features."
+            print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+            return 1
+        if exit_code == 124:
+            self._setup_error = "Codex bootstrap timed out."
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1

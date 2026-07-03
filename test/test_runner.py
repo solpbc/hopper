@@ -58,6 +58,17 @@ class TestBaseRunnerActivityMonitor:
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         return runner
 
+    def test_subprocess_env_disables_claude_auto_memory(self):
+        """Managed Hopper stages disable Claude Code auto-memory."""
+        runner = self._make_runner()
+
+        env = runner._get_subprocess_env()
+
+        assert env["HOPPER_LID"] == "test-session"
+        assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+        assert env["CLAUDE_CODE_DISABLE_MEMORY_PERIODIC_RESYNC"] == "1"
+        assert env["CLAUDE_CODE_DISABLE_MEMORY_BULK_INFLATE"] == "1"
+
     def test_check_activity_detects_stuck(self):
         """Monitor detects stuck state when pane content doesn't change."""
         runner = self._make_runner()
@@ -233,6 +244,39 @@ class TestBaseRunnerActivityMonitor:
         assert len(stuck_emissions) == 1
         assert stuck_emissions[0][1]["status"].startswith("No output for ")
         assert stuck_emissions[0][1]["status"].endswith("s")
+
+    def test_stuck_timeout_terminates_claude_process(self, monkeypatch):
+        """A long-stuck active lode terminates its Claude process."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = current_time_ms() - 1200
+        runner._stuck_since = current_time_ms() - 1200
+        runner._claude_proc = MagicMock(pid=1234)
+        runner._claude_proc.poll.return_value = None
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
+            ),
+        ):
+            runner._check_activity()
+
+        assert runner._stuck_error is not None
+        assert "timed out stuck Claude stage" in runner._stuck_error
+        runner._claude_proc.terminate.assert_called_once()
+        runner._claude_proc.wait.assert_called_once_with(timeout=5)
+        assert runner._monitor_stop.is_set()
 
     def test_codex_only_running_never_stuck(self, monkeypatch):
         """Fresh progress heartbeats keep an unchanged pane running across ticks."""

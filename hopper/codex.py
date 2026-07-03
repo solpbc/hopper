@@ -5,15 +5,23 @@
 
 import json
 import logging
+import os
+import signal
 import subprocess
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 CODEX_FLAGS = "--dangerously-bypass-approvals-and-sandbox"
+CODEX_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
 
 
-def bootstrap_codex(prompt: str, cwd: str, env: dict | None = None) -> tuple[int, str | None]:
+def bootstrap_codex(
+    prompt: str,
+    cwd: str,
+    env: dict | None = None,
+    timeout_sec: float = CODEX_BOOTSTRAP_TIMEOUT_SEC,
+) -> tuple[int, str | None]:
     """Bootstrap a new Codex session and return its thread ID.
 
     Runs codex exec --json to create a fresh session. Parses the thread_id
@@ -23,28 +31,69 @@ def bootstrap_codex(prompt: str, cwd: str, env: dict | None = None) -> tuple[int
         prompt: The prompt text to send to Codex.
         cwd: Working directory for Codex.
         env: Optional environment dict. Uses inherited env if None.
+        timeout_sec: Maximum bootstrap runtime in seconds.
 
     Returns:
         (exit_code, thread_id) tuple. thread_id is None on failure.
-        Exit code is 127 if codex not found, 130 on KeyboardInterrupt.
+        Exit code is 124 on timeout, 127 if codex not found, 130 on KeyboardInterrupt.
     """
     cmd = ["codex", "exec", CODEX_FLAGS, "--json", prompt]
 
     logger.debug(f"Bootstrapping codex session in {cwd}")
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            text=True,
+            process_group=0,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(proc)
+            logger.error(f"codex bootstrap timed out after {timeout_sec}s")
+            return 124, None
     except FileNotFoundError:
         logger.error("codex command not found")
         return 127, None
     except KeyboardInterrupt:
         return 130, None
 
-    thread_id = _parse_thread_id(result.stdout)
-    if result.returncode == 0 and not thread_id:
+    thread_id = _parse_thread_id(stdout)
+    return_code = proc.returncode if proc.returncode is not None else 0
+    if return_code == 0 and not thread_id:
         logger.error("Failed to parse thread_id from codex output")
 
-    return result.returncode, thread_id
+    return return_code, thread_id
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess group, then hard-kill if it ignores SIGTERM."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        logger.debug("Failed to terminate codex process group; terminating proc", exc_info=True)
+        proc.terminate()
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except Exception:
+            logger.debug("Failed to kill codex process group; killing proc", exc_info=True)
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.debug("Codex process did not exit after SIGKILL")
 
 
 def run_codex(

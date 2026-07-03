@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from hopper.codex import _parse_thread_id, bootstrap_codex, run_codex
+from hopper.codex import CODEX_BOOTSTRAP_TIMEOUT_SEC, _parse_thread_id, bootstrap_codex, run_codex
 
 
 class TestParseThreadId:
@@ -33,18 +33,23 @@ class TestParseThreadId:
 
 
 class TestBootstrapCodex:
+    def _mock_proc(self, stdout="", returncode=0):
+        proc = MagicMock()
+        proc.communicate.return_value = (stdout, None)
+        proc.returncode = returncode
+        proc.pid = 1234
+        return proc
+
     def test_returns_thread_id_on_success(self):
         """Parses thread_id from codex exec --json output."""
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"type":"thread.started","thread_id":"uuid-1234"}\n'
+        mock_proc = self._mock_proc(stdout='{"type":"thread.started","thread_id":"uuid-1234"}\n')
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
             exit_code, thread_id = bootstrap_codex("hello", "/tmp/work")
 
         assert exit_code == 0
         assert thread_id == "uuid-1234"
-        cmd = mock_run.call_args[0][0]
+        cmd = mock_popen.call_args[0][0]
         assert cmd == [
             "codex",
             "exec",
@@ -52,17 +57,17 @@ class TestBootstrapCodex:
             "--json",
             "hello",
         ]
-        assert mock_run.call_args[1]["cwd"] == "/tmp/work"
-        assert mock_run.call_args[1]["stdout"] == subprocess.PIPE
-        assert "stderr" not in mock_run.call_args[1]
+        assert mock_popen.call_args[1]["cwd"] == "/tmp/work"
+        assert mock_popen.call_args[1]["stdout"] == subprocess.PIPE
+        assert mock_popen.call_args[1]["process_group"] == 0
+        assert "stderr" not in mock_popen.call_args[1]
+        mock_proc.communicate.assert_called_once_with(timeout=CODEX_BOOTSTRAP_TIMEOUT_SEC)
 
     def test_returns_none_thread_id_on_parse_failure(self):
         """Returns None thread_id when output has no thread.started event."""
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"type":"turn.started"}\n'
+        mock_proc = self._mock_proc(stdout='{"type":"turn.started"}\n')
 
-        with patch("subprocess.run", return_value=mock_result):
+        with patch("subprocess.Popen", return_value=mock_proc):
             exit_code, thread_id = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 0
@@ -70,7 +75,7 @@ class TestBootstrapCodex:
 
     def test_codex_not_found(self):
         """Returns 127 when codex command not found."""
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        with patch("subprocess.Popen", side_effect=FileNotFoundError):
             exit_code, thread_id = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 127
@@ -78,19 +83,35 @@ class TestBootstrapCodex:
 
     def test_keyboard_interrupt(self):
         """Returns 130 on KeyboardInterrupt."""
-        with patch("subprocess.run", side_effect=KeyboardInterrupt):
+        with patch("subprocess.Popen", side_effect=KeyboardInterrupt):
             exit_code, thread_id = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 130
         assert thread_id is None
 
+    def test_timeout(self):
+        """Returns 124 when Codex bootstrap exceeds its timeout."""
+        mock_proc = self._mock_proc()
+        mock_proc.communicate.side_effect = subprocess.TimeoutExpired("codex", 10)
+
+        with (
+            patch("subprocess.Popen", return_value=mock_proc),
+            patch("hopper.codex.os.killpg") as mock_killpg,
+        ):
+            exit_code, thread_id = bootstrap_codex("hello", "/tmp", timeout_sec=10)
+
+        assert exit_code == 124
+        assert thread_id is None
+        mock_killpg.assert_called_once()
+
     def test_nonzero_exit_still_parses_thread_id(self):
         """Returns thread_id even on non-zero exit (partial output)."""
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stdout = '{"type":"thread.started","thread_id":"partial-id"}\n'
+        mock_proc = self._mock_proc(
+            stdout='{"type":"thread.started","thread_id":"partial-id"}\n',
+            returncode=1,
+        )
 
-        with patch("subprocess.run", return_value=mock_result):
+        with patch("subprocess.Popen", return_value=mock_proc):
             exit_code, thread_id = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 1

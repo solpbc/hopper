@@ -169,7 +169,13 @@ human approval.
 
 For Codex refine runs, recent JSON heartbeat progress can keep a lode in
 `running` even if the tmux pane text has not changed yet. Pane-diff remains the
-primary stuck signal for the senior Claude-driven mill/refine/ship runners.
+primary stuck signal for the senior Claude-driven mill/refine/ship runners. If
+a senior Claude stage stays stuck past the runner timeout, Hopper terminates it,
+marks the lode `error`, and releases `active` so `hop restart <id>` can retry.
+
+Refine setup also bounds `make install` and Codex bootstrap. If setup hits its
+timeout, the lode errors with the captured output tail instead of remaining
+active at "Running make install...".
 
 If the action is safe (e.g. a routine permission prompt, a test confirmation),
 use send-keys to unblock it:

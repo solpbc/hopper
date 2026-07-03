@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
-from hopper.process import STAGES, ProcessRunner, _get_worktree_env, run_process
+from hopper.process import STAGES, ProcessRunner, _get_worktree_env, _run_make_install, run_process
 
 CLAUDE_SESSIONS = {
     "mill": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
@@ -51,6 +51,33 @@ def _mock_conn(emitted=None):
 def test_ship_next_stage_is_shipped():
     """Ship stage should transition to shipped on completion."""
     assert STAGES["ship"]["next_stage"] == "shipped"
+
+
+class TestRunMakeInstall:
+    def test_returns_output_tail_on_failure(self, tmp_path):
+        """make install failures include the command output tail."""
+        (tmp_path / "Makefile").write_text(
+            "install:\n\t@echo installing\n\t@echo failed >&2\n\t@exit 7\n"
+        )
+
+        ok, detail = _run_make_install(tmp_path)
+
+        assert ok is False
+        assert detail is not None
+        assert "Exited with code 2." in detail
+        assert "installing" in detail
+        assert "failed" in detail
+        assert "Error 7" in detail
+
+    def test_times_out_and_kills_process_group(self, tmp_path):
+        """Long make install runs time out instead of leaving the lode active."""
+        (tmp_path / "Makefile").write_text("install:\n\t@sleep 30\n")
+
+        ok, detail = _run_make_install(tmp_path, timeout_sec=0.1)
+
+        assert ok is False
+        assert detail is not None
+        assert "Timed out after 0s." in detail
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +554,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process._has_makefile", return_value=True),
-            patch("hopper.process._run_make_install", return_value=True),
+            patch("hopper.process._run_make_install", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc")),
             patch("hopper.process.set_codex_thread_id", return_value=True),
@@ -543,6 +570,36 @@ class TestRefineStage:
             call(runner.socket_path, runner.lode_id, "Running make install..."),
             call(runner.socket_path, runner.lode_id, "Bootstrapping Codex..."),
         ]
+
+    def test_make_install_failure_includes_detail(self, tmp_path):
+        """Refine setup emits captured setup detail when make install fails."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process._has_makefile", return_value=True),
+            patch(
+                "hopper.process._run_make_install",
+                return_value=(False, "Timed out after 1200s.\npytest output tail"),
+            ),
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
+        ):
+            assert runner.run() == 0
+
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Failed to run make install.\nTimed out after 1200s.\npytest output tail",
+        )
 
     def test_no_makefile_skips_make_install(self, tmp_path):
         """First-run refine without Makefile skips make install and env setup."""
@@ -632,7 +689,7 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process._has_makefile", return_value=True),
-            patch("hopper.process._run_make_install", return_value=True) as mock_install,
+            patch("hopper.process._run_make_install", return_value=(True, None)) as mock_install,
             patch("hopper.process.set_lode_status") as mock_status,
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),
@@ -665,7 +722,7 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process._has_makefile", return_value=True),
-            patch("hopper.process._run_make_install", return_value=True),
+            patch("hopper.process._run_make_install", return_value=(True, None)),
             patch("hopper.process.set_lode_status") as mock_status,
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),
@@ -824,6 +881,34 @@ class TestRefineStage:
             status="Codex bootstrap failed (exit 1).",
         )
         MockConn.return_value.stop.assert_called_once()
+
+    def test_bootstrap_timeout_bails(self, tmp_path):
+        """Codex bootstrap timeout emits a setup error and releases the lode."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+        (session_dir / "mill_out.md").write_text("Build it")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", project="my-project"),
+            ),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.prompt.load", return_value="prompt"),
+            patch("hopper.process.bootstrap_codex", return_value=(124, None)),
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
+        ):
+            assert runner.run() == 0
+
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status="Codex bootstrap timed out.",
+        )
 
     def test_clean_exit_after_done_emits_ready_and_ship(self, tmp_path):
         """Refine emits state=ready then stage=ship after completion."""

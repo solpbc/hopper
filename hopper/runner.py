@@ -22,6 +22,7 @@ ERROR_LINES = 5  # Number of stderr lines to capture on error
 MONITOR_INTERVAL = 5.0  # Seconds between activity checks
 MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
+STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
 
 
 def extract_error_message(stderr_bytes: bytes) -> str | None:
@@ -79,6 +80,8 @@ class BaseRunner:
         self._stuck_since: int | None = None
         self._last_pane_activity_ms: int | None = None
         self._pane_id: str | None = None
+        self._claude_proc: subprocess.Popen | None = None
+        self._stuck_error: str | None = None
         # Completion tracking
         self._done = threading.Event()
         self._gated = threading.Event()
@@ -215,6 +218,11 @@ class BaseRunner:
         """Build environment for subprocess. Subclasses can override to add venv."""
         env = os.environ.copy()
         env["HOPPER_LID"] = self.lode_id
+        # Hopper lodes are scoped by their prompt and repo context; do not let
+        # Claude Code read/write project auto-memory during managed stages.
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+        env["CLAUDE_CODE_DISABLE_MEMORY_PERIODIC_RESYNC"] = "1"
+        env["CLAUDE_CODE_DISABLE_MEMORY_BULK_INFLATE"] = "1"
         return env
 
     def _run_claude(self) -> tuple[int, str | None]:
@@ -226,7 +234,13 @@ class BaseRunner:
         logger.debug(f"Running: {' '.join(cmd[:3])}...")
 
         try:
-            proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, cwd=cwd)
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+            )
+            self._claude_proc = proc
 
             self._emit_state("running", "Claude running")
             self._start_monitor()
@@ -242,6 +256,8 @@ class BaseRunner:
 
             proc.wait()
 
+            if self._stuck_error:
+                return 1, self._stuck_error
             if proc.returncode != 0 and proc.stderr:
                 stderr_bytes = proc.stderr.read()
                 error_msg = extract_error_message(stderr_bytes)
@@ -253,6 +269,8 @@ class BaseRunner:
             return 127, "claude command not found"
         except KeyboardInterrupt:
             return 130, None
+        finally:
+            self._claude_proc = None
 
     def _handle_signal(self, signum: int, frame) -> None:
         """Handle shutdown signals gracefully."""
@@ -418,6 +436,13 @@ class BaseRunner:
                 self._stuck_since = now
             duration_sec = (now - last_activity) // 1000
             self._emit_state("stuck", f"No output for {duration_sec}s")
+            stuck_for = now - self._stuck_since
+            if stuck_for > STUCK_FAIL_THRESHOLD_MS and self._stuck_error is None:
+                msg = f"No output or progress for {duration_sec}s; timed out stuck Claude stage."
+                self._stuck_error = msg
+                logger.error(f"stuck timeout lode={self.lode_id}: {msg}")
+                self._terminate_claude_process()
+                self._monitor_stop.set()
         else:
             if self._stuck_since is not None:
                 status = (
@@ -427,3 +452,19 @@ class BaseRunner:
                 )
                 self._emit_state("running", status)
             self._stuck_since = None
+
+    def _terminate_claude_process(self) -> None:
+        """Terminate the active Claude process after a stuck timeout."""
+        proc = self._claude_proc
+        if proc is None or proc.poll() is not None:
+            return
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.debug("Claude process did not exit after SIGKILL")
