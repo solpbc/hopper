@@ -39,9 +39,24 @@ hop wait <id1> <id2> <id3>
 hop wait <lode-id> --timeout 300
 ```
 
-Prints a status line as each lode resolves. Exit 0 if all shipped, 1 on error, 2 on timeout, 3 if a lode is stuck.
+Prints a status line as each lode resolves. Exit `0` if all shipped, `1` on error, `2` on timeout or gate, `3` if a lode is stuck (after a ~2-min grace period).
 
-**For waits expected to run past a few minutes, set `run_in_background: true` on the Bash call** and use Monitor to tail stdout for the "shipped" line. Claude Code's Bash tool caps foreground calls at 10 minutes; any lode that runs longer triggers a timeout → retry loop that wastes wake cycles and re-replays the conversation past the 5-minute prompt cache TTL. Background + Monitor stays in-process for the full lode duration, no matter how long.
+### For any wait past a few minutes, poll `hop lode status` — don't lean on a single long-lived `hop wait`
+
+A lode routinely runs far longer than one blocking call survives, and both ways of holding a `hop wait` open fail on long lodes:
+
+- **Foreground:** the Bash tool caps foreground calls at ~10 minutes. A longer lode trips a timeout → retry loop that burns wake cycles and replays the conversation past the ~5-minute prompt-cache TTL.
+- **Background (`run_in_background: true`):** the harness reaps a quiet background process (~1 min in practice). `hop wait` is event-driven — it prints only on a state change — so a busy-but-silent lode produces no output, looks idle, and gets killed. (An earlier version of this doc claimed background + Monitor "stays in-process for the full lode duration" — that was wrong and cost sessions their waits.)
+
+**Do this instead:** drive a poll loop (e.g. a Monitor loop) over `hop lode status <lode-id>` on an interval (~30–60s). `hop lode status` is a one-shot read that returns immediately, so it never trips the foreground cap or the idle reaper.
+
+### Reading the status — three traps
+
+`hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `completed`, `error`, `gated`).
+
+1. **`state: completed` is a STAGE boundary, not the finish.** State flips to `completed` at the end of *each* stage (mill done, refine done, ship done), then the next stage begins. **The only terminal success signal is `stage: shipped`** — key your loop on that, never on `state: completed`.
+2. **Debounce `stuck` — one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` itself waits ~2 min before treating stuck as terminal. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
+3. **`hop wait` exit `0` is not proof of a ship.** A wait can return before the lode genuinely shipped — reaped in the background, or the lode archived without a clean ship. **Never treat exit `0` (or a vanished background wait) as done on its own** — confirm `stage: shipped` via `hop lode status` first.
 
 Watch live status events for a lode **(outside lode only)**:
 
@@ -53,8 +68,8 @@ Practical create + wait workflow:
 
 ```bash
 cat scope.md | hop implement myproject
-# note the lode ID from output
-hop wait <lode-id>
+# note the lode ID from output, then poll to completion:
+hop lode status <lode-id>   # repeat on an interval until: stage: shipped
 ```
 
 ## Lode management
