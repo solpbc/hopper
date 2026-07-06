@@ -44,7 +44,7 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
-from hopper.projects import Project
+from hopper.projects import Project, load_projects, save_projects
 
 LONG_SCOPE = "this is a stdin scope that is long enough to pass the minimum character validation"
 
@@ -1070,6 +1070,27 @@ def test_lode_create_dirty_repo_rejected(capsys):
     out = capsys.readouterr().out
     assert "uncommitted changes" in out
     assert "use --force to override" in out
+
+
+def test_lode_create_rejects_disabled_project_before_dirty_check(capsys):
+    """Disabled projects are rejected before dirty checks or create RPC."""
+    from io import StringIO
+
+    project = Project(path="/fake", name="P", disabled=True, disabled_reason="wip")
+    with (
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status") as mock_dirty_status,
+        patch("hopper.client.create_lode") as mock_create_lode,
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        result = cmd_lode(["create", "P"])
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "error: project 'P' is disabled" in captured.out
+    assert "  reason: wip" in captured.out
+    mock_dirty_status.assert_not_called()
+    mock_create_lode.assert_not_called()
 
 
 def test_lode_create_dirty_hint_before_files(capsys):
@@ -2718,6 +2739,7 @@ def test_project_list_shows_projects(tmp_path, monkeypatch, capsys):
     projects = [
         Project(path="/path/to/foo", name="foo"),
         Project(path="/path/to/bar", name="bar", disabled=True),
+        Project(path="/path/to/baz", name="baz", disabled=True, disabled_reason="paused"),
     ]
     monkeypatch.setattr("hopper.projects.load_projects", lambda: projects)
     result = cmd_project(["list"])
@@ -2727,6 +2749,7 @@ def test_project_list_shows_projects(tmp_path, monkeypatch, capsys):
     assert "/path/to/foo" in captured.out
     assert "bar" in captured.out
     assert "(disabled)" in captured.out
+    assert "baz (disabled: paused)" in captured.out
 
 
 def test_project_add_missing_path(capsys):
@@ -2758,6 +2781,94 @@ def test_project_remove_not_found(tmp_path, monkeypatch, capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "not found" in captured.out
+
+
+def test_project_disable_with_reason(capsys):
+    """project disable stores reason and prints it."""
+    from hopper.cli import cmd_project
+
+    save_projects([Project(path="/path/to/P", name="P")])
+
+    result = cmd_project(["disable", "P", "maintenance"])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Disabled project: P" in captured.out
+    assert "  reason: maintenance" in captured.out
+    project = load_projects()[0]
+    assert project.disabled is True
+    assert project.disabled_reason == "maintenance"
+
+
+def test_project_disable_without_reason(capsys):
+    """project disable stores empty reason when none is provided."""
+    from hopper.cli import cmd_project
+
+    save_projects([Project(path="/path/to/P", name="P")])
+
+    result = cmd_project(["disable", "P"])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Disabled project: P" in captured.out
+    assert "  reason:" not in captured.out
+    project = load_projects()[0]
+    assert project.disabled is True
+    assert project.disabled_reason == ""
+
+
+def test_project_disable_not_found(capsys):
+    """project disable returns 1 when project is missing."""
+    from hopper.cli import cmd_project
+
+    result = cmd_project(["disable", "NOPE", "reason"])
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Project not found: NOPE" in captured.out
+
+
+def test_project_enable_clears_reason(capsys):
+    """project enable clears disabled state and reason."""
+    from hopper.cli import cmd_project
+
+    save_projects(
+        [Project(path="/path/to/P", name="P", disabled=True, disabled_reason="maintenance")]
+    )
+
+    result = cmd_project(["enable", "P"])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Enabled project: P" in captured.out
+    project = load_projects()[0]
+    assert project.disabled is False
+    assert project.disabled_reason == ""
+
+
+def test_project_enable_not_found(capsys):
+    """project enable returns 1 when project is missing."""
+    from hopper.cli import cmd_project
+
+    result = cmd_project(["enable", "NOPE"])
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Project not found: NOPE" in captured.out
+
+
+def test_project_disable_unquoted_multiword_reason(capsys):
+    """Unquoted reason tokens are joined with a single space."""
+    from hopper.cli import cmd_project
+
+    save_projects([Project(path="/path/to/P", name="P")])
+
+    result = cmd_project(["disable", "P", "foo", "bar"])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "  reason: foo bar" in captured.out
+    assert load_projects()[0].disabled_reason == "foo bar"
 
 
 def test_project_add_notifies_server(tmp_path, monkeypatch, capsys):
@@ -2873,6 +2984,17 @@ def test_project_add_rejects_extra_arg(capsys):
     assert result == 1
     captured = capsys.readouterr()
     assert "unexpected argument" in captured.out
+
+
+def test_project_rename_rejects_stray_fourth_arg(capsys):
+    """project rename rejects a stray fourth arg after trailing reason parser change."""
+    from hopper.cli import cmd_project
+
+    result = cmd_project(["rename", "old", "new", "junk"])
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "unexpected argument: junk" in captured.out
 
 
 # Tests for screenshot command

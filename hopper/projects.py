@@ -18,7 +18,19 @@ class Project:
     path: str  # Absolute path to git directory
     name: str  # Basename of directory
     disabled: bool = False  # True if removed but has existing sessions
+    disabled_reason: str = ""  # human-readable why, only meaningful when disabled is True
     last_used_at: int = 0
+
+
+def disabled_project_message(project: "Project") -> str:
+    """Prescriptive block message for a disabled-project lode-creation attempt."""
+    lines = [
+        f"error: project '{project.name}' is disabled — no new lodes can be created for it on this hopper.",  # noqa: E501
+    ]
+    if project.disabled_reason:
+        lines.append(f"  reason: {project.disabled_reason}")
+    lines.append(f"  re-enable with: hop project enable {project.name}")
+    return "\n".join(lines)
 
 
 def validate_git_dir(path: str) -> bool:
@@ -81,6 +93,7 @@ def load_projects() -> list[Project]:
                     path=item["path"],
                     name=item["name"],
                     disabled=item.get("disabled", False),
+                    disabled_reason=item.get("disabled_reason", ""),
                     last_used_at=item.get("last_used_at", 0),
                 )
             )
@@ -99,6 +112,7 @@ def save_projects(projects: list[Project]) -> None:
             "path": p.path,
             "name": p.name,
             "disabled": p.disabled,
+            "disabled_reason": p.disabled_reason,
             "last_used_at": p.last_used_at,
         }
         for p in projects
@@ -167,6 +181,30 @@ def remove_project(name: str) -> bool:
     for p in projects:
         if p.name == name:
             p.disabled = True
+            save_projects(projects)
+            return True
+    return False
+
+
+def disable_project(name: str, reason: str = "") -> bool:
+    """Disable a project by name with an optional reason."""
+    projects = load_projects()
+    for p in projects:
+        if p.name == name:
+            p.disabled = True
+            p.disabled_reason = reason
+            save_projects(projects)
+            return True
+    return False
+
+
+def enable_project(name: str) -> bool:
+    """Enable a disabled project by name."""
+    projects = load_projects()
+    for p in projects:
+        if p.name == name:
+            p.disabled = False
+            p.disabled_reason = ""
             save_projects(projects)
             return True
     return False

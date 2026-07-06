@@ -11,6 +11,9 @@ from hopper.config import load_config, save_config
 from hopper.projects import (
     Project,
     add_project,
+    disable_project,
+    disabled_project_message,
+    enable_project,
     find_project,
     get_active_projects,
     load_projects,
@@ -98,6 +101,15 @@ def test_save_and_load_projects(mock_config):
     assert loaded[1].disabled is True
 
 
+def test_disabled_reason_roundtrip(mock_config):
+    """disabled_reason survives save/load roundtrip."""
+    projects = [Project(path="/path/to/foo", name="foo", disabled=True, disabled_reason="paused")]
+    save_projects(projects)
+
+    loaded = load_projects()
+    assert loaded[0].disabled_reason == "paused"
+
+
 def test_load_projects_preserves_other_config(mock_config):
     """save_projects preserves other config keys."""
     import json
@@ -111,6 +123,17 @@ def test_load_projects_preserves_other_config(mock_config):
     assert config["name"] == "jer"
     assert config["other"] == "value"
     assert "projects" in config
+
+
+def test_load_projects_missing_disabled_reason_defaults_empty(mock_config, git_dir):
+    """Projects without disabled_reason field default to empty string."""
+    add_project(str(git_dir))
+    config = load_config()
+    for p in config["projects"]:
+        p.pop("disabled_reason", None)
+    save_config(config)
+    projects = load_projects()
+    assert projects[0].disabled_reason == ""
 
 
 # Tests for add_project
@@ -227,6 +250,88 @@ def test_remove_project_not_found(mock_config):
     """remove_project returns False for unknown project."""
     result = remove_project("nonexistent")
     assert result is False
+
+
+def test_disable_project_with_reason(mock_config, git_dir):
+    """disable_project disables the project and stores the reason."""
+    add_project(str(git_dir))
+
+    result = disable_project("test-repo", "maintenance")
+
+    assert result is True
+    project = load_projects()[0]
+    assert project.disabled is True
+    assert project.disabled_reason == "maintenance"
+
+
+def test_disable_project_without_reason(mock_config, git_dir):
+    """disable_project stores an empty reason when none is provided."""
+    add_project(str(git_dir))
+
+    result = disable_project("test-repo")
+
+    assert result is True
+    project = load_projects()[0]
+    assert project.disabled is True
+    assert project.disabled_reason == ""
+
+
+def test_disable_project_idempotent_updates_reason(mock_config, git_dir):
+    """Calling disable_project again updates the stored reason."""
+    add_project(str(git_dir))
+    disable_project("test-repo", "old")
+
+    result = disable_project("test-repo", "new")
+
+    assert result is True
+    project = load_projects()[0]
+    assert project.disabled is True
+    assert project.disabled_reason == "new"
+
+
+def test_disable_project_not_found(mock_config):
+    """disable_project returns False for unknown project."""
+    assert disable_project("nonexistent", "reason") is False
+
+
+def test_enable_project_clears_disabled_reason(mock_config, git_dir):
+    """enable_project enables the project and clears the reason."""
+    add_project(str(git_dir))
+    disable_project("test-repo", "maintenance")
+
+    result = enable_project("test-repo")
+
+    assert result is True
+    project = load_projects()[0]
+    assert project.disabled is False
+    assert project.disabled_reason == ""
+
+
+def test_enable_project_not_found(mock_config):
+    """enable_project returns False for unknown project."""
+    assert enable_project("nonexistent") is False
+
+
+def test_disabled_project_message_with_reason():
+    """disabled_project_message includes the reason when present."""
+    project = Project(path="/path/to/foo", name="foo", disabled=True, disabled_reason="paused")
+
+    message = disabled_project_message(project)
+
+    assert "error: project 'foo' is disabled" in message
+    assert "  reason: paused" in message
+    assert "  re-enable with: hop project enable foo" in message
+
+
+def test_disabled_project_message_without_reason():
+    """disabled_project_message omits the reason line when absent."""
+    project = Project(path="/path/to/foo", name="foo", disabled=True)
+
+    message = disabled_project_message(project)
+
+    assert "error: project 'foo' is disabled" in message
+    assert "  reason:" not in message
+    assert "  re-enable with: hop project enable foo" in message
 
 
 # Tests for rename_project

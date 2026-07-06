@@ -105,6 +105,23 @@ def _decode_mock_response(conn: MagicMock) -> dict:
     return json.loads(payload)
 
 
+def test_lode_create_disabled_project_noop_without_conn(socket_path):
+    """lode_create refuses disabled projects before creating or broadcasting."""
+    srv = Server(socket_path)
+    disabled = Project(path="/fake/repo", name="P", disabled=True, disabled_reason="wip")
+
+    with (
+        patch("hopper.server.find_project", return_value=disabled),
+        patch.object(srv, "broadcast") as mock_broadcast,
+    ):
+        srv._handle_mutation({"type": "lode_create", "project": "P", "scope": "scope"}, None)
+
+    assert srv.lodes == []
+    assert not any(
+        call.args[0].get("type") == "lode_created" for call in mock_broadcast.call_args_list
+    )
+
+
 def test_server_creates_socket(socket_path):
     """Server creates socket file on start."""
     srv = Server(socket_path)
@@ -739,6 +756,97 @@ def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, ma
         mock_spawn.assert_called_once_with(created["lode"]["id"], None, foreground=False)
 
         client.close()
+
+
+def test_promote_backlog_item_disabled_project_returns_none(socket_path):
+    """Disabled project backlog items are not promoted or removed."""
+    srv = Server(socket_path)
+    item = BacklogItem(
+        id="bl111111",
+        project="P",
+        description="Promote me",
+        created_at=1000,
+    )
+    srv.backlog = [item]
+    disabled = Project(path="/fake/repo", name="P", disabled=True, disabled_reason="wip")
+
+    with (
+        patch("hopper.server.find_project", return_value=disabled),
+        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch.object(srv, "broadcast") as mock_broadcast,
+    ):
+        result = srv._promote_backlog_item(item)
+
+    assert result is None
+    assert srv.lodes == []
+    assert srv.backlog == [item]
+    mock_spawn.assert_not_called()
+    mock_broadcast.assert_not_called()
+
+
+def test_auto_promote_on_ship_disabled_project_does_not_promote(socket_path, make_lode):
+    """Auto-promote leaves a disabled project's queued item in place."""
+    srv = Server(socket_path)
+    lode = make_lode(id="lode1234", project="P", stage="ship")
+    item = BacklogItem(
+        id="bl111111",
+        project="P",
+        description="Promote me",
+        created_at=1000,
+        queued="lode1234",
+    )
+    srv.lodes = [lode]
+    srv.backlog = [item]
+    disabled = Project(path="/fake/repo", name="P", disabled=True, disabled_reason="wip")
+
+    with (
+        patch("hopper.server.find_project", return_value=disabled),
+        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch.object(srv, "broadcast") as mock_broadcast,
+    ):
+        srv._handle_mutation(
+            {"type": "lode_set_stage", "lode_id": "lode1234", "stage": "shipped"},
+            None,
+        )
+
+    assert len(srv.lodes) == 1
+    assert srv.backlog == [item]
+    assert item.queued == "lode1234"
+    assert not any(
+        call.args[0].get("type") == "lode_created" for call in mock_broadcast.call_args_list
+    )
+    mock_spawn.assert_not_called()
+
+
+def test_lode_promote_backlog_disabled_sends_promote_error(socket_path):
+    """Manual promote reports disabled projects with promote_error."""
+    srv = Server(socket_path)
+    item = BacklogItem(
+        id="bl111111",
+        project="P",
+        description="Promote me",
+        created_at=1000,
+    )
+    srv.backlog = [item]
+    conn = MagicMock()
+    disabled = Project(path="/fake/repo", name="P", disabled=True, disabled_reason="wip")
+
+    with (
+        patch("hopper.server.find_project", return_value=disabled),
+        patch("hopper.server.spawn_claude") as mock_spawn,
+    ):
+        srv._handle_mutation(
+            {"type": "lode_promote_backlog", "item_id": "bl111111", "scope": ""},
+            conn,
+        )
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "promote_error"
+    assert "error: project 'P' is disabled" in response["error"]
+    assert "  reason: wip" in response["error"]
+    assert srv.lodes == []
+    assert srv.backlog == [item]
+    mock_spawn.assert_not_called()
 
 
 def test_auto_promote_backlog_on_ship_stage_uses_oldest(

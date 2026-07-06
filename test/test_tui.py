@@ -3,6 +3,7 @@
 
 """Tests for the TUI module."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -33,6 +34,7 @@ from hopper.tui import (
     Row,
     ScopeInputScreen,
     ShippedTable,
+    _picker_option_label,
     format_diff_summary,
     format_stage_text,
     format_status_label,
@@ -506,6 +508,27 @@ class MockServer:
 
     def enqueue(self, message: dict) -> None:
         self.events.append(message)
+
+
+def test_project_picker_call_sites_use_full_load_projects(monkeypatch):
+    """Project picker call sites pass the full project list, including disabled."""
+    active = Project(path="/path/to/active", name="active")
+    disabled = Project(path="/path/to/disabled", name="disabled", disabled=True)
+    full_projects = [active, disabled]
+    server = MockServer(projects=[active])
+    app = HopperApp(server=server)
+    screens = []
+
+    monkeypatch.setattr("hopper.tui.load_projects", lambda: full_projects)
+    monkeypatch.setattr(app, "push_screen", lambda screen, callback=None: screens.append(screen))
+
+    app.action_filter_project()
+    app.action_new_lode()
+    app.action_new_backlog()
+
+    assert len(screens) == 3
+    assert all(isinstance(screen, ProjectPickerScreen) for screen in screens)
+    assert all(screen._projects == full_projects for screen in screens)
 
 
 @pytest.mark.asyncio
@@ -1221,6 +1244,48 @@ async def test_project_picker_navigation():
         # Move back up
         await pilot.press("up")
         assert option_list.highlighted == 0
+
+
+def test_picker_option_label_marks_disabled():
+    """Disabled projects are marked in picker labels."""
+    active = Project(path="/path/to/proj1", name="proj1")
+    disabled = Project(path="/path/to/proj2", name="proj2", disabled=True)
+
+    assert _picker_option_label(active) == "proj1"
+    assert _picker_option_label(disabled) == "proj2 (disabled)"
+
+
+def test_project_picker_disabled_selection_notifies_without_dismiss():
+    """Selecting a disabled project warns and keeps the picker open."""
+    active = Project(path="/path/to/proj1", name="proj1")
+    disabled = Project(
+        path="/path/to/proj2",
+        name="proj2",
+        disabled=True,
+        disabled_reason="maintenance",
+    )
+    screen = ProjectPickerScreen([active, disabled])
+    screen.dismiss = MagicMock()
+    screen.notify = MagicMock()
+
+    screen.on_option_list_option_selected(SimpleNamespace(option_index=1))
+
+    screen.notify.assert_called_once_with("maintenance", severity="warning")
+    screen.dismiss.assert_not_called()
+
+
+def test_project_picker_active_selection_dismisses():
+    """Selecting an active project dismisses with that project."""
+    active = Project(path="/path/to/proj1", name="proj1")
+    disabled = Project(path="/path/to/proj2", name="proj2", disabled=True)
+    screen = ProjectPickerScreen([active, disabled])
+    screen.dismiss = MagicMock()
+    screen.notify = MagicMock()
+
+    screen.on_option_list_option_selected(SimpleNamespace(option_index=0))
+
+    screen.dismiss.assert_called_once_with(active)
+    screen.notify.assert_not_called()
 
 
 # Tests for ScopeInputScreen

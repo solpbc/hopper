@@ -50,7 +50,7 @@ from hopper.lodes import (
     update_lode_title,
 )
 from hopper.process import STAGES
-from hopper.projects import Project, find_project, get_active_projects
+from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
 from hopper.tmux import capture_pane, send_keys
 
 logger = logging.getLogger(__name__)
@@ -378,8 +378,16 @@ class Server:
         elif msg_type == "archived_list":
             self._send_response(conn, {"type": "archived_list", "lodes": self.archived_lodes})
 
-    def _promote_backlog_item(self, item: BacklogItem, scope: str = "") -> dict:
+    def _promote_backlog_item(self, item: BacklogItem, scope: str = "") -> dict | None:
         """Promote a backlog item to a lode. Returns the new lode dict."""
+        proj = find_project(item.project)
+        if proj and proj.disabled:
+            logger.warning(
+                "Refusing to promote backlog %s for disabled project %s",
+                item.id,
+                item.project,
+            )
+            return None
         lode = create_lode(self.lodes, item.project, scope or item.description)
         lode["backlog"] = item.to_dict()
         save_lodes(self.lodes)
@@ -387,7 +395,6 @@ class Server:
         self.broadcast({"type": "lode_created", "lode": lode})
         remove_backlog_item(self.backlog, item.id)
         self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
-        proj = find_project(item.project)
         project_path = proj.path if proj else None
         spawn_claude(lode["id"], project_path, foreground=False)
         return lode
@@ -411,6 +418,15 @@ class Server:
         elif msg_type == "lode_create":
             project = message.get("project", "")
             scope = message.get("scope", "")
+            proj = find_project(project)
+            if proj and proj.disabled:
+                logger.warning("Refusing to create lode for disabled project %s", project)
+                if conn:
+                    self._send_response(
+                        conn,
+                        {"type": "error", "error": disabled_project_message(proj)},
+                    )
+                return
             lode = create_lode(self.lodes, project, scope)
             backlog_data = message.get("backlog")
             if backlog_data:
@@ -422,7 +438,6 @@ class Server:
                 self._send_response(conn, {"type": "lode_created", "lode": lode})
             # Auto-spawn if requested
             if message.get("spawn"):
-                proj = find_project(project)
                 project_path = proj.path if proj else None
                 spawn_claude(lode["id"], project_path, foreground=False)
 
@@ -446,17 +461,22 @@ class Server:
                             oldest = min(candidates, key=lambda x: x.created_at)
                             new_lode = self._promote_backlog_item(oldest)
                             # Re-queue remaining items behind the new lode
-                            remaining = [item for item in self.backlog if item.queued == lode_id]
-                            for item in remaining:
-                                item.queued = new_lode["id"]
-                                self.broadcast({"type": "backlog_updated", "item": item.to_dict()})
-                            if remaining:
-                                save_backlog(self.backlog)
-                                logger.info(
-                                    "Re-queued %d backlog items behind %s",
-                                    len(remaining),
-                                    new_lode["id"],
-                                )
+                            if new_lode:
+                                remaining = [
+                                    item for item in self.backlog if item.queued == lode_id
+                                ]
+                                for item in remaining:
+                                    item.queued = new_lode["id"]
+                                    self.broadcast(
+                                        {"type": "backlog_updated", "item": item.to_dict()}
+                                    )
+                                if remaining:
+                                    save_backlog(self.backlog)
+                                    logger.info(
+                                        "Re-queued %d backlog items behind %s",
+                                        len(remaining),
+                                        new_lode["id"],
+                                    )
 
         elif msg_type == "lode_archive":
             lode_id = message.get("lode_id")
@@ -678,8 +698,14 @@ class Server:
             else:
                 try:
                     lode = self._promote_backlog_item(item, scope)
-                    if conn:
+                    if lode and conn:
                         self._send_response(conn, {"type": "lode_promoted", "lode": lode})
+                    elif conn:
+                        proj = find_project(item.project)
+                        self._send_response(
+                            conn,
+                            {"type": "promote_error", "error": disabled_project_message(proj)},
+                        )
                 except Exception:
                     logger.exception(f"Promote failed for backlog item {item_id}")
                     if conn:

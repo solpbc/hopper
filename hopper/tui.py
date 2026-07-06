@@ -51,7 +51,7 @@ from hopper.lodes import (
     lode_icon,
     read_diff_totals,
 )
-from hopper.projects import Project, find_project, touch_project
+from hopper.projects import Project, find_project, load_projects, touch_project
 from hopper.tmux import capture_pane, rename_window
 
 # Claude Code-inspired theme
@@ -172,6 +172,10 @@ def format_diff_summary(diff: str) -> Text:
     return text
 
 
+def _picker_option_label(project: Project) -> str:
+    return f"{project.name} (disabled)" if project.disabled else project.name
+
+
 class ProjectPickerScreen(ModalScreen[Project | None]):
     """Modal screen for picking a project."""
 
@@ -218,7 +222,7 @@ class ProjectPickerScreen(ModalScreen[Project | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="picker-container"):
             yield Static(self._picker_title, id="picker-title")
-            options = [Option(p.name, id=p.name) for p in self._projects]
+            options = [Option(_picker_option_label(p), id=p.name) for p in self._projects]
             yield OptionList(*options, id="project-list")
 
     def on_mount(self) -> None:
@@ -231,11 +235,21 @@ class ProjectPickerScreen(ModalScreen[Project | None]):
         option_list = self.query_one("#project-list", OptionList)
         if option_list.highlighted is not None:
             project = self._projects[option_list.highlighted]
+            if self._guard_disabled(project):
+                return
             self.dismiss(project)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         project = self._projects[event.option_index]
+        if self._guard_disabled(project):
+            return
         self.dismiss(project)
+
+    def _guard_disabled(self, project: Project) -> bool:
+        if not project.disabled:
+            return False
+        self.notify(project.disabled_reason or "project is disabled", severity="warning")
+        return True
 
 
 class LodePickerScreen(ModalScreen[str | None]):
@@ -1525,7 +1539,7 @@ class HopperApp(App):
             self._refresh_all_tables()
             self._update_sub_title()
 
-        self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
+        self.push_screen(ProjectPickerScreen(load_projects()), on_project_selected)
 
     def _refresh_all_tables(self) -> None:
         self.refresh_table()
@@ -1923,7 +1937,7 @@ class HopperApp(App):
 
             self.push_screen(ScopeInputScreen(project.name), on_scope_entered)
 
-        self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
+        self.push_screen(ProjectPickerScreen(load_projects()), on_project_selected)
 
     def action_new_backlog(self) -> None:
         """Open project picker, then backlog input, to create a new backlog item."""
@@ -1952,7 +1966,7 @@ class HopperApp(App):
 
             self.push_screen(BacklogInputScreen(), on_description_entered)
 
-        self.push_screen(ProjectPickerScreen(self._projects), on_project_selected)
+        self.push_screen(ProjectPickerScreen(load_projects()), on_project_selected)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter key on selected row in any table."""

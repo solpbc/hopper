@@ -370,6 +370,8 @@ def cmd_project(args: list[str]) -> int:
     from hopper.client import reload_projects
     from hopper.projects import (
         add_project,
+        disable_project,
+        enable_project,
         load_projects,
         remove_project,
         rename_project,
@@ -383,12 +385,13 @@ def cmd_project(args: list[str]) -> int:
     parser.add_argument(
         "action",
         nargs="?",
-        choices=["add", "remove", "rename", "list"],
+        choices=["add", "remove", "rename", "list", "disable", "enable"],
         default="list",
         help="Action to perform (default: list)",
     )
     parser.add_argument("path", nargs="?", help="Path (for add) or name (for remove/rename)")
     parser.add_argument("new_name", nargs="?", help="New name (for rename)")
+    parser.add_argument("reason", nargs="*", help="Reason (for disable)")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -398,8 +401,12 @@ def cmd_project(args: list[str]) -> int:
         parser.print_usage()
         return 1
 
-    if parsed.action != "rename" and parsed.new_name is not None:
+    if parsed.action not in ("rename", "disable") and parsed.new_name is not None:
         print(f"error: unexpected argument: {parsed.new_name}")
+        parser.print_usage()
+        return 1
+    if parsed.action != "disable" and parsed.reason:
+        print(f"error: unexpected argument: {parsed.reason[0]}")
         parser.print_usage()
         return 1
 
@@ -409,7 +416,9 @@ def cmd_project(args: list[str]) -> int:
             print("No projects configured. Use: hop project add <path>")
             return 0
         for p in projects:
-            status = " (disabled)" if p.disabled else ""
+            status = ""
+            if p.disabled:
+                status = f" (disabled: {p.disabled_reason})" if p.disabled_reason else " (disabled)"
             print(f"{p.name}{status}")
             print(f"  {p.path}")
         return 0
@@ -434,6 +443,41 @@ def cmd_project(args: list[str]) -> int:
             return 0
         except ValueError as e:
             print(f"error: {e}")
+            return 1
+
+    if parsed.action == "disable":
+        if not parsed.path:
+            print("error: name required for disable")
+            parser.print_usage()
+            return 1
+        reason = " ".join(t for t in [parsed.new_name, *parsed.reason] if t)
+        if disable_project(parsed.path, reason):
+            print(f"Disabled project: {parsed.path}")
+            if reason:
+                print(f"  reason: {reason}")
+            try:
+                reload_projects(_socket())
+            except Exception:
+                pass
+            return 0
+        else:
+            print(f"Project not found: {parsed.path}")
+            return 1
+
+    if parsed.action == "enable":
+        if not parsed.path:
+            print("error: name required for enable")
+            parser.print_usage()
+            return 1
+        if enable_project(parsed.path):
+            print(f"Enabled project: {parsed.path}")
+            try:
+                reload_projects(_socket())
+            except Exception:
+                pass
+            return 0
+        else:
+            print(f"Project not found: {parsed.path}")
             return 1
 
     if parsed.action == "add":
@@ -1175,7 +1219,7 @@ def _create_alias_help(cmd_name: str, description: str, args: list[str]) -> int 
 def cmd_lode(args: list[str]) -> int:
     """Manage lodes — list, create, restart, watch, wait."""
     import hopper.client as client
-    from hopper.projects import find_project
+    from hopper.projects import disabled_project_message, find_project
 
     STAGE_ORDER = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
 
@@ -1291,6 +1335,9 @@ def cmd_lode(args: list[str]) -> int:
             names = ", ".join(p.name for p in get_active_projects())
             print(f"Project '{project_name}' not found.")
             print(f"Registered projects: {names}")
+            return 1
+        if project.disabled:
+            print(disabled_project_message(project))
             return 1
         if not parsed.force:
             from hopper.git import dirty_status
