@@ -2,9 +2,13 @@
 # Copyright (c) 2026 sol pbc
 
 import argparse
+import json
 import os
+import re
+import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,7 +23,7 @@ from hopper.lodes import (
     format_age,
     lode_icon,
 )
-from hopper.tmux import capture_pane
+from hopper.tmux import capture_pane, paste_buffer, send_keys
 
 STUCK_GRACE_MS = 120_000
 
@@ -56,6 +60,13 @@ class ArgumentError(Exception):
     pass
 
 
+class HopperArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that raises on errors but keeps normal --help behavior."""
+
+    def error(self, message: str) -> None:
+        raise ArgumentError(message)
+
+
 def make_parser(cmd: str, description: str) -> argparse.ArgumentParser:
     """Create an argument parser for a subcommand.
 
@@ -63,7 +74,7 @@ def make_parser(cmd: str, description: str) -> argparse.ArgumentParser:
     - prog set to 'hop <cmd>' for proper usage lines
     - exit_on_error=False so we can handle errors gracefully
     """
-    return argparse.ArgumentParser(
+    return HopperArgumentParser(
         prog=f"hop {cmd}",
         description=description,
         exit_on_error=False,
@@ -85,7 +96,7 @@ def print_help() -> None:
     """Print help text."""
     print(f"hop v{__version__} - TUI for managing coding agents")
     print()
-    print("Usage: hop <command> [options]")
+    print("Usage: hop [-H host|--host host] <command> [options]")
     for group_key, group_label in HELP_GROUPS:
         cmds = [(n, d) for n, (_, d, g) in COMMANDS.items() if g == group_key]
         if cmds:
@@ -94,6 +105,7 @@ def print_help() -> None:
                 print(f"  {name:<12} {desc}")
     print()
     print("Options:")
+    print("  -H, --host   Run the command on a remote hopper host (use 'local' to force local)")
     print("  -h, --help   Show this help message")
     print("  --version    Show version number")
 
@@ -200,6 +212,155 @@ def require_not_inside_lode() -> int | None:
         print("Use hop backlog add to queue work instead.")
         return 1
     return None
+
+
+def _remote_disabled() -> bool:
+    """Return True when routing must be skipped."""
+    return bool(os.environ.get("HOP_NO_ROUTE") or os.environ.get("HOPPER_LID"))
+
+
+def _global_host_arg(args: list[str]) -> tuple[str | None, list[str], str | None]:
+    """Parse the global -H/--host flag before command dispatch."""
+    if not args:
+        return None, args, None
+    if args[0] in ("-H", "--host"):
+        if len(args) < 2:
+            return None, args, "error: -H/--host requires a host"
+        return args[1], args[2:], None
+    if args[0].startswith("--host="):
+        return args[0].split("=", 1)[1], args[1:], None
+    return None, args, None
+
+
+def _stdin_for_remote(cmd: str, cmd_args: list[str]) -> str | None:
+    """Read stdin only for commands that are expected to consume it."""
+    if sys.stdin.isatty():
+        return None
+    if cmd in ("implement", "submit", "feedback"):
+        return sys.stdin.read()
+    if cmd == "lode" and cmd_args and cmd_args[0] == "create":
+        return sys.stdin.read()
+    if cmd == "gate" and cmd_args and cmd_args[0] == "feedback":
+        return sys.stdin.read()
+    return None
+
+
+def _extract_create_project(cmd: str, cmd_args: list[str]) -> str | None:
+    """Return the project argument for create-like commands."""
+    args = cmd_args
+    if cmd == "lode":
+        if not args or args[0] != "create":
+            return None
+        args = args[1:]
+    elif cmd not in ("implement", "submit"):
+        return None
+
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-f", "--force", "--json"):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return None
+
+
+def _create_wants_json(cmd: str, cmd_args: list[str]) -> bool:
+    args = cmd_args[1:] if cmd == "lode" and cmd_args[:1] == ["create"] else cmd_args
+    return "--json" in args
+
+
+def _remote_host_for_create(project: str) -> tuple[str, str] | None:
+    """Resolve a create command to a remote host when local should not handle it."""
+    from hopper.projects import find_project
+    from hopper.remote import remote_registry
+
+    registry = remote_registry()
+    host = registry.get(project)
+    if not host:
+        return None
+    project_record = find_project(project)
+    if project_record and not project_record.disabled:
+        return None
+    return host, f"remote.{project}"
+
+
+def _remote_process_output(
+    result,
+    *,
+    host: str,
+    annotate_create: bool = False,
+    annotate_json: bool = False,
+) -> None:
+    """Pass through remote output, optionally adding host context."""
+    stdout = result.stdout
+    if annotate_json and stdout.strip():
+        try:
+            payload = json.loads(stdout)
+            if isinstance(payload, dict):
+                payload["host"] = host
+                stdout = json.dumps(payload) + "\n"
+        except json.JSONDecodeError:
+            pass
+    elif annotate_create and stdout.strip():
+        lines = stdout.splitlines()
+        if lines:
+            match = re.match(r"^(Created lode \S+ \([^)]+\))(.*)$", lines[0])
+            if match and " on " not in lines[0]:
+                lines[0] = f"{match.group(1)} on {host}{match.group(2)}"
+                stdout = "\n".join(lines) + ("\n" if result.stdout.endswith("\n") else "")
+
+    if stdout:
+        sys.stdout.write(stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+
+
+def _run_remote_cli(
+    host: str,
+    hop_args: list[str],
+    *,
+    reason: str,
+    stdin_text: str | None = None,
+    annotate_create: bool = False,
+    annotate_json: bool = False,
+    remember_project: str | None = None,
+) -> int:
+    """Run a remote hop command and mirror its result locally."""
+    from hopper.remote import remember_lode, run_remote
+
+    print(f"→ {host} ({reason})", file=sys.stderr)
+    try:
+        result = run_remote(host, hop_args, stdin_text=stdin_text)
+    except subprocess.TimeoutExpired as e:
+        print(f"remote command timed out on {host}: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"remote command failed on {host}: {e}", file=sys.stderr)
+        return 1
+
+    _remote_process_output(
+        result,
+        host=host,
+        annotate_create=annotate_create,
+        annotate_json=annotate_json,
+    )
+    if result.returncode == 0 and remember_project:
+        lode_id = None
+        try:
+            payload = json.loads(result.stdout)
+            if isinstance(payload, dict):
+                lode_id = payload.get("id")
+        except json.JSONDecodeError:
+            match = re.search(r"Created lode (\S+)", result.stdout)
+            if match:
+                lode_id = match.group(1)
+        if isinstance(lode_id, str) and lode_id:
+            remember_lode(lode_id, host, remember_project)
+    return result.returncode
 
 
 @command("up", "Start the server and TUI")
@@ -610,6 +771,82 @@ def cmd_config(args: list[str]) -> int:
     return 0
 
 
+@command("remote", "Manage remote hopper hosts")
+def cmd_remote(args: list[str]) -> int:
+    """Manage project -> remote hopper host mappings."""
+    from hopper.projects import find_project
+    from hopper.remote import remote_registry, remove_remote, run_remote, set_remote
+
+    parser = make_parser("remote", "Manage project -> remote hopper host mappings.")
+    subs = parser.add_subparsers(dest="subcommand")
+    list_p = subs.add_parser("list", aliases=["ls"], help="List remotes", exit_on_error=False)
+    list_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    set_p = subs.add_parser("set", help="Set a project remote", exit_on_error=False)
+    set_p.add_argument("project", help="Project name")
+    set_p.add_argument("host", help="Remote host")
+    rm_p = subs.add_parser(
+        "rm",
+        aliases=["remove"],
+        help="Remove a project remote",
+        exit_on_error=False,
+    )
+    rm_p.add_argument("project", help="Project name")
+
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    subcommand = parsed.subcommand or "list"
+    if subcommand in ("list", "ls"):
+        registry = remote_registry()
+        rows = [{"project": project, "host": host} for project, host in sorted(registry.items())]
+        if getattr(parsed, "json_output", False):
+            print(json.dumps({"remotes": rows}, indent=2))
+            return 0
+        if not rows:
+            print("No remote projects configured.")
+            return 0
+        for row in rows:
+            print(f"{row['project']:<24} {row['host']}")
+        return 0
+
+    if subcommand == "set":
+        project = find_project(parsed.project)
+        if project and not project.disabled:
+            print(f"error: project '{parsed.project}' is active locally; disable it before routing")
+            print(f'  hop project disable {parsed.project} --reason "moved to {parsed.host}"')
+            return 1
+        try:
+            result = run_remote(parsed.host, ["ping"], timeout=15)
+            failed = result.returncode != 0
+            detail = (result.stderr or result.stdout or "remote ping failed").strip()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            failed = True
+            detail = str(e)
+        if failed:
+            print(
+                f"warning: remote host {parsed.host} did not answer hop ping: {detail}",
+                file=sys.stderr,
+            )
+        set_remote(parsed.project, parsed.host)
+        print(f"remote.{parsed.project}={parsed.host}")
+        return 0
+
+    if subcommand in ("rm", "remove"):
+        if not remove_remote(parsed.project):
+            print(f"Remote project '{parsed.project}' not set.")
+            return 1
+        print(f"Removed remote.{parsed.project}")
+        return 0
+
+    return 0
+
+
 @command("screenshot", "Capture TUI window as ANSI text")
 def cmd_screenshot(args: list[str]) -> int:
     """Capture the TUI window content with ANSI styling."""
@@ -728,11 +965,26 @@ def _cmd_gate_show(args: list[str]) -> int:
         return 1
 
     if err := require_server():
+        remote_lode, _checked = _find_remote_lode(parsed.lode_id)
+        if remote_lode:
+            return _run_remote_cli(
+                remote_lode["host"],
+                ["gate", "show", parsed.lode_id],
+                reason=f"lode {remote_lode['id']}",
+            )
         return err
 
     gate_data = client.get_gate(_socket(), parsed.lode_id)
     if not gate_data:
-        print(f"Error: lode {parsed.lode_id} not found")
+        remote_lode, checked = _find_remote_lode(parsed.lode_id)
+        if remote_lode:
+            return _run_remote_cli(
+                remote_lode["host"],
+                ["gate", "show", parsed.lode_id],
+                reason=f"lode {remote_lode['id']}",
+            )
+        suffix = f" Checked remote hosts: {checked}." if checked else ""
+        print(f"Error: lode {parsed.lode_id} not found.{suffix}")
         return 1
 
     lode = gate_data["lode"]
@@ -773,9 +1025,6 @@ def _cmd_gate_feedback(args: list[str]) -> int:
         parser.print_usage()
         return 1
 
-    if err := require_server():
-        return err
-
     text = sys.stdin.read() if parsed.text in (None, "-") else parsed.text
     if not text.strip():
         print(
@@ -787,15 +1036,40 @@ def _cmd_gate_feedback(args: list[str]) -> int:
         )
         return 1
 
+    if err := require_server():
+        remote_lode, _checked = _find_remote_lode(parsed.lode_id)
+        if remote_lode:
+            return _run_remote_cli(
+                remote_lode["host"],
+                ["gate", "feedback", parsed.lode_id, "-"],
+                reason=f"lode {remote_lode['id']}",
+                stdin_text=text,
+            )
+        return err
+
     response = client.send_gate_feedback(_socket(), parsed.lode_id, text)
     if response and response.get("type") == "feedback_sent":
         print(f"Feedback sent to {parsed.lode_id} (pane {response.get('tmux_pane', '')})")
+        if not response.get("submitted", True):
+            print("Warning: feedback paste was not verified as submitted.", file=sys.stderr)
+            tail = response.get("tail", "")
+            if tail:
+                print(tail, file=sys.stderr)
         return 0
 
     error = (
         response.get("error", "failed to send feedback") if response else "failed to send feedback"
     )
-    print(f"Error: {error}")
+    remote_lode, checked = _find_remote_lode(parsed.lode_id)
+    if remote_lode:
+        return _run_remote_cli(
+            remote_lode["host"],
+            ["gate", "feedback", parsed.lode_id, "-"],
+            reason=f"lode {remote_lode['id']}",
+            stdin_text=text,
+        )
+    suffix = f" Checked remote hosts: {checked}." if checked else ""
+    print(f"Error: {error}.{suffix}")
     return 1
 
 
@@ -1097,9 +1371,12 @@ def format_lode_line(lode: dict) -> str:
     icon = lode_icon(lode)
     stage = lode.get("stage", "mill")
     lid = lode["id"]
+    host = lode.get("host")
     project = lode.get("project", "")
     title = lode.get("title", "")
     status_text = lode.get("status", "")
+    if host:
+        return f"  {host:<14} {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
     return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
 
 
@@ -1126,6 +1403,8 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(_format_lode_error(lode))
         lines.append("")
     lines.append(f"  id:       {lode.get('id', '')}")
+    if lode.get("host"):
+        lines.append(f"  host:     {lode.get('host', '')}")
     lines.append(f"  project:  {lode.get('project', '')}")
     lines.append(f"  stage:    {lode.get('stage', '')}")
     lines.append(f"  state:    {lode.get('state', '')}")
@@ -1182,10 +1461,131 @@ def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
     return None, f"Lode '{prefix}' not found."
 
 
+def _remote_lode_status(host: str, lode_id: str, timeout: float = 5.0) -> dict | None:
+    """Return a remote lode status dict, or None when not found/unreachable."""
+    from hopper.remote import run_remote
+
+    try:
+        result = run_remote(host, ["lode", "status", lode_id, "--json"], timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        lode = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(lode, dict) or not lode.get("id"):
+        return None
+    lode["host"] = host
+    return lode
+
+
+def _find_remote_lode(prefix: str) -> tuple[dict | None, str]:
+    """Find a lode on configured remote hosts using cache, then fan-out."""
+    from hopper.remote import load_lode_cache, remember_lode, remote_registry
+
+    registry = remote_registry()
+    hosts = sorted(set(registry.values()))
+    checked: list[str] = []
+
+    cache_entry = load_lode_cache().get(prefix)
+    if cache_entry and isinstance(cache_entry.get("host"), str):
+        host = cache_entry["host"]
+        checked.append(host)
+        lode = _remote_lode_status(host, prefix)
+        if lode:
+            remember_lode(lode["id"], host, lode.get("project", ""))
+            return lode, ", ".join(checked)
+
+    remaining_hosts = [host for host in hosts if host not in checked]
+    if not remaining_hosts:
+        return None, ", ".join(checked)
+
+    lock = threading.Lock()
+    found: list[dict] = []
+
+    def check_host(host: str) -> None:
+        lode = _remote_lode_status(host, prefix)
+        with lock:
+            checked.append(host)
+            if lode and not found:
+                found.append(lode)
+
+    threads = [
+        threading.Thread(target=check_host, args=(host,), daemon=True) for host in remaining_hosts
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.5)
+
+    if found:
+        lode = found[0]
+        remember_lode(lode["id"], lode["host"], lode.get("project", ""))
+        return lode, ", ".join(sorted(set(checked)))
+    return None, ", ".join(sorted(set(checked)))
+
+
+def _lookup_lode_with_remote(socket_path, prefix: str) -> tuple[dict | None, str | None]:
+    """Look up a lode locally, then on configured remote hosts."""
+    lode, error = _lookup_lode(socket_path, prefix)
+    if lode or (error and not error.startswith("Lode '")):
+        return lode, error
+    remote_lode, checked = _find_remote_lode(prefix)
+    if remote_lode:
+        return remote_lode, None
+    suffix = f" Checked remote hosts: {checked}." if checked else " No remote hosts configured."
+    return None, f"Lode '{prefix}' not found.{suffix}"
+
+
+def _tail_text(text: str, lines: int = 10) -> str:
+    """Return the last N lines of text."""
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def _submission_tail(text: str) -> str:
+    """Return a small tail used to check whether pasted input remains pending."""
+    compact = " ".join(text.strip().split())
+    return compact[-80:] if compact else ""
+
+
+def _pane_has_pending_text(pane_text: str | None, submitted_text: str) -> bool:
+    """Heuristic for whether submitted text still appears on the input line."""
+    if not pane_text:
+        return False
+    tail = _submission_tail(submitted_text)
+    if not tail:
+        return False
+    compact_tail = " ".join(_tail_text(pane_text, 5).split())
+    return tail in compact_tail
+
+
+def _submit_to_pane(target: str, text: str, *, paste: bool = True) -> tuple[bool, str]:
+    """Submit text to a tmux pane and return (submitted, post-submit tail)."""
+    before = capture_pane(target, plain=True)
+    if before is None:
+        return False, f"pane {target} no longer exists"
+    delivered = paste_buffer(target, text) if paste else send_keys(target, text)
+    if not delivered:
+        return False, f"failed to deliver text to {target}"
+    send_keys(target, "Enter")
+    time.sleep(2)
+    after = capture_pane(target, plain=True)
+    if not _pane_has_pending_text(after, text):
+        return True, _tail_text(after or "", 10)
+    send_keys(target, "Enter")
+    time.sleep(0.2)
+    retry_after = capture_pane(target, plain=True)
+    submitted = not _pane_has_pending_text(retry_after, text)
+    return submitted, _tail_text(retry_after or after or "", 10)
+
+
 def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
     parser.add_argument("-f", "--force", action="store_true", help="Override dirty-repo check")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     prog = parser.prog
     parser.epilog = (
@@ -1238,6 +1638,12 @@ def cmd_lode(args: list[str]) -> int:
     )
     list_p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
     list_p.add_argument("-p", "--project", help="Filter by project name")
+    list_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    list_p.add_argument(
+        "--all-hosts",
+        action="store_true",
+        help="Aggregate local and configured remote hopper hosts",
+    )
 
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
     _add_create_args(create_p)
@@ -1256,10 +1662,14 @@ def cmd_lode(args: list[str]) -> int:
     wait_p = subs.add_parser("wait", help="Wait for lode to ship", exit_on_error=False)
     wait_p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
     wait_p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
+    wait_p.add_argument("--poll", type=float, default=30, help="Remote poll interval seconds")
+    wait_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSONL")
     status_p = subs.add_parser("status", help="Show a lode's status", exit_on_error=False)
     status_p.add_argument("lode_id", help="Lode ID to show")
+    status_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     show_p = subs.add_parser("show", help="Show a lode's status", exit_on_error=False)
     show_p.add_argument("lode_id", help="Lode ID to show")
+    show_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     log_p = subs.add_parser("log", help="Show activity log for a lode", exit_on_error=False)
     log_p.add_argument("lode_id", help="Lode ID (or prefix)")
     log_p.add_argument("-n", "--tail", type=int, default=0, help="Show last N entries")
@@ -1267,6 +1677,15 @@ def cmd_lode(args: list[str]) -> int:
     kill_p = subs.add_parser("kill", help="Kill a running lode", exit_on_error=False)
     kill_p.add_argument("lode_id", help="Lode ID to kill")
     kill_p.add_argument("-f", "--force", action="store_true", help="Force kill (no confirmation)")
+    peek_p = subs.add_parser("peek", help="Show plain text from a lode pane", exit_on_error=False)
+    peek_p.add_argument("lode_id", help="Lode ID to inspect")
+    peek_p.add_argument("-n", "--lines", type=int, default=40, help="Number of lines to show")
+    nudge_p = subs.add_parser("nudge", help="Send text to a lode pane", exit_on_error=False)
+    nudge_p.add_argument("lode_id", help="Lode ID to nudge")
+    nudge_p.add_argument("--text", default="continue", help="Text to submit")
+    answer_p = subs.add_parser("answer", help="Answer a numbered lode prompt", exit_on_error=False)
+    answer_p.add_argument("lode_id", help="Lode ID to answer")
+    answer_p.add_argument("choice", help="Numbered choice, 1-9")
 
     try:
         parsed = parse_args(parser, args)
@@ -1285,28 +1704,57 @@ def cmd_lode(args: list[str]) -> int:
 
     if subcommand in ("list", "ls"):
         err = require_server()
-        if err:
+        if err and not getattr(parsed, "all_hosts", False):
             return err
         archived = getattr(parsed, "archived", False)
-        if archived:
-            lodes = client.list_archived_lodes(socket_path)
-            lodes.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
-            project_filter = getattr(parsed, "project", None)
+        project_filter = getattr(parsed, "project", None)
+
+        def local_lodes() -> list[dict]:
+            if err:
+                return []
+            if archived:
+                rows = client.list_archived_lodes(socket_path)
+                rows.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
+            else:
+                rows = client.list_lodes(socket_path)
+                rows = [lode for lode in rows if lode.get("stage") in STAGE_ORDER]
+                rows.sort(key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 99))
             if project_filter:
-                lodes = [lode for lode in lodes if lode.get("project") == project_filter]
-            if not lodes:
-                print("No archived lodes")
-                return 0
-        else:
-            lodes = client.list_lodes(socket_path)
-            lodes = [lode for lode in lodes if lode.get("stage") in STAGE_ORDER]
-            lodes.sort(key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 99))
-            project_filter = getattr(parsed, "project", None)
+                rows = [lode for lode in rows if lode.get("project") == project_filter]
+            return rows
+
+        lodes = local_lodes()
+        if getattr(parsed, "all_hosts", False):
+            from hopper.remote import remote_registry, run_remote
+
+            for lode in lodes:
+                lode["host"] = "local"
+            remote_args = ["lode", "list", "--json"]
+            if archived:
+                remote_args.append("--archived")
             if project_filter:
-                lodes = [lode for lode in lodes if lode.get("project") == project_filter]
-            if not lodes:
-                print("No active lodes")
-                return 0
+                remote_args.extend(["--project", project_filter])
+            for host in sorted(set(remote_registry().values())):
+                try:
+                    result = run_remote(host, remote_args, timeout=8)
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+                if result.returncode != 0:
+                    continue
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    continue
+                for lode in payload.get("lodes", []) if isinstance(payload, dict) else []:
+                    if isinstance(lode, dict):
+                        lode["host"] = host
+                        lodes.append(lode)
+        if getattr(parsed, "json_output", False):
+            print(json.dumps({"lodes": lodes}, indent=2))
+            return 0
+        if not lodes:
+            print("No archived lodes" if archived else "No active lodes")
+            return 0
         for lode in lodes:
             print(format_lode_line(lode))
         return 0
@@ -1354,6 +1802,12 @@ def cmd_lode(args: list[str]) -> int:
         if err:
             return err
         lode = client.create_lode(socket_path, project_name, scope, spawn=True)
+        if getattr(parsed, "json_output", False):
+            if not lode:
+                print("error: lode was not created", file=sys.stderr)
+                return 1
+            print(json.dumps({"id": lode["id"], "project": project_name, "host": "local"}))
+            return 0
         if lode:
             print(f"Created lode {lode['id']} ({project_name})")
         else:
@@ -1369,11 +1823,25 @@ def cmd_lode(args: list[str]) -> int:
             return err
         lode = client.get_lode(socket_path, lode_id)
         if not lode:
-            print(f"Lode not found: {lode_id}")
+            remote_lode, checked = _find_remote_lode(lode_id)
+            if remote_lode:
+                return _run_remote_cli(
+                    remote_lode["host"],
+                    ["lode", "restart", lode_id, *(["--force"] if parsed.force else [])],
+                    reason=f"lode {remote_lode['id']}",
+                )
+            suffix = f" Checked remote hosts: {checked}." if checked else ""
+            print(f"Lode not found: {lode_id}.{suffix}")
             return 1
         if lode.get("active"):
-            print(f"Cannot restart: lode {lode_id} is active")
-            return 1
+            pane = lode.get("tmux_pane")
+            pane_dead = not pane or capture_pane(pane, plain=True) is None
+            if not (parsed.force and pane_dead):
+                print(f"Cannot restart: lode {lode_id} is active")
+                if pane_dead:
+                    print("pane appears dead; pass --force to restart anyway")
+                return 1
+            print(f"Detected active lode with dead pane {pane}; restarting with --force")
         stage = lode.get("stage", "")
         if stage not in ("mill", "refine", "ship"):
             print(f"Cannot restart: lode {lode_id} stage is {stage}")
@@ -1458,8 +1926,10 @@ def cmd_lode(args: list[str]) -> int:
         if (rc := require_not_inside_lode()) is not None:
             return rc
         lode_ids = parsed.lode_id
-        if require_server():
-            return 1
+        server_err = require_server()
+        local_available = not server_err
+        json_output = getattr(parsed, "json_output", False)
+        poll_interval = max(10.0, float(getattr(parsed, "poll", 30) or 30))
 
         def _shipped_line(lid: str, title: str) -> str:
             if title:
@@ -1489,21 +1959,88 @@ def cmd_lode(args: list[str]) -> int:
             lines.append("  --- end pane ---")
             return "\n".join(lines)
 
+        def _event(lode: dict, outcome: str) -> dict:
+            event = {
+                "id": lode.get("id", ""),
+                "outcome": outcome,
+                "stage": lode.get("stage", ""),
+                "state": lode.get("state", ""),
+                "status": lode.get("status", ""),
+            }
+            if lode.get("host"):
+                event["host"] = lode["host"]
+            return event
+
+        def _print_terminal(lode: dict, outcome: str) -> None:
+            lid = lode.get("id", "")
+            if json_output:
+                print(json.dumps(_event(lode, outcome)))
+                if outcome == "stuck":
+                    print(
+                        _stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")),
+                        file=sys.stderr,
+                    )
+                return
+            if outcome == "shipped":
+                print(_shipped_line(lid, lode.get("title", "")))
+            elif outcome == "error":
+                print(_error_line(lid, lode.get("status", "")))
+            elif outcome == "gated":
+                print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
+            elif outcome == "stuck":
+                print(_stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")))
+            elif outcome == "timeout":
+                print(f"Timed out waiting for lode(s): {lid}")
+
+        def _terminal(lode: dict) -> tuple[str, int] | None:
+            if lode.get("state") == "error":
+                return "error", 1
+            if lode.get("state") == "gated":
+                return "gated", 2
+            if lode.get("state") == "stuck":
+                return "stuck", 3
+            if lode.get("stage") == "shipped":
+                return "shipped", 0
+            return None
+
         resolved: dict[str, dict] = {}
         pending: set[str] = set()
+        pending_remote: dict[str, str] = {}
         stuck_timers: dict[str, threading.Timer] = {}
 
         for raw_id in lode_ids:
-            lode = client.get_lode(socket_path, raw_id)
+            lode = client.get_lode(socket_path, raw_id) if local_available else None
+            if not lode and local_available:
+                lode, error = _lookup_lode(socket_path, raw_id)
+                if error and not error.startswith("Lode '"):
+                    print(error)
+                    return 1
+            if not lode:
+                remote_lode, checked = _find_remote_lode(raw_id)
+                if remote_lode:
+                    lode = remote_lode
+                else:
+                    suffix = (
+                        f" Checked remote hosts: {checked}."
+                        if checked
+                        else " No remote hosts configured."
+                    )
+                    print(f"Lode '{raw_id}' not found.{suffix}")
+                    return 1
+
             if lode:
                 lid = lode["id"]
-                if lode.get("state") == "error":
+                terminal = _terminal(lode)
+                if terminal and terminal[0] == "error":
                     print(_format_lode_error(lode))
                     return 1
-                if lode.get("state") == "stuck":
-                    print(_stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")))
+                if terminal and terminal[0] == "stuck":
+                    _print_terminal(lode, "stuck")
                     return 3
-                if lode.get("stage") == "shipped":
+                if terminal and terminal[0] == "gated":
+                    _print_terminal(lode, "gated")
+                    return 2
+                if terminal and terminal[0] == "shipped":
                     resolved[lid] = lode
                 elif not lode.get("active"):
                     print(f"Lode '{raw_id}' is not active")
@@ -1511,36 +2048,19 @@ def cmd_lode(args: list[str]) -> int:
                 else:
                     resolved[lid] = lode
                     pending.add(lid)
-            else:
-                lode, error = _lookup_lode(socket_path, raw_id)
-                if not lode:
-                    print(error or f"Lode '{raw_id}' not found")
-                    return 1
-                lid = lode["id"]
-                if lode.get("state") == "error":
-                    print(_format_lode_error(lode))
-                    return 1
-                if lode.get("state") == "stuck":
-                    print(_stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")))
-                    return 3
-                if lode.get("stage") == "shipped":
-                    resolved[lid] = lode
-                elif not lode.get("active"):
-                    print(f"Lode '{lid}' is not active")
-                    return 1
-                else:
-                    resolved[lid] = lode
-                    pending.add(lid)
+                    if lode.get("host"):
+                        pending_remote[lid] = lode["host"]
 
         for lid, lode in resolved.items():
             if lid not in pending:
-                print(_shipped_line(lid, lode.get("title", "")))
+                _print_terminal(lode, "shipped")
 
         if not pending:
             return 0
 
         done = threading.Event()
         result = [0]
+        lock = threading.Lock()
 
         def _cancel_stuck_timer(lid: str) -> None:
             timer = stuck_timers.pop(lid, None)
@@ -1556,9 +2076,21 @@ def cmd_lode(args: list[str]) -> int:
                 return
             if not current or current.get("state") != "stuck":
                 return
-            print(_stuck_diagnostic(lid, current.get("status", ""), current.get("tmux_pane")))
+            _print_terminal(current, "stuck")
             result[0] = 3
             done.set()
+
+        def _finish(lid: str, lode: dict, outcome: str, code: int) -> None:
+            with lock:
+                if lid not in pending:
+                    return
+                _cancel_stuck_timer(lid)
+                pending.discard(lid)
+                pending_remote.pop(lid, None)
+                _print_terminal(lode, outcome)
+                result[0] = max(result[0], code)
+                if code != 0 or not pending:
+                    done.set()
 
         def on_message(message: dict) -> None:
             msg_type = message.get("type")
@@ -1578,35 +2110,110 @@ def cmd_lode(args: list[str]) -> int:
                 return
             _cancel_stuck_timer(lid)
             if msg_lode.get("state") == "error":
-                print(_error_line(lid, msg_lode.get("status", "")))
-                result[0] = 1
-                done.set()
+                _finish(lid, msg_lode, "error", 1)
             elif msg_lode.get("state") == "gated":
-                print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
-                result[0] = 2
-                done.set()
+                _finish(lid, msg_lode, "gated", 2)
             elif msg_lode.get("stage") == "shipped" or msg_type == "lode_archived":
-                pending.discard(lid)
-                print(_shipped_line(lid, msg_lode.get("title", "")))
-                if not pending:
-                    done.set()
+                _finish(lid, msg_lode, "shipped", 0)
 
-        conn = client.HopperConnection(socket_path)
+        def _remote_poll_lode(lid: str, host: str) -> None:
+            from hopper.remote import remember_lode, run_remote
+
+            prior: tuple[str, str, str] | None = None
+            stuck_since: float | None = None
+            consecutive_failures = 0
+            while not done.is_set() and lid in pending:
+                try:
+                    remote_result = run_remote(
+                        host,
+                        ["lode", "status", lid, "--json"],
+                        timeout=max(5.0, min(poll_interval, 30.0)),
+                    )
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 2:
+                        print(f"remote poll failed for {lid} on {host}: {e}", file=sys.stderr)
+                    done.wait(5 if consecutive_failures == 1 else poll_interval)
+                    continue
+
+                if remote_result.returncode != 0:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 2:
+                        detail = (remote_result.stderr or remote_result.stdout).strip()
+                        print(f"remote poll failed for {lid} on {host}: {detail}", file=sys.stderr)
+                    done.wait(5 if consecutive_failures == 1 else poll_interval)
+                    continue
+
+                consecutive_failures = 0
+                try:
+                    lode = json.loads(remote_result.stdout)
+                except json.JSONDecodeError:
+                    done.wait(poll_interval)
+                    continue
+                if not isinstance(lode, dict):
+                    done.wait(poll_interval)
+                    continue
+                lode["host"] = host
+                remember_lode(lode.get("id", lid), host, lode.get("project", ""))
+                signature = (
+                    str(lode.get("stage", "")),
+                    str(lode.get("state", "")),
+                    str(lode.get("status", "")),
+                )
+                if prior is None:
+                    prior = signature
+                elif signature != prior and not json_output:
+                    print(format_lode_line(lode))
+                    prior = signature
+
+                terminal = _terminal(lode)
+                if terminal and terminal[0] == "stuck":
+                    if stuck_since is None:
+                        stuck_since = time.monotonic()
+                    if (time.monotonic() - stuck_since) * 1000 >= STUCK_GRACE_MS:
+                        _finish(lid, lode, "stuck", 3)
+                        return
+                else:
+                    stuck_since = None
+                if terminal and terminal[0] != "stuck":
+                    _finish(lid, lode, terminal[0], terminal[1])
+                    return
+                done.wait(poll_interval)
+
+        remote_threads = [
+            threading.Thread(target=_remote_poll_lode, args=(lid, host), daemon=True)
+            for lid, host in pending_remote.items()
+        ]
+        for thread in remote_threads:
+            thread.start()
+
+        conn = (
+            client.HopperConnection(socket_path)
+            if local_available and (pending - set(pending_remote))
+            else None
+        )
         try:
-            conn.start(callback=on_message)
+            if conn:
+                conn.start(callback=on_message)
             timeout = parsed.timeout or None
             completed = done.wait(timeout=timeout)
             if not completed:
-                remaining = ", ".join(sorted(pending))
-                print(f"Timed out waiting for lode(s): {remaining}")
-                result[0] = 2
+                remaining_lodes = [resolved[lid] for lid in sorted(pending) if lid in resolved]
+                if json_output:
+                    for lode in remaining_lodes:
+                        print(json.dumps(_event(lode, "timeout")))
+                else:
+                    remaining = ", ".join(lode.get("id", "") for lode in remaining_lodes)
+                    print(f"Timed out waiting for lode(s): {remaining}")
+                result[0] = 4
         except KeyboardInterrupt:
             pass
         finally:
             for timer in list(stuck_timers.values()):
                 timer.cancel()
             stuck_timers.clear()
-            conn.stop()
+            if conn:
+                conn.stop()
         return result[0]
 
     if subcommand == "log":
@@ -1615,6 +2222,23 @@ def cmd_lode(args: list[str]) -> int:
         from hopper.config import hopper_dir
 
         lode_id = parsed.lode_id
+        if client.ping(socket_path):
+            local_lode, local_error = _lookup_lode(socket_path, lode_id)
+        else:
+            local_lode, local_error = None, "local server unavailable"
+        if not local_lode and local_error:
+            remote_lode, _checked = _find_remote_lode(lode_id)
+            if remote_lode:
+                remote_args = ["lode", "log", lode_id]
+                if parsed.tail:
+                    remote_args.extend(["-n", str(parsed.tail)])
+                if parsed.json_output:
+                    remote_args.append("--json")
+                return _run_remote_cli(
+                    remote_lode["host"],
+                    remote_args,
+                    reason=f"lode {remote_lode['id']}",
+                )
         log_file = hopper_dir() / "activity.log"
         if not log_file.exists():
             print("No activity log found.")
@@ -1657,6 +2281,13 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand == "kill":
         err = require_server()
         if err:
+            remote_lode, _checked = _find_remote_lode(parsed.lode_id)
+            if remote_lode:
+                return _run_remote_cli(
+                    remote_lode["host"],
+                    ["lode", "kill", parsed.lode_id, *(["--force"] if parsed.force else [])],
+                    reason=f"lode {remote_lode['id']}",
+                )
             return err
         lode_id = parsed.lode_id
         lode = client.get_lode(socket_path, lode_id)
@@ -1666,7 +2297,16 @@ def cmd_lode(args: list[str]) -> int:
             if found:
                 print(f"Lode {found['id']} is already archived.")
                 return 0
+            remote_lode, checked = _find_remote_lode(lode_id)
+            if remote_lode:
+                return _run_remote_cli(
+                    remote_lode["host"],
+                    ["lode", "kill", lode_id, *(["--force"] if parsed.force else [])],
+                    reason=f"lode {remote_lode['id']}",
+                )
             print(f"Lode not found: {lode_id}")
+            if checked:
+                print(f"Checked remote hosts: {checked}.")
             return 1
         if lode.get("stage") == "shipped":
             print(f"Lode {lode['id']} has already shipped.")
@@ -1675,14 +2315,77 @@ def cmd_lode(args: list[str]) -> int:
         print(f"Killed lode {lode['id']}")
         return 0
 
-    if subcommand in ("status", "show"):
+    if subcommand in ("peek", "nudge", "answer"):
         err = require_server()
         if err:
+            remote_lode, _checked = _find_remote_lode(parsed.lode_id)
+            if remote_lode:
+                remote_args = ["lode", subcommand, parsed.lode_id]
+                if subcommand == "peek":
+                    remote_args.extend(["-n", str(parsed.lines)])
+                elif subcommand == "nudge":
+                    remote_args.extend(["--text", parsed.text])
+                else:
+                    remote_args.append(parsed.choice)
+                return _run_remote_cli(
+                    remote_lode["host"],
+                    remote_args,
+                    reason=f"lode {remote_lode['id']}",
+                )
             return err
-        lode, error = _lookup_lode(socket_path, parsed.lode_id)
+        lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)
         if error:
             print(error)
             return 1
+        if lode.get("host"):
+            remote_args = ["lode", subcommand, parsed.lode_id]
+            if subcommand == "peek":
+                remote_args.extend(["-n", str(parsed.lines)])
+            elif subcommand == "nudge":
+                remote_args.extend(["--text", parsed.text])
+            else:
+                remote_args.append(parsed.choice)
+            return _run_remote_cli(lode["host"], remote_args, reason=f"lode {lode['id']}")
+
+        pane = lode.get("tmux_pane")
+        pane_text = capture_pane(pane, plain=True) if pane else None
+        if pane_text is None:
+            print(
+                f"pane {pane or '<unknown>'} no longer exists "
+                f"(lode active={lode.get('active')}, state={lode.get('state')})"
+            )
+            return 1
+        if subcommand == "peek":
+            lines = max(1, parsed.lines)
+            print("\n".join(pane_text.splitlines()[-lines:]))
+            return 0
+        if subcommand == "answer" and parsed.choice not in {str(i) for i in range(1, 10)}:
+            print("choice must be a digit 1..9")
+            return 1
+        text = parsed.text if subcommand == "nudge" else parsed.choice
+        submitted, tail = _submit_to_pane(pane, text, paste=subcommand == "nudge")
+        print("submitted" if submitted else "not submitted")
+        if tail:
+            print("--- pane tail ---")
+            print(tail)
+            print("--- end pane tail ---")
+        return 0 if submitted else 1
+
+    if subcommand in ("status", "show"):
+        err = require_server()
+        if err:
+            remote_lode, _checked = _find_remote_lode(parsed.lode_id)
+            if not remote_lode:
+                return err
+            lode, error = remote_lode, None
+        else:
+            lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)
+        if error:
+            print(error)
+            return 1
+        if getattr(parsed, "json_output", False):
+            print(json.dumps(lode, indent=2))
+            return 0
         print(format_lode_detail(lode))
         return 0
 
@@ -1737,6 +2440,8 @@ def cmd_list(args: list[str]) -> int:
         p = make_parser("list", "List lodes (alias for lode list)")
         p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
         p.add_argument("-p", "--project", help="Filter by project name")
+        p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+        p.add_argument("--all-hosts", action="store_true", help="Aggregate remote hosts")
         try:
             parse_args(p, args)
         except SystemExit:
@@ -1763,6 +2468,8 @@ def cmd_wait(args: list[str]) -> int:
         p = make_parser("wait", "Wait for a lode to ship (alias for lode wait)")
         p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
         p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
+        p.add_argument("--poll", type=float, default=30, help="Remote poll interval seconds")
+        p.add_argument("--json", dest="json_output", action="store_true", help="Output JSONL")
         try:
             parse_args(p, args)
         except SystemExit:
@@ -1776,6 +2483,7 @@ def cmd_show(args: list[str]) -> int:
     if "-h" in args or "--help" in args:
         p = make_parser("show", "Show lode details (alias for lode show)")
         p.add_argument("lode_id", help="Lode ID to show")
+        p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
         try:
             parse_args(p, args)
         except SystemExit:
@@ -1885,6 +2593,10 @@ def cmd_ping(args: list[str]) -> int:
 def main() -> int:
     """Main entry point with command dispatch."""
     args = sys.argv[1:]
+    explicit_host, args, host_error = _global_host_arg(args)
+    if host_error:
+        print(host_error)
+        return 1
 
     # No args or help flags -> show help
     if not args or args[0] in ("-h", "--help", "help"):
@@ -1908,6 +2620,35 @@ def main() -> int:
 
     # Set process title
     setproctitle.setproctitle(f"hop:{cmd}")
+
+    if explicit_host and explicit_host != "local" and not _remote_disabled():
+        stdin_text = _stdin_for_remote(cmd, cmd_args)
+        return _run_remote_cli(
+            explicit_host,
+            [cmd, *cmd_args],
+            reason=f"-H {explicit_host}",
+            stdin_text=stdin_text,
+            annotate_create=_extract_create_project(cmd, cmd_args) is not None,
+            annotate_json=_create_wants_json(cmd, cmd_args),
+            remember_project=_extract_create_project(cmd, cmd_args),
+        )
+
+    if not explicit_host and not _remote_disabled():
+        project = _extract_create_project(cmd, cmd_args)
+        if project:
+            remote_target = _remote_host_for_create(project)
+            if remote_target:
+                host, reason = remote_target
+                stdin_text = _stdin_for_remote(cmd, cmd_args)
+                return _run_remote_cli(
+                    host,
+                    [cmd, *cmd_args],
+                    reason=reason,
+                    stdin_text=stdin_text,
+                    annotate_create=True,
+                    annotate_json=_create_wants_json(cmd, cmd_args),
+                    remember_project=project,
+                )
 
     # Dispatch to command handler
     handler, *_ = COMMANDS[cmd]

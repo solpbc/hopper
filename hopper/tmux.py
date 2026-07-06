@@ -175,18 +175,23 @@ def send_keys(target: str, keys: str) -> bool:
         return False
 
 
-def capture_pane(target: str) -> str | None:
-    """Capture the contents of a tmux pane with ANSI escape sequences.
+def capture_pane(target: str, plain: bool = False) -> str | None:
+    """Capture the contents of a tmux pane.
 
     Args:
         target: The tmux target (pane ID like "%1" or window ID like "@1").
+        plain: If True, omit ANSI escape sequences.
 
     Returns:
-        The pane contents with ANSI styling, or None on failure.
+        The pane contents, or None on failure.
     """
+    cmd = ["tmux", "capture-pane"]
+    if not plain:
+        cmd.append("-e")
+    cmd.extend(["-p", "-t", target])
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-e", "-p", "-t", target],
+            cmd,
             capture_output=True,
             text=True,
         )
@@ -195,6 +200,34 @@ def capture_pane(target: str) -> str | None:
         return result.stdout
     except FileNotFoundError:
         return None
+
+
+def paste_buffer(target: str, text: str) -> bool:
+    """Paste text into a tmux pane via a tmux buffer.
+
+    Args:
+        target: The tmux target (pane ID like "%1" or window ID like "@1").
+        text: Text to paste.
+
+    Returns:
+        True if both buffer creation and paste succeeded, False otherwise.
+    """
+    try:
+        set_result = subprocess.run(
+            ["tmux", "set-buffer", text],
+            capture_output=True,
+            text=True,
+        )
+        if set_result.returncode != 0:
+            return False
+        paste_result = subprocess.run(
+            ["tmux", "paste-buffer", "-t", target],
+            capture_output=True,
+            text=True,
+        )
+        return paste_result.returncode == 0
+    except FileNotFoundError:
+        return False
 
 
 def kill_pane(target: str) -> bool:

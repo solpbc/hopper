@@ -1579,17 +1579,17 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
 
     with (
         patch("hopper.server.capture_pane", return_value="prompt ready"),
+        patch("hopper.server.paste_buffer", return_value=True) as mock_paste_buffer,
         patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
+        patch("hopper.server.time.sleep"),
     ):
         srv._handle_mutation(
             {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Looks good"},
             conn,
         )
 
-    assert [call.args for call in mock_send_keys.call_args_list] == [
-        ("%1", "Looks good"),
-        ("%1", "Enter"),
-    ]
+    mock_paste_buffer.assert_called_once_with("%1", "Looks good")
+    assert [call.args for call in mock_send_keys.call_args_list] == [("%1", "Enter")]
     assert srv.lodes[0]["state"] == "running"
     assert srv.lodes[0]["status"] == "Feedback sent"
     broadcast = srv.broadcast_queue.get_nowait()
@@ -1598,6 +1598,7 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     assert response["type"] == "feedback_sent"
     assert response["lode_id"] == "test-id"
     assert response["tmux_pane"] == "%1"
+    assert response["submitted"] is True
 
 
 def test_lode_send_feedback_dead_pane_respawns(socket_path, make_lode):
@@ -1625,6 +1626,7 @@ def test_lode_send_feedback_dead_pane_respawns(socket_path, make_lode):
         ),
         patch("hopper.server.capture_pane", return_value=None),
         patch("hopper.server.spawn_claude", side_effect=fake_spawn) as mock_spawn,
+        patch("hopper.server.paste_buffer", return_value=True) as mock_paste_buffer,
         patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
         patch("hopper.server.time.sleep"),
     ):
@@ -1634,13 +1636,12 @@ def test_lode_send_feedback_dead_pane_respawns(socket_path, make_lode):
         )
 
     mock_spawn.assert_called_once_with("test-id", "/fake/repo", foreground=False)
-    assert [call.args for call in mock_send_keys.call_args_list] == [
-        ("%2", "Please revise"),
-        ("%2", "Enter"),
-    ]
+    mock_paste_buffer.assert_called_once_with("%2", "Please revise")
+    assert [call.args for call in mock_send_keys.call_args_list] == [("%2", "Enter")]
     response = _decode_mock_response(conn)
     assert response["type"] == "feedback_sent"
     assert response["tmux_pane"] == "%2"
+    assert response["submitted"] is True
 
 
 def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
@@ -1664,6 +1665,7 @@ def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
         ),
         patch("hopper.server.capture_pane", return_value=None),
         patch("hopper.server.spawn_claude"),
+        patch("hopper.server.paste_buffer") as mock_paste_buffer,
         patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
         patch("hopper.server.time.sleep"),
     ):
@@ -1673,6 +1675,7 @@ def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
         )
 
     mock_send_keys.assert_not_called()
+    mock_paste_buffer.assert_not_called()
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["error"] == "failed to respawn claude pane"

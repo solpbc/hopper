@@ -14,6 +14,11 @@ description: >
 - `HOPPER_LID` is set when Claude runs inside a hopper lode.
 - All commands require the hopper server to be running (`hop ping` to check).
 - Commands marked **(outside lode only)** are blocked when `HOPPER_LID` is set.
+- Remote hopper hosts are reached through the same `hop` CLI. Use `hop remote`
+  for project routing and `hop -H <host> ...` for an explicit one-off host.
+  Routed commands print `→ <host> (...)` to stderr; remote lodes are cached in
+  `remote-lodes.json` so follow-up status/recovery commands do not need host
+  rediscovery.
 
 ## Creating work
 
@@ -27,7 +32,27 @@ Fix login timeout and add regression coverage
 EOF
 ```
 
-`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters.
+`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data.
+
+If `remote.<project>` is configured and the project is disabled or absent
+locally, `hop implement <project>` forwards to that host automatically. A
+locally active project always wins.
+
+## Remote host registry
+
+```bash
+hop remote list
+hop remote list --json
+hop remote set solstone-android suze.local
+hop remote rm solstone-android
+
+hop -H pro5e.local lode list
+hop -H local lode list
+```
+
+`hop remote set` refuses active local projects; disable a moved project first.
+The remote install contract is `$HOME/.local/bin/hop`, installed by
+`make install-user`.
 
 ## Waiting and monitoring
 
@@ -37,18 +62,14 @@ Block until one or more lodes ship **(outside lode only)**:
 hop wait <lode-id>
 hop wait <id1> <id2> <id3>
 hop wait <lode-id> --timeout 300
+hop wait <lode-id> --poll 30 --json
 ```
 
-Prints a status line as each lode resolves. Exit `0` if all shipped, `1` on error, `2` on timeout or gate, `3` if a lode is stuck (after a ~2-min grace period).
-
-### For any wait past a few minutes, poll `hop lode status` — don't lean on a single long-lived `hop wait`
-
-A lode routinely runs far longer than one blocking call survives, and both ways of holding a `hop wait` open fail on long lodes:
-
-- **Foreground:** the Bash tool caps foreground calls at ~10 minutes. A longer lode trips a timeout → retry loop that burns wake cycles and replays the conversation past the ~5-minute prompt-cache TTL.
-- **Background (`run_in_background: true`):** the harness reaps a quiet background process (~1 min in practice). `hop wait` is event-driven — it prints only on a state change — so a busy-but-silent lode produces no output, looks idle, and gets killed. (An earlier version of this doc claimed background + Monitor "stays in-process for the full lode duration" — that was wrong and cost sessions their waits.)
-
-**Do this instead:** drive a poll loop (e.g. a Monitor loop) over `hop lode status <lode-id>` on an interval (~30–60s). `hop lode status` is a one-shot read that returns immediately, so it never trips the foreground cap or the idle reaper.
+Prints a status line as each lode resolves. Exit codes are disambiguated:
+`0` all shipped, `1` error/not-found/not-active, `2` gated, `3` stuck,
+`4` timeout. For remote lodes, `hop wait` polls remote status internally at the
+configured `--poll` interval and applies the same terminal-state rules. Do not
+hand-roll SSH polling loops for remote lodes.
 
 ### Reading the status — three traps
 
@@ -56,7 +77,7 @@ A lode routinely runs far longer than one blocking call survives, and both ways 
 
 1. **`state: completed` is a STAGE boundary, not the finish.** State flips to `completed` at the end of *each* stage (mill done, refine done, ship done), then the next stage begins. **The only terminal success signal is `stage: shipped`** — key your loop on that, never on `state: completed`.
 2. **Debounce `stuck` — one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` itself waits ~2 min before treating stuck as terminal. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
-3. **`hop wait` exit `0` is not proof of a ship.** A wait can return before the lode genuinely shipped — reaped in the background, or the lode archived without a clean ship. **Never treat exit `0` (or a vanished background wait) as done on its own** — confirm `stage: shipped` via `hop lode status` first.
+3. **`hop wait` timeout is exit `4`, not gate.** Gate is exit `2`; wrappers can now branch cleanly.
 
 Watch live status events for a lode **(outside lode only)**:
 
@@ -81,6 +102,8 @@ hop lode
 hop lode list
 hop lode list -a          # include archived
 hop lode list -p PROJECT  # filter by project name
+hop lode list --json
+hop lode list --all-hosts # aggregate configured remote hosts
 hop list                  # alias for lode list (same flags)
 ```
 
@@ -88,6 +111,7 @@ Show detailed status for a lode:
 
 ```bash
 hop lode status <lode-id>
+hop lode status <lode-id> --json
 hop lode show <lode-id>   # alias for status
 ```
 
@@ -95,6 +119,7 @@ Restart an inactive lode (error, stuck, or failed ship):
 
 ```bash
 hop lode restart <lode-id>
+hop lode restart <lode-id> --force   # also restarts active lodes with a dead pane
 ```
 
 ## Project management
@@ -170,14 +195,17 @@ cat feedback.md | hop feedback <lode-id> -
 ```bash
 hop ping                            # check server connectivity
 hop screenshot                      # capture TUI window as ANSI text
+hop lode peek <lode-id>             # plain-text tail of the lode pane
+hop lode nudge <lode-id>            # submit "continue" via buffer paste
+hop lode nudge <lode-id> --text "..."
+hop lode answer <lode-id> 1         # answer numbered prompts
 ```
 
 ### Stuck lodes
 
-When `hop lode status` shows a lode in `stuck` state, the `pane:` field tells
-you where to look. Capture the pane to see what's happening:
+When `hop lode status` shows a lode in `stuck` state, inspect it through hop:
 
-    tmux capture-pane -t <pane> -p -S -50
+    hop lode peek <lode-id>
 
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
@@ -193,9 +221,10 @@ timeout, the lode errors with the captured output tail instead of remaining
 active at "Running make install...".
 
 If the action is safe (e.g. a routine permission prompt, a test confirmation),
-use send-keys to unblock it:
+use the recovery primitives:
 
-    tmux send-keys -t <pane> '1' Enter
+    hop lode nudge <lode-id>
+    hop lode answer <lode-id> 1
 
 If the pane shows something you're not comfortable resolving (destructive action,
 ambiguous approval, sensitive operation), leave it for the founder to resolve.

@@ -5,6 +5,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,7 @@ from hopper.cli import (
     cmd_process,
     cmd_processed,
     cmd_projects,
+    cmd_remote,
     cmd_restart,
     cmd_screenshot,
     cmd_show,
@@ -2235,7 +2237,7 @@ def test_wait_timeout_shorter_than_grace(capsys):
                 mock_conn.start = fake_start
                 with patch("hopper.client.HopperConnection", return_value=mock_conn):
                     result = cmd_lode(["wait", "abc123", "--timeout", "0.05"])
-    assert result == 2
+    assert result == 4
     out = capsys.readouterr().out
     assert "Timed out waiting for lode(s): abc123" in out
     assert "✗ abc123 stuck" not in out
@@ -2263,7 +2265,7 @@ def test_lode_wait_not_active(capsys):
 
 
 def test_lode_wait_timeout(capsys):
-    """wait exits 2 with timeout message when no terminal event arrives."""
+    """wait exits 4 with timeout message when no terminal event arrives."""
     lode = {
         "id": "abc123",
         "stage": "mill",
@@ -2281,7 +2283,7 @@ def test_lode_wait_timeout(capsys):
             mock_conn.start = fake_start
             with patch("hopper.client.HopperConnection", return_value=mock_conn):
                 result = cmd_lode(["wait", "abc123", "--timeout", "0.01"])
-    assert result == 2
+    assert result == 4
     assert "Timed out waiting for lode(s): abc123" in capsys.readouterr().out
 
 
@@ -2430,7 +2432,7 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
 
 
 def test_lode_wait_multi_timeout(capsys):
-    """wait exits 2 with remaining IDs on timeout."""
+    """wait exits 4 with remaining IDs on timeout."""
     lode1 = {
         "id": "aaa111",
         "stage": "refine",
@@ -2459,7 +2461,7 @@ def test_lode_wait_multi_timeout(capsys):
             mock_conn.start = MagicMock()
             with patch("hopper.client.HopperConnection", return_value=mock_conn):
                 result = cmd_lode(["wait", "aaa111", "bbb222", "--timeout", "0.01"])
-    assert result == 2
+    assert result == 4
     out = capsys.readouterr().out
     assert "Timed out waiting for lode(s): aaa111, bbb222" in out
 
@@ -2486,6 +2488,41 @@ def test_lode_wait_multi_one_not_found(capsys):
     assert result == 1
     assert "not found" in capsys.readouterr().out
     mock_conn_cls.assert_not_called()
+
+
+def test_lode_wait_remote_poll_json_shipped(capsys):
+    initial = {
+        "id": "remote123",
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+        "project": "journal",
+        "host": "fedora.local",
+    }
+    shipped = {**initial, "stage": "shipped", "state": "ready", "status": "Done"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_lodes", return_value=[]):
+                with patch("hopper.client.list_archived_lodes", return_value=[]):
+                    with patch(
+                        "hopper.cli._find_remote_lode", return_value=(initial, "fedora.local")
+                    ):
+                        with patch(
+                            "hopper.remote.run_remote",
+                            return_value=subprocess.CompletedProcess(
+                                [],
+                                0,
+                                stdout=json.dumps(shipped) + "\n",
+                                stderr="",
+                            ),
+                        ):
+                            result = cmd_lode(["wait", "remote123", "--json", "--timeout", "1"])
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "shipped"
+    assert payload["host"] == "fedora.local"
 
 
 def test_lode_wait_rejects_inside_lode(monkeypatch, capsys):
@@ -4031,3 +4068,166 @@ def test_format_lode_detail_no_hint_when_not_gated(make_lode):
     lode = make_lode(id="gate1234", state="running")
     output = format_lode_detail(lode)
     assert "Gate blocked. Review with: hop gate show gate1234" not in output
+
+
+def test_remote_set_refuses_active_local_project(capsys):
+    save_projects([Project(path="/fake/repo", name="myproj")])
+
+    rc = cmd_remote(["set", "myproj", "fedora.local"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "active locally" in out
+    assert "hop project disable myproj" in out
+
+
+def test_remote_set_warns_but_saves_when_unreachable(capsys):
+    with patch(
+        "hopper.remote.run_remote",
+        return_value=subprocess.CompletedProcess([], 255, stdout="", stderr="no route"),
+    ):
+        rc = cmd_remote(["set", "journal", "fedora.local"])
+
+    assert rc == 0
+    assert "remote.journal=fedora.local" in capsys.readouterr().out
+
+
+def test_remote_list_json(capsys):
+    with patch(
+        "hopper.remote.run_remote", return_value=subprocess.CompletedProcess([], 0, "pong", "")
+    ):
+        assert cmd_remote(["set", "journal", "fedora.local"]) == 0
+
+    assert cmd_remote(["list", "--json"]) == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out[out.index("{") :])
+    assert payload["remotes"] == [{"project": "journal", "host": "fedora.local"}]
+
+
+def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
+    from io import StringIO
+
+    save_projects([Project(path="/fake/repo", name="journal", disabled=True)])
+    with patch("hopper.remote.run_remote") as mock_remote:
+        mock_remote.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"id": "remote123", "project": "journal", "host": "local"}\n',
+            stderr="",
+        )
+        with patch("hopper.remote.remote_registry", return_value={"journal": "fedora.local"}):
+            monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal", "--json"])
+            monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
+            rc = main()
+
+    assert rc == 0
+    assert mock_remote.call_args.args[:2] == ("fedora.local", ["implement", "journal", "--json"])
+    assert json.loads(capsys.readouterr().out)["host"] == "fedora.local"
+
+
+def test_lode_create_json(capsys):
+    from io import StringIO
+
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.projects.find_project", return_value=project):
+            with patch("hopper.git.dirty_status", return_value=""):
+                with patch("hopper.client.create_lode", return_value=created_lode):
+                    with patch("sys.stdin", StringIO(LONG_SCOPE)):
+                        assert cmd_lode(["create", "myproj", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "id": "abc12345",
+        "project": "myproj",
+        "host": "local",
+    }
+
+
+def test_lode_status_json_remote(capsys):
+    remote_lode = {
+        "id": "remote123",
+        "project": "journal",
+        "stage": "mill",
+        "state": "running",
+        "status": "Working",
+        "host": "fedora.local",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=None):
+            with patch("hopper.client.list_lodes", return_value=[]):
+                with patch("hopper.client.list_archived_lodes", return_value=[]):
+                    with patch(
+                        "hopper.cli._find_remote_lode", return_value=(remote_lode, "fedora.local")
+                    ):
+                        assert cmd_lode(["status", "remote123", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["id"] == "remote123"
+    assert payload["host"] == "fedora.local"
+
+
+def test_lode_list_json_envelope(capsys):
+    lode = {
+        "id": "abc123",
+        "stage": "mill",
+        "state": "running",
+        "active": True,
+        "project": "proj",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[lode]):
+            assert cmd_lode(["list", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"lodes": [lode]}
+
+
+def test_lode_peek_plain_text(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[lode]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                with patch("hopper.cli.capture_pane", return_value="one\ntwo\nthree\n"):
+                    assert cmd_lode(["peek", "abc123", "-n", "2"]) == 0
+
+    assert capsys.readouterr().out == "two\nthree\n"
+
+
+def test_lode_nudge_uses_buffer_paste(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[lode]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                with patch("hopper.cli.capture_pane", side_effect=["prompt", "prompt", "done"]):
+                    with patch("hopper.cli.paste_buffer", return_value=True) as mock_paste:
+                        with patch("hopper.cli.send_keys", return_value=True) as mock_send:
+                            with patch("hopper.cli.time.sleep"):
+                                assert cmd_lode(["nudge", "abc123", "--text", "continue"]) == 0
+
+    mock_paste.assert_called_once_with("%1", "continue")
+    assert mock_send.call_args_list[0].args == ("%1", "Enter")
+    assert "submitted" in capsys.readouterr().out
+
+
+def test_lode_answer_restricts_choice(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[lode]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                with patch("hopper.cli.capture_pane", return_value="prompt"):
+                    assert cmd_lode(["answer", "abc123", "10"]) == 1
+
+    assert "choice must be a digit" in capsys.readouterr().out
+
+
+def test_lode_restart_allows_force_when_active_pane_dead(capsys):
+    lode = {"id": "abc123", "stage": "mill", "state": "running", "active": True, "tmux_pane": "%9"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.cli.capture_pane", return_value=None):
+                with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
+                    assert cmd_lode(["restart", "abc123", "--force"]) == 0
+
+    mock_restart.assert_called_once()
+    assert "dead pane" in capsys.readouterr().out

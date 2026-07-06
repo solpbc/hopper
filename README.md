@@ -35,6 +35,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 |---------|-------------|
 | `hop up` | Start the server and TUI |
 | `hop project` | Manage projects |
+| `hop remote` | Manage project-to-host routing for remote hopper instances |
 | `hop config` | Get or set config values |
 | `hop screenshot` | Capture TUI window as ANSI text |
 | `hop backlog` | Manage backlog items |
@@ -61,6 +62,10 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop watch` | Watch lode status events (alias for lode watch) |
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
+
+Useful lode subcommands include `hop lode peek`, `hop lode nudge`, and
+`hop lode answer` for pane inspection and routine prompt recovery. Use
+`hop remote` plus the global `-H/--host` flag for remote hopper hosts.
 
 ## Key concepts
 **Lode** -- a Claude Code session with a unique ID, workflow stage, status, and associated tmux window.

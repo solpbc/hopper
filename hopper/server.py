@@ -51,9 +51,47 @@ from hopper.lodes import (
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
-from hopper.tmux import capture_pane, send_keys
+from hopper.tmux import capture_pane, paste_buffer, send_keys
 
 logger = logging.getLogger(__name__)
+
+
+def _tail_text(text: str, lines: int = 10) -> str:
+    """Return the last N lines of text."""
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def _submission_tail(text: str) -> str:
+    """Return a small tail used to check whether pasted input remains pending."""
+    compact = " ".join(text.strip().split())
+    return compact[-80:] if compact else ""
+
+
+def _pane_has_pending_text(pane_text: str | None, submitted_text: str) -> bool:
+    """Heuristic for whether submitted text still appears on the input line."""
+    if not pane_text:
+        return False
+    tail = _submission_tail(submitted_text)
+    if not tail:
+        return False
+    compact_tail = " ".join(_tail_text(pane_text, 5).split())
+    return tail in compact_tail
+
+
+def _paste_submit_verify(pane_id: str, text: str) -> tuple[bool, str]:
+    """Paste text into a pane, press Enter, and verify submission."""
+    if not paste_buffer(pane_id, text):
+        return False, f"failed to paste into {pane_id}"
+    send_keys(pane_id, "Enter")
+    time.sleep(2)
+    after = capture_pane(pane_id, plain=True)
+    if not _pane_has_pending_text(after, text):
+        return True, _tail_text(after or "", 10)
+    send_keys(pane_id, "Enter")
+    time.sleep(0.2)
+    retry_after = capture_pane(pane_id, plain=True)
+    submitted = not _pane_has_pending_text(retry_after, text)
+    return submitted, _tail_text(retry_after or after or "", 10)
 
 
 def get_git_hash() -> str | None:
@@ -673,15 +711,20 @@ class Server:
                         )
                     return
 
-            send_keys(pane_id, text)
-            send_keys(pane_id, "Enter")
+            submitted, tail = _paste_submit_verify(pane_id, text)
             updated = update_lode_state(self.lodes, lode_id, "running", "Feedback sent")
             if updated:
                 self.broadcast({"type": "lode_updated", "lode": updated})
             if conn:
                 self._send_response(
                     conn,
-                    {"type": "feedback_sent", "lode_id": lode_id, "tmux_pane": pane_id},
+                    {
+                        "type": "feedback_sent",
+                        "lode_id": lode_id,
+                        "tmux_pane": pane_id,
+                        "submitted": submitted,
+                        "tail": tail,
+                    },
                 )
 
         elif msg_type == "lode_promote_backlog":

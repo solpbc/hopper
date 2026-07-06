@@ -13,6 +13,7 @@ from hopper.tmux import (
     is_inside_tmux,
     is_tmux_server_running,
     kill_pane,
+    paste_buffer,
     rename_window,
     send_keys,
 )
@@ -137,6 +138,18 @@ class TestCapturePane:
                 text=True,
             )
 
+    def test_plain_omits_ansi_flag(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "Plain text\n"
+            result = capture_pane("@0", plain=True)
+            assert result == "Plain text\n"
+            mock_run.assert_called_once_with(
+                ["tmux", "capture-pane", "-p", "-t", "@0"],
+                capture_output=True,
+                text=True,
+            )
+
     def test_returns_none_when_command_fails(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value.returncode = 1
@@ -219,3 +232,35 @@ class TestSendKeys:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = send_keys("@0", "C-d")
             assert result is False
+
+
+class TestPasteBuffer:
+    def test_pastes_buffer_successfully(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+
+            result = paste_buffer("%1", "hello\nthere")
+
+        assert result is True
+        assert mock_run.call_args_list[0].args[0] == ["tmux", "set-buffer", "hello\nthere"]
+        assert mock_run.call_args_list[1].args[0] == ["tmux", "paste-buffer", "-t", "%1"]
+
+    def test_returns_false_when_set_buffer_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+
+            result = paste_buffer("%1", "hello")
+
+        assert result is False
+        assert mock_run.call_count == 1
+
+    def test_returns_false_when_paste_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                type("Result", (), {"returncode": 0})(),
+                type("Result", (), {"returncode": 1})(),
+            ]
+
+            result = paste_buffer("%1", "hello")
+
+        assert result is False
