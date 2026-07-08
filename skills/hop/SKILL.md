@@ -9,6 +9,8 @@ description: >
 
 # hop CLI Reference
 
+Invoke via Bash: `hop <command> [flags]`.
+
 ## Context
 
 - `HOPPER_LID` is set when Claude runs inside a hopper lode.
