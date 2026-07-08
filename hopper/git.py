@@ -79,6 +79,44 @@ def dirty_status(repo_dir: str) -> str:
         return ""  # Fail open - process runner's is_dirty() is the safety net
 
 
+def commit_all(repo_dir: str, message: str) -> bool:
+    """Commit all working tree changes in a git repo.
+
+    Args:
+        repo_dir: Path to the git repository.
+        message: Commit message.
+
+    Returns:
+        True on success, False on failure.
+    """
+    try:
+        add_result = subprocess.run(
+            ["git", "add", "-A"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if add_result.returncode != 0:
+            logger.warning(f"git add -A failed: {add_result.stderr.strip()}")
+            return False
+        commit_result = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if commit_result.returncode != 0:
+            logger.warning(f"git commit failed: {commit_result.stderr.strip()}")
+            return False
+        return True
+    except FileNotFoundError:
+        logger.warning("git command not found")
+        return False
+    except subprocess.SubprocessError as err:
+        logger.warning(f"git commit failed: {err}")
+        return False
+
+
 def current_branch(repo_dir: str) -> str | None:
     """Get the current branch name of a git repo.
 

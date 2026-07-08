@@ -3,11 +3,12 @@
 
 """Tests for the base runner module."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from hopper.lodes import current_time_ms
-from hopper.runner import BaseRunner, extract_error_message
+from hopper.runner import BaseRunner, _parse_ps_time, _sum_descendant_cpu_ms, extract_error_message
 
 
 class TestExtractErrorMessage:
@@ -49,6 +50,64 @@ class TestExtractErrorMessage:
         result = extract_error_message(stderr)
         assert "Error:" in result
         assert "invalid" in result
+
+
+class TestPsCpuHelpers:
+    def test_parse_ps_time_formats(self):
+        assert _parse_ps_time("12:34.50") == 754.5
+        assert _parse_ps_time("01:02:03") == 3723
+        assert _parse_ps_time("2-01:02:03") == 176523
+        assert _parse_ps_time("garbage") is None
+
+    def test_sum_descendant_cpu_ms_sums_descendants_and_skips_bad_rows(self):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "\n".join(
+            [
+                "10 1 01:00:00",
+                "11 10 00:01:00",
+                "12 11 02:03.50",
+                "13 11 garbage",
+                "14 99 00:10:00",
+                "bad row",
+            ]
+        )
+
+        with patch("hopper.runner.subprocess.run", return_value=result) as mock_run:
+            assert _sum_descendant_cpu_ms(10) == 183500
+
+        mock_run.assert_called_once_with(
+            ["ps", "-Ao", "pid=,ppid=,time="],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_sum_descendant_cpu_ms_cycle_does_not_loop_or_count_root(self):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "\n".join(
+            [
+                "10 12 01:00:00",
+                "11 10 00:01:00",
+                "12 11 00:02:00",
+            ]
+        )
+
+        with patch("hopper.runner.subprocess.run", return_value=result):
+            assert _sum_descendant_cpu_ms(10) == 180_000
+
+    def test_sum_descendant_cpu_ms_absent_on_command_failure(self):
+        failed = MagicMock()
+        failed.returncode = 1
+        failed.stdout = ""
+
+        with patch("hopper.runner.subprocess.run", return_value=failed):
+            assert _sum_descendant_cpu_ms(10) is None
+        with patch("hopper.runner.subprocess.run", side_effect=FileNotFoundError):
+            assert _sum_descendant_cpu_ms(10) is None
+        with patch("hopper.runner.subprocess.run", side_effect=subprocess.SubprocessError):
+            assert _sum_descendant_cpu_ms(10) is None
+        assert _sum_descendant_cpu_ms(None) is None
 
 
 class TestBaseRunnerActivityMonitor:
@@ -316,6 +375,102 @@ class TestBaseRunnerActivityMonitor:
         assert not running_emissions or all(
             emission[1]["status"] == "codex thinking" for emission in running_emissions
         )
+
+    def test_descendant_cpu_activity_keeps_silent_runner_alive(self, monkeypatch):
+        """Increasing descendant CPU is activity while pane and heartbeat are quiet."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        times = iter([200_000, 351_000])
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: next(times))
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+        runner._claude_proc = MagicMock(pid=1234)
+        runner._claude_proc.poll.return_value = None
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
+            ),
+            patch("hopper.runner._sum_descendant_cpu_ms", side_effect=[1000, 2000]),
+        ):
+            runner._check_activity()
+            runner._check_activity()
+
+        assert runner._stuck_error is None
+        runner._claude_proc.terminate.assert_not_called()
+        assert any(
+            e[0] == "lode_set_state"
+            and e[1]["state"] == "running"
+            and e[1]["status"] == "background work active (5m)"
+            for e in emitted
+        )
+
+    def test_flat_descendant_cpu_still_times_out(self, monkeypatch):
+        """Flat descendant CPU does not veto the normal stuck timeout."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 351_000)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+        runner._last_descendant_cpu_ms = 1000
+        runner._stuck_since = 0
+        runner._claude_proc = MagicMock(pid=1234)
+        runner._claude_proc.poll.return_value = None
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
+            ),
+            patch("hopper.runner._sum_descendant_cpu_ms", return_value=1000),
+        ):
+            runner._check_activity()
+
+        assert runner._stuck_error is not None
+        assert "timed out stuck Claude stage" in runner._stuck_error
+        runner._claude_proc.terminate.assert_called_once()
+
+    def test_real_silence_absolute_cap_terminates_even_with_cpu(self, monkeypatch):
+        """The absolute cap is based on pane/heartbeat silence, not CPU activity."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 10_000)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+        runner._last_descendant_cpu_ms = 1000
+        runner._real_quiet_since = 0
+        runner._claude_proc = MagicMock(pid=1234)
+        runner._claude_proc.poll.return_value = None
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
+            ),
+            patch("hopper.runner._sum_descendant_cpu_ms", return_value=2000),
+        ):
+            runner._check_activity()
+
+        assert runner._stuck_error is not None
+        assert "absolute cap" in runner._stuck_error
+        runner._claude_proc.terminate.assert_called_once()
 
     def test_parent_claude_idle_with_fresh_codex(self):
         """Fresh heartbeats keep the runner active even when the pane is older than 10 seconds."""

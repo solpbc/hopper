@@ -212,11 +212,17 @@ When `hop lode status` shows a lode in `stuck` state, inspect it through hop:
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
 
-For Codex refine runs, recent JSON heartbeat progress can keep a lode in
-`running` even if the tmux pane text has not changed yet. Pane-diff remains the
-primary stuck signal for the senior Claude-driven mill/refine/ship runners. If
-a senior Claude stage stays stuck past the runner timeout, Hopper terminates it,
-marks the lode `error`, and releases `active` so `hop restart <id>` can retry.
+Hopper's liveness model uses pane-diff activity, in-flight Codex exec
+heartbeats, and descendant-process CPU activity. Pane and heartbeat silence are
+the real foreground signals; descendant CPU can keep a lode `running` while
+background work is active. If pane and heartbeat stay silent for 60 minutes,
+Hopper applies an absolute cap even if descendant CPU is still accruing.
+
+If a senior Claude stage stays stuck past the runner timeout, Hopper terminates
+it, marks the lode `error`, and releases `active` so `hop restart <id>` can
+retry. On a stuck-kill, Hopper auto-snapshots a dirty worktree to the lode
+branch before releasing it. Worktree cleanup also refuses to destroy a dirty
+worktree; it retains the path and logs a warning instead.
 
 Refine setup also bounds `make install` and Codex bootstrap. If setup hits its
 timeout, the lode errors with the captured output tail instead of remaining

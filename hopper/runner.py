@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 
 from hopper.client import HopperConnection, connect
-from hopper.lodes import current_time_ms
+from hopper.lodes import current_time_ms, format_duration_ms
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
 
@@ -23,6 +23,78 @@ MONITOR_INTERVAL = 5.0  # Seconds between activity checks
 MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
 STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
+ABSOLUTE_CAP_MS = 60 * 60_000
+
+
+def _parse_ps_time(raw: str) -> float | None:
+    """Parse ps CPU time into seconds."""
+    try:
+        text = raw.strip()
+        if not text:
+            return None
+        days = 0
+        if "-" in text:
+            day_text, text = text.split("-", 1)
+            days = int(day_text)
+        parts = text.split(":")
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            return days * 86400 + minutes * 60 + seconds
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
+    """Return cumulative CPU time for descendants of root_pid, excluding root_pid."""
+    if root_pid is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,time="],
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    children: dict[int, list[int]] = {}
+    times: dict[int, float] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        parsed = _parse_ps_time(parts[2])
+        if parsed is None:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        times[pid] = parsed
+
+    total = 0.0
+    seen = {root_pid}
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += times.get(pid, 0.0)
+        stack.extend(children.get(pid, []))
+    return int(total * 1000)
 
 
 def extract_error_message(stderr_bytes: bytes) -> str | None:
@@ -78,6 +150,9 @@ class BaseRunner:
         self._monitor_stop = threading.Event()
         self._last_snapshot: str | None = None
         self._stuck_since: int | None = None
+        self._last_descendant_cpu_ms: int | None = None
+        self._last_cpu_activity_ms: int | None = None
+        self._real_quiet_since: int | None = None
         self._last_pane_activity_ms: int | None = None
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
@@ -429,7 +504,23 @@ class BaseRunner:
 
         pane_activity = self._last_pane_activity_ms or 0
         heartbeat = last_progress_at or 0
-        last_activity = max(pane_activity, heartbeat)
+        real_activity = max(pane_activity, heartbeat)
+        real_quiet = now - real_activity > IDLE_THRESHOLD_MS
+        if real_quiet:
+            if self._real_quiet_since is None:
+                self._real_quiet_since = now
+            cpu = _sum_descendant_cpu_ms(self._claude_proc.pid if self._claude_proc else None)
+            if cpu is not None:
+                if self._last_descendant_cpu_ms is not None and cpu > self._last_descendant_cpu_ms:
+                    self._last_cpu_activity_ms = now
+                self._last_descendant_cpu_ms = cpu
+        else:
+            self._real_quiet_since = None
+            self._last_descendant_cpu_ms = None
+            self._last_cpu_activity_ms = None
+
+        cpu_activity = self._last_cpu_activity_ms or 0
+        last_activity = max(real_activity, cpu_activity)
 
         if now - last_activity > IDLE_THRESHOLD_MS:
             if self._stuck_since is None:
@@ -439,12 +530,25 @@ class BaseRunner:
             stuck_for = now - self._stuck_since
             if stuck_for > STUCK_FAIL_THRESHOLD_MS and self._stuck_error is None:
                 msg = f"No output or progress for {duration_sec}s; timed out stuck Claude stage."
-                self._stuck_error = msg
-                logger.error(f"stuck timeout lode={self.lode_id}: {msg}")
-                self._terminate_claude_process()
-                self._monitor_stop.set()
+                self._fail_stuck(msg)
         else:
-            if self._stuck_since is not None:
+            if (
+                self._real_quiet_since is not None
+                and now - self._real_quiet_since > ABSOLUTE_CAP_MS
+                and self._stuck_error is None
+            ):
+                msg = (
+                    f"Exceeded {ABSOLUTE_CAP_MS // 60_000}-min absolute cap while "
+                    "pane/heartbeat silent; terminating stage."
+                )
+                self._fail_stuck(msg)
+                return
+            if cpu_activity >= real_activity and real_quiet:
+                self._emit_state(
+                    "running",
+                    f"background work active ({format_duration_ms(now - real_activity)})",
+                )
+            elif self._stuck_since is not None:
                 status = (
                     last_progress_summary
                     if heartbeat > pane_activity and last_progress_summary
@@ -452,6 +556,18 @@ class BaseRunner:
                 )
                 self._emit_state("running", status)
             self._stuck_since = None
+
+    def _snapshot_stuck_worktree(self) -> None:
+        """Overridden by runners that own a worktree."""
+        return
+
+    def _fail_stuck(self, msg: str) -> None:
+        """Terminate a stuck runner and preserve failure state."""
+        self._stuck_error = msg
+        logger.error(f"stuck timeout lode={self.lode_id}: {msg}")
+        self._terminate_claude_process()
+        self._snapshot_stuck_worktree()
+        self._monitor_stop.set()
 
     def _terminate_claude_process(self) -> None:
         """Terminate the active Claude process after a stuck timeout."""

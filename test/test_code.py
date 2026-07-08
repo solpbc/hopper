@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from hopper.code import _next_version, _summarize_event, run_code
+from hopper.code import (
+    EXEC_HEARTBEAT_COMMAND_CHARS,
+    ExecHeartbeat,
+    _next_version,
+    _summarize_event,
+    run_code,
+)
 
 MOCK_CMD = [
     "codex",
@@ -418,3 +424,120 @@ class TestSummarizeEvent:
 
     def test_non_dict_input(self):
         assert _summarize_event("not a dict") == ""
+
+
+class TestExecHeartbeat:
+    def test_summary_reports_command_and_elapsed(self, monkeypatch):
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: 10_000)
+        hb = ExecHeartbeat(lambda summary: None)
+
+        hb.on_event(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_1",
+                    "type": "command_execution",
+                    "command": "pytest test/test_code.py",
+                    "status": "in_progress",
+                },
+            }
+        )
+
+        summary = hb.summary(16_000)
+        assert summary is not None
+        assert "pytest test/test_code.py" in summary
+        assert "(6s)" in summary
+
+    def test_summary_truncates_long_command(self, monkeypatch):
+        command = "x" * 100
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: 1_000)
+        hb = ExecHeartbeat(lambda summary: None)
+
+        hb.on_event(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_1",
+                    "type": "command_execution",
+                    "command": command,
+                },
+            }
+        )
+
+        summary = hb.summary(2_000)
+        assert summary is not None
+        cmd = summary.removeprefix("codex: running ").split(" (", 1)[0]
+        assert len(cmd) == EXEC_HEARTBEAT_COMMAND_CHARS
+        assert cmd.endswith("...")
+
+    def test_matching_completed_clears_in_flight(self, monkeypatch):
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: 1_000)
+        hb = ExecHeartbeat(lambda summary: None)
+
+        hb.on_event(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_1",
+                    "type": "command_execution",
+                    "command": "make test",
+                },
+            }
+        )
+        hb.on_event({"type": "item.completed", "item": {"id": "item_1"}})
+
+        assert hb.summary(2_000) is None
+
+    def test_summary_without_in_flight_returns_none(self):
+        hb = ExecHeartbeat(lambda summary: None)
+
+        assert hb.summary(2_000) is None
+
+    def test_summary_uses_most_recently_started_command(self, monkeypatch):
+        now = 1_000
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: now)
+        hb = ExecHeartbeat(lambda summary: None)
+
+        hb.on_event(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_1",
+                    "type": "command_execution",
+                    "command": "first command",
+                },
+            }
+        )
+        now = 3_000
+        hb.on_event(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_2",
+                    "type": "command_execution",
+                    "command": "second command",
+                },
+            }
+        )
+
+        summary = hb.summary(5_000)
+        assert summary is not None
+        assert "second command" in summary
+        assert "first command" not in summary
+
+    def test_non_command_execution_started_is_ignored(self, monkeypatch):
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: 1_000)
+        hb = ExecHeartbeat(lambda summary: None)
+
+        hb.on_event(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_1",
+                    "type": "agent_message",
+                    "text": "hello",
+                },
+            }
+        )
+
+        assert hb.summary(2_000) is None

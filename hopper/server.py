@@ -29,7 +29,7 @@ from hopper.backlog import (
     find_by_prefix as find_backlog_by_prefix,
 )
 from hopper.claude import spawn_claude
-from hopper.git import delete_branch, remove_worktree
+from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
     archive_lode,
     create_lode,
@@ -339,6 +339,12 @@ class Server:
         project = find_project(project_name)
         if not project:
             logger.warning(f"Cleanup skipped for {lode_id}: project not found")
+            return
+        if is_dirty(str(worktree_path)):
+            logger.warning(
+                f"Cleanup skipped for {lode_id}: worktree has uncommitted changes; "
+                f"retaining {worktree_path}"
+            )
             return
         remove_worktree(project.path, str(worktree_path))
         branch = lode.get("branch", "") or f"hopper-{lode_id}"

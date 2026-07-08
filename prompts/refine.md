@@ -16,6 +16,8 @@ You have one tool for getting work done: **stage delegation**. You dispatch work
 
 **IMPORTANT:** Always use the Bash tool to run hop commands. Set `timeout` to 600000 (10 minutes) since stages can take several minutes to complete. Wait for the command to finish before proceeding.
 
+If a gate or command may exceed the 10-minute foreground command limit, poll it in a loop of short foreground checks that print visible output, such as `sleep` plus a tail of the gate log. Never launch it in the background and idle-wait; fire-and-idle looks dead to the monitor.
+
 ```bash
 hop code <stage> <<'EOF'
 <your directions here>
@@ -44,7 +46,7 @@ Good: "In acme/sessions.py, rename `update_session_state` to `set_state` and upd
 After each stage, read the output and decide:
 1. **Proceed** - the work meets your standards, move to the next stage
 2. **Iterate** - re-run the same stage with specific feedback on what to fix
-3. **Go back** - dispatch an earlier stage to address issues (e.g., audit finds problems → run implement to fix them)
+3. **Go back** - dispatch an earlier stage to address issues (e.g., audit finds problems → run implement to fix them, then commit the fixes as a follow-up commit)
 
 Do not accept mediocre work. If the output is vague, incomplete, or misses the point, run the stage again with clearer direction and specific feedback.
 
@@ -52,7 +54,7 @@ Do not accept mediocre work. If the output is vague, incomplete, or misses the p
 
 ## Stages
 
-You have five stages available. Use your judgment on which stages to run based on the scope and complexity of the assignment. Simple changes may skip stages; complex changes should use all of them.
+You have five stages available. Use your judgment on which stages to run based on the scope and complexity of the assignment. Simple changes may skip stages; complex changes should use all of them. Normal flow is prep → design → implement → commit → audit.
 
 ### prep - establish ground truth
 
@@ -66,13 +68,13 @@ Dispatch this when the work needs a design before implementation. Tell them the 
 
 Dispatch this with clear implementation instructions: what to change, what to delete, what patterns to follow, and what to test. Include specific file references and any decisions from the design stage. Review the result for completeness and quality.
 
-### audit - self-review
-
-Dispatch this to have the junior engineer review their own work. Tell them what to look for: dead code, naming consistency, missing tests, stale docs, regressions. Review their findings and have them fix anything critical.
-
 ### commit - land the changes
 
-Dispatch this to finalize. The junior engineer stages the changes, writes a commit message, and commits. Review the result for clean git state and a clear message.
+Dispatch this immediately after implementation is accepted. The junior engineer stages the changes, writes a commit message, and commits. Review the result for clean git state and a clear message.
+
+### audit - self-review
+
+Dispatch this after commit to have the junior engineer review the committed tree. Tell them what to look for: dead code, naming consistency, missing tests, stale docs, regressions. Review their findings and have them fix anything critical through a follow-up implement dispatch, then a follow-up commit dispatch. Do not amend the reviewed commit.
 
 ---
 
@@ -104,7 +106,7 @@ If you encounter a hard blocker — genuine ambiguity that the scope, codebase, 
 
 ## Completion
 
-When you have finished all necessary stages and the work is committed, signal completion:
+When audit is complete and all necessary fixes are committed as follow-up commits, signal completion:
 
 ```bash
 hop processed <<'EOF'

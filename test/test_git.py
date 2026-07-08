@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from hopper.git import (
+    commit_all,
     create_worktree,
     current_branch,
     delete_branch,
@@ -19,6 +20,31 @@ from hopper.git import (
     is_dirty,
     remove_worktree,
 )
+
+
+def _run_git(repo_dir, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _init_git_repo(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _run_git(repo_dir, "init")
+    _run_git(repo_dir, "config", "user.email", "test@example.com")
+    _run_git(repo_dir, "config", "user.name", "Test User")
+    (repo_dir / "README.md").write_text("init\n")
+    _run_git(repo_dir, "add", ".")
+    _run_git(repo_dir, "commit", "-m", "init")
+    return repo_dir
 
 
 class TestCreateWorktree:
@@ -485,6 +511,42 @@ class TestDeleteBranch:
             result = delete_branch("/repo", "hopper-abc12345")
 
         assert result is False
+
+
+class TestCommitAllIntegration:
+    def test_commit_all_dirty_repo_creates_commit(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / "new.txt").write_text("new\n")
+
+        assert commit_all(str(repo_dir), "snapshot dirty tree") is True
+
+        message = _run_git(repo_dir, "log", "-1", "--pretty=%B").stdout.strip()
+        assert message == "snapshot dirty tree"
+        files = _run_git(repo_dir, "show", "--name-only", "--pretty=", "HEAD").stdout.splitlines()
+        assert "README.md" in files
+        assert "new.txt" in files
+
+    def test_commit_all_clean_repo_returns_false(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+
+        assert commit_all(str(repo_dir), "nothing to commit") is False
+
+        message = _run_git(repo_dir, "log", "-1", "--pretty=%B").stdout.strip()
+        assert message == "init"
+
+    def test_unmerged_snapshotted_branch_survives_delete_branch(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        base_branch = _run_git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+        _run_git(repo_dir, "checkout", "-b", "hopper-snapshot")
+        (repo_dir / "snapshot.txt").write_text("snapshot\n")
+        assert commit_all(str(repo_dir), "hopper snapshot") is True
+        _run_git(repo_dir, "checkout", base_branch)
+
+        assert delete_branch(str(repo_dir), "hopper-snapshot") is False
+        branches = _run_git(repo_dir, "branch", "--list", "hopper-snapshot").stdout
+        assert "hopper-snapshot" in branches
 
 
 class TestRemoveWorktreeIntegration:

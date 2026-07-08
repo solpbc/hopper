@@ -216,6 +216,7 @@ def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode
         patch(
             "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
         ),
+        patch("hopper.server.is_dirty", return_value=False),
         patch("hopper.server.remove_worktree") as mock_remove_worktree,
         patch("hopper.server.delete_branch") as mock_delete_branch,
     ):
@@ -243,6 +244,67 @@ def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode
             thread.join(timeout=2)
 
 
+def test_cleanup_dirty_worktree_skips_remove_and_branch(
+    socket_path, temp_config, make_lode, caplog
+):
+    """Dirty worktree cleanup retains path and skips branch deletion."""
+    lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        project="myproject",
+        branch="hopper-test-id",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+    caplog.set_level("WARNING")
+
+    with (
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=True) as mock_dirty,
+        patch("hopper.server.remove_worktree") as mock_remove_worktree,
+        patch("hopper.server.delete_branch") as mock_delete_branch,
+    ):
+        srv._cleanup_worktree(lode)
+
+    mock_dirty.assert_called_once_with(str(worktree_dir))
+    mock_remove_worktree.assert_not_called()
+    mock_delete_branch.assert_not_called()
+    assert worktree_dir.exists()
+    assert any(
+        "worktree has uncommitted changes" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_cleanup_clean_worktree_removes_and_deletes_branch(socket_path, temp_config, make_lode):
+    """Clean worktree cleanup removes the worktree and deletes the branch."""
+    lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        project="myproject",
+        branch="hopper-test-id",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+
+    with (
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False) as mock_dirty,
+        patch("hopper.server.remove_worktree") as mock_remove_worktree,
+        patch("hopper.server.delete_branch") as mock_delete_branch,
+    ):
+        srv._cleanup_worktree(lode)
+
+    mock_dirty.assert_called_once_with(str(worktree_dir))
+    mock_remove_worktree.assert_called_once_with("/fake/repo", str(worktree_dir))
+    mock_delete_branch.assert_called_once_with("/fake/repo", lode["branch"])
+
+
 def test_cleanup_skipped_without_worktree_dir(socket_path, temp_config, make_lode):
     """Cleanup is skipped when archived lode has no worktree directory."""
     shipped_lode = make_lode(id="test-id", stage="shipped", project="myproject")
@@ -252,6 +314,7 @@ def test_cleanup_skipped_without_worktree_dir(socket_path, temp_config, make_lod
         patch(
             "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
         ),
+        patch("hopper.server.is_dirty", return_value=False),
         patch("hopper.server.remove_worktree") as mock_remove_worktree,
         patch("hopper.server.delete_branch") as mock_delete_branch,
     ):
@@ -1304,6 +1367,7 @@ def test_cleanup_worktree_on_disconnect_archive(socket_path, server, temp_config
         patch(
             "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
         ),
+        patch("hopper.server.is_dirty", return_value=False),
         patch("hopper.server.remove_worktree") as mock_remove_worktree,
         patch("hopper.server.delete_branch") as mock_delete_branch,
     ):

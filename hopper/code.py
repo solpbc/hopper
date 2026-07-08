@@ -6,6 +6,7 @@
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from hopper import prompt
@@ -15,6 +16,84 @@ from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
 from hopper.projects import find_project
 
 logger = logging.getLogger(__name__)
+
+HEARTBEAT_INTERVAL_SEC = 30.0
+HEARTBEAT_STOP_TIMEOUT_SEC = 1.0
+EXEC_HEARTBEAT_COMMAND_CHARS = 60
+
+
+class ExecHeartbeat:
+    """Emit synthetic progress while a Codex command execution is in flight."""
+
+    def __init__(self, emit, interval=HEARTBEAT_INTERVAL_SEC):
+        self.emit = emit
+        self.interval = interval
+        self._in_flight: dict[str, tuple[str, int]] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def on_event(self, event) -> None:
+        """Track command_execution item lifetime from Codex events."""
+        try:
+            if not isinstance(event, dict):
+                return
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return
+            event_type = event.get("type")
+            item_id = item.get("id")
+            if not item_id:
+                return
+            if event_type == "item.started" and item.get("type") == "command_execution":
+                command = str(item.get("command") or "")
+                with self._lock:
+                    self._in_flight[item_id] = (command, current_time_ms())
+            elif event_type == "item.completed":
+                with self._lock:
+                    self._in_flight.pop(item_id, None)
+        except Exception:
+            logger.debug("exec heartbeat event handling failed", exc_info=True)
+
+    def summary(self, now_ms: int) -> str | None:
+        """Return the current in-flight command summary, if any."""
+        try:
+            with self._lock:
+                if not self._in_flight:
+                    return None
+                command, started_ms = max(self._in_flight.values(), key=lambda value: value[1])
+            cmd = command
+            if len(cmd) > EXEC_HEARTBEAT_COMMAND_CHARS:
+                cmd = cmd[: EXEC_HEARTBEAT_COMMAND_CHARS - 3] + "..."
+            elapsed = (now_ms - started_ms) // 1000
+            return f"codex: running {cmd} ({elapsed}s)"
+        except Exception:
+            logger.debug("exec heartbeat summary failed", exc_info=True)
+            return None
+
+    def start(self) -> None:
+        """Start emitting in-flight command summaries."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+
+        def _loop() -> None:
+            while not self._stop.wait(self.interval):
+                try:
+                    summary = self.summary(current_time_ms())
+                    if summary:
+                        self.emit(summary)
+                except Exception:
+                    logger.debug("exec heartbeat emit failed", exc_info=True)
+
+        self._thread = threading.Thread(target=_loop, name="codex-exec-heartbeat", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the heartbeat thread."""
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=HEARTBEAT_STOP_TIMEOUT_SEC)
 
 
 def _summarize_event(event: dict) -> str:
@@ -130,8 +209,10 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     # Run codex (resume existing thread)
     output_path = lode_dir / f"{suffix}.out.md"
     started_at = current_time_ms()
+    hb = ExecHeartbeat(lambda s: set_lode_progress(socket_path, lode_id, s))
 
     def _on_event(event):
+        hb.on_event(event)
         try:
             summary = _summarize_event(event)
             if summary:
@@ -139,13 +220,17 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         except Exception:
             logger.debug("progress heartbeat failed", exc_info=True)
 
-    exit_code, cmd = run_codex(
-        prompt_text,
-        str(cwd),
-        str(output_path),
-        codex_thread_id,
-        on_event=_on_event,
-    )
+    hb.start()
+    try:
+        exit_code, cmd = run_codex(
+            prompt_text,
+            str(cwd),
+            str(output_path),
+            codex_thread_id,
+            on_event=_on_event,
+        )
+    finally:
+        hb.stop()
     finished_at = current_time_ms()
 
     # Save run metadata
