@@ -18,6 +18,7 @@ from hopper.git import (
     get_diff_numstat,
     get_diff_stat,
     is_dirty,
+    quarantine_dirty_repo,
     remove_worktree,
 )
 
@@ -547,6 +548,80 @@ class TestCommitAllIntegration:
         assert delete_branch(str(repo_dir), "hopper-snapshot") is False
         branches = _run_git(repo_dir, "branch", "--list", "hopper-snapshot").stdout
         assert "hopper-snapshot" in branches
+
+
+class TestQuarantineDirtyRepoIntegration:
+    def test_quarantines_tracked_and_untracked(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / "new.txt").write_text("new\n")
+        original_branch = _run_git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        original_head = _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+
+        branch = quarantine_dirty_repo(str(repo_dir), "test-id")
+
+        assert branch is not None
+        assert branch.startswith("hopper-quarantine-")
+        assert is_dirty(str(repo_dir)) is False
+        assert (
+            _run_git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            == original_branch
+        )
+        assert _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip() == original_head
+        _run_git(repo_dir, "rev-parse", "--verify", branch)
+        files = _run_git(repo_dir, "show", "--name-only", "--pretty=format:", branch).stdout
+        assert "README.md" in files.splitlines()
+        assert "new.txt" in files.splitlines()
+        message = _run_git(repo_dir, "log", "-1", "--format=%s", branch).stdout.strip()
+        assert message == "hopper: quarantined dirty project repo blocking lode test-id"
+
+    def test_precondition_merge_in_progress_returns_none(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        head = _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+        (repo_dir / ".git" / "MERGE_HEAD").write_text(f"{head}\n")
+
+        assert quarantine_dirty_repo(str(repo_dir), "test-id") is None
+
+        branches = _run_git(repo_dir, "branch", "--list", "hopper-quarantine-*").stdout.strip()
+        assert branches == ""
+        assert is_dirty(str(repo_dir)) is True
+        assert (repo_dir / "README.md").read_text() == "changed\n"
+
+    def test_precondition_detached_head_returns_none(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        head = _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+        _run_git(repo_dir, "checkout", head)
+        (repo_dir / "README.md").write_text("changed\n")
+
+        assert quarantine_dirty_repo(str(repo_dir), "test-id") is None
+
+        branches = _run_git(repo_dir, "branch", "--list", "hopper-quarantine-*").stdout.strip()
+        assert branches == ""
+        assert is_dirty(str(repo_dir)) is True
+        assert (repo_dir / "README.md").read_text() == "changed\n"
+
+    def test_commit_failure_leaves_state_intact(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / "new.txt").write_text("new\n")
+
+        with patch("hopper.git.commit_all", return_value=False):
+            assert quarantine_dirty_repo(str(repo_dir), "test-id") is None
+
+        assert (repo_dir / "README.md").read_text() == "changed\n"
+        assert (repo_dir / "new.txt").read_text() == "new\n"
+        assert is_dirty(str(repo_dir)) is True
+        current = _run_git(repo_dir, "branch", "--show-current").stdout.strip()
+        assert current.startswith("hopper-quarantine-")
+        branches = _run_git(repo_dir, "branch", "--list", "hopper-quarantine-*").stdout
+        assert current in branches
+
+
+class TestQuarantineDirtyRepo:
+    def test_git_missing_returns_none(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert quarantine_dirty_repo("/repo", "test-id") is None
 
 
 class TestRemoveWorktreeIntegration:

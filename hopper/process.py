@@ -13,7 +13,13 @@ from pathlib import Path
 from hopper import config, prompt
 from hopper.client import set_codex_thread_id, set_lode_branch, set_lode_state, set_lode_status
 from hopper.codex import bootstrap_codex
-from hopper.git import commit_all, create_worktree, get_diff_numstat, is_dirty
+from hopper.git import (
+    commit_all,
+    create_worktree,
+    get_diff_numstat,
+    is_dirty,
+    quarantine_dirty_repo,
+)
 from hopper.lodes import get_lode_dir, slugify
 from hopper.runner import BaseRunner
 
@@ -22,6 +28,7 @@ logger = logging.getLogger(__name__)
 SETUP_COMMAND_TIMEOUT_SEC = 20 * 60
 SETUP_OUTPUT_TAIL_BYTES = 64 * 1024
 SETUP_OUTPUT_TAIL_LINES = 20
+QUARANTINE_STATUS = "Quarantined dirty project repo to branch {branch}; continuing"
 
 
 def _has_makefile(worktree_path: Path) -> bool:
@@ -235,12 +242,9 @@ class ProcessRunner(BaseRunner):
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
             if is_dirty(self.project_dir):
-                self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
-                print(self._setup_error)
-                print("Commit or stash changes before milling.")
-                print(f"hint: after fixing, restart with: hop restart {self.lode_id}")
-                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
-                return 1
+                rc = self._quarantine_or_error("Commit or stash changes before milling.")
+                if rc is not None:
+                    return rc
 
         self._cwd = self.project_dir if self.project_dir else None
         if self.is_first_run:
@@ -332,6 +336,23 @@ class ProcessRunner(BaseRunner):
         logger.debug(f"refine setup complete lode={self.lode_id}")
         return None
 
+    def _quarantine_or_error(self, stash_hint: str) -> int | None:
+        """Quarantine a dirty project repo, or fall back to the setup error.
+
+        Returns None if setup should proceed (repo is now clean), or 1 if the
+        caller should abort setup with the existing dirty-repo error.
+        """
+        branch = quarantine_dirty_repo(self.project_dir, self.lode_id)
+        if branch is None:
+            self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
+            print(self._setup_error)
+            print(stash_hint)
+            print(f"hint: after fixing, restart with: hop restart {self.lode_id}")
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+            return 1
+        set_lode_status(self.socket_path, self.lode_id, QUARANTINE_STATUS.format(branch=branch))
+        return None
+
     def _setup_ship(self) -> int | None:
         if not self.project_dir:
             self._setup_error = "No project directory found for lode."
@@ -358,12 +379,9 @@ class ProcessRunner(BaseRunner):
 
         # Pre-flight: project repo must be clean
         if is_dirty(self.project_dir):
-            self._setup_error = f"Project repo has uncommitted changes: {self.project_dir}"
-            print(self._setup_error)
-            print("Commit or stash changes before shipping.")
-            print(f"hint: after fixing, restart with: hop restart {self.lode_id}")
-            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
-            return 1
+            rc = self._quarantine_or_error("Commit or stash changes before shipping.")
+            if rc is not None:
+                return rc
 
         self._cwd = str(self.worktree_path)
 

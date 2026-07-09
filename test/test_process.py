@@ -13,7 +13,15 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from hopper.process import STAGES, ProcessRunner, _get_worktree_env, _run_make_install, run_process
+from hopper.git import is_dirty
+from hopper.process import (
+    QUARANTINE_STATUS,
+    STAGES,
+    ProcessRunner,
+    _get_worktree_env,
+    _run_make_install,
+    run_process,
+)
 
 CLAUDE_SESSIONS = {
     "mill": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
@@ -484,6 +492,7 @@ class TestMillStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.is_dirty", return_value=True),
+            patch("hopper.process.quarantine_dirty_repo", return_value=None),
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -499,6 +508,36 @@ class TestMillStage:
             status=f"Project repo has uncommitted changes: {project_dir}",
         )
         MockConn.return_value.stop.assert_called_once()
+
+    def test_quarantines_dirty_repo(self, tmp_path):
+        """Dirty project repo is quarantined before milling."""
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / "new.txt").write_text("new\n")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_dir = str(repo_dir)
+        runner.is_first_run = False
+
+        with patch("hopper.process.set_lode_status") as mock_status:
+            assert runner._setup_mill() is None
+
+        assert runner._setup_error is None
+        assert is_dirty(str(repo_dir)) is False
+        branch = _run_git(
+            repo_dir,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/hopper-quarantine-*",
+        ).stdout.strip()
+        assert branch.startswith("hopper-quarantine-")
+        mock_status.assert_called_once_with(
+            runner.socket_path,
+            "test-id",
+            QUARANTINE_STATUS.format(branch=branch),
+        )
+        assert mock_status.call_args[0][2].startswith(
+            "Quarantined dirty project repo to branch hopper-quarantine-"
+        )
 
     def test_loads_scope_in_context(self):
         """Runner passes scope to prompt template."""
@@ -1302,6 +1341,7 @@ class TestShipStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=True),
+            patch("hopper.process.quarantine_dirty_repo", return_value=None),
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -1317,6 +1357,41 @@ class TestShipStage:
             status=f"Project repo has uncommitted changes: {project_dir}",
         )
         MockConn.return_value.stop.assert_called_once()
+
+    def test_quarantines_dirty_repo(self, tmp_path):
+        """Dirty project repo is quarantined before shipping."""
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / "new.txt").write_text("new\n")
+        session_dir = tmp_path / "lodes" / "test-id"
+        (session_dir / "worktree").mkdir(parents=True)
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        runner.project_dir = str(repo_dir)
+        runner.is_first_run = False
+
+        with (
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.set_lode_status") as mock_status,
+        ):
+            assert runner._setup_ship() is None
+
+        assert runner._setup_error is None
+        assert is_dirty(str(repo_dir)) is False
+        branch = _run_git(
+            repo_dir,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/hopper-quarantine-*",
+        ).stdout.strip()
+        assert branch.startswith("hopper-quarantine-")
+        mock_status.assert_called_once_with(
+            runner.socket_path,
+            "test-id",
+            QUARANTINE_STATUS.format(branch=branch),
+        )
+        assert mock_status.call_args[0][2].startswith(
+            "Quarantined dirty project repo to branch hopper-quarantine-"
+        )
 
     def test_emits_shipped_stage_transition_on_completion(self, tmp_path):
         """Ship emits a stage transition to shipped after completion."""

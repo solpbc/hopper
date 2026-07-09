@@ -6,6 +6,7 @@
 import logging
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,102 @@ def current_branch(repo_dir: str) -> str | None:
         branch = result.stdout.strip()
         return branch if branch != "HEAD" else None
     except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+
+
+def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
+    """Move a dirty project repo's uncommitted changes onto a fresh quarantine
+    branch, restoring a clean working tree at the original HEAD.
+
+    Preconditions (all must hold, else returns None without touching the repo):
+      - HEAD is not detached.
+      - No merge/rebase/cherry-pick is in progress.
+
+    On success, returns the name of the newly created quarantine branch. Returns
+    None if a precondition fails or any step of the quarantine fails; in the
+    failure case nothing is deleted or reset, so no uncommitted work is lost.
+    """
+    try:
+        # Precondition: HEAD must not be detached.
+        symref = subprocess.run(
+            ["git", "symbolic-ref", "-q", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if symref.returncode != 0:
+            logger.warning(f"quarantine skipped: detached HEAD in {repo_dir}")
+            return None
+
+        # Precondition: no merge/rebase/cherry-pick in progress.
+        git_dir_result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if git_dir_result.returncode != 0:
+            logger.warning(f"quarantine skipped: cannot resolve git dir in {repo_dir}")
+            return None
+        git_dir = (Path(repo_dir) / git_dir_result.stdout.strip()).resolve()
+        in_progress = [
+            git_dir / "MERGE_HEAD",
+            git_dir / "REBASE_HEAD",
+            git_dir / "CHERRY_PICK_HEAD",
+            git_dir / "rebase-merge",
+            git_dir / "rebase-apply",
+        ]
+        if any(p.exists() for p in in_progress):
+            logger.warning(f"quarantine skipped: git operation in progress in {repo_dir}")
+            return None
+
+        original_branch = current_branch(repo_dir)
+        if original_branch is None:
+            logger.warning(f"quarantine skipped: no current branch in {repo_dir}")
+            return None
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        branch = f"hopper-quarantine-{timestamp}"
+
+        switch_result = subprocess.run(
+            ["git", "switch", "-c", branch],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if switch_result.returncode != 0:
+            logger.warning(
+                f"quarantine failed: git switch -c {branch}: {switch_result.stderr.strip()}"
+            )
+            return None
+
+        message = f"hopper: quarantined dirty project repo blocking lode {lode_id}"
+        if not commit_all(repo_dir, message):
+            logger.warning(f"quarantine failed: could not commit dirty state in {repo_dir}")
+            return None
+
+        back_result = subprocess.run(
+            ["git", "switch", original_branch],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if back_result.returncode != 0:
+            logger.warning(
+                f"quarantine failed: git switch {original_branch}: {back_result.stderr.strip()}"
+            )
+            return None
+
+        if is_dirty(repo_dir):
+            logger.warning(f"quarantine failed: {repo_dir} still dirty after switch-back")
+            return None
+
+        logger.warning(
+            f"quarantined dirty project repo {repo_dir} onto branch {branch} (lode {lode_id})"
+        )
+        return branch
+    except (FileNotFoundError, subprocess.SubprocessError) as err:
+        logger.warning(f"quarantine failed for {repo_dir}: {err}")
         return None
 
 
