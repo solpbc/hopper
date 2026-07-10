@@ -7,7 +7,35 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from hopper.codex import CODEX_BOOTSTRAP_TIMEOUT_SEC, _parse_thread_id, bootstrap_codex, run_codex
+from hopper.codex import (
+    CODEX_BOOTSTRAP_TIMEOUT_SEC,
+    _parse_thread_id,
+    _parse_turn_failed_message,
+    bootstrap_codex,
+    run_codex,
+    turn_failed_message,
+)
+
+
+class TestTurnFailedMessage:
+    def test_extracts_message_from_turn_failed_event(self):
+        event = {"type": "turn.failed", "error": {"message": "usage limit"}}
+
+        assert turn_failed_message(event) == "usage limit"
+
+    def test_returns_none_for_other_type(self):
+        assert turn_failed_message({"type": "turn.completed"}) is None
+
+    def test_returns_none_for_non_dict_input(self):
+        assert turn_failed_message("not a dict") is None
+
+    def test_returns_none_when_error_missing_or_not_dict(self):
+        assert turn_failed_message({"type": "turn.failed"}) is None
+        assert turn_failed_message({"type": "turn.failed", "error": "bad"}) is None
+
+    def test_returns_none_when_message_empty_or_non_string(self):
+        assert turn_failed_message({"type": "turn.failed", "error": {"message": ""}}) is None
+        assert turn_failed_message({"type": "turn.failed", "error": {"message": 123}}) is None
 
 
 class TestParseThreadId:
@@ -32,6 +60,26 @@ class TestParseThreadId:
         assert _parse_thread_id(stdout) is None
 
 
+class TestParseTurnFailedMessage:
+    def test_finds_message_in_turn_failed_line(self):
+        stdout = (
+            '{"type":"turn.started"}\n'
+            '{"type":"turn.failed","error":{"message":"stream disconnected"}}\n'
+        )
+
+        assert _parse_turn_failed_message(stdout) == "stream disconnected"
+
+    def test_returns_none_when_no_match(self):
+        stdout = '{"type":"turn.started"}\n{"type":"turn.completed"}\n'
+
+        assert _parse_turn_failed_message(stdout) is None
+
+    def test_skips_invalid_json(self):
+        stdout = 'not json\n{"type":"turn.failed","error":{"message":"quota"}}\n'
+
+        assert _parse_turn_failed_message(stdout) == "quota"
+
+
 class TestBootstrapCodex:
     def _mock_proc(self, stdout="", returncode=0):
         proc = MagicMock()
@@ -45,10 +93,11 @@ class TestBootstrapCodex:
         mock_proc = self._mock_proc(stdout='{"type":"thread.started","thread_id":"uuid-1234"}\n')
 
         with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
-            exit_code, thread_id = bootstrap_codex("hello", "/tmp/work")
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp/work")
 
         assert exit_code == 0
         assert thread_id == "uuid-1234"
+        assert failed is None
         cmd = mock_popen.call_args[0][0]
         assert cmd == [
             "codex",
@@ -68,26 +117,29 @@ class TestBootstrapCodex:
         mock_proc = self._mock_proc(stdout='{"type":"turn.started"}\n')
 
         with patch("subprocess.Popen", return_value=mock_proc):
-            exit_code, thread_id = bootstrap_codex("hello", "/tmp")
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 0
         assert thread_id is None
+        assert failed is None
 
     def test_codex_not_found(self):
         """Returns 127 when codex command not found."""
         with patch("subprocess.Popen", side_effect=FileNotFoundError):
-            exit_code, thread_id = bootstrap_codex("hello", "/tmp")
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 127
         assert thread_id is None
+        assert failed is None
 
     def test_keyboard_interrupt(self):
         """Returns 130 on KeyboardInterrupt."""
         with patch("subprocess.Popen", side_effect=KeyboardInterrupt):
-            exit_code, thread_id = bootstrap_codex("hello", "/tmp")
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 130
         assert thread_id is None
+        assert failed is None
 
     def test_timeout(self):
         """Returns 124 when Codex bootstrap exceeds its timeout."""
@@ -98,10 +150,11 @@ class TestBootstrapCodex:
             patch("subprocess.Popen", return_value=mock_proc),
             patch("hopper.codex.os.killpg") as mock_killpg,
         ):
-            exit_code, thread_id = bootstrap_codex("hello", "/tmp", timeout_sec=10)
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp", timeout_sec=10)
 
         assert exit_code == 124
         assert thread_id is None
+        assert failed is None
         mock_killpg.assert_called_once()
 
     def test_nonzero_exit_still_parses_thread_id(self):
@@ -112,10 +165,28 @@ class TestBootstrapCodex:
         )
 
         with patch("subprocess.Popen", return_value=mock_proc):
-            exit_code, thread_id = bootstrap_codex("hello", "/tmp")
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp")
 
         assert exit_code == 1
         assert thread_id == "partial-id"
+        assert failed is None
+
+    def test_nonzero_exit_returns_turn_failed_message(self):
+        """Returns turn.failed message from partial bootstrap output."""
+        mock_proc = self._mock_proc(
+            stdout=(
+                '{"type":"thread.started","thread_id":"partial-id"}\n'
+                '{"type":"turn.failed","error":{"message":"usage limit"}}\n'
+            ),
+            returncode=1,
+        )
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            exit_code, thread_id, failed = bootstrap_codex("hello", "/tmp")
+
+        assert exit_code == 1
+        assert thread_id == "partial-id"
+        assert failed == "usage limit"
 
 
 class TestRunCodex:

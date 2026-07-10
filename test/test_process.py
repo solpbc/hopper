@@ -709,7 +709,7 @@ class TestRefineStage:
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch(
-                "hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc")
+                "hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)
             ) as mock_boot,
             patch(
                 "hopper.process.set_codex_thread_id",
@@ -746,7 +746,7 @@ class TestRefineStage:
             patch("hopper.process._has_makefile", return_value=True),
             patch("hopper.process._run_make_install", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc")),
+            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
             patch("hopper.process.set_codex_thread_id", return_value=True),
             patch("hopper.process.set_lode_status") as mock_status,
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
@@ -809,7 +809,7 @@ class TestRefineStage:
             patch("hopper.process._has_makefile", return_value=False),
             patch("hopper.process._run_make_install") as mock_make_install,
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc")),
+            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
             patch("hopper.process.set_codex_thread_id", return_value=True),
             patch("hopper.process.set_lode_status"),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
@@ -842,7 +842,7 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree") as mock_wt,
-            patch("hopper.process.bootstrap_codex") as mock_boot,
+            patch("hopper.process.bootstrap_codex", return_value=(0, "unused", None)) as mock_boot,
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
             ) as mock_popen,
@@ -1057,7 +1057,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(1, None)),
+            patch("hopper.process.bootstrap_codex", return_value=(1, None, None)),
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -1069,6 +1069,36 @@ class TestRefineStage:
             lode_id="test-id",
             state="error",
             status="Codex bootstrap failed (exit 1).",
+        )
+        MockConn.return_value.stop.assert_called_once()
+
+    def test_bootstrap_failure_with_turn_failed_message_bails(self, tmp_path):
+        """Codex bootstrap failure with a turn.failed message emits that message."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+        (session_dir / "mill_out.md").write_text("Build it")
+        message = "You've hit your usage limit. try again at Jul 11th, 2026 9:36 AM."
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", project="my-project"),
+            ),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.prompt.load", return_value="prompt"),
+            patch("hopper.process.bootstrap_codex", return_value=(1, None, message)),
+            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
+        ):
+            assert runner.run() == 0
+
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=f"Codex bootstrap failed: {message}",
         )
         MockConn.return_value.stop.assert_called_once()
 
@@ -1087,7 +1117,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(124, None)),
+            patch("hopper.process.bootstrap_codex", return_value=(124, None, None)),
             patch("hopper.runner.HopperConnection") as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -1117,7 +1147,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "thread-123")),
+            patch("hopper.process.bootstrap_codex", return_value=(0, "thread-123", None)),
             patch("hopper.process.set_codex_thread_id", return_value=True),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),

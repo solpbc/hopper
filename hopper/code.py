@@ -11,7 +11,7 @@ from pathlib import Path
 
 from hopper import prompt
 from hopper.client import connect, set_lode_progress, set_lode_state
-from hopper.codex import run_codex
+from hopper.codex import run_codex, turn_failed_message
 from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
 from hopper.projects import find_project
 
@@ -20,6 +20,32 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_SEC = 30.0
 HEARTBEAT_STOP_TIMEOUT_SEC = 1.0
 EXEC_HEARTBEAT_COMMAND_CHARS = 60
+
+TURN_FAILED_BANNER = """\
+============================================================
+CODEX TURN FAILED
+{message}
+============================================================
+"""
+
+QUOTA_GUIDANCE = """\
+The Codex seat is one shared account used by every hopper host: a
+usage-limit failure is fleet-wide, not specific to this lode or machine.
+Do NOT retry `hop code` and do NOT spend time diagnosing the dispatcher —
+it will keep failing until the usage window resets. (The reset time
+quoted above can be pessimistic; the seat may recover earlier.)
+
+Do ONE of the following instead:
+1. Implement this stage directly yourself, honoring the same review bar
+   and test gates the stage prompt requires, then continue the normal
+   stage flow.
+2. If direct implementation is not possible, record the block with
+   `hop status "codex usage limit - waiting for reset"` and stop.
+"""
+
+
+def _is_quota_message(message: str) -> bool:
+    return "usage limit" in message.lower()
 
 
 class ExecHeartbeat:
@@ -210,6 +236,7 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     output_path = lode_dir / f"{suffix}.out.md"
     started_at = current_time_ms()
     hb = ExecHeartbeat(lambda s: set_lode_progress(socket_path, lode_id, s))
+    captured = {"turn_failed": None}
 
     def _on_event(event):
         hb.on_event(event)
@@ -219,6 +246,12 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
                 set_lode_progress(socket_path, lode_id, summary)
         except Exception:
             logger.debug("progress heartbeat failed", exc_info=True)
+        try:
+            msg = turn_failed_message(event)
+            if msg:
+                captured["turn_failed"] = msg
+        except Exception:
+            logger.debug("turn.failed capture failed", exc_info=True)
 
     hb.start()
     try:
@@ -232,6 +265,7 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     finally:
         hb.stop()
     finished_at = current_time_ms()
+    turn_failed = captured["turn_failed"]
 
     # Save run metadata
     metadata = {
@@ -244,6 +278,8 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         "exit_code": exit_code,
         "cmd": cmd,
     }
+    if turn_failed:
+        metadata["turn_failed_message"] = turn_failed
     meta_path = lode_dir / f"{suffix}.json"
     _atomic_write(meta_path, json.dumps(metadata, indent=2) + "\n")
 
@@ -251,12 +287,21 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     duration = format_duration_ms(finished_at - started_at)
     if exit_code == 0:
         status = f"{stage_name} ran for {duration}"
+    elif turn_failed:
+        if _is_quota_message(turn_failed):
+            status = f"{stage_name} failed: codex usage limit"
+        else:
+            status = f"{stage_name} failed: codex turn failed"
     else:
         status = f"{stage_name} failed after {duration}"
     set_lode_state(socket_path, lode_id, "running", status)
 
     # Print output if it was written
-    if output_path.exists():
+    if turn_failed and exit_code != 0:
+        print(TURN_FAILED_BANNER.format(message=turn_failed))
+        if _is_quota_message(turn_failed):
+            print(QUOTA_GUIDANCE)
+    elif output_path.exists():
         content = output_path.read_text()
         if content:
             print(content)

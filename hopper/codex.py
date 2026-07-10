@@ -16,12 +16,27 @@ CODEX_FLAGS = "--dangerously-bypass-approvals-and-sandbox"
 CODEX_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
 
 
+def turn_failed_message(event: dict) -> str | None:
+    """Return the error message from a turn.failed event, else None."""
+    if not isinstance(event, dict):
+        return None
+    if event.get("type") != "turn.failed":
+        return None
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return None
+    message = error.get("message")
+    if not isinstance(message, str) or not message:
+        return None
+    return message
+
+
 def bootstrap_codex(
     prompt: str,
     cwd: str,
     env: dict | None = None,
     timeout_sec: float = CODEX_BOOTSTRAP_TIMEOUT_SEC,
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str | None]:
     """Bootstrap a new Codex session and return its thread ID.
 
     Runs codex exec --json to create a fresh session. Parses the thread_id
@@ -34,7 +49,7 @@ def bootstrap_codex(
         timeout_sec: Maximum bootstrap runtime in seconds.
 
     Returns:
-        (exit_code, thread_id) tuple. thread_id is None on failure.
+        (exit_code, thread_id, turn_failed_message) tuple. thread_id is None on failure.
         Exit code is 124 on timeout, 127 if codex not found, 130 on KeyboardInterrupt.
     """
     cmd = ["codex", "exec", CODEX_FLAGS, "--json", prompt]
@@ -55,19 +70,20 @@ def bootstrap_codex(
         except subprocess.TimeoutExpired:
             _terminate_process_group(proc)
             logger.error(f"codex bootstrap timed out after {timeout_sec}s")
-            return 124, None
+            return 124, None, None
     except FileNotFoundError:
         logger.error("codex command not found")
-        return 127, None
+        return 127, None, None
     except KeyboardInterrupt:
-        return 130, None
+        return 130, None, None
 
     thread_id = _parse_thread_id(stdout)
+    failed_msg = _parse_turn_failed_message(stdout)
     return_code = proc.returncode if proc.returncode is not None else 0
     if return_code == 0 and not thread_id:
         logger.error("Failed to parse thread_id from codex output")
 
-    return return_code, thread_id
+    return return_code, thread_id, failed_msg
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:
@@ -195,6 +211,22 @@ def _parse_thread_id(stdout: str) -> str | None:
             event = json.loads(line)
             if event.get("type") == "thread.started" and "thread_id" in event:
                 return event["thread_id"]
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _parse_turn_failed_message(stdout: str) -> str | None:
+    """Parse the first turn.failed error message from codex --json output."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+            message = turn_failed_message(event)
+            if message:
+                return message
         except json.JSONDecodeError:
             continue
     return None

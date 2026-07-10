@@ -228,6 +228,11 @@ Refine setup also bounds `make install` and Codex bootstrap. If setup hits its
 timeout, the lode errors with the captured output tail instead of remaining
 active at "Running make install...".
 
+`hop code` prints a `CODEX TURN FAILED` banner when the backend fails a turn.
+Usage-limit failures are fleet-wide because Hopper uses one shared Codex seat
+across all hosts, so the in-lode agent should implement the stage directly
+under the same review bar rather than retrying `hop code`.
+
 If the action is safe (e.g. a routine permission prompt, a test confirmation),
 use the recovery primitives:
 

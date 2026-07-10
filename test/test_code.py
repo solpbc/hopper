@@ -178,6 +178,7 @@ class TestRunCode:
         assert meta["codex_thread_id"] == THREAD_ID
         assert meta["exit_code"] == 0
         assert meta["cmd"] == MOCK_CMD
+        assert "turn_failed_message" not in meta
         assert meta["duration_ms"] >= 0
         assert meta["started_at"] <= meta["finished_at"]
         assert progress.called
@@ -212,6 +213,88 @@ class TestRunCode:
         # Metadata written even on failure
         meta = json.loads((session_dir / "audit.json").read_text())
         assert meta["exit_code"] == 1
+
+    def test_quota_turn_failed_prints_banner_and_guidance(self, tmp_path, monkeypatch, capsys):
+        """Prints a loud banner and quota guidance for Codex usage-limit failures."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        message = "You've hit your usage limit. try again at Jul 11th, 2026 9:36 AM."
+        state_calls = []
+
+        def mock_set_state(sock, sid, state, status):
+            state_calls.append((state, status))
+            return True
+
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+            if on_event:
+                on_event({"type": "turn.failed", "error": {"message": message}})
+            return 1, MOCK_CMD
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", side_effect=mock_set_state),
+            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
+
+        output = capsys.readouterr().out
+        assert exit_code == 1
+        assert "CODEX TURN FAILED" in output
+        assert message in output
+        assert "one shared account used by every hopper host" in output
+        assert state_calls[-1][0] == "running"
+        assert "codex usage limit" in state_calls[-1][1]
+
+        meta = json.loads((session_dir / "audit.json").read_text())
+        assert meta["turn_failed_message"] == message
+
+    def test_nonquota_turn_failed_prints_banner_without_guidance(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Prints the banner without quota guidance for other turn.failed messages."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        message = "stream disconnected"
+        state_calls = []
+
+        def mock_set_state(sock, sid, state, status):
+            state_calls.append((state, status))
+            return True
+
+        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+            if on_event:
+                on_event({"type": "turn.failed", "error": {"message": message}})
+            return 1, MOCK_CMD
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", side_effect=mock_set_state),
+            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
+
+        output = capsys.readouterr().out
+        assert exit_code == 1
+        assert "CODEX TURN FAILED" in output
+        assert message in output
+        assert "one shared account used by every hopper host" not in output
+        assert state_calls[-1][0] == "running"
+        assert "codex turn failed" in state_calls[-1][1]
+
+        meta = json.loads((session_dir / "audit.json").read_text())
+        assert meta["turn_failed_message"] == message
 
     def test_server_unreachable(self, capsys):
         """Returns 1 when server connection fails."""

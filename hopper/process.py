@@ -492,7 +492,9 @@ class ProcessRunner(BaseRunner):
 
         env = self._get_subprocess_env() if self.use_env else None
         set_lode_status(self.socket_path, self.lode_id, "Bootstrapping Codex...")
-        exit_code, thread_id = bootstrap_codex(code_prompt, str(self.worktree_path), env=env)
+        exit_code, thread_id, failed_msg = bootstrap_codex(
+            code_prompt, str(self.worktree_path), env=env
+        )
 
         if exit_code == 127:
             self._setup_error = "codex command not found. Install codex to use code features."
@@ -505,7 +507,10 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         if exit_code != 0:
-            self._setup_error = f"Codex bootstrap failed (exit {exit_code})."
+            if failed_msg:
+                self._setup_error = f"Codex bootstrap failed: {failed_msg}"
+            else:
+                self._setup_error = f"Codex bootstrap failed (exit {exit_code})."
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
