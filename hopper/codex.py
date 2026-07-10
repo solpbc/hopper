@@ -40,7 +40,7 @@ def bootstrap_codex(
     """Bootstrap a new Codex session and return its thread ID.
 
     Runs codex exec --json to create a fresh session. Parses the thread_id
-    from the JSONL output and discards everything else.
+    and any turn.failed error message from the JSONL output.
 
     Args:
         prompt: The prompt text to send to Codex.
