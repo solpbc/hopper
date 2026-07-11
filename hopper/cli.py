@@ -2590,6 +2590,85 @@ def cmd_ping(args: list[str]) -> int:
     return 0
 
 
+# Default number of trailing output lines `hop check` prints.
+CHECK_TAIL_LINES = 50
+
+
+@command("check", "Run a validation command, truncating output but keeping its exit status")
+def cmd_check(args: list[str]) -> int:
+    """Run a command, print only its output tail, and exit with its real status.
+
+    Replaces the false-green `make ci 2>&1 | tail -30` pattern used to keep a
+    long CI log out of an agent's context: a pipe reports the pager's exit code,
+    not the command's, so a failing build can be truncated into an apparent
+    success. `hop check` captures combined stdout+stderr, prints the last -n
+    lines plus an explicit `exited N` summary, and returns the command's own
+    exit code — so a red command can never be reported as green.
+    """
+    parser = make_parser(
+        "check",
+        "Run a validation command, print only the tail of its output, and exit "
+        "with the command's real status (never the pager's). "
+        "Usage: hop check [-n LINES] -- <command> [args...]",
+    )
+    parser.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=CHECK_TAIL_LINES,
+        help=f"Trailing output lines to print (default: {CHECK_TAIL_LINES})",
+    )
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Command to run, e.g. -- make ci",
+    )
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as e:
+        print(f"error: {e}")
+        parser.print_usage()
+        return 1
+
+    command = parsed.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("error: no command given. Usage: hop check [-n LINES] -- <command> [args...]")
+        parser.print_usage()
+        return 1
+    if parsed.lines < 0:
+        print("error: --lines must be non-negative")
+        return 1
+
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError:
+        print(f"hop check: command not found: {command[0]}", file=sys.stderr)
+        return 127
+
+    output = proc.stdout or ""
+    total = len(output.splitlines())
+    tail = _tail_text(output, parsed.lines) if parsed.lines else ""
+    if tail:
+        print(tail)
+
+    shown = min(parsed.lines, total)
+    truncated = f", showing last {shown} of {total} lines" if total > shown else ""
+    print(
+        f"hop check: `{' '.join(command)}` exited {proc.returncode}{truncated}",
+        file=sys.stderr,
+    )
+    return proc.returncode
+
+
 def main() -> int:
     """Main entry point with command dispatch."""
     args = sys.argv[1:]

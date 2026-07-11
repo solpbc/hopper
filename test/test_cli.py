@@ -15,6 +15,7 @@ import pytest
 from hopper import __version__
 from hopper.cli import (
     cmd_backlog,
+    cmd_check,
     cmd_code,
     cmd_config,
     cmd_feedback,
@@ -4231,3 +4232,69 @@ def test_lode_restart_allows_force_when_active_pane_dead(capsys):
 
     mock_restart.assert_called_once()
     assert "dead pane" in capsys.readouterr().out
+
+
+# Tests for hop check — validation runner that preserves the command's exit status
+
+
+def test_check_help(capsys):
+    """check --help shows help and returns 0."""
+    result = cmd_check(["--help"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "usage: hop check" in captured.out
+
+
+def _noisy_failing_cmd(lines: int, code: int) -> list[str]:
+    """A portable command that prints `lines` numbered lines then exits `code`."""
+    return [
+        sys.executable,
+        "-c",
+        f"import sys\nfor i in range({lines}): print(i)\nsys.exit({code})",
+    ]
+
+
+def test_check_preserves_failure_exit_status_when_truncated(capsys):
+    """The regression: a red command truncated to its tail must still exit non-zero.
+
+    This is the exact false-green the ship stage hit — `make ci 2>&1 | tail -30`
+    returned 0 because tail succeeded. `hop check` truncates the output but
+    reports the producer's real status, so a red build cannot look green.
+    """
+    result = cmd_check(["-n", "5", "--", *_noisy_failing_cmd(100, 1)])
+    assert result == 1  # producer exit status preserved, not tail's 0
+    captured = capsys.readouterr()
+    assert "99" in captured.out  # tail is present
+    assert "94" not in captured.out  # earlier output was truncated away
+    assert "exited 1" in captured.err  # failure surfaced explicitly
+    assert "showing last 5 of 100 lines" in captured.err
+
+
+def test_check_passes_through_success(capsys):
+    """A green command exits 0 and its output is shown."""
+    result = cmd_check(["--", sys.executable, "-c", "print('all good')"])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "all good" in captured.out
+    assert "exited 0" in captured.err
+
+
+def test_check_preserves_nonzero_exit_code_value(capsys):
+    """The specific non-zero code is passed through, not collapsed to 1."""
+    result = cmd_check(["--", *_noisy_failing_cmd(3, 7)])
+    assert result == 7
+    assert "exited 7" in capsys.readouterr().err
+
+
+def test_check_requires_a_command(capsys):
+    """No command is a usage error, not a silent success."""
+    result = cmd_check([])
+    assert result == 1
+    assert "no command" in capsys.readouterr().out
+
+
+def test_check_command_not_found_returns_127(capsys):
+    """A missing executable returns 127 rather than a false 0."""
+    result = cmd_check(["--", "hopper-no-such-command-xyzzy"])
+    assert result == 127
+    assert "not found" in capsys.readouterr().err
