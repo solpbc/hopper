@@ -17,7 +17,7 @@ These are internalized, not optional:
 - **DRY** — don't duplicate logic. Reuse what exists.
 - **Clean breaks** — when updating, update all callers. Remove dead code. No compatibility shims unless directed.
 - **Consistency** — match existing naming, patterns, and conventions in the codebase.
-- **Verify your work** — run relevant tests. Check that your changes do what was asked.
+- **Verify your work** — run relevant tests, each through `hop check` (e.g. `hop check -- make test`) so a truncated log can't hide a failure: it exits with the command's real status. Check that your changes do what was asked.
 
 ## Output
 
