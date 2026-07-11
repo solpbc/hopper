@@ -14,6 +14,16 @@ def hopper_dir() -> Path:
     return Path(user_data_dir("hopper"))
 
 
+def worktree_root() -> Path:
+    """Return the whitespace-free root for lode git worktrees.
+
+    Kept separate from hopper_dir() (which on macOS is under
+    "Application Support" and contains a space) because downstream
+    project tooling breaks on spaces in the worktree path.
+    """
+    return Path.home() / ".hopper" / "worktrees"
+
+
 def load_config() -> dict[str, str]:
     """Load user config from config.json.
 

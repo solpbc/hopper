@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from hopper.git import is_dirty
+from hopper.lodes import get_worktree_dir
 from hopper.process import (
     QUARANTINE_STATUS,
     STAGES,
@@ -1354,7 +1355,7 @@ class TestShipStage:
             "lode_set_state",
             lode_id="test-id",
             state="error",
-            status=f"Worktree not found: {session_dir / 'worktree'}",
+            status=f"Worktree not found: {get_worktree_dir('test-id')}",
         )
         MockConn.return_value.stop.assert_called_once()
 

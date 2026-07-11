@@ -48,6 +48,7 @@ from hopper.lodes import (
     format_duration_ms,
     format_uptime,
     get_lode_dir,
+    get_worktree_dir,
     lode_icon,
     read_diff_totals,
 )
@@ -2059,7 +2060,7 @@ class HopperApp(App):
             branch = lode.get("branch", "") if lode else ""
             branch = branch or f"hopper-{lode_id}"
             # Check for worktree with unmerged changes
-            worktree_path = get_lode_dir(lode_id) / "worktree"
+            worktree_path = get_worktree_dir(lode_id)
             if worktree_path.is_dir():
                 diff_stat = get_diff_stat(str(worktree_path))
                 if diff_stat:
@@ -2229,7 +2230,7 @@ class HopperApp(App):
 
     def _review_ship(self, lode: dict, project_path: str | None) -> None:
         """Open the ship review modal for a ship-ready lode."""
-        worktree_path = get_lode_dir(lode["id"]) / "worktree"
+        worktree_path = get_worktree_dir(lode["id"])
         if not worktree_path.is_dir():
             self.notify("Worktree not found", severity="error")
             return

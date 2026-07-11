@@ -12,7 +12,7 @@ from pathlib import Path
 from hopper import prompt
 from hopper.client import connect, set_lode_progress, set_lode_state
 from hopper.codex import run_codex, turn_failed_message
-from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
+from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir, get_worktree_dir
 from hopper.projects import find_project
 
 logger = logging.getLogger(__name__)
@@ -190,7 +190,7 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         return 1
 
     # Validate cwd is the lode worktree
-    worktree_path = get_lode_dir(lode_id) / "worktree"
+    worktree_path = get_worktree_dir(lode_id)
     cwd = Path.cwd()
     try:
         if cwd.resolve() != worktree_path.resolve():

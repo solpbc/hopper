@@ -2110,13 +2110,10 @@ def test_action_delete_archives_lode():
     worktree_path = MagicMock()
     worktree_path.is_dir.return_value = False
 
-    lode_dir = MagicMock()
-    lode_dir.__truediv__.return_value = worktree_path
-
     with (
         patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
         patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
-        patch("hopper.tui.get_lode_dir", return_value=lode_dir),
+        patch("hopper.tui.get_worktree_dir", return_value=worktree_path),
     ):
         app.action_delete()
     assert len(server.events) == 1
@@ -2136,13 +2133,10 @@ def test_action_delete_shows_modal_for_unmerged_changes():
     worktree_path.is_dir.return_value = True
     worktree_path.__str__.return_value = "/fake/worktree"
 
-    lode_dir = MagicMock()
-    lode_dir.__truediv__.return_value = worktree_path
-
     with (
         patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
         patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
-        patch("hopper.tui.get_lode_dir", return_value=lode_dir),
+        patch("hopper.tui.get_worktree_dir", return_value=worktree_path),
         patch("hopper.tui.get_diff_stat", return_value=fake_diff),
         patch.object(app, "push_screen") as mock_push,
     ):
@@ -2165,13 +2159,10 @@ def test_action_delete_archives_immediately_without_worktree():
     worktree_path = MagicMock()
     worktree_path.is_dir.return_value = False
 
-    lode_dir = MagicMock()
-    lode_dir.__truediv__.return_value = worktree_path
-
     with (
         patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
         patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
-        patch("hopper.tui.get_lode_dir", return_value=lode_dir),
+        patch("hopper.tui.get_worktree_dir", return_value=worktree_path),
         patch.object(app, "push_screen") as mock_push,
     ):
         app.action_delete()
@@ -2192,13 +2183,10 @@ def test_action_delete_archives_immediately_with_empty_diff():
     worktree_path.is_dir.return_value = True
     worktree_path.__str__.return_value = "/fake/worktree"
 
-    lode_dir = MagicMock()
-    lode_dir.__truediv__.return_value = worktree_path
-
     with (
         patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
         patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
-        patch("hopper.tui.get_lode_dir", return_value=lode_dir),
+        patch("hopper.tui.get_worktree_dir", return_value=worktree_path),
         patch("hopper.tui.get_diff_stat", return_value=""),
         patch.object(app, "push_screen") as mock_push,
     ):
@@ -2221,13 +2209,10 @@ def test_action_delete_cancel_does_not_archive():
     worktree_path.is_dir.return_value = True
     worktree_path.__str__.return_value = "/fake/worktree"
 
-    lode_dir = MagicMock()
-    lode_dir.__truediv__.return_value = worktree_path
-
     with (
         patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
         patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
-        patch("hopper.tui.get_lode_dir", return_value=lode_dir),
+        patch("hopper.tui.get_worktree_dir", return_value=worktree_path),
         patch("hopper.tui.get_diff_stat", return_value=fake_diff),
         patch.object(app, "push_screen") as mock_push,
     ):

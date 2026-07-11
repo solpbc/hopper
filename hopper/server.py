@@ -34,7 +34,7 @@ from hopper.lodes import (
     archive_lode,
     create_lode,
     current_time_ms,
-    get_lode_dir,
+    get_worktree_dir,
     load_archived_lodes,
     load_lodes,
     reset_lode_claude_stage,
@@ -330,7 +330,7 @@ class Server:
     def _cleanup_worktree(self, lode: dict) -> None:
         """Remove git worktree and branch for an archived lode."""
         lode_id = lode["id"]
-        worktree_path = get_lode_dir(lode_id) / "worktree"
+        worktree_path = get_worktree_dir(lode_id)
         if not worktree_path.is_dir():
             return
         project_name = lode.get("project", "")

@@ -16,6 +16,7 @@ def isolate_config(tmp_path, monkeypatch):
     (lodes, backlog, config, socket) resolve there automatically.
     """
     monkeypatch.setattr(config, "hopper_dir", lambda: tmp_path)
+    monkeypatch.setattr(config, "worktree_root", lambda: tmp_path / "worktrees")
     return tmp_path
 
 

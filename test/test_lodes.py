@@ -4,8 +4,14 @@
 """Tests for lode management."""
 
 import json
+import shutil
+import subprocess
 import uuid
 
+import pytest
+
+from hopper import config
+from hopper.git import create_worktree
 from hopper.lodes import (
     ID_ALPHABET,
     ID_LEN,
@@ -19,6 +25,7 @@ from hopper.lodes import (
     format_duration_ms,
     format_uptime,
     get_lode_dir,
+    get_worktree_dir,
     load_archived_lodes,
     load_lodes,
     reset_lode_claude_stage,
@@ -343,6 +350,65 @@ def test_get_lode_dir(temp_config):
     """Test lode directory path."""
     path = get_lode_dir("my-lode-id")
     assert path == temp_config / "lodes" / "my-lode-id"
+
+
+def test_worktree_dir_uses_whitespace_free_root_without_moving_durable_state(tmp_path, monkeypatch):
+    """Worktrees avoid spaced app-data paths while durable lode state stays there."""
+    lode_id = "abc12345"
+    app_data_path = tmp_path / "App Support" / "hopper"
+    worktree_path = tmp_path / "worktrees"
+    monkeypatch.setattr(config, "hopper_dir", lambda: app_data_path)
+    monkeypatch.setattr(config, "worktree_root", lambda: worktree_path)
+
+    assert " " not in str(get_worktree_dir(lode_id))
+    assert get_lode_dir(lode_id).is_relative_to(app_data_path)
+    assert (get_lode_dir(lode_id) / "diff.txt").is_relative_to(app_data_path)
+
+
+def test_worktree_dir_resolves_legacy_worktree_in_place(tmp_path):
+    """Existing legacy worktrees remain resolved until removed."""
+    lode_id = "abc12345"
+    legacy_path = get_lode_dir(lode_id) / "worktree"
+    legacy_path.mkdir(parents=True)
+
+    assert get_worktree_dir(lode_id) == legacy_path
+
+    legacy_path.rmdir()
+    assert get_worktree_dir(lode_id) == config.worktree_root() / lode_id
+
+
+def test_create_worktree_at_resolved_whitespace_free_path(tmp_path, monkeypatch):
+    """A real git checkout can be created at the resolved new-root path."""
+    if shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    def run_git(*args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    run_git("init")
+    run_git("config", "user.email", "test@example.com")
+    run_git("config", "user.name", "Test User")
+    (repo_path / "README.md").write_text("init\n")
+    run_git("add", ".")
+    run_git("commit", "-m", "init")
+
+    lode_id = "abc12345"
+    monkeypatch.setattr(config, "worktree_root", lambda: tmp_path / "worktrees")
+    worktree_path = get_worktree_dir(lode_id)
+    worktree_path.parent.mkdir(parents=True)
+
+    assert create_worktree(str(repo_path), worktree_path, f"hopper-{lode_id}")
+    assert worktree_path.is_dir()
+    assert " " not in str(worktree_path)
 
 
 def test_find_lode_prefix_helpers():

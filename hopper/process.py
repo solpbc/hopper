@@ -20,7 +20,7 @@ from hopper.git import (
     is_dirty,
     quarantine_dirty_repo,
 )
-from hopper.lodes import get_lode_dir, slugify
+from hopper.lodes import get_lode_dir, get_worktree_dir, slugify
 from hopper.runner import BaseRunner
 
 logger = logging.getLogger(__name__)
@@ -272,7 +272,7 @@ class ProcessRunner(BaseRunner):
             return 1
 
         # Ensure worktree exists
-        self.worktree_path = get_lode_dir(self.lode_id) / "worktree"
+        self.worktree_path = get_worktree_dir(self.lode_id)
         if not self.worktree_path.is_dir():
             set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
             if self.lode_branch:
@@ -280,6 +280,7 @@ class ProcessRunner(BaseRunner):
             else:
                 slug = slugify(self.lode_title)
                 branch_name = f"hopper-{self.lode_id}-{slug}" if slug else f"hopper-{self.lode_id}"
+            self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
             if not create_worktree(self.project_dir, self.worktree_path, branch_name):
                 self._setup_error = "Failed to create git worktree."
                 print(self._setup_error)
@@ -366,7 +367,7 @@ class ProcessRunner(BaseRunner):
             return 1
 
         # Validate worktree exists
-        self.worktree_path = get_lode_dir(self.lode_id) / "worktree"
+        self.worktree_path = get_worktree_dir(self.lode_id)
         if not self.worktree_path.is_dir():
             self._setup_error = f"Worktree not found: {self.worktree_path}"
             print(self._setup_error)

@@ -181,6 +181,22 @@ def get_lode_dir(lode_id: str) -> Path:
     return config.hopper_dir() / "lodes" / lode_id
 
 
+def get_worktree_dir(lode_id: str) -> Path:
+    """Return the on-disk git worktree location for a lode.
+
+    New worktrees live under config.worktree_root() (whitespace-free)
+    so downstream project tooling that mishandles spaces in paths does
+    not break. A worktree already created at the legacy location
+    (get_lode_dir(lode_id)/"worktree") is returned in place so existing
+    lodes stay resumable, inspectable, and cleanable with no filesystem
+    surgery.
+    """
+    legacy = get_lode_dir(lode_id) / "worktree"
+    if legacy.is_dir():
+        return legacy
+    return config.worktree_root() / lode_id
+
+
 def parse_diff_numstat_totals(text: str) -> tuple[int, int]:
     """Parse git numstat output and return (total_additions, total_deletions)."""
     total_additions = 0
