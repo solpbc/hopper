@@ -229,6 +229,16 @@ When `hop lode status` shows a lode in `stuck` state, inspect it through hop:
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
 
+**New project, first lode: workspace-trust dialog.** The very first lode run
+against a freshly `hop project add`-ed directory can wedge silently on Claude
+Code's one-time workspace-trust prompt ("Do you trust the files in this
+folder?"). The pane shows only the prompt and produces zero output, so
+Hopper's liveness model times it out (~351s) and errors the lode; restarting
+reproduces the same wedge. `hop lode peek <lode-id>` confirms it's the trust
+dialog. Recovery: `hop lode answer <lode-id> 1` (accepts the prompt); the
+lode then proceeds normally, and later lodes on the same project don't hit
+it again.
+
 Hopper's liveness model uses pane-diff activity, in-flight Codex exec
 heartbeats, and descendant-process CPU activity. Pane and heartbeat silence are
 the real foreground signals; descendant CPU can keep a lode `running` while
