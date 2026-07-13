@@ -317,7 +317,8 @@ def test_up_command_fails_if_server_running(capsys):
                 result = main()
     assert result == 1
     captured = capsys.readouterr()
-    assert "Server already running" in captured.out
+    assert "a hopper server is already running on" in captured.out
+    assert "attach to the existing hopper session" in captured.out
 
 
 def test_up_command_requires_name_config(capsys):
@@ -389,7 +390,8 @@ def test_require_no_server_failure(capsys):
         result = require_no_server()
     assert result == 1
     captured = capsys.readouterr()
-    assert "Server already running" in captured.out
+    assert "a hopper server is already running on" in captured.out
+    assert "stop that server before running hop up" in captured.out
 
 
 @pytest.mark.parametrize("require", [require_server, require_no_server])
@@ -4178,7 +4180,7 @@ def test_format_lode_line_shows_spawn_refusal():
         "id": "abc12345",
         "stage": "refine",
         "state": "running",
-        "status": "spawn refused: tmux unreachable — run hop check abc12345",
+        "status": "spawn refused: tmux unreachable — verify tmux is running, then retry",
     }
 
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)

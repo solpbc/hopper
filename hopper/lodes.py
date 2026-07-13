@@ -494,7 +494,13 @@ def set_lode_claude_started(lodes: list[dict], lode_id: str, claude_stage: str) 
     return None
 
 
-def reset_lode_claude_stage(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:
+def reset_lode_claude_stage(
+    lodes: list[dict],
+    lode_id: str,
+    claude_stage: str,
+    *,
+    persist: bool = True,
+) -> dict | None:
     """Reset a claude stage (new session_id, started=False)."""
     for lode in lodes:
         if lode["id"] == lode_id:
@@ -504,8 +510,9 @@ def reset_lode_claude_stage(lodes: list[dict], lode_id: str, claude_stage: str) 
             lode["claude"][claude_stage]["started"] = False
             lode["last_progress_at"] = None
             lode["last_progress_summary"] = ""
-            touch(lode)
-            save_lodes(lodes)
+            if persist:
+                touch(lode)
+                save_lodes(lodes)
             return lode
     return None
 

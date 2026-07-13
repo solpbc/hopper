@@ -99,8 +99,8 @@ def test_lode_to_row_uses_progress_summary_when_active():
 @pytest.mark.parametrize(
     "status",
     [
-        "spawn refused: tmux unreachable — run hop check abcd1234",
-        "spawn failed: tmux could not create a runner pane — run hop check abcd1234",
+        "spawn refused: tmux unreachable — verify tmux is running, then retry",
+        "spawn failed: tmux could not create a runner pane — verify tmux is running, then retry",
     ],
 )
 def test_lode_to_row_spawn_status_overrides_stale_progress(status):

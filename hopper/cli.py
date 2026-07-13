@@ -143,12 +143,16 @@ def require_no_server(timeout: float = 2.0) -> int | None:
     """Check that the server is NOT running. Returns exit code on failure, None on success."""
     from hopper.client import probe_server
 
-    status = probe_server(_socket(), timeout=timeout)
+    socket_path = _socket()
+    status = probe_server(socket_path, timeout=timeout)
     if status == "up":
-        print("Server already running.")
+        print(
+            f"a hopper server is already running on {socket_path}; attach to the existing "
+            "hopper session or stop that server before running hop up"
+        )
         return 1
     if status == "unresponsive":
-        _print_unresponsive_server(_socket(), timeout)
+        _print_unresponsive_server(socket_path, timeout)
         return 1
     return None
 

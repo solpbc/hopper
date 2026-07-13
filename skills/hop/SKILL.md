@@ -14,7 +14,9 @@ Invoke via Bash: `hop <command> [flags]`.
 ## Context
 
 - `HOPPER_LID` is set when Claude runs inside a hopper lode.
-- All commands require the hopper server to be running (`hop ping` to check).
+- Commands that query or mutate live lodes require the hopper server to be
+  running (`hop ping` to check). Local commands such as `hop check` and config
+  management do not.
 - Commands marked **(outside lode only)** are blocked when `HOPPER_LID` is set.
 - Remote hopper hosts are reached through the same `hop` CLI. Use `hop remote`
   for project routing and `hop -H <host> ...` for an explicit one-off host.
@@ -39,6 +41,15 @@ EOF
 If `remote.<project>` is configured and the project is disabled or absent
 locally, `hop implement <project>` forwards to that host automatically. A
 locally active project always wins.
+
+## Starting hopper
+
+`hop up` permits one server for its socket. If another server is responsive,
+attach to its existing hopper session or stop it before retrying. A racing
+second start reports the PID holding the singleton lock when available. If the
+socket accepts connections but does not answer, `hop up` refuses to start a
+replacement; retry after the existing server recovers, or stop it if it is
+wedged.
 
 ## Remote host registry
 
@@ -123,6 +134,16 @@ Restart an inactive lode (error, stuck, or failed ship):
 hop lode restart <lode-id>
 hop lode restart <lode-id> --force   # also restarts active lodes with a dead pane
 ```
+
+Runner spawn problems remain visible in lode status. `spawn refused:` means
+hopper did not launch a duplicate: attach when the recorded pane is live, or
+verify tmux is running and retry when tmux liveness is unknown. `spawn failed:`
+means tmux did not create the runner pane; verify tmux is running, then retry.
+These messages do not change the lode's workflow state.
+
+Backlog add/remove operations update the local backlog directly only when the
+server is provably down. If a server socket is listening but unresponsive, they
+refuse instead of risking an update concurrent with the live server.
 
 ## Project management
 

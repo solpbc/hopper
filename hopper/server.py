@@ -4,6 +4,7 @@
 """Unix socket JSONL server for hopper."""
 
 import atexit
+import copy
 import fcntl
 import json
 import logging
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
@@ -253,11 +255,12 @@ class Server:
                         lode["tmux_pane"] = None
                         lode["pid"] = None
                         changed = True
+                    changed = _clear_spawn_refusal(lode) or changed
                 else:
                     changed = (
                         _set_spawn_refusal(
                             lode,
-                            f"tmux unreachable — run hop check {lode['id']}",
+                            "tmux unreachable — verify tmux is running, then retry",
                         )
                         or changed
                     )
@@ -266,11 +269,13 @@ class Server:
                         lode["id"],
                         pane,
                     )
-            elif lode.get("active") or lode.get("pid"):
-                lode["active"] = False
-                lode["tmux_pane"] = None
-                lode["pid"] = None
-                changed = True
+            else:
+                if lode.get("active") or lode.get("pid"):
+                    lode["active"] = False
+                    lode["tmux_pane"] = None
+                    lode["pid"] = None
+                    changed = True
+                changed = _clear_spawn_refusal(lode) or changed
 
         if changed:
             save_lodes(self.lodes)
@@ -282,6 +287,7 @@ class Server:
         *,
         foreground: bool = False,
         spawn_updates: dict | None = None,
+        pre_spawn: Callable[[], None] | None = None,
     ) -> tuple[SpawnOutcome, str | None]:
         """Spawn a runner only when its recorded pane is absent or gone."""
         pane = lode.get("tmux_pane")
@@ -308,28 +314,40 @@ class Server:
                 )
                 if _set_spawn_refusal(
                     lode,
-                    f"tmux unreachable — run hop check {lode['id']}",
+                    "tmux unreachable — verify tmux is running, then retry",
                 ):
                     save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
                 return SpawnOutcome.REFUSED_UNKNOWN, None
 
+        prior_lode = copy.deepcopy(lode)
         lode["active"] = False
         lode["tmux_pane"] = None
         lode["pid"] = None
         _clear_spawn_refusal(lode)
         if spawn_updates:
             lode.update(spawn_updates)
-            if spawn_updates.get("state") == "running":
-                stage = lode.get("stage", "")
-                if stage in STAGES:
-                    lode.setdefault("runs", {})[stage] = {"started_at": current_time_ms()}
+        if pre_spawn:
+            pre_spawn()
 
-        pane_id = spawn_claude(lode["id"], project_path, foreground=foreground)
+        launch_error = None
+        try:
+            pane_id = spawn_claude(lode["id"], project_path, foreground=foreground)
+        except OSError as error:
+            logger.error("lode %s: failed to create tmux runner pane: %s", lode["id"], error)
+            launch_error = error
+            pane_id = None
         if not pane_id:
-            logger.error("lode %s: failed to create tmux runner pane", lode["id"])
+            if launch_error is None:
+                logger.error("lode %s: failed to create tmux runner pane", lode["id"])
+            lode.clear()
+            lode.update(prior_lode)
+            lode["active"] = False
+            lode["tmux_pane"] = None
+            lode["pid"] = None
             lode["status"] = (
-                f"spawn failed: tmux could not create a runner pane — run hop check {lode['id']}"
+                "spawn failed: tmux could not create a runner pane — "
+                "verify tmux is running, then retry"
             )
             touch(lode)
             save_lodes(self.lodes)
@@ -792,11 +810,16 @@ class Server:
             if outcome is not SpawnOutcome.SPAWNED:
                 if conn:
                     if outcome is SpawnOutcome.ALREADY_LIVE:
-                        error = f"lode {lode_id} already has a live runner"
+                        error = (
+                            f"lode {lode_id} already has a live runner; attach instead of spawning"
+                        )
                     elif outcome is SpawnOutcome.REFUSED_UNKNOWN:
-                        error = f"lode {lode_id} spawn refused because tmux is unreachable"
+                        error = (
+                            f"lode {lode_id} spawn refused because tmux is unreachable; "
+                            "verify tmux is running, then retry"
+                        )
                     else:
-                        error = "failed to resume claude pane"
+                        error = "failed to resume claude pane; verify tmux is running, then retry"
                     self._send_response(
                         conn,
                         {"type": "error", "error": error},
@@ -944,19 +967,32 @@ class Server:
             lode_id = message.get("lode_id")
             claude_stage = message.get("claude_stage")
             if lode_id and claude_stage:
-                lode = reset_lode_claude_stage(self.lodes, lode_id, claude_stage)
-                if lode:
+                lode = self._find_lode(lode_id)
+                if not lode or claude_stage not in lode.get("claude", {}):
+                    return
+                if message.get("spawn"):
+                    proj = find_project(lode.get("project", ""))
+                    project_path = proj.path if proj else None
+
+                    def reset_before_spawn() -> None:
+                        reset_lode_claude_stage(
+                            self.lodes,
+                            lode_id,
+                            claude_stage,
+                            persist=False,
+                        )
+
+                    outcome, _ = self._gated_spawn(
+                        lode,
+                        project_path,
+                        pre_spawn=reset_before_spawn,
+                    )
+                    if outcome is SpawnOutcome.SPAWNED:
+                        logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
+                else:
+                    reset_lode_claude_stage(self.lodes, lode_id, claude_stage)
                     logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
-                    # Auto-spawn if requested (reload flow)
-                    if message.get("spawn"):
-                        proj = find_project(
-                            self._find_lode(lode_id).get("project", "")
-                            if self._find_lode(lode_id)
-                            else ""
-                        )
-                        project_path = proj.path if proj else None
-                        self._gated_spawn(lode, project_path)
 
         elif msg_type == "lode_resume_refine":
             # Compound: apply refine state only when the gated spawn is allowed.
