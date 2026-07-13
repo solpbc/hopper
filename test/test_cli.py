@@ -5,6 +5,7 @@
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -15,8 +16,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import hopper.code as hopper_code
-from hopper import __version__
+from hopper import __version__, config
 from hopper.cli import (
+    _socket,
     cmd_backlog,
     cmd_check,
     cmd_code,
@@ -65,6 +67,13 @@ def clear_hopper_lid_env(monkeypatch):
 
 def test_main_is_callable():
     assert callable(main)
+
+
+def test_server_socket_path_is_shared_with_cli(temp_config):
+    """The CLI and config agree on the late-bound production socket path."""
+    expected = temp_config / "server.sock"
+    assert config.server_socket_path() == expected
+    assert _socket() == expected
 
 
 # Tests for help and version
@@ -304,7 +313,7 @@ def test_up_command_fails_if_server_running(capsys):
     """Up command returns 1 if server already running."""
     with patch.object(sys, "argv", ["hopper", "up"]):
         with patch("hopper.cli.require_not_coding_agent", return_value=None):
-            with patch("hopper.client.ping", return_value=True):
+            with patch("hopper.client.probe_server", return_value="up"):
                 result = main()
     assert result == 1
     captured = capsys.readouterr()
@@ -349,14 +358,14 @@ def test_require_config_name_failure(capsys):
 
 def test_require_server_success():
     """require_server returns None when server is running."""
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         result = require_server()
     assert result is None
 
 
 def test_require_server_failure(capsys):
     """require_server returns 1 when server not running."""
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         result = require_server()
     assert result == 1
     captured = capsys.readouterr()
@@ -369,18 +378,45 @@ def test_require_server_failure(capsys):
 
 def test_require_no_server_success():
     """require_no_server returns None when server is not running."""
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         result = require_no_server()
     assert result is None
 
 
 def test_require_no_server_failure(capsys):
     """require_no_server returns 1 when server is running."""
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         result = require_no_server()
     assert result == 1
     captured = capsys.readouterr()
     assert "Server already running" in captured.out
+
+
+@pytest.mark.parametrize("require", [require_server, require_no_server])
+def test_require_helpers_refuse_unresponsive_server(require, capsys):
+    with patch("hopper.client.probe_server", return_value="unresponsive"):
+        assert require(timeout=0.25) == 1
+
+    output = capsys.readouterr().out
+    assert "a hopper server is listening on" in output
+    assert "did not answer within 0.25s" in output
+    assert "retry, or stop it if wedged" in output
+
+
+def test_require_no_server_refuses_real_unresponsive_listener(tmp_path, monkeypatch, capsys):
+    """Regression: this fails on unpatched main's existence-only/down probe."""
+    socket_path = tmp_path / "unresponsive.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    monkeypatch.setattr("hopper.cli._socket", lambda: socket_path)
+
+    try:
+        assert require_no_server(timeout=0.05) == 1
+    finally:
+        listener.close()
+
+    assert "it may be busy" in capsys.readouterr().out
 
 
 # Tests for detect_coding_agent
@@ -535,7 +571,7 @@ def test_validate_hopper_lid_invalid(capsys):
 
 def test_status_no_server(capsys):
     """status command returns 1 when server not running."""
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         result = cmd_status([])
     assert result == 1
     captured = capsys.readouterr()
@@ -547,7 +583,7 @@ def test_status_no_hopper_lid(capsys):
     env = os.environ.copy()
     env.pop("HOPPER_LID", None)
     with patch.dict(os.environ, env, clear=True):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             result = cmd_status([])
     assert result == 1
     captured = capsys.readouterr()
@@ -557,7 +593,7 @@ def test_status_no_hopper_lid(capsys):
 def test_status_invalid_session(capsys):
     """status command returns 1 when session doesn't exist."""
     with patch.dict(os.environ, {"HOPPER_LID": "bad-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=False):
                 result = cmd_status([])
     assert result == 1
@@ -570,7 +606,7 @@ def test_status_show(capsys):
     """status command shows current status when no args."""
     session_data = {"id": "test-session", "status": "Working on feature X"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=session_data):
                     result = cmd_status([])
@@ -583,7 +619,7 @@ def test_status_show_title(capsys):
     """status command shows title when present."""
     session_data = {"id": "test-session", "title": "Auth Flow", "status": "Working on feature X"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=session_data):
                     result = cmd_status([])
@@ -597,7 +633,7 @@ def test_status_show_empty(capsys):
     """status command shows placeholder when no status set."""
     session_data = {"id": "test-session", "status": ""}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=session_data):
                     result = cmd_status([])
@@ -610,7 +646,7 @@ def test_status_update(capsys):
     """status command updates status when args provided."""
     session_data = {"id": "test-session", "status": "Old status"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=session_data):
                     with patch("hopper.client.set_lode_status", return_value=True):
@@ -623,7 +659,7 @@ def test_status_update(capsys):
 def test_status_set_title(capsys):
     """status -t sets title only."""
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.set_lode_title", return_value=True) as mock_set_title:
                     result = cmd_status(["-t", "Auth Flow"])
@@ -638,7 +674,7 @@ def test_status_set_title_and_text(capsys):
     """status -t with text sets both title and status."""
     session_data = {"id": "test-session", "status": "Old status"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=session_data):
                     with patch("hopper.client.set_lode_title", return_value=True) as mock_set_title:
@@ -660,7 +696,7 @@ def test_status_update_from_empty(capsys):
     """status command shows simpler message when updating from empty."""
     session_data = {"id": "test-session", "status": ""}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=session_data):
                     with patch("hopper.client.set_lode_status", return_value=True):
@@ -674,7 +710,7 @@ def test_status_update_from_empty(capsys):
 def test_status_empty_text_error(capsys):
     """status command returns 1 when given empty text."""
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 result = cmd_status(["", "  "])
     assert result == 1
@@ -689,7 +725,7 @@ def test_backlog_add_reads_description_from_stdin(capsys):
     """backlog add accepts description from stdin when text args are omitted."""
     from io import StringIO
 
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         with patch("hopper.backlog.load_backlog", return_value=[]):
             with patch("hopper.backlog.add_backlog_item", return_value=MagicMock()) as mock_add:
                 with patch("sys.stdin", StringIO("Backlog from stdin")):
@@ -715,6 +751,35 @@ def test_backlog_add_requires_description_or_stdin(capsys):
     assert "Use: hop backlog add [-p project] <text...>" in out
 
 
+def test_backlog_add_refuses_unresponsive_server(capsys):
+    with (
+        patch("hopper.client.probe_server", return_value="unresponsive"),
+        patch("hopper.backlog.add_backlog_item") as mock_local_add,
+        patch("hopper.client.add_backlog") as mock_remote_add,
+    ):
+        assert cmd_backlog(["add", "-p", "myproj", "Do work"]) == 1
+
+    mock_local_add.assert_not_called()
+    mock_remote_add.assert_not_called()
+    assert "it may be busy" in capsys.readouterr().out
+
+
+def test_backlog_remove_refuses_unresponsive_server(capsys):
+    item = _mock_backlog_item()
+    with (
+        patch("hopper.client.probe_server", return_value="unresponsive"),
+        patch("hopper.backlog.load_backlog", return_value=[item]),
+        patch("hopper.backlog.find_by_prefix", return_value=item),
+        patch("hopper.backlog.remove_backlog_item") as mock_local_remove,
+        patch("hopper.client.remove_backlog") as mock_remote_remove,
+    ):
+        assert cmd_backlog(["remove", "abc"]) == 1
+
+    mock_local_remove.assert_not_called()
+    mock_remote_remove.assert_not_called()
+    assert "it may be busy" in capsys.readouterr().out
+
+
 def _mock_backlog_item(id="abc123", project="myproj", description="Fix bug"):
     item = MagicMock()
     item.id = id
@@ -728,7 +793,7 @@ def test_backlog_promote_success(capsys):
     socket_path = MagicMock()
 
     with patch("hopper.cli._socket", return_value=socket_path):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.backlog.load_backlog", return_value=[item]):
                 with patch("hopper.backlog.find_by_prefix", return_value=item):
                     with patch(
@@ -747,7 +812,7 @@ def test_backlog_promote_with_scope(capsys):
     socket_path = MagicMock()
 
     with patch("hopper.cli._socket", return_value=socket_path):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.backlog.load_backlog", return_value=[item]):
                 with patch("hopper.backlog.find_by_prefix", return_value=item):
                     with patch(
@@ -762,7 +827,7 @@ def test_backlog_promote_with_scope(capsys):
 
 
 def test_backlog_promote_not_found(capsys):
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         with patch("hopper.backlog.load_backlog", return_value=[]):
             with patch("hopper.backlog.find_by_prefix", return_value=None):
                 assert cmd_backlog(["promote", "abc"]) == 1
@@ -772,7 +837,7 @@ def test_backlog_promote_not_found(capsys):
 
 
 def test_backlog_promote_requires_server(capsys):
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         assert cmd_backlog(["promote", "abc"]) == 1
 
     out = capsys.readouterr().out
@@ -784,7 +849,7 @@ def test_backlog_queue_success(capsys):
     socket_path = MagicMock()
 
     with patch("hopper.cli._socket", return_value=socket_path):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.backlog.load_backlog", return_value=[item]):
                 with patch("hopper.backlog.find_by_prefix", return_value=item):
                     with patch("hopper.client.set_backlog_queued", return_value=True):
@@ -800,7 +865,7 @@ def test_backlog_queue_clear(capsys):
     socket_path = MagicMock()
 
     with patch("hopper.cli._socket", return_value=socket_path):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.backlog.load_backlog", return_value=[item]):
                 with patch("hopper.backlog.find_by_prefix", return_value=item):
                     with patch(
@@ -815,7 +880,7 @@ def test_backlog_queue_clear(capsys):
 
 
 def test_backlog_queue_not_found(capsys):
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         with patch("hopper.backlog.load_backlog", return_value=[]):
             with patch("hopper.backlog.find_by_prefix", return_value=None):
                 assert cmd_backlog(["queue", "abc", "lode42"]) == 1
@@ -827,7 +892,7 @@ def test_backlog_queue_not_found(capsys):
 def test_backlog_queue_missing_lode_id(capsys):
     item = _mock_backlog_item()
 
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         with patch("hopper.backlog.load_backlog", return_value=[item]):
             with patch("hopper.backlog.find_by_prefix", return_value=item):
                 assert cmd_backlog(["queue", "abc"]) == 1
@@ -3104,7 +3169,7 @@ def test_screenshot_help(capsys):
 
 def test_screenshot_no_server(capsys):
     """screenshot returns 1 when server not running."""
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         result = cmd_screenshot([])
     assert result == 1
     captured = capsys.readouterr()
@@ -3114,7 +3179,7 @@ def test_screenshot_no_server(capsys):
 def test_screenshot_no_tmux_location(capsys):
     """screenshot returns 1 when server has no tmux location."""
     mock_response = {"type": "connected", "tmux": None}
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         with patch("hopper.client.connect", return_value=mock_response):
             result = cmd_screenshot([])
     assert result == 1
@@ -3125,7 +3190,7 @@ def test_screenshot_no_tmux_location(capsys):
 def test_screenshot_capture_fails(capsys):
     """screenshot returns 1 when capture_pane fails."""
     mock_response = {"type": "connected", "tmux": {"lode": "main", "pane": "%0"}}
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         with patch("hopper.client.connect", return_value=mock_response):
             with patch("hopper.tmux.capture_pane", return_value=None):
                 result = cmd_screenshot([])
@@ -3138,7 +3203,7 @@ def test_screenshot_success(capsys):
     """screenshot prints captured content on success."""
     mock_response = {"type": "connected", "tmux": {"lode": "main", "pane": "%0"}}
     ansi_content = "\x1b[32mGreen text\x1b[0m\nMore lines\n"
-    with patch("hopper.client.ping", return_value=True):
+    with patch("hopper.client.probe_server", return_value="up"):
         with patch("hopper.client.connect", return_value=mock_response):
             with patch("hopper.tmux.capture_pane", return_value=ansi_content):
                 result = cmd_screenshot([])
@@ -3160,7 +3225,7 @@ def test_processed_help(capsys):
 
 def test_processed_no_server(capsys):
     """processed returns 1 when server not running."""
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         result = cmd_processed([])
     assert result == 1
     captured = capsys.readouterr()
@@ -3172,7 +3237,7 @@ def test_processed_no_hopper_lid(capsys):
     env = os.environ.copy()
     env.pop("HOPPER_LID", None)
     with patch.dict(os.environ, env, clear=True):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             result = cmd_processed([])
     assert result == 1
     captured = capsys.readouterr()
@@ -3182,7 +3247,7 @@ def test_processed_no_hopper_lid(capsys):
 def test_processed_invalid_session(capsys):
     """processed returns 1 when session doesn't exist."""
     with patch.dict(os.environ, {"HOPPER_LID": "bad-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=False):
                 result = cmd_processed([])
     assert result == 1
@@ -3197,7 +3262,7 @@ def test_processed_empty_stdin(capsys):
 
     lode_data = {"id": "test-session", "stage": "mill"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("sys.stdin", StringIO("")):
@@ -3217,7 +3282,7 @@ def test_processed_saves_file(temp_config, capsys):
     lode_data = {"id": lode_id, "stage": "mill"}
 
     with patch.dict(os.environ, {"HOPPER_LID": lode_id}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
@@ -3245,7 +3310,7 @@ def test_processed_no_stage(capsys):
     """processed returns 1 when lode has no stage."""
     lode_data = {"id": "test-session", "stage": ""}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     result = cmd_processed([])
@@ -3264,7 +3329,7 @@ def test_processed_refine_stage(temp_config, capsys):
     lode_data = {"id": lode_id, "stage": "refine"}
 
     with patch.dict(os.environ, {"HOPPER_LID": lode_id}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
@@ -3382,7 +3447,7 @@ def test_feedback_alias_treats_dash_as_stdin_sentinel(capsys):
 
 def test_gate_no_server(capsys):
     """gate returns error when server is not running."""
-    with patch("hopper.client.ping", return_value=False):
+    with patch("hopper.client.probe_server", return_value="down"):
         with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
             result = cmd_gate([])
     assert result != 0
@@ -3404,7 +3469,7 @@ def test_gate_wrong_stage(capsys):
     """gate returns 1 when lode is not in refine stage."""
     lode_data = {"id": "test-session", "stage": "mill"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     result = cmd_gate([])
@@ -3419,7 +3484,7 @@ def test_gate_empty_stdin(capsys):
 
     lode_data = {"id": "test-session", "stage": "refine"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("sys.stdin", StringIO("")):
@@ -3438,7 +3503,7 @@ def test_gate_saves_file_and_sets_state(temp_config, capsys):
     lode_data = {"id": lode_id, "stage": "refine"}
 
     with patch.dict(os.environ, {"HOPPER_LID": lode_id}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
@@ -3609,7 +3674,7 @@ def test_status_inside_lode_unchanged(capsys):
     """hop status inside a lode (with HOPPER_LID) still works."""
     lode = {"id": "test123", "title": "Title", "status": "Working"}
     with patch.dict(os.environ, {"HOPPER_LID": "test123"}):
-        with patch("hopper.client.ping", return_value=True):
+        with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode):
                     result = cmd_status([])
@@ -4108,6 +4173,17 @@ def test_format_lode_line_basic():
     assert "Working" in line
 
 
+def test_format_lode_line_shows_spawn_refusal():
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "state": "running",
+        "status": "spawn refused: tmux unreachable — run hop check abc12345",
+    }
+
+    assert "spawn refused: tmux unreachable" in format_lode_line(lode)
+
+
 def test_format_lode_detail_pane_active(make_lode):
     """Active lode with tmux_pane shows pane line."""
     lode = make_lode(active=True, tmux_pane="%123")
@@ -4417,12 +4493,7 @@ def check_server(tmp_path):
     server = Server(socket_path)
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
-    else:
-        raise TimeoutError("Server did not start")
+    assert server.ready.wait(5), "Server did not start"
 
     yield server, socket_path
 

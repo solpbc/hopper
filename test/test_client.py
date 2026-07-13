@@ -3,6 +3,8 @@
 
 """Tests for the hopper client."""
 
+import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -16,6 +18,7 @@ from hopper.client import (
     get_gate,
     lode_exists,
     ping,
+    probe_server,
     send_gate_feedback,
     send_message,
     set_lode_branch,
@@ -38,13 +41,7 @@ def server(socket_path):
     srv = Server(socket_path)
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
-
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
-    else:
-        raise TimeoutError("Server did not start")
+    assert srv.ready.wait(5), "Server did not start"
 
     yield srv
 
@@ -59,13 +56,7 @@ def server_with_tmux(socket_path):
     srv = Server(socket_path, tmux_location=tmux_location)
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
-
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
-    else:
-        raise TimeoutError("Server did not start")
+    assert srv.ready.wait(5), "Server did not start"
 
     yield srv
 
@@ -125,6 +116,81 @@ def test_ping_failure_no_server(socket_path):
     """Ping returns False when server not running."""
     result = ping(socket_path, timeout=0.5)
     assert result is False
+
+
+def test_probe_server_down_when_socket_missing(socket_path):
+    assert probe_server(socket_path, timeout=0.1) == "down"
+
+
+def test_probe_server_down_when_socket_refuses_connection(socket_path):
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(socket_path))
+    stale.close()
+
+    assert probe_server(socket_path, timeout=0.1) == "down"
+
+
+def test_probe_server_up_includes_identity(server, socket_path):
+    assert probe_server(socket_path) == "up"
+    response = send_message(socket_path, {"type": "ping"}, wait_for_response=True)
+    assert response["type"] == "pong"
+    assert response["pid"] == os.getpid()
+    assert response["started_at"] == server.started_at
+
+
+def test_probe_server_unresponsive_when_listener_never_accepts(socket_path):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    try:
+        assert probe_server(socket_path, timeout=0.05) == "unresponsive"
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b"", "unresponsive"),
+        (b"not-json\n", "unresponsive"),
+        (b"[]\n", "unresponsive"),
+        (b'{"type":"not-pong"}\n', "unresponsive"),
+        # A bare pong is a responsive server; identity fields are not
+        # liveness criteria.
+        (b'{"type":"pong"}\n', "up"),
+    ],
+)
+def test_probe_server_classifies_handcrafted_responses(socket_path, payload, expected):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+
+    def respond():
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(4096)
+            if payload:
+                conn.sendall(payload)
+
+    thread = threading.Thread(target=respond)
+    thread.start()
+    try:
+        assert probe_server(socket_path, timeout=0.2) == expected
+    finally:
+        thread.join(timeout=1)
+        listener.close()
+
+
+@pytest.mark.parametrize("error", [TimeoutError(), BlockingIOError()])
+def test_probe_server_transport_stalls_are_unresponsive(socket_path, error):
+    with patch("hopper.client._exchange_message", side_effect=error):
+        assert probe_server(socket_path) == "unresponsive"
+
+
+def test_send_message_does_not_hide_programming_errors(socket_path):
+    with patch("hopper.client.socket.socket"):
+        with pytest.raises(TypeError):
+            send_message(socket_path, {"value": object()})
 
 
 def test_send_message_no_response(server, socket_path):
@@ -443,17 +509,14 @@ class TestHopperConnection:
         # Should have received the broadcast
         assert any(msg.get("type") == "test_broadcast" for msg in received)
 
-    def test_reconnects_after_server_restart(self, socket_path):
+    def test_reconnects_after_server_restart(self, socket_path, release_server_lock):
         """Connection reconnects when server restarts."""
         # Start first server
         srv1 = Server(socket_path)
         thread1 = threading.Thread(target=srv1.start, daemon=True)
         thread1.start()
 
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
+        assert srv1.ready.wait(5), "First server did not start"
 
         conn = HopperConnection(socket_path)
         conn.start()
@@ -464,16 +527,14 @@ class TestHopperConnection:
         # Stop first server
         srv1.stop()
         thread1.join(timeout=2)
+        release_server_lock(srv1)
 
         # Start second server
         srv2 = Server(socket_path)
         thread2 = threading.Thread(target=srv2.start, daemon=True)
         thread2.start()
 
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
+        assert srv2.ready.wait(5), "Second server did not start"
 
         # Give time to reconnect (reconnect rate is 1/sec)
         time.sleep(1.5)
@@ -499,7 +560,7 @@ class TestHopperConnection:
 
         assert len(calls) == 1
 
-    def test_on_connect_fires_on_reconnect(self, socket_path):
+    def test_on_connect_fires_on_reconnect(self, socket_path, release_server_lock):
         """on_connect callback fires on both initial connect and reconnect."""
         calls = []
 
@@ -508,10 +569,7 @@ class TestHopperConnection:
         thread1 = threading.Thread(target=srv1.start, daemon=True)
         thread1.start()
 
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
+        assert srv1.ready.wait(5), "First server did not start"
 
         conn = HopperConnection(socket_path)
         conn.start(on_connect=lambda: calls.append(1))
@@ -524,16 +582,14 @@ class TestHopperConnection:
         # Stop first server
         srv1.stop()
         thread1.join(timeout=2)
+        release_server_lock(srv1)
 
         # Start second server
         srv2 = Server(socket_path)
         thread2 = threading.Thread(target=srv2.start, daemon=True)
         thread2.start()
 
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
+        assert srv2.ready.wait(5), "Second server did not start"
 
         # Give time to reconnect (reconnect rate is 1/sec)
         time.sleep(1.5)

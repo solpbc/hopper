@@ -10,11 +10,15 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from hopper.lodes import current_time_ms
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidServerResponse(ValueError):
+    """Raised when a server response is not a JSON object."""
 
 
 class HopperConnection:
@@ -194,6 +198,36 @@ class HopperConnection:
             logger.warning("Background thread did not stop cleanly")
 
 
+def _exchange_message(
+    socket_path: Path,
+    message: dict,
+    timeout: float = 2.0,
+    wait_for_response: bool = False,
+) -> dict | None:
+    """Exchange one message with the server, raising transport/protocol errors."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(socket_path))
+
+        line = json.dumps(message) + "\n"
+        sock.sendall(line.encode("utf-8"))
+
+        if not wait_for_response:
+            return None
+
+        buffer = ""
+        while "\n" not in buffer:
+            data = sock.recv(4096)
+            if not data:
+                raise ConnectionError("server closed connection before responding")
+            buffer += data.decode("utf-8")
+        response_line, _ = buffer.split("\n", 1)
+        response = json.loads(response_line)
+        if not isinstance(response, dict):
+            raise InvalidServerResponse("server response is not a JSON object")
+        return response
+
+
 def send_message(
     socket_path: Path,
     message: dict,
@@ -212,28 +246,8 @@ def send_message(
         Response dict if wait_for_response=True and response received, else None
     """
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect(str(socket_path))
-
-        line = json.dumps(message) + "\n"
-        sock.sendall(line.encode("utf-8"))
-
-        if wait_for_response:
-            buffer = ""
-            while True:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                buffer += data.decode("utf-8")
-                if "\n" in buffer:
-                    response_line, _ = buffer.split("\n", 1)
-                    sock.close()
-                    return json.loads(response_line)
-
-        sock.close()
-        return None
-    except Exception as e:
+        return _exchange_message(socket_path, message, timeout, wait_for_response)
+    except (OSError, UnicodeError, json.JSONDecodeError, InvalidServerResponse) as e:
         logger.debug(f"send_message failed: {e}")
         return None
 
@@ -265,6 +279,37 @@ def connect(socket_path: Path, lode_id: str | None = None, timeout: float = 2.0)
     return response
 
 
+ProbeStatus = Literal["up", "down", "unresponsive"]
+
+
+def probe_server(socket_path: Path, timeout: float = 2.0) -> ProbeStatus:
+    """Classify a server socket as up, down, or listening but unresponsive."""
+    try:
+        response = _exchange_message(
+            socket_path,
+            {"type": "ping", "ts": current_time_ms()},
+            timeout,
+            wait_for_response=True,
+        )
+    except (FileNotFoundError, ConnectionRefusedError):
+        return "down"
+    except (
+        TimeoutError,
+        BlockingIOError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        InvalidServerResponse,
+    ):
+        return "unresponsive"
+
+    # Liveness only requires a well-formed pong; pid/started_at are identity
+    # data for consumers that read them, not liveness criteria.
+    if response is None or response.get("type") != "pong":
+        return "unresponsive"
+    return "up"
+
+
 def ping(socket_path: Path, timeout: float = 2.0) -> bool:
     """Check if server is running.
 
@@ -275,7 +320,7 @@ def ping(socket_path: Path, timeout: float = 2.0) -> bool:
     Returns:
         True if server responds, False otherwise
     """
-    return connect(socket_path, timeout=timeout) is not None
+    return probe_server(socket_path, timeout=timeout) == "up"
 
 
 def lode_exists(socket_path: Path, lode_id: str, timeout: float = 2.0) -> bool:

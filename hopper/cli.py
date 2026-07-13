@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 def _socket() -> Path:
     """Return the server socket path (late-binding, safe for tests)."""
-    return config.hopper_dir() / "server.sock"
+    return config.server_socket_path()
 
 
 # Command registry: name -> (handler, description, group)
@@ -117,22 +117,38 @@ def print_help() -> None:
     print("  --version    Show version number")
 
 
-def require_server() -> int | None:
-    """Check that the server is running. Returns exit code on failure, None on success."""
-    from hopper.client import ping
+def _print_unresponsive_server(socket_path: Path, timeout: float) -> None:
+    """Print the prescriptive failure for a listening but unresponsive server."""
+    print(
+        f"a hopper server is listening on {socket_path} but did not answer within "
+        f"{timeout:g}s — it may be busy; retry, or stop it if wedged"
+    )
 
-    if not ping(_socket()):
+
+def require_server(timeout: float = 2.0) -> int | None:
+    """Check that the server is running. Returns exit code on failure, None on success."""
+    from hopper.client import probe_server
+
+    status = probe_server(_socket(), timeout=timeout)
+    if status == "down":
         print("Server not running. Start it with: hop up")
+        return 1
+    if status == "unresponsive":
+        _print_unresponsive_server(_socket(), timeout)
         return 1
     return None
 
 
-def require_no_server() -> int | None:
+def require_no_server(timeout: float = 2.0) -> int | None:
     """Check that the server is NOT running. Returns exit code on failure, None on success."""
-    from hopper.client import ping
+    from hopper.client import probe_server
 
-    if ping(_socket()):
+    status = probe_server(_socket(), timeout=timeout)
+    if status == "up":
         print("Server already running.")
+        return 1
+    if status == "unresponsive":
+        _print_unresponsive_server(_socket(), timeout)
         return 1
     return None
 
@@ -1206,7 +1222,7 @@ def cmd_backlog(args: list[str]) -> int:
     from hopper.client import (
         add_backlog,
         get_lode,
-        ping,
+        probe_server,
         promote_backlog,
         remove_backlog,
         set_backlog_queued,
@@ -1291,12 +1307,15 @@ def cmd_backlog(args: list[str]) -> int:
             return 1
 
         # Route through server if running, otherwise write directly
-        server_running = ping(_socket())
-        if server_running:
+        server_status = probe_server(_socket())
+        if server_status == "up":
             add_backlog(_socket(), project, description, lode_id=lode_id)
-        else:
+        elif server_status == "down":
             items = load_backlog()
             add_backlog_item(items, project, description, lode_id=lode_id)
+        else:
+            _print_unresponsive_server(_socket(), 2.0)
+            return 1
 
         print(f"Added: [{project}] {description}")
         return 0
@@ -1315,11 +1334,14 @@ def cmd_backlog(args: list[str]) -> int:
             return 1
 
         # Route through server if running, otherwise write directly
-        server_running = ping(_socket())
-        if server_running:
+        server_status = probe_server(_socket())
+        if server_status == "up":
             remove_backlog(_socket(), item.id)
-        else:
+        elif server_status == "down":
             remove_backlog_item(items, item.id)
+        else:
+            _print_unresponsive_server(_socket(), 2.0)
+            return 1
 
         print(f"Removed: {item.id} [{item.project}] {item.description}")
         return 0

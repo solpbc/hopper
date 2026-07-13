@@ -3,21 +3,32 @@
 
 """Tests for the hopper server."""
 
+import fcntl
 import json
 import logging
+import os
 import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hopper.backlog import BacklogItem
+from hopper.client import send_message
 from hopper.config import save_config
 from hopper.lodes import save_archived_lodes, save_lodes
 from hopper.projects import Project, touch_project
-from hopper.server import Server, get_git_hash
+from hopper.server import (
+    Server,
+    ServerLockHeld,
+    get_git_hash,
+    start_server_with_tui,
+)
 
 
 class TestGetGitHash:
@@ -65,14 +76,7 @@ def server(socket_path):
     srv = Server(socket_path)
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
-
-    # Wait for socket to be created
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
-    else:
-        raise TimeoutError("Server did not start")
+    assert srv.ready.wait(5), "Server did not start"
 
     yield srv
 
@@ -128,11 +132,7 @@ def test_server_creates_socket(socket_path):
     srv = Server(socket_path)
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
-
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
+    assert srv.ready.wait(5), "Server did not start"
 
     assert socket_path.exists()
 
@@ -143,27 +143,379 @@ def test_server_creates_socket(socket_path):
     assert not socket_path.exists()
 
 
-def test_server_clears_stale_pid_on_startup(socket_path, temp_config, make_lode):
-    """Server startup clears stale pid from persisted lode state."""
-    stale_lode = make_lode(id="test-id", pid=99999)
-    save_lodes([stale_lode])
-
-    srv = Server(socket_path)
-    thread = threading.Thread(target=srv.start, daemon=True)
+def test_second_server_refuses_without_disturbing_original(socket_path):
+    """A lock loser leaves the original socket and ping identity unchanged."""
+    winner = Server(socket_path)
+    thread = threading.Thread(target=winner.start, daemon=True)
     thread.start()
+    assert winner.ready.wait(5), "Winner did not start"
 
     try:
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("Server did not start")
+        socket_inode = socket_path.stat().st_ino
+        first_ping = send_message(socket_path, {"type": "ping"}, wait_for_response=True)
 
-        assert srv.lodes[0]["pid"] is None
+        loser = Server(socket_path)
+        with pytest.raises(ServerLockHeld, match="a live hopper server"):
+            loser.start()
+
+        second_ping = send_message(socket_path, {"type": "ping"}, wait_for_response=True)
+        assert socket_path.stat().st_ino == socket_inode
+        assert second_ping["pid"] == first_ping["pid"] == os.getpid()
+        assert second_ping["started_at"] == first_ping["started_at"] == winner.started_at
+        assert socket_path.with_suffix(".pid").read_text() == str(os.getpid())
     finally:
-        srv.stop()
+        winner.stop()
         thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("pidfile_contents", "expected_pid"),
+    [("1234", "1234"), ("", "unavailable"), ("not-a-pid", "unavailable")],
+)
+def test_lock_refusal_happens_before_any_startup_mutation(
+    socket_path, temp_config, make_lode, pidfile_contents, expected_pid
+):
+    """A lock loser cannot load, mutate, clean, spawn, or unlink startup state."""
+    lode = make_lode(id="locked", active=True, tmux_pane="%9", pid=999)
+    save_lodes([lode])
+    active_path = temp_config / "active.jsonl"
+    active_before = active_path.read_bytes()
+    socket_path.write_text("foreign socket sentinel")
+    socket_before = socket_path.read_bytes()
+    worktree = temp_config / "lodes" / "locked" / "worktree"
+    worktree.mkdir(parents=True)
+
+    pidfile = socket_path.with_suffix(".pid")
+    pidfile.write_text(pidfile_contents)
+    held = open(pidfile, "a+")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    server = Server(socket_path)
+
+    try:
+        with (
+            patch("hopper.server.load_lodes") as mock_load_lodes,
+            patch("hopper.server.load_archived_lodes") as mock_load_archived,
+            patch("hopper.server.load_backlog") as mock_load_backlog,
+            patch("hopper.server.get_active_projects") as mock_projects,
+            patch("hopper.server.save_lodes") as mock_save,
+            patch("hopper.server.remove_worktree") as mock_remove,
+            patch("hopper.server.delete_branch") as mock_delete,
+            patch("hopper.server.spawn_claude") as mock_spawn,
+        ):
+            with pytest.raises(ServerLockHeld) as exc_info:
+                server.start()
+
+        assert f"(pid {expected_pid})" in str(exc_info.value)
+        mock_load_lodes.assert_not_called()
+        mock_load_archived.assert_not_called()
+        mock_load_backlog.assert_not_called()
+        mock_projects.assert_not_called()
+        mock_save.assert_not_called()
+        mock_remove.assert_not_called()
+        mock_delete.assert_not_called()
+        mock_spawn.assert_not_called()
+        assert active_path.read_bytes() == active_before
+        assert socket_path.read_bytes() == socket_before
+        assert worktree.is_dir()
+        assert lode["active"] is True
+        assert lode["tmux_pane"] == "%9"
+        assert lode["pid"] == 999
+    finally:
+        held.close()
+
+
+@pytest.mark.parametrize("old_pid", [999_999_999, os.getpid()])
+def test_unlocked_stale_pidfile_does_not_block_start(socket_path, old_pid):
+    """Pidfile contents are display-only when no process holds the lock."""
+    socket_path.with_suffix(".pid").write_text(str(old_pid))
+    server = Server(socket_path)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    assert server.ready.wait(5), "Server did not start"
+
+    try:
+        assert socket_path.with_suffix(".pid").read_text() == str(os.getpid())
+    finally:
+        server.stop()
+        thread.join(timeout=2)
+
+
+def test_stale_socket_without_listener_does_not_block_start(socket_path):
+    """The lock holder replaces a stale socket path before binding."""
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(socket_path))
+    stale.close()
+    stale_inode = socket_path.stat().st_ino
+
+    server = Server(socket_path)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    assert server.ready.wait(5), "Server did not start"
+
+    try:
+        assert socket_path.stat().st_ino != stale_inode
+        assert send_message(socket_path, {"type": "ping"}, wait_for_response=True)["type"] == "pong"
+    finally:
+        server.stop()
+        thread.join(timeout=2)
+
+
+def test_server_that_never_bound_cannot_unlink_foreign_socket(socket_path):
+    """Socket cleanup is gated by successful bind ownership."""
+    socket_path.write_text("foreign")
+    server = Server(socket_path)
+
+    server.stop()
+
+    assert socket_path.read_text() == "foreign"
+
+
+def test_start_server_with_tui_reports_lock_refusal(socket_path, capsys):
+    """A startup lock refusal exits before entering the TUI."""
+    error = ServerLockHeld(
+        "a live hopper server (pid 1234) holds the lock; "
+        "attach to it or stop it before starting another"
+    )
+    with (
+        patch.object(Server, "start", side_effect=error),
+        patch("hopper.tui.run_tui") as mock_tui,
+    ):
+        assert start_server_with_tui(socket_path) == 1
+
+    mock_tui.assert_not_called()
+    assert str(error) in capsys.readouterr().out
+
+
+def test_start_server_with_tui_reports_other_startup_error(socket_path, capsys):
+    """A non-lock startup exception uses the generic failure path."""
+    with (
+        patch.object(Server, "start", side_effect=RuntimeError("bind exploded")),
+        patch("hopper.tui.run_tui") as mock_tui,
+    ):
+        assert start_server_with_tui(socket_path) == 1
+
+    mock_tui.assert_not_called()
+    assert "Server failed to start: bind exploded" in capsys.readouterr().out
+
+
+def test_two_process_server_start_race_has_one_stable_winner(tmp_path):
+    """Two barrier-released processes yield one binder and one lock refusal."""
+    child_code = r"""
+import os
+import socket
+import sys
+import threading
+
+from hopper import config
+from hopper.server import Server
+
+host, port, label = sys.argv[1:]
+control = socket.create_connection((host, int(port)), timeout=10)
+control_file = control.makefile("rwb", buffering=0)
+control_file.write(f"READY {label}\n".encode())
+assert control_file.readline() == b"GO\n"
+server = Server(config.server_socket_path())
+
+def run_server():
+    try:
+        server.start()
+    except Exception as error:
+        server.startup_error = error
+    finally:
+        server.ready.set()
+
+thread = threading.Thread(target=run_server, daemon=True)
+thread.start()
+assert server.ready.wait(5)
+if server.startup_error is not None:
+    message = str(server.startup_error)
+    control_file.write(f"ERROR {label} {message}\n".encode())
+    print(message)
+    sys.exit(1)
+
+control_file.write(
+    f"BOUND {label} {os.getpid()} {server.started_at}\n".encode()
+)
+assert control_file.readline() == b"STOP\n"
+server.stop()
+thread.join(timeout=2)
+"""
+    xdg_home = tmp_path / "xdg"
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(10)
+    host, port = listener.getsockname()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = str(xdg_home)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in [repo_root, env.get("PYTHONPATH", "")] if part
+    )
+    processes = {
+        label: subprocess.Popen(
+            [sys.executable, "-c", child_code, host, str(port), label],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for label in ("a", "b")
+    }
+    controls = {}
+    connections = []
+    try:
+        for _ in processes:
+            connection, _ = listener.accept()
+            connection.settimeout(10)
+            connections.append(connection)
+            control_file = connection.makefile("rwb", buffering=0)
+            ready = control_file.readline().decode().strip().split()
+            assert ready[0] == "READY"
+            controls[ready[1]] = control_file
+
+        for control_file in controls.values():
+            control_file.write(b"GO\n")
+        reports = {
+            label: control_file.readline().decode().strip()
+            for label, control_file in controls.items()
+        }
+        bound = [label for label, report in reports.items() if report.startswith("BOUND ")]
+        refused = [label for label, report in reports.items() if report.startswith("ERROR ")]
+        assert len(bound) == 1, reports
+        assert len(refused) == 1, reports
+        winner_label = bound[0]
+        loser_label = refused[0]
+        assert "a live hopper server (pid " in reports[loser_label]
+        assert "attach to it or stop it before starting another" in reports[loser_label]
+
+        socket_path = xdg_home / "hopper" / "server.sock"
+        first_ping = send_message(socket_path, {"type": "ping"}, wait_for_response=True)
+        loser_output = processes[loser_label].communicate(timeout=10)
+        assert processes[loser_label].returncode != 0
+        assert "a live hopper server (pid " in loser_output[0]
+        second_ping = send_message(socket_path, {"type": "ping"}, wait_for_response=True)
+        assert second_ping["pid"] == first_ping["pid"]
+        assert second_ping["started_at"] == first_ping["started_at"]
+
+        bound_parts = reports[winner_label].split()
+        assert first_ping["pid"] == int(bound_parts[2])
+        assert first_ping["started_at"] == int(bound_parts[3])
+        controls[winner_label].write(b"STOP\n")
+        winner_output = processes[winner_label].communicate(timeout=10)
+        assert processes[winner_label].returncode == 0, winner_output
+    finally:
+        for control_file in controls.values():
+            control_file.close()
+        for connection in connections:
+            connection.close()
+        listener.close()
+        for process in processes.values():
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+
+def test_server_lock_releases_after_sigkill(tmp_path):
+    """A killed server needs no reaper before a replacement can bind."""
+    child_code = r"""
+import os
+import socket
+import sys
+import threading
+
+from hopper import config
+from hopper.server import Server
+
+host, port = sys.argv[1:]
+control = socket.create_connection((host, int(port)), timeout=10)
+control_file = control.makefile("rwb", buffering=0)
+server = Server(config.server_socket_path())
+
+def run_server():
+    try:
+        server.start()
+    except Exception as error:
+        server.startup_error = error
+    finally:
+        server.ready.set()
+
+thread = threading.Thread(target=run_server, daemon=True)
+thread.start()
+assert server.ready.wait(5)
+if server.startup_error is not None:
+    control_file.write(f"ERROR {server.startup_error}\n".encode())
+    sys.exit(1)
+control_file.write(f"BOUND {os.getpid()} {server.started_at}\n".encode())
+assert control_file.readline() == b"STOP\n"
+server.stop()
+thread.join(timeout=2)
+"""
+    xdg_home = tmp_path / "xdg"
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    host, port = listener.getsockname()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = str(xdg_home)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in [repo_root, env.get("PYTHONPATH", "")] if part
+    )
+    processes = []
+    controls = []
+    connections = []
+
+    def start_child():
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code, host, str(port)],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        processes.append(process)
+        connection, _ = listener.accept()
+        connection.settimeout(10)
+        connections.append(connection)
+        control_file = connection.makefile("rwb", buffering=0)
+        controls.append(control_file)
+        report = control_file.readline().decode().strip().split()
+        assert report[0] == "BOUND", report
+        return process, control_file, int(report[1])
+
+    try:
+        first, first_control, first_pid = start_child()
+        assert first_pid == first.pid
+        os.kill(first_pid, signal.SIGKILL)
+        first_output = first.communicate(timeout=10)
+        assert first.returncode == -signal.SIGKILL, first_output
+        first_control.close()
+
+        second, second_control, second_pid = start_child()
+        assert second_pid == second.pid
+        socket_path = xdg_home / "hopper" / "server.sock"
+        response = send_message(socket_path, {"type": "ping"}, wait_for_response=True)
+        assert response["pid"] == second_pid
+        assert socket_path.with_suffix(".pid").read_text() == str(second_pid)
+
+        second_control.write(b"STOP\n")
+        second_output = second.communicate(timeout=10)
+        assert second.returncode == 0, second_output
+    finally:
+        for control_file in controls:
+            if not control_file.closed:
+                control_file.close()
+        for connection in connections:
+            connection.close()
+        listener.close()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
 
 
 def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
@@ -176,12 +528,7 @@ def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
     thread.start()
 
     try:
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("Server did not start")
+        assert srv.ready.wait(5), "Server did not start"
 
         assert srv.lodes == []
         assert len(srv.archived_lodes) == 1
@@ -226,12 +573,7 @@ def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode
         thread.start()
 
         try:
-            for _ in range(50):
-                if socket_path.exists():
-                    break
-                time.sleep(0.1)
-            else:
-                raise TimeoutError("Server did not start")
+            assert srv.ready.wait(5), "Server did not start"
 
             for _ in range(50):
                 if mock_remove_worktree.called and mock_delete_branch.called:
@@ -324,12 +666,7 @@ def test_cleanup_skipped_without_worktree_dir(socket_path, temp_config, make_lod
         thread.start()
 
         try:
-            for _ in range(50):
-                if socket_path.exists():
-                    break
-                time.sleep(0.1)
-            else:
-                raise TimeoutError("Server did not start")
+            assert srv.ready.wait(5), "Server did not start"
 
             for _ in range(50):
                 if not srv.lodes:
@@ -360,12 +697,7 @@ def test_cleanup_skipped_when_project_not_found(socket_path, temp_config, make_l
         thread.start()
 
         try:
-            for _ in range(50):
-                if socket_path.exists():
-                    break
-                time.sleep(0.1)
-            else:
-                raise TimeoutError("Server did not start")
+            assert srv.ready.wait(5), "Server did not start"
 
             for _ in range(50):
                 if not srv.lodes:
@@ -408,11 +740,7 @@ def test_server_sends_shutdown_to_clients(socket_path):
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
 
-    # Wait for socket
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
+    assert srv.ready.wait(5), "Server did not start"
 
     # Connect a client
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -471,12 +799,7 @@ def test_server_handles_connect_with_tmux_location(socket_path, temp_config):
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
 
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
-    else:
-        raise TimeoutError("Server did not start")
+    assert srv.ready.wait(5), "Server did not start"
 
     try:
         # Connect client
@@ -1879,7 +2202,11 @@ class TestActivityLog:
         """Server start creates activity.log with listening message."""
         log_path = isolate_config / "activity.log"
         assert log_path.exists()
-        content = log_path.read_text()
+        deadline = time.monotonic() + 2
+        content = ""
+        while "Server listening" not in content and time.monotonic() < deadline:
+            content = log_path.read_text()
+            time.sleep(0.01)
         assert "Server listening" in content
 
     def test_lode_mutation_logged(self, isolate_config, server, socket_path, make_lode):
@@ -1962,12 +2289,7 @@ class TestActivityLog:
         thread.start()
 
         try:
-            for _ in range(50):
-                if socket_path.exists():
-                    break
-                time.sleep(0.1)
-            else:
-                raise TimeoutError("Server did not start")
+            assert srv.ready.wait(5), "Server did not start"
 
             assert [project.name for project in srv.projects] == ["A", "B"]
 
@@ -1990,12 +2312,7 @@ class TestActivityLog:
         thread = threading.Thread(target=srv.start, daemon=True)
         thread.start()
 
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("Server did not start")
+        assert srv.ready.wait(5), "Server did not start"
 
         assert srv._log_handler is not None
         handler = srv._log_handler

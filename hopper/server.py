@@ -4,6 +4,7 @@
 """Unix socket JSONL server for hopper."""
 
 import atexit
+import fcntl
 import json
 import logging
 import os
@@ -56,6 +57,10 @@ from hopper.tmux import capture_pane, paste_buffer, send_keys
 logger = logging.getLogger(__name__)
 
 PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "completed", "error"})
+
+
+class ServerLockHeld(RuntimeError):
+    """Raised when another hopper server holds the socket's singleton lock."""
 
 
 def _tail_text(text: str, lines: int = 10) -> str:
@@ -124,7 +129,7 @@ class Server:
     """
 
     def __init__(self, socket_path: Path, tmux_location: dict | None = None):
-        self.socket_path = socket_path
+        self.socket_path = Path(socket_path)
         self.tmux_location = tmux_location
         self.git_hash = get_git_hash()
         self.started_at = current_time_ms()
@@ -144,14 +149,67 @@ class Server:
         self.lode_clients: dict[str, socket.socket] = {}
         self.client_lodes: dict[socket.socket, str] = {}
         self._log_handler: logging.FileHandler | None = None
+        self._lock_file = None
+        self._socket_bound = False
+        self.ready = threading.Event()
+        self.startup_error: Exception | None = None
 
     def _find_lode(self, lode_id: str) -> dict | None:
         """Find a lode by ID."""
         return next((lode for lode in self.lodes if lode["id"] == lode_id), None)
 
+    def _acquire_server_lock(self) -> None:
+        """Acquire and retain the singleton lock colocated with the server socket."""
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.socket_path.with_suffix(".pid")
+        lock_file = open(lock_path, "a+")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            try:
+                lock_file.seek(0)
+                contents = lock_file.read().strip()
+            except (OSError, UnicodeError):
+                contents = ""
+            lock_file.close()
+            try:
+                parsed_pid = int(contents)
+            except ValueError:
+                parsed_pid = 0
+            pid = str(parsed_pid) if parsed_pid > 0 else "unavailable"
+            raise ServerLockHeld(
+                f"a live hopper server (pid {pid}) holds the lock; "
+                "attach to it or stop it before starting another"
+            ) from error
+        except Exception:
+            lock_file.close()
+            raise
+
+        try:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(os.getpid()))
+            lock_file.flush()
+        except Exception:
+            lock_file.close()
+            raise
+        self._lock_file = lock_file
+
+    def _unlink_owned_socket(self) -> None:
+        """Unlink the socket only if this server successfully bound it."""
+        with self.lock:
+            if not self._socket_bound:
+                return
+            try:
+                self.socket_path.unlink(missing_ok=True)
+            except OSError as error:
+                logger.warning("Failed to remove server socket %s: %s", self.socket_path, error)
+            else:
+                self._socket_bound = False
+
     def start(self) -> None:
         """Start the server (blocking)."""
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._acquire_server_lock()
         # Configure file logging for all hopper modules
         log_path = config.hopper_dir() / "activity.log"
         handler = logging.FileHandler(log_path)
@@ -190,30 +248,32 @@ class Server:
                 logger.info(f"Startup: auto-archived shipped lode {lode['id']}")
                 self._cleanup_worktree(archived)
 
-        # Remove stale socket file
+        # Safe only because the singleton lock proves no live server owns it.
         if self.socket_path.exists():
             self.socket_path.unlink()
 
         self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server_socket.bind(str(self.socket_path))
-        self.server_socket.listen(5)
-        self.server_socket.settimeout(1.0)
-
-        # Start writer thread (serializes broadcasts)
-        self.writer_thread = threading.Thread(
-            target=self._writer_loop, name="server-writer", daemon=True
-        )
-        self.writer_thread.start()
-
-        # Start event loop thread (serializes all state mutations)
-        self.event_thread = threading.Thread(
-            target=self._event_loop, name="server-events", daemon=True
-        )
-        self.event_thread.start()
-
-        logger.info(f"Server listening on {self.socket_path}")
-
         try:
+            self.server_socket.bind(str(self.socket_path))
+            self._socket_bound = True
+            self.server_socket.listen(5)
+            self.ready.set()
+            self.server_socket.settimeout(1.0)
+
+            # Start writer thread (serializes broadcasts)
+            self.writer_thread = threading.Thread(
+                target=self._writer_loop, name="server-writer", daemon=True
+            )
+            self.writer_thread.start()
+
+            # Start event loop thread (serializes all state mutations)
+            self.event_thread = threading.Thread(
+                target=self._event_loop, name="server-events", daemon=True
+            )
+            self.event_thread.start()
+
+            logger.info(f"Server listening on {self.socket_path}")
+
             while not self.stop_event.is_set():
                 try:
                     conn, _ = self.server_socket.accept()
@@ -225,8 +285,7 @@ class Server:
                         logger.error(f"Accept error: {e}")
         finally:
             self.server_socket.close()
-            if self.socket_path.exists():
-                self.socket_path.unlink()
+            self._unlink_owned_socket()
 
     # Message types that only read state and send a response (safe from any thread)
     _READ_ONLY_TYPES = frozenset({"connect", "ping", "lode_list", "backlog_list", "archived_list"})
@@ -414,7 +473,10 @@ class Server:
             self._send_response(conn, response)
 
         elif msg_type == "ping":
-            self._send_response(conn, {"type": "pong"})
+            self._send_response(
+                conn,
+                {"type": "pong", "pid": os.getpid(), "started_at": self.started_at},
+            )
 
         elif msg_type == "lode_list":
             self._send_response(conn, {"type": "lode_list", "lodes": self.lodes})
@@ -1036,12 +1098,7 @@ class Server:
         if self.writer_thread and self.writer_thread.is_alive():
             self.writer_thread.join(timeout=1.0)
 
-        # Clean up socket file
-        if self.socket_path.exists():
-            try:
-                self.socket_path.unlink()
-            except Exception:
-                pass
+        self._unlink_owned_socket()
 
         logger.info("Server stopped")
         # Close log file handler
@@ -1071,26 +1128,37 @@ def start_server_with_tui(socket_path: Path, tmux_location: dict | None = None) 
 
     # Register atexit handler for socket cleanup (backup for abnormal exit)
     def cleanup_socket():
-        if socket_path.exists():
-            try:
-                socket_path.unlink()
-            except Exception:
-                pass
+        server._unlink_owned_socket()
 
     atexit.register(cleanup_socket)
 
     # Start server in background thread
-    server_thread = threading.Thread(target=server.start, name="server", daemon=True)
+    def start_server():
+        try:
+            server.start()
+        except Exception as error:
+            server.startup_error = error
+        finally:
+            server.ready.set()
+
+    server_thread = threading.Thread(target=start_server, name="server", daemon=True)
     server_thread.start()
 
-    # Wait for socket to be ready
-    for _ in range(50):
-        if socket_path.exists():
-            break
-        time.sleep(0.1)
-    else:
+    if not server.ready.wait(5.0):
         print("Server failed to start")
         server.stop()
+        server_thread.join(timeout=2.0)
+        atexit.unregister(cleanup_socket)
+        return 1
+
+    if server.startup_error is not None:
+        if isinstance(server.startup_error, ServerLockHeld):
+            print(server.startup_error)
+        else:
+            print(f"Server failed to start: {server.startup_error}")
+        server.stop()
+        server_thread.join(timeout=2.0)
+        atexit.unregister(cleanup_socket)
         return 1
 
     # Run Textual TUI in main thread

@@ -14,6 +14,11 @@ def hopper_dir() -> Path:
     return Path(user_data_dir("hopper"))
 
 
+def server_socket_path() -> Path:
+    """Return the hopper server socket path."""
+    return hopper_dir() / "server.sock"
+
+
 def worktree_root() -> Path:
     """Return the whitespace-free root for lode git worktrees.
 

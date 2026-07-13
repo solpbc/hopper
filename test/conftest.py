@@ -31,6 +31,18 @@ def temp_config(isolate_config):
 
 
 @pytest.fixture
+def release_server_lock():
+    """Return a test-only helper that simulates process exit after Server.stop()."""
+
+    def _release(server):
+        if server._lock_file is not None:
+            server._lock_file.close()
+            server._lock_file = None
+
+    return _release
+
+
+@pytest.fixture
 def make_lode():
     """Factory for creating lode dicts with all default fields.
 
