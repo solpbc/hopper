@@ -3,12 +3,14 @@
 
 """Tests for the base runner module."""
 
+import json
 import signal
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
-from hopper.lodes import current_time_ms
+from hopper.lodes import current_time_ms, get_lode_dir
 from hopper.runner import (
     BaseRunner,
     _descendant_pids,
@@ -240,6 +242,136 @@ class TestBaseRunnerActivityMonitor:
     def _make_runner(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         return runner
+
+    def test_base_stuck_kill_writes_no_worktree_recovery(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+
+        with (
+            patch("hopper.runner.current_time_ms", return_value=1234),
+            patch.object(runner, "_terminate_claude_process"),
+        ):
+            runner._fail_stuck("stuck reason")
+
+        record = json.loads((get_lode_dir("test-session") / "recovery.json").read_text())
+        assert record == {
+            "failed_at": 1234,
+            "stage": "mill",
+            "reason": "stuck reason",
+            "branch": None,
+            "worktree_path": None,
+            "snapshot": {"outcome": "no_worktree"},
+        }
+        assert runner._stuck_error == (
+            "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
+            "so no snapshot was created. Restart with: hop lode restart test-session"
+        )
+        assert runner._monitor_stop.is_set()
+        assert runner._stuck_failure_complete.is_set()
+
+    def test_format_stuck_error_outcomes(self):
+        runner = self._make_runner()
+        reason = "stuck reason"
+        record = {
+            "stage": "refine",
+            "branch": "hopper-test",
+            "worktree_path": "/tmp/worktree",
+        }
+
+        assert runner._format_stuck_error(
+            reason, {**record, "snapshot": {"outcome": "committed", "sha": "abc123"}}
+        ) == (
+            "stuck reason Recovery snapshot committed on branch hopper-test at abc123. "
+            "Restart with: hop lode restart test-session"
+        )
+        assert runner._format_stuck_error(reason, {**record, "snapshot": {"outcome": "clean"}}) == (
+            "stuck reason Recovery branch hopper-test; worktree was clean, so no snapshot "
+            "commit was created. Restart with: hop lode restart test-session"
+        )
+        assert runner._format_stuck_error(
+            reason, {**record, "snapshot": {"outcome": "no_worktree"}}
+        ) == (
+            "stuck reason Recovery branch unavailable; no worktree existed for stage refine, "
+            "so no snapshot was created. Restart with: hop lode restart test-session"
+        )
+        assert runner._format_stuck_error(
+            reason,
+            {
+                **record,
+                "snapshot": {"outcome": "failed", "git_error": "index locked"},
+            },
+        ) == (
+            "stuck reason Recovery snapshot failed on branch hopper-test: index locked. "
+            "Inspect /tmp/worktree before restarting with: hop lode restart test-session"
+        )
+
+    def test_recovery_write_failure_is_appended_to_enriched_error(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+
+        with (
+            patch.object(runner, "_terminate_claude_process"),
+            patch("hopper.runner._write_recovery_record", side_effect=OSError("disk full")),
+        ):
+            runner._fail_stuck("stuck reason")
+
+        assert runner._stuck_error == (
+            "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
+            "so no snapshot was created. Restart with: hop lode restart test-session "
+            "Recovery record could not be written: disk full."
+        )
+        assert runner._monitor_stop.is_set()
+        assert runner._stuck_failure_complete.is_set()
+
+    def test_run_claude_waits_for_enriched_stuck_error(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+        proc = MagicMock(returncode=1, stderr=None)
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+        failure_threads = []
+
+        def slow_snapshot():
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=1)
+            return {"outcome": "no_worktree"}
+
+        def wait_for_process():
+            thread = threading.Thread(target=runner._fail_stuck, args=("stuck reason",))
+            failure_threads.append(thread)
+            thread.start()
+            assert snapshot_started.wait(timeout=1)
+
+        proc.wait.side_effect = wait_for_process
+        result = []
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], None)),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+            patch.object(runner, "_terminate_claude_process"),
+            patch.object(runner, "_snapshot_stuck_worktree", side_effect=slow_snapshot),
+            patch("hopper.runner._write_recovery_record"),
+        ):
+            run_thread = threading.Thread(target=lambda: result.append(runner._run_claude()))
+            run_thread.start()
+            assert snapshot_started.wait(timeout=1)
+            assert run_thread.is_alive()
+            release_snapshot.set()
+            run_thread.join(timeout=1)
+
+        for thread in failure_threads:
+            thread.join(timeout=1)
+
+        assert not run_thread.is_alive()
+        assert result == [
+            (
+                1,
+                "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
+                "so no snapshot was created. Restart with: hop lode restart test-session",
+            )
+        ]
 
     def test_subprocess_env_disables_claude_auto_memory(self):
         """Managed Hopper stages disable Claude Code auto-memory."""

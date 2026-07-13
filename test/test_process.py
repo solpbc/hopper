@@ -5,6 +5,7 @@
 
 import copy
 import io
+import json
 import logging
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from hopper.git import is_dirty
-from hopper.lodes import get_worktree_dir
+from hopper.lodes import get_lode_dir, get_worktree_dir
 from hopper.process import (
     QUARANTINE_STATUS,
     STAGES,
@@ -127,14 +128,17 @@ class TestStuckWorktreeSnapshot:
 
         with (
             patch("hopper.process.is_dirty", return_value=True) as mock_dirty,
-            patch("hopper.process.commit_all", return_value=True) as mock_commit,
+            patch("hopper.process.commit_all", return_value=(True, None)) as mock_commit,
+            patch("hopper.process.head_sha", return_value="a" * 40) as mock_head,
         ):
-            runner._snapshot_stuck_worktree()
+            outcome = runner._snapshot_stuck_worktree()
 
+        assert outcome == {"outcome": "committed", "sha": "a" * 40}
         mock_dirty.assert_called_once_with(str(worktree))
         mock_commit.assert_called_once_with(
             str(worktree), "hopper: auto-snapshot after stuck timeout (test-id)"
         )
+        mock_head.assert_called_once_with(str(worktree))
 
     def test_snapshot_clean_worktree_skips_commit(self, tmp_path):
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
@@ -146,8 +150,9 @@ class TestStuckWorktreeSnapshot:
             patch("hopper.process.is_dirty", return_value=False) as mock_dirty,
             patch("hopper.process.commit_all") as mock_commit,
         ):
-            runner._snapshot_stuck_worktree()
+            outcome = runner._snapshot_stuck_worktree()
 
+        assert outcome == {"outcome": "clean"}
         mock_dirty.assert_called_once_with(str(worktree))
         mock_commit.assert_not_called()
 
@@ -158,10 +163,92 @@ class TestStuckWorktreeSnapshot:
             patch("hopper.process.is_dirty") as mock_dirty,
             patch("hopper.process.commit_all") as mock_commit,
         ):
-            runner._snapshot_stuck_worktree()
+            outcome = runner._snapshot_stuck_worktree()
 
+        assert outcome == {"outcome": "no_worktree"}
         mock_dirty.assert_not_called()
         mock_commit.assert_not_called()
+
+    def test_snapshot_commit_failure_returns_git_error(self, tmp_path):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        runner.worktree_path = worktree
+
+        with (
+            patch("hopper.process.is_dirty", return_value=True),
+            patch(
+                "hopper.process.commit_all",
+                return_value=(False, "git add -A failed: index locked"),
+            ),
+        ):
+            outcome = runner._snapshot_stuck_worktree()
+
+        assert outcome == {
+            "outcome": "failed",
+            "git_error": "git add -A failed: index locked",
+        }
+
+    def test_snapshot_sha_resolution_failure_is_failed(self, tmp_path):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        runner.worktree_path = worktree
+
+        with (
+            patch("hopper.process.is_dirty", return_value=True),
+            patch("hopper.process.commit_all", return_value=(True, None)),
+            patch("hopper.process.head_sha", return_value=None),
+        ):
+            outcome = runner._snapshot_stuck_worktree()
+
+        assert outcome == {
+            "outcome": "failed",
+            "git_error": "snapshot commit succeeded but HEAD SHA could not be resolved",
+        }
+
+    def test_snapshot_unexpected_exception_returns_failed(self, tmp_path):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        runner.worktree_path = worktree
+
+        with patch("hopper.process.is_dirty", side_effect=RuntimeError("status failed")):
+            outcome = runner._snapshot_stuck_worktree()
+
+        assert outcome == {"outcome": "failed", "git_error": "status failed"}
+
+    def test_index_lock_snapshot_is_failed_never_clean(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / ".git" / "index.lock").write_text("")
+        runner = ProcessRunner("test-id", Path("/tmp/missing.sock"), "refine")
+        runner.worktree_path = repo_dir
+
+        outcome = runner._snapshot_stuck_worktree()
+
+        assert outcome["outcome"] == "failed"
+        assert outcome["git_error"].startswith("git add -A failed:")
+
+    def test_fail_stuck_writes_recovery_without_server(self, temp_config):
+        runner = ProcessRunner("test-id", Path("/tmp/missing.sock"), "mill")
+        runner.lode_branch = "hopper-test-id"
+
+        with (
+            patch("hopper.runner.current_time_ms", return_value=1234),
+            patch.object(runner, "_terminate_claude_process"),
+        ):
+            runner._fail_stuck("stuck reason")
+
+        record = json.loads((get_lode_dir("test-id") / "recovery.json").read_text())
+        assert record == {
+            "failed_at": 1234,
+            "stage": "mill",
+            "reason": "stuck reason",
+            "branch": "hopper-test-id",
+            "worktree_path": None,
+            "snapshot": {"outcome": "no_worktree"},
+        }
 
     def test_stuck_timeout_snapshots_dirty_worktree_and_preserves_error(
         self, tmp_path, monkeypatch
@@ -178,6 +265,7 @@ class TestStuckWorktreeSnapshot:
 
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         runner.worktree_path = worktree
+        runner.lode_branch = "hopper-test-id"
         runner._pane_id = "%1"
         runner._last_snapshot = "Hello World"
         runner._last_pane_activity_ms = 0
@@ -192,11 +280,11 @@ class TestStuckWorktreeSnapshot:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=0),
+            patch("hopper.runner._descendant_pids", return_value=[]),
         ):
             runner._check_activity()
 
-        assert runner._stuck_error is not None
-        assert "timed out stuck Claude stage" in runner._stuck_error
+        reason = "No output or progress for 1s; timed out stuck Claude stage."
         assert _run_git(worktree, "status", "--porcelain").stdout.strip() == ""
         assert (
             _run_git(worktree, "log", "-1", "--pretty=%B").stdout.strip()
@@ -205,39 +293,20 @@ class TestStuckWorktreeSnapshot:
         files = _run_git(worktree, "show", "--name-only", "--pretty=", "HEAD").stdout.splitlines()
         assert "README.md" in files
         assert "new.txt" in files
-
-    def test_snapshot_exception_does_not_replace_stuck_error(self, tmp_path, monkeypatch):
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-
-        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 1_000)
-
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
-        runner.worktree_path = worktree
-        runner._pane_id = "%1"
-        runner._last_snapshot = "Hello World"
-        runner._last_pane_activity_ms = 0
-        runner._stuck_since = 0
-        runner._claude_proc = MagicMock(pid=1234)
-        runner._claude_proc.poll.return_value = None
-
-        with (
-            patch("hopper.runner.capture_pane", return_value="Hello World"),
-            patch(
-                "hopper.runner.connect",
-                return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
-            ),
-            patch("hopper.runner._sum_descendant_cpu_ms", return_value=0),
-            patch("hopper.process.is_dirty", return_value=True),
-            patch("hopper.process.commit_all", side_effect=RuntimeError("commit failed")),
-        ):
-            runner._check_activity()
-
-        assert runner._stuck_error is not None
-        assert "timed out stuck Claude stage" in runner._stuck_error
-        assert "commit failed" not in runner._stuck_error
+        sha = _run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        record = json.loads((get_lode_dir("test-id") / "recovery.json").read_text())
+        assert record == {
+            "failed_at": 1000,
+            "stage": "refine",
+            "reason": reason,
+            "branch": "hopper-test-id",
+            "worktree_path": str(worktree),
+            "snapshot": {"outcome": "committed", "sha": sha},
+        }
+        assert runner._stuck_error == (
+            f"{reason} Recovery snapshot committed on branch hopper-test-id at {sha}. "
+            "Restart with: hop lode restart test-id"
+        )
 
 
 # ---------------------------------------------------------------------------

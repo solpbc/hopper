@@ -54,6 +54,11 @@ def is_dirty(repo_dir: str) -> bool:
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            logger.warning(
+                f"git status --porcelain failed in {repo_dir} (exit {result.returncode})"
+            )
+            return True
         return bool(result.stdout.strip())
     except (FileNotFoundError, subprocess.SubprocessError):
         return True  # Assume dirty if we can't check
@@ -80,7 +85,7 @@ def dirty_status(repo_dir: str) -> str:
         return ""  # Fail open - process runner's is_dirty() is the safety net
 
 
-def commit_all(repo_dir: str, message: str) -> bool:
+def commit_all(repo_dir: str, message: str) -> tuple[bool, str | None]:
     """Commit all working tree changes in a git repo.
 
     Args:
@@ -88,7 +93,7 @@ def commit_all(repo_dir: str, message: str) -> bool:
         message: Commit message.
 
     Returns:
-        True on success, False on failure.
+        (True, None) on success, or (False, error detail) on failure.
     """
     try:
         add_result = subprocess.run(
@@ -98,8 +103,10 @@ def commit_all(repo_dir: str, message: str) -> bool:
             text=True,
         )
         if add_result.returncode != 0:
-            logger.warning(f"git add -A failed: {add_result.stderr.strip()}")
-            return False
+            detail = add_result.stderr.strip() or f"exit code {add_result.returncode}"
+            error = f"git add -A failed: {detail}"
+            logger.warning(error)
+            return False, error
         commit_result = subprocess.run(
             ["git", "commit", "-m", message],
             cwd=repo_dir,
@@ -107,15 +114,36 @@ def commit_all(repo_dir: str, message: str) -> bool:
             text=True,
         )
         if commit_result.returncode != 0:
-            logger.warning(f"git commit failed: {commit_result.stderr.strip()}")
-            return False
-        return True
+            detail = commit_result.stderr.strip() or f"exit code {commit_result.returncode}"
+            error = f"git commit failed: {detail}"
+            logger.warning(error)
+            return False, error
+        return True, None
     except FileNotFoundError:
-        logger.warning("git command not found")
-        return False
-    except subprocess.SubprocessError as err:
-        logger.warning(f"git commit failed: {err}")
-        return False
+        error = "git command not found"
+        logger.warning(error)
+        return False, error
+    except Exception as err:
+        error = f"git commit failed: {err}"
+        logger.warning(error)
+        return False, error
+
+
+def head_sha(repo_dir: str) -> str | None:
+    """Return the full SHA for HEAD, or None when it cannot be resolved."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        sha = result.stdout.strip()
+        return sha or None
+    except Exception:
+        return None
 
 
 def current_branch(repo_dir: str) -> str | None:
@@ -209,8 +237,11 @@ def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
             return None
 
         message = f"hopper: quarantined dirty project repo blocking lode {lode_id}"
-        if not commit_all(repo_dir, message):
-            logger.warning(f"quarantine failed: could not commit dirty state in {repo_dir}")
+        committed, commit_error = commit_all(repo_dir, message)
+        if not committed:
+            logger.warning(
+                f"quarantine failed: could not commit dirty state in {repo_dir}: {commit_error}"
+            )
             return None
 
         back_result = subprocess.run(

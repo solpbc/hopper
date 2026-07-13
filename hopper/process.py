@@ -17,6 +17,7 @@ from hopper.git import (
     commit_all,
     create_worktree,
     get_diff_numstat,
+    head_sha,
     is_dirty,
     quarantine_dirty_repo,
 )
@@ -460,17 +461,29 @@ class ProcessRunner(BaseRunner):
 
         return cmd, self._cwd
 
-    def _snapshot_stuck_worktree(self) -> None:
+    def _snapshot_stuck_worktree(self) -> dict:
         """Commit dirty worktree contents after a stuck timeout."""
-        if not self.worktree_path or not self.worktree_path.is_dir():
-            return
-        wt = str(self.worktree_path)
-        if not is_dirty(wt):
-            return
         try:
-            commit_all(wt, f"hopper: auto-snapshot after stuck timeout ({self.lode_id})")
-        except Exception:
+            if not self.worktree_path or not self.worktree_path.is_dir():
+                return {"outcome": "no_worktree"}
+            wt = str(self.worktree_path)
+            if not is_dirty(wt):
+                return {"outcome": "clean"}
+            committed, error = commit_all(
+                wt, f"hopper: auto-snapshot after stuck timeout ({self.lode_id})"
+            )
+            if not committed:
+                return {"outcome": "failed", "git_error": error or "unknown git error"}
+            sha = head_sha(wt)
+            if sha is None:
+                return {
+                    "outcome": "failed",
+                    "git_error": "snapshot commit succeeded but HEAD SHA could not be resolved",
+                }
+            return {"outcome": "committed", "sha": sha}
+        except Exception as exc:
             logger.warning(f"failed to snapshot stuck worktree lode={self.lode_id}", exc_info=True)
+            return {"outcome": "failed", "git_error": str(exc)}
 
     def _bootstrap_codex(self) -> int | None:
         """Bootstrap a Codex session for the refine stage."""

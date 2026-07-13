@@ -49,7 +49,7 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
-from hopper.lodes import save_lodes
+from hopper.lodes import get_lode_dir, save_lodes
 from hopper.projects import Project, load_projects, save_projects
 from hopper.server import Server
 
@@ -4059,6 +4059,84 @@ def test_format_lode_detail_progress_line(make_lode):
     output = format_lode_detail(lode)
     assert "  status:   Working" in output
     assert "  progress: codex thinking" in output
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "detail"),
+    [
+        ({"outcome": "committed", "sha": "a" * 40}, f"    sha:       {'a' * 40}"),
+        ({"outcome": "clean"}, "    outcome:   clean"),
+        ({"outcome": "no_worktree"}, "    outcome:   no_worktree"),
+        (
+            {"outcome": "failed", "git_error": "git add -A failed: index locked"},
+            "    git_error: git add -A failed: index locked",
+        ),
+    ],
+)
+def test_format_lode_detail_recovery_outcomes(make_lode, snapshot, detail):
+    recovery = {
+        "failed_at": 1234,
+        "stage": "refine",
+        "reason": "stuck reason",
+        "branch": "hopper-test-id",
+        "worktree_path": "/tmp/worktree",
+        "snapshot": snapshot,
+    }
+    lode = make_lode(
+        id="test-id",
+        state="error",
+        status="enriched error with restart command",
+        recovery=recovery,
+    )
+
+    output = format_lode_detail(lode)
+
+    assert "  recovery:" in output
+    assert detail in output
+    assert "    failed_at: 1234" in output
+    assert "    stage:     refine" in output
+    assert "    branch:    hopper-test-id" in output
+    assert "    worktree:  /tmp/worktree" in output
+    assert "    reason:    stuck reason" in output
+    assert "to retry:" not in output
+
+
+def test_lode_status_json_includes_recovery_without_mutating_lode(capsys, make_lode):
+    lode = make_lode(id="test-id", state="error")
+    recovery = {
+        "failed_at": 1234,
+        "stage": "mill",
+        "reason": "stuck reason",
+        "branch": None,
+        "worktree_path": None,
+        "snapshot": {"outcome": "no_worktree"},
+    }
+    lode_dir = get_lode_dir("test-id")
+    lode_dir.mkdir(parents=True)
+    (lode_dir / "recovery.json").write_text(json.dumps(recovery))
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.cli._lookup_lode_with_remote", return_value=(lode, None)),
+    ):
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["recovery"] == recovery
+    assert "recovery" not in lode
+
+
+def test_lode_status_missing_recovery_leaves_output_unchanged(capsys, make_lode):
+    lode = make_lode(id="test-id", state="running")
+    expected = format_lode_detail(lode)
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.cli._lookup_lode_with_remote", return_value=(lode, None)),
+    ):
+        assert cmd_lode(["status", "test-id"]) == 0
+
+    assert capsys.readouterr().out == f"{expected}\n"
+    assert "recovery" not in lode
 
 
 def test_format_lode_detail_appends_gate_hint_when_gated(make_lode):

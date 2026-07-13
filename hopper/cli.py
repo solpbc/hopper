@@ -25,6 +25,7 @@ from hopper.lodes import (
     find_lode_by_prefix,
     find_lodes_by_prefix,
     format_age,
+    get_lode_dir,
     lode_icon,
 )
 from hopper.tmux import capture_pane, paste_buffer, send_keys
@@ -1396,9 +1397,25 @@ def _format_lode_error(lode: dict) -> str:
     status = lode.get("status", "")
     if status:
         lines.append(f"  status: {status}")
-    lines.append("")
-    lines.append(f"to retry: hop lode restart {lode_id}")
+    if not lode.get("recovery"):
+        lines.append("")
+        lines.append(f"to retry: hop lode restart {lode_id}")
     return "\n".join(lines)
+
+
+def _load_lode_recovery(lode_id: str) -> dict | None:
+    """Load a local lode's recovery record without breaking status rendering."""
+    recovery_path = get_lode_dir(lode_id) / "recovery.json"
+    try:
+        record = json.loads(recovery_path.read_text())
+        if not isinstance(record, dict):
+            raise ValueError("recovery record is not a JSON object")
+        return record
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(f"Failed to read recovery record {recovery_path}: {exc}")
+        return None
 
 
 def format_lode_detail(lode: dict) -> str:
@@ -1442,6 +1459,21 @@ def format_lode_detail(lode: dict) -> str:
     lines.append(f"  active:   {'yes' if lode.get('active') else 'no'}")
     if lode.get("active") and lode.get("tmux_pane"):
         lines.append(f"  pane:     {lode['tmux_pane']}")
+    recovery = lode.get("recovery")
+    if recovery:
+        snapshot = recovery.get("snapshot", {})
+        lines.append("")
+        lines.append("  recovery:")
+        lines.append(f"    outcome:   {snapshot.get('outcome', '')}")
+        if snapshot.get("sha"):
+            lines.append(f"    sha:       {snapshot['sha']}")
+        if snapshot.get("git_error"):
+            lines.append(f"    git_error: {snapshot['git_error']}")
+        lines.append(f"    failed_at: {recovery.get('failed_at', '')}")
+        lines.append(f"    stage:     {recovery.get('stage', '')}")
+        lines.append(f"    branch:    {recovery.get('branch') or 'unavailable'}")
+        lines.append(f"    worktree:  {recovery.get('worktree_path') or 'unavailable'}")
+        lines.append(f"    reason:    {recovery.get('reason', '')}")
     if lode.get("state") == "gated":
         lines.append("")
         lines.append(f"Gate blocked. Review with: hop gate show {lode.get('id', '')}")
@@ -2389,10 +2421,15 @@ def cmd_lode(args: list[str]) -> int:
         if error:
             print(error)
             return 1
+        display_lode = dict(lode)
+        if not lode.get("host"):
+            recovery = _load_lode_recovery(lode["id"])
+            if recovery is not None:
+                display_lode["recovery"] = recovery
         if getattr(parsed, "json_output", False):
-            print(json.dumps(lode, indent=2))
+            print(json.dumps(display_lode, indent=2))
             return 0
-        print(format_lode_detail(lode))
+        print(format_lode_detail(display_lode))
         return 0
 
     return 0

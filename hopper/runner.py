@@ -3,6 +3,7 @@
 
 """Base runner - shared lifecycle logic for the process runner."""
 
+import json
 import logging
 import os
 import signal
@@ -13,7 +14,7 @@ import time
 from pathlib import Path
 
 from hopper.client import HopperConnection, connect
-from hopper.lodes import current_time_ms, format_duration_ms
+from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
 
@@ -27,6 +28,19 @@ STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
 ABSOLUTE_CAP_MS = 60 * 60_000
 DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
+STUCK_FAILURE_WAIT_SEC = 60
+
+
+def _write_recovery_record(lode_id: str, record: dict) -> None:
+    """Atomically persist a stuck-kill recovery record for a lode."""
+    lode_dir = get_lode_dir(lode_id)
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    recovery_path = lode_dir / "recovery.json"
+    tmp_path = recovery_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, recovery_path)
 
 
 def _parse_ps_time(raw: str) -> float | None:
@@ -192,6 +206,7 @@ class BaseRunner:
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
         self._stuck_error: str | None = None
+        self._stuck_failure_complete = threading.Event()
         # Completion tracking
         self._done = threading.Event()
         self._gated = threading.Event()
@@ -367,6 +382,8 @@ class BaseRunner:
             proc.wait()
 
             if self._stuck_error:
+                if not self._stuck_failure_complete.wait(timeout=STUCK_FAILURE_WAIT_SEC):
+                    logger.warning(f"timed out waiting for stuck recovery lode={self.lode_id}")
                 return 1, self._stuck_error
             if proc.returncode != 0 and proc.stderr:
                 stderr_bytes = proc.stderr.read()
@@ -588,17 +605,72 @@ class BaseRunner:
                 self._emit_state("running", status)
             self._stuck_since = None
 
-    def _snapshot_stuck_worktree(self) -> None:
+    def _snapshot_stuck_worktree(self) -> dict:
         """Overridden by runners that own a worktree."""
-        return
+        return {"outcome": "no_worktree"}
 
-    def _fail_stuck(self, msg: str) -> None:
+    def _format_stuck_error(self, reason: str, record: dict) -> str:
+        """Add recovery details and the restart command to a stuck error."""
+        snapshot = record["snapshot"]
+        outcome = snapshot["outcome"]
+        branch = record.get("branch") or "unavailable"
+        stage = record.get("stage", "")
+        if outcome == "committed":
+            return (
+                f"{reason} Recovery snapshot committed on branch {branch} at {snapshot['sha']}. "
+                f"Restart with: hop lode restart {self.lode_id}"
+            )
+        if outcome == "clean":
+            return (
+                f"{reason} Recovery branch {branch}; worktree was clean, so no snapshot commit "
+                f"was created. Restart with: hop lode restart {self.lode_id}"
+            )
+        if outcome == "no_worktree":
+            return (
+                f"{reason} Recovery branch unavailable; no worktree existed for stage {stage}, "
+                f"so no snapshot was created. Restart with: hop lode restart {self.lode_id}"
+            )
+        worktree_path = record.get("worktree_path") or "unavailable"
+        return (
+            f"{reason} Recovery snapshot failed on branch {branch}: {snapshot['git_error']}. "
+            f"Inspect {worktree_path} before restarting with: hop lode restart {self.lode_id}"
+        )
+
+    def _fail_stuck(self, reason: str) -> None:
         """Terminate a stuck runner and preserve failure state."""
-        self._stuck_error = msg
-        logger.error(f"stuck timeout lode={self.lode_id}: {msg}")
-        self._terminate_claude_process()
-        self._snapshot_stuck_worktree()
-        self._monitor_stop.set()
+        failed_at = current_time_ms()
+        self._stuck_error = reason
+        logger.error(f"stuck timeout lode={self.lode_id}: {reason}")
+        try:
+            self._terminate_claude_process()
+            try:
+                snapshot = self._snapshot_stuck_worktree()
+            except Exception as exc:
+                logger.exception(f"unexpected stuck snapshot failure lode={self.lode_id}")
+                snapshot = {"outcome": "failed", "git_error": str(exc)}
+
+            worktree_path = getattr(self, "worktree_path", None)
+            record = {
+                "failed_at": failed_at,
+                "stage": self._claude_stage,
+                "reason": reason,
+                "branch": getattr(self, "lode_branch", None) or None,
+                "worktree_path": str(worktree_path) if worktree_path else None,
+                "snapshot": snapshot,
+            }
+            try:
+                _write_recovery_record(self.lode_id, record)
+            except Exception as exc:
+                logger.error(f"failed to write recovery record lode={self.lode_id}: {exc}")
+                self._stuck_error = (
+                    f"{self._format_stuck_error(reason, record)} "
+                    f"Recovery record could not be written: {exc}."
+                )
+            else:
+                self._stuck_error = self._format_stuck_error(reason, record)
+        finally:
+            self._monitor_stop.set()
+            self._stuck_failure_complete.set()
 
     def _terminate_claude_process(self) -> None:
         """Terminate the active Claude process after a stuck timeout."""
