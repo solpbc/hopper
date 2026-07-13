@@ -759,7 +759,11 @@ def test_backlog_add_refuses_unresponsive_server(capsys):
         patch("hopper.backlog.add_backlog_item") as mock_local_add,
         patch("hopper.client.add_backlog") as mock_remote_add,
     ):
-        assert cmd_backlog(["add", "-p", "myproj", "Do work"]) == 1
+        # NOTE: text must precede --project. `backlog add -p proj "text"` is a real
+        # argparse allocation bug (an optional between two positionals swallows the
+        # trailing `text`); tracked separately. Use the working order so this test
+        # actually exercises the unresponsive-server refusal instead of an arg error.
+        assert cmd_backlog(["add", "Do work", "--project", "myproj"]) == 1
 
     mock_local_add.assert_not_called()
     mock_remote_add.assert_not_called()

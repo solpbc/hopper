@@ -268,9 +268,14 @@ class TestStuckWorktreeSnapshot:
             "snapshot": {"outcome": "no_worktree"},
         }
 
-    def test_stuck_timeout_snapshots_dirty_worktree_and_preserves_error(
-        self, tmp_path, monkeypatch
-    ):
+    def test_idle_stage_parks_and_leaves_the_worktree_untouched(self, tmp_path, monkeypatch):
+        """An idle stage parks: the agent lives, and hopper does not touch the worktree.
+
+        The old behavior killed the agent and auto-committed the dirty worktree to
+        rescue work from the kill. With no kill there is nothing to rescue -- the agent
+        is still alive and still owns its files. Committing a live agent's worktree
+        could capture half-written files, so hopper leaves it strictly alone.
+        """
         repo_dir = _init_git_repo(tmp_path)
         worktree = tmp_path / "worktree"
         _run_git(repo_dir, "worktree", "add", str(worktree), "-b", "hopper-test-id")
@@ -302,29 +307,26 @@ class TestStuckWorktreeSnapshot:
         ):
             runner._check_activity()
 
-        reason = "No output or progress for 1s; timed out stuck Claude stage."
-        assert _run_git(worktree, "status", "--porcelain").stdout.strip() == ""
-        assert (
-            _run_git(worktree, "log", "-1", "--pretty=%B").stdout.strip()
-            == "hopper: auto-snapshot after stuck timeout (test-id)"
-        )
-        files = _run_git(worktree, "show", "--name-only", "--pretty=", "HEAD").stdout.splitlines()
-        assert "README.md" in files
-        assert "new.txt" in files
-        sha = _run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        # THE POINT: the agent is alive and the worktree is untouched.
+        runner._claude_proc.terminate.assert_not_called()
+        runner._claude_proc.kill.assert_not_called()
+        assert _run_git(worktree, "status", "--porcelain").stdout.strip() != ""
+        assert "auto-snapshot" not in _run_git(worktree, "log", "-1", "--pretty=%B").stdout
+
+        # It parked as gated, not errored, and recorded why.
+        assert runner._gated.is_set()
+        assert runner._stuck_error is None
+
         record = json.loads((get_lode_dir("test-id") / "recovery.json").read_text())
         assert record == {
-            "failed_at": 1000,
+            "parked_at": 1000,
+            "state": "gated",
             "stage": "refine",
-            "reason": reason,
+            "reason": "no pane output, heartbeat, or CPU activity for 1s",
             "branch": "hopper-test-id",
             "worktree_path": str(worktree),
-            "snapshot": {"outcome": "committed", "sha": sha},
+            "terminated": False,
         }
-        assert runner._stuck_error == (
-            f"{reason} Recovery snapshot committed on branch hopper-test-id at {sha}. "
-            "Restart with: hop lode restart test-id"
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -620,8 +620,13 @@ class TestBaseRunnerActivityMonitor:
         assert stuck_emissions[0][1]["status"].startswith("No output for ")
         assert stuck_emissions[0][1]["status"].endswith("s")
 
-    def test_stuck_timeout_terminates_claude_process(self, monkeypatch):
-        """A long-stuck active lode terminates its Claude process."""
+    def test_idle_stage_is_parked_never_terminated(self, monkeypatch):
+        """An idle stage is PARKED as gated and left alive. Hopper never kills it.
+
+        A quiet stage may be blocked on a prompt, stalled on a model stream, or hung.
+        Hopper cannot tell from the outside, and killing it destroys agent context a
+        human could often resume in one keystroke. So it parks and waits.
+        """
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
 
@@ -647,11 +652,18 @@ class TestBaseRunnerActivityMonitor:
         ):
             runner._check_activity()
 
-        assert runner._stuck_error is not None
-        assert "timed out stuck Claude stage" in runner._stuck_error
-        runner._claude_proc.terminate.assert_called_once()
-        runner._claude_proc.wait.assert_called_once_with(timeout=5)
-        assert runner._monitor_stop.is_set()
+        # THE POINT: the agent is still alive.
+        runner._claude_proc.terminate.assert_not_called()
+        runner._claude_proc.kill.assert_not_called()
+
+        # It is parked as gated, not errored, and the monitor keeps watching so the
+        # gate clears itself the moment the pane moves again.
+        assert runner._gated.is_set()
+        assert runner._stuck_error is None
+        assert not runner._monitor_stop.is_set()
+
+        states = [kw.get("state") for msg_type, kw in emitted if msg_type == "lode_set_state"]
+        assert "gated" in states
 
     def test_codex_only_running_never_stuck(self, monkeypatch):
         """Fresh progress heartbeats keep an unchanged pane running across ticks."""
@@ -730,7 +742,7 @@ class TestBaseRunnerActivityMonitor:
             for e in emitted
         )
 
-    def test_flat_descendant_cpu_still_times_out(self, monkeypatch):
+    def test_flat_descendant_cpu_parks_never_terminates(self, monkeypatch):
         """Flat descendant CPU does not veto the normal stuck timeout."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
@@ -755,11 +767,11 @@ class TestBaseRunnerActivityMonitor:
         ):
             runner._check_activity()
 
-        assert runner._stuck_error is not None
-        assert "timed out stuck Claude stage" in runner._stuck_error
-        runner._claude_proc.terminate.assert_called_once()
+        assert runner._gated.is_set()
+        assert runner._stuck_error is None
+        runner._claude_proc.terminate.assert_not_called()
 
-    def test_real_silence_absolute_cap_terminates_even_with_cpu(self, monkeypatch):
+    def test_real_silence_absolute_cap_parks_even_with_cpu(self, monkeypatch):
         """The absolute cap is based on pane silence, not heartbeat or CPU activity."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
@@ -783,11 +795,11 @@ class TestBaseRunnerActivityMonitor:
         ):
             runner._check_activity()
 
-        assert runner._stuck_error is not None
-        assert "pane-silence cap" in runner._stuck_error
-        runner._claude_proc.terminate.assert_called_once()
+        assert runner._gated.is_set()
+        assert runner._stuck_error is None
+        runner._claude_proc.terminate.assert_not_called()
 
-    def test_pane_silence_cap_terminates_with_fresh_heartbeat_without_cpu_probe(self, monkeypatch):
+    def test_pane_silence_cap_parks_with_fresh_heartbeat_without_cpu_probe(self, monkeypatch):
         """Fresh heartbeats cannot hide a pane-silent stage from the absolute cap."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
@@ -798,10 +810,7 @@ class TestBaseRunnerActivityMonitor:
         runner._last_snapshot = "Hello World"
         runner._last_pane_activity_ms = 0
 
-        expected = (
-            "Exceeded 0-min pane-silence cap; stage was sustained only by heartbeat/CPU "
-            "activity with no pane output."
-        )
+        expected = "no pane output for 0 min (sustained only by heartbeat/CPU activity)"
         with (
             patch("hopper.runner.capture_pane", return_value="Hello World"),
             patch(
@@ -814,7 +823,7 @@ class TestBaseRunnerActivityMonitor:
                 },
             ),
             patch("hopper.runner._sum_descendant_cpu_ms") as mock_cpu,
-            patch.object(runner, "_fail_stuck") as mock_fail,
+            patch.object(runner, "_park_idle") as mock_fail,
         ):
             runner._check_activity()
 
@@ -851,7 +860,7 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.capture_pane", return_value="Hello World"),
             patch("hopper.runner.connect", side_effect=heartbeat),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=0) as mock_cpu,
-            patch.object(runner, "_fail_stuck") as mock_fail,
+            patch.object(runner, "_park_idle") as mock_fail,
         ):
             for tick in range(1_000, 1_701, 100):
                 now[0] = tick

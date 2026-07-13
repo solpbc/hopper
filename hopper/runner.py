@@ -602,19 +602,23 @@ class BaseRunner:
             duration_sec = (now - last_activity) // 1000
             self._emit_state("stuck", f"No output for {duration_sec}s")
             stuck_for = now - self._stuck_since
-            if stuck_for > STUCK_FAIL_THRESHOLD_MS and self._stuck_error is None:
-                msg = f"No output or progress for {duration_sec}s; timed out stuck Claude stage."
-                self._fail_stuck(msg)
+            if stuck_for > STUCK_FAIL_THRESHOLD_MS and not self._gated.is_set():
+                # NEVER terminate an idle stage. Park it and wait for a human.
+                self._park_idle(f"no pane output, heartbeat, or CPU activity for {duration_sec}s")
+                return
         else:
             if (
                 now - (self._last_pane_activity_ms or 0) > ABSOLUTE_CAP_MS
-                and self._stuck_error is None
+                and not self._gated.is_set()
             ):
-                msg = (
-                    f"Exceeded {ABSOLUTE_CAP_MS // 60_000}-min pane-silence cap; stage was "
-                    "sustained only by heartbeat/CPU activity with no pane output."
+                # Sustained only by heartbeat/CPU with a silent pane for an hour.
+                # Surface it to a human -- but do not kill it; it may be a long,
+                # legitimately quiet build. The gate clears itself the moment the
+                # pane moves again.
+                self._park_idle(
+                    f"no pane output for {ABSOLUTE_CAP_MS // 60_000} min "
+                    "(sustained only by heartbeat/CPU activity)"
                 )
-                self._fail_stuck(msg)
                 return
             if cpu_activity >= real_activity and real_quiet:
                 self._emit_state(
@@ -633,6 +637,49 @@ class BaseRunner:
     def _snapshot_stuck_worktree(self) -> dict:
         """Overridden by runners that own a worktree."""
         return {"outcome": "no_worktree"}
+
+    def _park_idle(self, reason: str) -> None:
+        """Park an idle stage as gated and wait for a human. NEVER terminate it.
+
+        Hopper cannot tell, from the outside, whether a quiet stage is blocked on a
+        prompt, stalled on a model stream, or genuinely hung. Killing it destroys
+        agent context that a human can often resume with one keystroke -- and a stage
+        that is merely *waiting for a person* must never be executed for waiting.
+
+        So a quiet stage is parked, not killed: the agent stays alive, the reason is
+        recorded, and the lode waits. The monitor keeps watching, so the moment the
+        pane changes (an operator answers, nudges, or the stage resumes on its own)
+        the existing gated branch clears the gate and the stage carries on.
+
+        Only an explicit operator action through the hop CLI may end a stage.
+        """
+        logger.warning(f"parking idle stage lode={self.lode_id}: {reason}")
+        worktree_path = getattr(self, "worktree_path", None)
+        record = {
+            "parked_at": current_time_ms(),
+            "state": "gated",
+            "stage": self._claude_stage,
+            "reason": reason,
+            "branch": getattr(self, "lode_branch", None) or None,
+            "worktree_path": str(worktree_path) if worktree_path else None,
+            "terminated": False,
+        }
+        try:
+            _write_recovery_record(self.lode_id, record)
+        except Exception as exc:
+            logger.error(f"failed to write park record lode={self.lode_id}: {exc}")
+
+        self._stuck_since = None
+        self._emit_state("gated", self._format_park_status(reason))
+        self._gated.set()
+
+    def _format_park_status(self, reason: str) -> str:
+        """Prescriptive park status -- agents and operators both read this."""
+        return (
+            f"Parked (idle): {reason}. The agent is ALIVE and was NOT terminated. "
+            f"Inspect: hop lode peek {self.lode_id} | "
+            f"Resume: hop lode nudge {self.lode_id} (or hop lode answer {self.lode_id} 1)"
+        )
 
     def _format_stuck_error(self, reason: str, record: dict) -> str:
         """Add recovery details and the restart command to a stuck error."""
