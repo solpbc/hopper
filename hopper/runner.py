@@ -3,6 +3,7 @@
 
 """Base runner - shared lifecycle logic for the process runner."""
 
+import json
 import logging
 import os
 import re
@@ -10,10 +11,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from hopper.client import HopperConnection, connect
-from hopper.lodes import current_time_ms, format_duration_ms
+from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
 
@@ -29,6 +31,9 @@ _QUESTION_SELECTOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.MULTILINE)
 _QUESTION_CHROME_RE = re.compile(
     r"(?:↑/↓ to navigate|Esc to cancel|Enter to select|Type something)", re.IGNORECASE
 )
+DESCENDANT_TERM_GRACE_SEC = 5.0
+DESCENDANT_POLL_INTERVAL_SEC = 0.1
+STUCK_FAILURE_WAIT_SEC = 60
 
 
 def pane_needs_answer(snapshot: str) -> bool:
@@ -36,6 +41,18 @@ def pane_needs_answer(snapshot: str) -> bool:
     return bool(
         snapshot and _QUESTION_SELECTOR_RE.search(snapshot) and _QUESTION_CHROME_RE.search(snapshot)
     )
+
+
+def _write_recovery_record(lode_id: str, record: dict) -> None:
+    """Atomically persist a stuck-kill recovery record for a lode."""
+    lode_dir = get_lode_dir(lode_id)
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    recovery_path = lode_dir / "recovery.json"
+    tmp_path = recovery_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, recovery_path)
 
 
 def _parse_ps_time(raw: str) -> float | None:
@@ -61,6 +78,54 @@ def _parse_ps_time(raw: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def _walk_descendant_pids(root_pid: int, children: dict[int, list[int]]) -> list[int]:
+    """Walk a parent-to-children map, excluding root_pid from the result."""
+    descendants: list[int] = []
+    seen = {root_pid}
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        descendants.append(pid)
+        stack.extend(children.get(pid, []))
+    return descendants
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Return all descendant process IDs of root_pid."""
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            f"ps failed; descendant cleanup degraded to parent-only ({type(exc).__name__}: {exc})"
+        )
+        return []
+    if result.returncode != 0:
+        logger.warning(
+            f"ps failed; descendant cleanup degraded to parent-only (exit code {result.returncode})"
+        )
+        return []
+
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return _walk_descendant_pids(root_pid, children)
 
 
 def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
@@ -96,16 +161,7 @@ def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
         children.setdefault(ppid, []).append(pid)
         times[pid] = parsed
 
-    total = 0.0
-    seen = {root_pid}
-    stack = list(children.get(root_pid, []))
-    while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        total += times.get(pid, 0.0)
-        stack.extend(children.get(pid, []))
+    total = sum(times.get(pid, 0.0) for pid in _walk_descendant_pids(root_pid, children))
     return int(total * 1000)
 
 
@@ -164,11 +220,11 @@ class BaseRunner:
         self._stuck_since: int | None = None
         self._last_descendant_cpu_ms: int | None = None
         self._last_cpu_activity_ms: int | None = None
-        self._real_quiet_since: int | None = None
         self._last_pane_activity_ms: int | None = None
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
         self._stuck_error: str | None = None
+        self._stuck_failure_complete = threading.Event()
         # Completion tracking
         self._done = threading.Event()
         self._gated = threading.Event()
@@ -344,6 +400,8 @@ class BaseRunner:
             proc.wait()
 
             if self._stuck_error:
+                if not self._stuck_failure_complete.wait(timeout=STUCK_FAILURE_WAIT_SEC):
+                    logger.warning(f"timed out waiting for stuck recovery lode={self.lode_id}")
                 return 1, self._stuck_error
             if proc.returncode != 0 and proc.stderr:
                 stderr_bytes = proc.stderr.read()
@@ -526,15 +584,12 @@ class BaseRunner:
         real_activity = max(pane_activity, heartbeat)
         real_quiet = now - real_activity > IDLE_THRESHOLD_MS
         if real_quiet:
-            if self._real_quiet_since is None:
-                self._real_quiet_since = now
             cpu = _sum_descendant_cpu_ms(self._claude_proc.pid if self._claude_proc else None)
             if cpu is not None:
                 if self._last_descendant_cpu_ms is not None and cpu > self._last_descendant_cpu_ms:
                     self._last_cpu_activity_ms = now
                 self._last_descendant_cpu_ms = cpu
         else:
-            self._real_quiet_since = None
             self._last_descendant_cpu_ms = None
             self._last_cpu_activity_ms = None
 
@@ -552,13 +607,12 @@ class BaseRunner:
                 self._fail_stuck(msg)
         else:
             if (
-                self._real_quiet_since is not None
-                and now - self._real_quiet_since > ABSOLUTE_CAP_MS
+                now - (self._last_pane_activity_ms or 0) > ABSOLUTE_CAP_MS
                 and self._stuck_error is None
             ):
                 msg = (
-                    f"Exceeded {ABSOLUTE_CAP_MS // 60_000}-min absolute cap while "
-                    "pane/heartbeat silent; terminating stage."
+                    f"Exceeded {ABSOLUTE_CAP_MS // 60_000}-min pane-silence cap; stage was "
+                    "sustained only by heartbeat/CPU activity with no pane output."
                 )
                 self._fail_stuck(msg)
                 return
@@ -576,17 +630,72 @@ class BaseRunner:
                 self._emit_state("running", status)
             self._stuck_since = None
 
-    def _snapshot_stuck_worktree(self) -> None:
+    def _snapshot_stuck_worktree(self) -> dict:
         """Overridden by runners that own a worktree."""
-        return
+        return {"outcome": "no_worktree"}
 
-    def _fail_stuck(self, msg: str) -> None:
+    def _format_stuck_error(self, reason: str, record: dict) -> str:
+        """Add recovery details and the restart command to a stuck error."""
+        snapshot = record["snapshot"]
+        outcome = snapshot["outcome"]
+        branch = record.get("branch") or "unavailable"
+        stage = record.get("stage", "")
+        if outcome == "committed":
+            return (
+                f"{reason} Recovery snapshot committed on branch {branch} at {snapshot['sha']}. "
+                f"Restart with: hop lode restart {self.lode_id}"
+            )
+        if outcome == "clean":
+            return (
+                f"{reason} Recovery branch {branch}; worktree was clean, so no snapshot commit "
+                f"was created. Restart with: hop lode restart {self.lode_id}"
+            )
+        if outcome == "no_worktree":
+            return (
+                f"{reason} Recovery branch unavailable; no worktree existed for stage {stage}, "
+                f"so no snapshot was created. Restart with: hop lode restart {self.lode_id}"
+            )
+        worktree_path = record.get("worktree_path") or "unavailable"
+        return (
+            f"{reason} Recovery snapshot failed on branch {branch}: {snapshot['git_error']}. "
+            f"Inspect {worktree_path} before restarting with: hop lode restart {self.lode_id}"
+        )
+
+    def _fail_stuck(self, reason: str) -> None:
         """Terminate a stuck runner and preserve failure state."""
-        self._stuck_error = msg
-        logger.error(f"stuck timeout lode={self.lode_id}: {msg}")
-        self._terminate_claude_process()
-        self._snapshot_stuck_worktree()
-        self._monitor_stop.set()
+        failed_at = current_time_ms()
+        self._stuck_error = reason
+        logger.error(f"stuck timeout lode={self.lode_id}: {reason}")
+        try:
+            self._terminate_claude_process()
+            try:
+                snapshot = self._snapshot_stuck_worktree()
+            except Exception as exc:
+                logger.exception(f"unexpected stuck snapshot failure lode={self.lode_id}")
+                snapshot = {"outcome": "failed", "git_error": str(exc)}
+
+            worktree_path = getattr(self, "worktree_path", None)
+            record = {
+                "failed_at": failed_at,
+                "stage": self._claude_stage,
+                "reason": reason,
+                "branch": getattr(self, "lode_branch", None) or None,
+                "worktree_path": str(worktree_path) if worktree_path else None,
+                "snapshot": snapshot,
+            }
+            try:
+                _write_recovery_record(self.lode_id, record)
+            except Exception as exc:
+                logger.error(f"failed to write recovery record lode={self.lode_id}: {exc}")
+                self._stuck_error = (
+                    f"{self._format_stuck_error(reason, record)} "
+                    f"Recovery record could not be written: {exc}."
+                )
+            else:
+                self._stuck_error = self._format_stuck_error(reason, record)
+        finally:
+            self._monitor_stop.set()
+            self._stuck_failure_complete.set()
 
     def _terminate_claude_process(self) -> None:
         """Terminate the active Claude process after a stuck timeout."""
@@ -594,12 +703,59 @@ class BaseRunner:
         if proc is None or proc.poll() is not None:
             return
 
-        proc.terminate()
+        descendants = _descendant_pids(proc.pid)
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            logger.debug(f"Permission denied terminating Claude process pid={proc.pid}")
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                logger.debug(f"Permission denied killing Claude process pid={proc.pid}")
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logger.debug("Claude process did not exit after SIGKILL")
+
+        survivors = []
+        for pid in descendants:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                logger.warning(f"Permission denied sending SIGTERM to descendant pid={pid}")
+            survivors.append(pid)
+
+        deadline = time.monotonic() + DESCENDANT_TERM_GRACE_SEC
+        while survivors:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            alive = []
+            for pid in survivors:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    logger.warning(f"Permission denied probing descendant pid={pid}")
+                alive.append(pid)
+            survivors = alive
+            if survivors:
+                time.sleep(min(DESCENDANT_POLL_INTERVAL_SEC, remaining))
+
+        for pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                logger.warning(f"Permission denied sending SIGKILL to descendant pid={pid}")

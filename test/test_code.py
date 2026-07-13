@@ -4,15 +4,20 @@
 """Tests for the code runner module."""
 
 import json
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from hopper.code import (
     EXEC_HEARTBEAT_COMMAND_CHARS,
     ExecHeartbeat,
+    ProgressHeartbeat,
     _next_version,
     _summarize_event,
+    format_progress_duration,
     run_code,
+    truncate_progress_command,
 )
 
 MOCK_CMD = [
@@ -507,6 +512,129 @@ class TestSummarizeEvent:
 
     def test_non_dict_input(self):
         assert _summarize_event("not a dict") == ""
+
+
+class TestProgressHeartbeat:
+    def test_periodically_emits_summary(self):
+        emitted = []
+        emitted_once = threading.Event()
+
+        def emit(summary):
+            emitted.append(summary)
+            emitted_once.set()
+
+        hb = ProgressHeartbeat(emit, lambda now_ms: f"working at {now_ms}", interval=0.01)
+        hb.start()
+        try:
+            assert emitted_once.wait(timeout=1)
+        finally:
+            hb.stop()
+
+        assert emitted
+        assert emitted[0].startswith("working at ")
+        assert hb._thread is not None
+        assert not hb._thread.is_alive()
+
+    def test_stop_is_emit_barrier_and_joins(self):
+        emit_started = threading.Event()
+        release_emit = threading.Event()
+        stop_returned = threading.Event()
+        emitted = []
+
+        def emit(summary):
+            emitted.append(summary)
+            emit_started.set()
+            assert release_emit.wait(timeout=1)
+
+        hb = ProgressHeartbeat(emit, lambda now_ms: "working", interval=0.01)
+        hb.start()
+        assert emit_started.wait(timeout=1)
+
+        def stop():
+            hb.stop()
+            stop_returned.set()
+
+        stop_thread = threading.Thread(target=stop)
+        stop_thread.start()
+        assert not stop_returned.wait(timeout=0.05)
+        release_emit.set()
+        stop_thread.join(timeout=1)
+
+        assert stop_returned.is_set()
+        assert hb._thread is not None
+        assert not hb._thread.is_alive()
+        emitted_after_stop = len(emitted)
+        time.sleep(0.03)
+        assert len(emitted) == emitted_after_stop
+
+    def test_stop_recheck_skips_emit_after_summary(self):
+        summary_started = threading.Event()
+        release_summary = threading.Event()
+        stop_returned = threading.Event()
+        emitted = []
+
+        def summary(now_ms):
+            summary_started.set()
+            assert release_summary.wait(timeout=1)
+            return "working"
+
+        hb = ProgressHeartbeat(emitted.append, summary, interval=0.01)
+        hb.start()
+        assert summary_started.wait(timeout=1)
+
+        def stop():
+            hb.stop()
+            stop_returned.set()
+
+        stop_thread = threading.Thread(target=stop)
+        stop_thread.start()
+        assert not stop_returned.wait(timeout=0.05)
+        release_summary.set()
+        stop_thread.join(timeout=1)
+
+        assert stop_returned.is_set()
+        assert emitted == []
+        assert hb._thread is not None
+        assert not hb._thread.is_alive()
+
+    def test_summary_and_emit_exceptions_are_isolated(self):
+        summary_calls = 0
+        emit_called = threading.Event()
+
+        def summary(now_ms):
+            nonlocal summary_calls
+            summary_calls += 1
+            if summary_calls == 1:
+                raise RuntimeError("summary failed")
+            return "working"
+
+        def emit(value):
+            emit_called.set()
+            raise RuntimeError("emit failed")
+
+        hb = ProgressHeartbeat(emit, summary, interval=0.01)
+        hb.start()
+        try:
+            assert emit_called.wait(timeout=1)
+        finally:
+            hb.stop()
+
+        assert summary_calls >= 2
+        assert hb._thread is not None
+        assert not hb._thread.is_alive()
+
+    def test_format_progress_duration(self):
+        assert format_progress_duration(-1) == "0s"
+        assert format_progress_duration(0) == "0s"
+        assert format_progress_duration(12_999) == "12s"
+        assert format_progress_duration(4 * 60_000 + 12_000) == "4m12s"
+        assert format_progress_duration(60 * 60_000 + 2 * 60_000 + 3_000) == "1h02m03s"
+
+    def test_truncate_progress_command(self):
+        assert truncate_progress_command("make ci") == "make ci"
+        truncated = truncate_progress_command("x" * 100)
+        assert len(truncated) == EXEC_HEARTBEAT_COMMAND_CHARS
+        assert truncated.endswith("...")
 
 
 class TestExecHeartbeat:

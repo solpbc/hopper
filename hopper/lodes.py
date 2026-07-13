@@ -496,6 +496,8 @@ def reset_lode_claude_stage(lodes: list[dict], lode_id: str, claude_stage: str) 
                 return None
             lode["claude"][claude_stage]["session_id"] = str(uuid.uuid4())
             lode["claude"][claude_stage]["started"] = False
+            lode["last_progress_at"] = None
+            lode["last_progress_summary"] = ""
             touch(lode)
             save_lodes(lodes)
             return lode

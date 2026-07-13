@@ -17,6 +17,7 @@ from hopper.git import (
     dirty_status,
     get_diff_numstat,
     get_diff_stat,
+    head_sha,
     is_dirty,
     quarantine_dirty_repo,
     remove_worktree,
@@ -91,6 +92,7 @@ class TestIsDirty:
     def test_clean_repo(self):
         """Returns False for a clean repo."""
         mock_result = MagicMock()
+        mock_result.returncode = 0
         mock_result.stdout = ""
 
         with patch("subprocess.run", return_value=mock_result):
@@ -99,6 +101,7 @@ class TestIsDirty:
     def test_dirty_repo(self):
         """Returns True when there are uncommitted changes."""
         mock_result = MagicMock()
+        mock_result.returncode = 0
         mock_result.stdout = " M file.py\n"
 
         with patch("subprocess.run", return_value=mock_result):
@@ -108,6 +111,14 @@ class TestIsDirty:
         """Returns True (assumes dirty) when git is not found."""
         with patch("subprocess.run", side_effect=FileNotFoundError):
             assert is_dirty("/repo") is True
+
+    def test_nonzero_status_exit_is_conservatively_dirty(self, caplog):
+        mock_result = MagicMock(returncode=128, stdout="", stderr="fatal")
+
+        with patch("subprocess.run", return_value=mock_result):
+            assert is_dirty("/repo") is True
+
+        assert "git status --porcelain failed in /repo (exit 128)" in caplog.messages
 
 
 class TestDirtyStatus:
@@ -520,7 +531,7 @@ class TestCommitAllIntegration:
         (repo_dir / "README.md").write_text("changed\n")
         (repo_dir / "new.txt").write_text("new\n")
 
-        assert commit_all(str(repo_dir), "snapshot dirty tree") is True
+        assert commit_all(str(repo_dir), "snapshot dirty tree") == (True, None)
 
         message = _run_git(repo_dir, "log", "-1", "--pretty=%B").stdout.strip()
         assert message == "snapshot dirty tree"
@@ -531,7 +542,10 @@ class TestCommitAllIntegration:
     def test_commit_all_clean_repo_returns_false(self, tmp_path):
         repo_dir = _init_git_repo(tmp_path)
 
-        assert commit_all(str(repo_dir), "nothing to commit") is False
+        success, error = commit_all(str(repo_dir), "nothing to commit")
+
+        assert success is False
+        assert error == "git commit failed: exit code 1"
 
         message = _run_git(repo_dir, "log", "-1", "--pretty=%B").stdout.strip()
         assert message == "init"
@@ -542,12 +556,63 @@ class TestCommitAllIntegration:
 
         _run_git(repo_dir, "checkout", "-b", "hopper-snapshot")
         (repo_dir / "snapshot.txt").write_text("snapshot\n")
-        assert commit_all(str(repo_dir), "hopper snapshot") is True
+        assert commit_all(str(repo_dir), "hopper snapshot") == (True, None)
         _run_git(repo_dir, "checkout", base_branch)
 
         assert delete_branch(str(repo_dir), "hopper-snapshot") is False
         branches = _run_git(repo_dir, "branch", "--list", "hopper-snapshot").stdout
         assert "hopper-snapshot" in branches
+
+
+class TestCommitAllFailures:
+    def test_add_failure_returns_operation_detail(self):
+        add_result = MagicMock(returncode=128, stderr="fatal: index.lock exists")
+
+        with patch("subprocess.run", return_value=add_result):
+            assert commit_all("/repo", "snapshot") == (
+                False,
+                "git add -A failed: fatal: index.lock exists",
+            )
+
+    def test_commit_failure_returns_operation_detail(self):
+        add_result = MagicMock(returncode=0, stderr="")
+        commit_result = MagicMock(returncode=1, stderr="commit rejected")
+
+        with patch("subprocess.run", side_effect=[add_result, commit_result]):
+            assert commit_all("/repo", "snapshot") == (
+                False,
+                "git commit failed: commit rejected",
+            )
+
+    def test_missing_git_returns_detail(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert commit_all("/repo", "snapshot") == (False, "git command not found")
+
+    def test_subprocess_exception_returns_detail(self):
+        with patch("subprocess.run", side_effect=subprocess.SubprocessError("boom")):
+            assert commit_all("/repo", "snapshot") == (
+                False,
+                "git commit failed: boom",
+            )
+
+
+class TestHeadSha:
+    def test_returns_full_head_sha(self, tmp_path):
+        repo_dir = _init_git_repo(tmp_path)
+        expected = _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+
+        assert head_sha(str(repo_dir)) == expected
+        assert len(expected) == 40
+
+    def test_returns_none_when_rev_parse_fails(self):
+        result = MagicMock(returncode=128, stdout="")
+
+        with patch("subprocess.run", return_value=result):
+            assert head_sha("/repo") is None
+
+    def test_returns_none_when_git_is_missing(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert head_sha("/repo") is None
 
 
 class TestQuarantineDirtyRepoIntegration:
@@ -606,7 +671,7 @@ class TestQuarantineDirtyRepoIntegration:
         (repo_dir / "README.md").write_text("changed\n")
         (repo_dir / "new.txt").write_text("new\n")
 
-        with patch("hopper.git.commit_all", return_value=False):
+        with patch("hopper.git.commit_all", return_value=(False, "commit failed")):
             assert quarantine_dirty_repo(str(repo_dir), "test-id") is None
 
         assert (repo_dir / "README.md").read_text() == "changed\n"

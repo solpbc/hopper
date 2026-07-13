@@ -55,6 +55,8 @@ from hopper.tmux import capture_pane, paste_buffer, send_keys
 
 logger = logging.getLogger(__name__)
 
+PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "completed", "error"})
+
 
 def _tail_text(text: str, lines: int = 10) -> str:
     """Return the last N lines of text."""
@@ -679,6 +681,12 @@ class Server:
             if lode_id:
                 lode = self._find_lode(lode_id)
                 if lode:
+                    state = lode.get("state", "new")
+                    if state in PROGRESS_REJECT_STATES:
+                        logger.debug(
+                            f"Ignoring progress heartbeat for lode {lode_id} in state={state}"
+                        )
+                        return
                     summary = message.get("summary", "")
                     lode["last_progress_at"] = current_time_ms()
                     lode["last_progress_summary"] = (summary or "")[:120]

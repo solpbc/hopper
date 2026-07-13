@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from hopper import prompt
@@ -18,7 +19,6 @@ from hopper.projects import find_project
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_SEC = 30.0
-HEARTBEAT_STOP_TIMEOUT_SEC = 1.0
 EXEC_HEARTBEAT_COMMAND_CHARS = 60
 
 TURN_FAILED_BANNER = """\
@@ -48,16 +48,85 @@ def _is_quota_message(message: str) -> bool:
     return "usage limit" in message.lower()
 
 
-class ExecHeartbeat:
-    """Emit synthetic progress while a Codex command execution is in flight."""
+def truncate_progress_command(command: str) -> str:
+    """Truncate a command for a compact progress summary."""
+    if len(command) <= EXEC_HEARTBEAT_COMMAND_CHARS:
+        return command
+    return command[: EXEC_HEARTBEAT_COMMAND_CHARS - 3] + "..."
 
-    def __init__(self, emit, interval=HEARTBEAT_INTERVAL_SEC):
+
+def format_progress_duration(duration_ms: int) -> str:
+    """Format a progress duration while retaining seconds."""
+    total_seconds = max(0, duration_ms) // 1000
+    hours, remainder = divmod(total_seconds, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+class ProgressHeartbeat:
+    """Periodically emit a best-effort progress summary."""
+
+    def __init__(
+        self,
+        emit: Callable[[str], object],
+        summary: Callable[[int], str | None],
+        interval: float = HEARTBEAT_INTERVAL_SEC,
+    ) -> None:
         self.emit = emit
+        self._summary = summary
         self.interval = interval
-        self._in_flight: dict[str, tuple[str, int]] = {}
-        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._emit_lock = threading.Lock()
+
+    def start(self) -> None:
+        """Start emitting progress summaries."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+
+        def _loop() -> None:
+            while not self._stop.wait(self.interval):
+                try:
+                    summary = self._summary(current_time_ms())
+                except Exception:
+                    logger.debug("progress heartbeat summary failed", exc_info=True)
+                    continue
+                if not summary:
+                    continue
+                with self._emit_lock:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        self.emit(summary)
+                    except Exception:
+                        logger.debug("progress heartbeat emit failed", exc_info=True)
+
+        self._thread = threading.Thread(target=_loop, name="progress-heartbeat", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the heartbeat and wait until no further emit can begin."""
+        self._stop.set()
+        with self._emit_lock:
+            pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join()
+
+
+class ExecHeartbeat(ProgressHeartbeat):
+    """Emit synthetic progress while a Codex command execution is in flight."""
+
+    def __init__(
+        self, emit: Callable[[str], object], interval: float = HEARTBEAT_INTERVAL_SEC
+    ) -> None:
+        self._in_flight: dict[str, tuple[str, int]] = {}
+        self._lock = threading.Lock()
+        super().__init__(emit, self.summary, interval)
 
     def on_event(self, event) -> None:
         """Track command_execution item lifetime from Codex events."""
@@ -88,38 +157,12 @@ class ExecHeartbeat:
                 if not self._in_flight:
                     return None
                 command, started_ms = max(self._in_flight.values(), key=lambda value: value[1])
-            cmd = command
-            if len(cmd) > EXEC_HEARTBEAT_COMMAND_CHARS:
-                cmd = cmd[: EXEC_HEARTBEAT_COMMAND_CHARS - 3] + "..."
+            cmd = truncate_progress_command(command)
             elapsed = (now_ms - started_ms) // 1000
             return f"codex: running {cmd} ({elapsed}s)"
         except Exception:
             logger.debug("exec heartbeat summary failed", exc_info=True)
             return None
-
-    def start(self) -> None:
-        """Start emitting in-flight command summaries."""
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-
-        def _loop() -> None:
-            while not self._stop.wait(self.interval):
-                try:
-                    summary = self.summary(current_time_ms())
-                    if summary:
-                        self.emit(summary)
-                except Exception:
-                    logger.debug("exec heartbeat emit failed", exc_info=True)
-
-        self._thread = threading.Thread(target=_loop, name="codex-exec-heartbeat", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Stop the heartbeat thread."""
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=HEARTBEAT_STOP_TIMEOUT_SEC)
 
 
 def _summarize_event(event: dict) -> str:

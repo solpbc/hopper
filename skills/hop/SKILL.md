@@ -239,38 +239,25 @@ dialog. Recovery: `hop lode answer <lode-id> 1` (accepts the prompt); the
 lode then proceeds normally, and later lodes on the same project don't hit
 it again.
 
-**Long output-silent test runs can still be killed at ~351s (open bug).** A stage
-that sits inside a long, quiet command — a full `make ci` on a large suite is the
-canonical case — can be killed with `No output or progress for 351s` even while
-the test run is burning CPU. That 351s is structural, not tuned: `IDLE_THRESHOLD`
-(50s) + `STUCK_FAIL_THRESHOLD` (300s). Descendant-CPU credit exists precisely to
-cover this and is supposed to prevent it, but was observed not to apply
-(2026-07-12, lode `4x676kjo`, ship stage, twice). Recovery: **don't re-run the
-stage from scratch** — a stuck-kill auto-snapshots the worktree to the lode
-branch, so the work is already committed there; finish the ship by hand (merge +
-verify). Root-cause spike is tracked in the extro repo (`cto/roadmap.md`).
-
-**`hop check` does not protect liveness — it makes the pane quieter.** `hop check`
-buffers stdout+stderr and prints only the tail *after* the command exits. Its job
-is preserving the real exit status (killing the `| tail` false-green), and it does
-that well — but it produces **zero** pane output for the entire run, so it removes
-pane activity rather than supplying it. It does not defend against the timeout
-above; it depends on descendant-CPU credit working. If you need pane activity
-during a long gate, stream the output.
+**Long output-silent test runs are protected by `hop check` heartbeats.** While
+its child runs, `hop check` emits a socket progress heartbeat every 30 seconds,
+so a healthy output-silent run is no longer killed with `No output or progress
+for 351s`. Output is still buffered and only the tail is printed after the
+command exits; the heartbeat supplies liveness without changing that contract.
 
 Hopper's liveness model uses pane-diff activity, in-flight Codex exec
 heartbeats, and descendant-process CPU activity. Pane and heartbeat silence are
 the real foreground signals; descendant CPU can keep a lode `running` while
-background work is active. Heartbeats are event-driven, so a single long exec
-emits none — inside one long command, descendant CPU is the *only* defense. If
-pane and heartbeat stay silent for 60 minutes, Hopper applies an absolute cap
-even if descendant CPU is still accruing.
+background work is active. Heartbeat or CPU activity can carry a quiet stage,
+but neither bypasses the 60-minute pane-silence cap.
 
 If a senior Claude stage stays stuck past the runner timeout, Hopper terminates
 it, marks the lode `error`, and releases `active` so `hop restart <id>` can
-retry. On a stuck-kill, Hopper auto-snapshots a dirty worktree to the lode
-branch before releasing it. Worktree cleanup also refuses to destroy a dirty
-worktree; it retains the path and logs a warning instead.
+retry. Every stuck-kill writes `recovery.json` under the lode directory with a
+snapshot outcome (committed SHA, clean, no worktree, or failed with the git
+error); `hop lode status <id>` surfaces the record. Worktree cleanup also
+refuses to destroy a dirty worktree; it retains the path and logs a warning
+instead.
 
 Refine setup also bounds `make install` and Codex bootstrap. If setup hits its
 timeout, the lode errors with the captured output tail instead of remaining

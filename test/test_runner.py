@@ -3,12 +3,21 @@
 
 """Tests for the base runner module."""
 
+import json
+import signal
 import subprocess
+import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
-from hopper.lodes import current_time_ms
-from hopper.runner import BaseRunner, _parse_ps_time, _sum_descendant_cpu_ms, extract_error_message
+from hopper.lodes import current_time_ms, get_lode_dir
+from hopper.runner import (
+    BaseRunner,
+    _descendant_pids,
+    _parse_ps_time,
+    _sum_descendant_cpu_ms,
+    extract_error_message,
+)
 
 
 class TestExtractErrorMessage:
@@ -109,6 +118,135 @@ class TestPsCpuHelpers:
             assert _sum_descendant_cpu_ms(10) is None
         assert _sum_descendant_cpu_ms(None) is None
 
+    def test_descendant_pids_walks_nested_tree_and_skips_bad_rows(self):
+        result = MagicMock(returncode=0)
+        result.stdout = "\n".join(
+            [
+                "10 1",
+                "11 10",
+                "12 11",
+                "13 10",
+                "bad row",
+                "14 nope",
+                "15 11 extra",
+            ]
+        )
+
+        with patch("hopper.runner.subprocess.run", return_value=result) as mock_run:
+            assert _descendant_pids(10) == [13, 11, 12]
+
+        mock_run.assert_called_once_with(
+            ["ps", "-Ao", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_descendant_pids_cycle_does_not_loop_or_include_root(self):
+        result = MagicMock(returncode=0)
+        result.stdout = "\n".join(["10 12", "11 10", "12 11"])
+
+        with patch("hopper.runner.subprocess.run", return_value=result):
+            assert _descendant_pids(10) == [11, 12]
+
+    def test_descendant_pids_returns_empty_and_warns_on_ps_failure(self, caplog):
+        failed = MagicMock(returncode=1, stdout="")
+
+        with patch("hopper.runner.subprocess.run", return_value=failed):
+            assert _descendant_pids(10) == []
+        with patch("hopper.runner.subprocess.run", side_effect=FileNotFoundError):
+            assert _descendant_pids(10) == []
+        with patch("hopper.runner.subprocess.run", side_effect=subprocess.SubprocessError):
+            assert _descendant_pids(10) == []
+
+        assert caplog.messages == [
+            "ps failed; descendant cleanup degraded to parent-only (exit code 1)",
+            "ps failed; descendant cleanup degraded to parent-only (FileNotFoundError: )",
+            "ps failed; descendant cleanup degraded to parent-only (SubprocessError: )",
+        ]
+
+
+class TestDescendantTermination:
+    def _make_runner(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._claude_proc = MagicMock(pid=1234)
+        runner._claude_proc.poll.return_value = None
+        return runner
+
+    def test_descendants_get_term_then_survivors_get_kill(self):
+        runner = self._make_runner()
+        runner._claude_proc.wait.side_effect = [
+            subprocess.TimeoutExpired("claude", 5),
+            None,
+        ]
+        events = []
+
+        def descendants(pid):
+            events.append(("collect", pid))
+            return [2001, 2002]
+
+        runner._claude_proc.terminate.side_effect = lambda: events.append(("parent-term", 1234))
+
+        def send_signal(pid, sig):
+            events.append(("signal", pid, sig))
+            if sig == 0 and pid == 2001:
+                raise ProcessLookupError
+
+        with (
+            patch("hopper.runner._descendant_pids", side_effect=descendants),
+            patch("hopper.runner.os.kill", side_effect=send_signal),
+            patch("hopper.runner.time.monotonic", side_effect=[0.0, 0.0, 6.0]),
+            patch("hopper.runner.time.sleep"),
+        ):
+            runner._terminate_claude_process()
+
+        assert events[:2] == [("collect", 1234), ("parent-term", 1234)]
+        runner._claude_proc.kill.assert_called_once()
+        assert runner._claude_proc.wait.call_args_list == [call(timeout=5), call(timeout=5)]
+        assert ("signal", 2001, signal.SIGTERM) in events
+        assert ("signal", 2002, signal.SIGTERM) in events
+        assert ("signal", 2001, signal.SIGKILL) not in events
+        assert ("signal", 2002, signal.SIGKILL) in events
+
+    def test_already_dead_descendant_is_tolerated(self):
+        runner = self._make_runner()
+
+        with (
+            patch("hopper.runner._descendant_pids", return_value=[2001]),
+            patch("hopper.runner.os.kill", side_effect=ProcessLookupError) as mock_kill,
+        ):
+            runner._terminate_claude_process()
+
+        mock_kill.assert_called_once_with(2001, signal.SIGTERM)
+
+    def test_permission_errors_are_tolerated_and_logged(self, caplog):
+        runner = self._make_runner()
+        runner._claude_proc.terminate.side_effect = PermissionError
+        runner._claude_proc.wait.side_effect = [
+            subprocess.TimeoutExpired("claude", 5),
+            None,
+        ]
+        runner._claude_proc.kill.side_effect = PermissionError
+
+        with (
+            patch("hopper.runner._descendant_pids", return_value=[2001]),
+            patch("hopper.runner.os.kill", side_effect=PermissionError) as mock_kill,
+            patch("hopper.runner.time.monotonic", side_effect=[0.0, 0.0, 6.0]),
+            patch("hopper.runner.time.sleep"),
+        ):
+            runner._terminate_claude_process()
+
+        assert mock_kill.call_args_list == [
+            call(2001, signal.SIGTERM),
+            call(2001, 0),
+            call(2001, signal.SIGKILL),
+        ]
+        for message in (
+            "Permission denied sending SIGTERM to descendant pid=2001",
+            "Permission denied probing descendant pid=2001",
+            "Permission denied sending SIGKILL to descendant pid=2001",
+        ):
+            assert message in caplog.messages
+
 
 class TestBaseRunnerActivityMonitor:
     """Tests for BaseRunner activity monitor shared behavior."""
@@ -116,6 +254,153 @@ class TestBaseRunnerActivityMonitor:
     def _make_runner(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         return runner
+
+    def test_base_stuck_kill_writes_no_worktree_recovery(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+
+        with (
+            patch("hopper.runner.current_time_ms", return_value=1234),
+            patch.object(runner, "_terminate_claude_process"),
+        ):
+            runner._fail_stuck("stuck reason")
+
+        record = json.loads((get_lode_dir("test-session") / "recovery.json").read_text())
+        assert record == {
+            "failed_at": 1234,
+            "stage": "mill",
+            "reason": "stuck reason",
+            "branch": None,
+            "worktree_path": None,
+            "snapshot": {"outcome": "no_worktree"},
+        }
+        assert runner._stuck_error == (
+            "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
+            "so no snapshot was created. Restart with: hop lode restart test-session"
+        )
+        assert runner._monitor_stop.is_set()
+        assert runner._stuck_failure_complete.is_set()
+
+    def test_format_stuck_error_outcomes(self):
+        runner = self._make_runner()
+        reason = "stuck reason"
+        record = {
+            "stage": "refine",
+            "branch": "hopper-test",
+            "worktree_path": "/tmp/worktree",
+        }
+
+        assert runner._format_stuck_error(
+            reason, {**record, "snapshot": {"outcome": "committed", "sha": "abc123"}}
+        ) == (
+            "stuck reason Recovery snapshot committed on branch hopper-test at abc123. "
+            "Restart with: hop lode restart test-session"
+        )
+        assert runner._format_stuck_error(reason, {**record, "snapshot": {"outcome": "clean"}}) == (
+            "stuck reason Recovery branch hopper-test; worktree was clean, so no snapshot "
+            "commit was created. Restart with: hop lode restart test-session"
+        )
+        assert runner._format_stuck_error(
+            reason, {**record, "snapshot": {"outcome": "no_worktree"}}
+        ) == (
+            "stuck reason Recovery branch unavailable; no worktree existed for stage refine, "
+            "so no snapshot was created. Restart with: hop lode restart test-session"
+        )
+        assert runner._format_stuck_error(
+            reason,
+            {
+                **record,
+                "snapshot": {"outcome": "failed", "git_error": "index locked"},
+            },
+        ) == (
+            "stuck reason Recovery snapshot failed on branch hopper-test: index locked. "
+            "Inspect /tmp/worktree before restarting with: hop lode restart test-session"
+        )
+
+    def test_recovery_write_failure_is_appended_to_enriched_error(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+
+        with (
+            patch.object(runner, "_terminate_claude_process"),
+            patch("hopper.runner._write_recovery_record", side_effect=OSError("disk full")),
+        ):
+            runner._fail_stuck("stuck reason")
+
+        assert runner._stuck_error == (
+            "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
+            "so no snapshot was created. Restart with: hop lode restart test-session "
+            "Recovery record could not be written: disk full."
+        )
+        assert runner._monitor_stop.is_set()
+        assert runner._stuck_failure_complete.is_set()
+
+    def test_run_claude_waits_for_enriched_stuck_error(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+        proc = MagicMock(returncode=1, stderr=None)
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+        failure_threads = []
+
+        def slow_snapshot():
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=1)
+            return {"outcome": "no_worktree"}
+
+        def wait_for_process():
+            thread = threading.Thread(target=runner._fail_stuck, args=("stuck reason",))
+            failure_threads.append(thread)
+            thread.start()
+            assert snapshot_started.wait(timeout=1)
+
+        proc.wait.side_effect = wait_for_process
+        result = []
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], None)),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+            patch.object(runner, "_terminate_claude_process"),
+            patch.object(runner, "_snapshot_stuck_worktree", side_effect=slow_snapshot),
+            patch("hopper.runner._write_recovery_record"),
+        ):
+            run_thread = threading.Thread(target=lambda: result.append(runner._run_claude()))
+            run_thread.start()
+            assert snapshot_started.wait(timeout=1)
+            assert run_thread.is_alive()
+            release_snapshot.set()
+            run_thread.join(timeout=1)
+
+        for thread in failure_threads:
+            thread.join(timeout=1)
+
+        assert not run_thread.is_alive()
+        assert result == [
+            (
+                1,
+                "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
+                "so no snapshot was created. Restart with: hop lode restart test-session",
+            )
+        ]
+
+    def test_run_claude_stuck_recovery_wait_timeout_returns_current_error(self, caplog):
+        runner = self._make_runner()
+        runner._stuck_error = "stuck reason"
+        proc = MagicMock(returncode=1, stderr=None)
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], None)),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+            patch("hopper.runner.STUCK_FAILURE_WAIT_SEC", 0),
+        ):
+            result = runner._run_claude()
+
+        assert result == (1, "stuck reason")
+        assert "timed out waiting for stuck recovery lode=test-session" in caplog.messages
 
     def test_subprocess_env_disables_claude_auto_memory(self):
         """Managed Hopper stages disable Claude Code auto-memory."""
@@ -475,7 +760,7 @@ class TestBaseRunnerActivityMonitor:
         runner._claude_proc.terminate.assert_called_once()
 
     def test_real_silence_absolute_cap_terminates_even_with_cpu(self, monkeypatch):
-        """The absolute cap is based on pane/heartbeat silence, not CPU activity."""
+        """The absolute cap is based on pane silence, not heartbeat or CPU activity."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
         monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 10_000)
@@ -485,7 +770,6 @@ class TestBaseRunnerActivityMonitor:
         runner._last_snapshot = "Hello World"
         runner._last_pane_activity_ms = 0
         runner._last_descendant_cpu_ms = 1000
-        runner._real_quiet_since = 0
         runner._claude_proc = MagicMock(pid=1234)
         runner._claude_proc.poll.return_value = None
 
@@ -500,8 +784,86 @@ class TestBaseRunnerActivityMonitor:
             runner._check_activity()
 
         assert runner._stuck_error is not None
-        assert "absolute cap" in runner._stuck_error
+        assert "pane-silence cap" in runner._stuck_error
         runner._claude_proc.terminate.assert_called_once()
+
+    def test_pane_silence_cap_terminates_with_fresh_heartbeat_without_cpu_probe(self, monkeypatch):
+        """Fresh heartbeats cannot hide a pane-silent stage from the absolute cap."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 10_000)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+
+        expected = (
+            "Exceeded 0-min pane-silence cap; stage was sustained only by heartbeat/CPU "
+            "activity with no pane output."
+        )
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={
+                    "lode": {
+                        "last_progress_at": 9_990,
+                        "last_progress_summary": "make ci — running 10s",
+                    }
+                },
+            ),
+            patch("hopper.runner._sum_descendant_cpu_ms") as mock_cpu,
+            patch.object(runner, "_fail_stuck") as mock_fail,
+        ):
+            runner._check_activity()
+
+        mock_cpu.assert_not_called()
+        mock_fail.assert_called_once_with(expected)
+
+    def test_refreshed_heartbeat_carries_pane_silent_stage_past_stuck_timeout(self, monkeypatch):
+        """Recurring progress prevents the ordinary stuck kill across enough quiet ticks."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 200)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 10_000)
+        now = [1_000]
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: now[0])
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        def heartbeat(*args, **kwargs):
+            return {
+                "lode": {
+                    "last_progress_at": now[0] - 10,
+                    "last_progress_summary": "make ci — running",
+                }
+            }
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch("hopper.runner.connect", side_effect=heartbeat),
+            patch("hopper.runner._sum_descendant_cpu_ms", return_value=0) as mock_cpu,
+            patch.object(runner, "_fail_stuck") as mock_fail,
+        ):
+            for tick in range(1_000, 1_701, 100):
+                now[0] = tick
+                runner._check_activity()
+
+        mock_cpu.assert_not_called()
+        mock_fail.assert_not_called()
+        assert runner._stuck_since is None
+        assert not any(
+            event_type == "lode_set_state" and fields["state"] == "stuck"
+            for event_type, fields in emitted
+        )
 
     def test_parent_claude_idle_with_fresh_codex(self):
         """Fresh heartbeats keep the runner active even when the pane is older than 10 seconds."""
