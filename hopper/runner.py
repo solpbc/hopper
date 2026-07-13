@@ -152,7 +152,6 @@ class BaseRunner:
         self._stuck_since: int | None = None
         self._last_descendant_cpu_ms: int | None = None
         self._last_cpu_activity_ms: int | None = None
-        self._real_quiet_since: int | None = None
         self._last_pane_activity_ms: int | None = None
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
@@ -507,15 +506,12 @@ class BaseRunner:
         real_activity = max(pane_activity, heartbeat)
         real_quiet = now - real_activity > IDLE_THRESHOLD_MS
         if real_quiet:
-            if self._real_quiet_since is None:
-                self._real_quiet_since = now
             cpu = _sum_descendant_cpu_ms(self._claude_proc.pid if self._claude_proc else None)
             if cpu is not None:
                 if self._last_descendant_cpu_ms is not None and cpu > self._last_descendant_cpu_ms:
                     self._last_cpu_activity_ms = now
                 self._last_descendant_cpu_ms = cpu
         else:
-            self._real_quiet_since = None
             self._last_descendant_cpu_ms = None
             self._last_cpu_activity_ms = None
 
@@ -533,13 +529,12 @@ class BaseRunner:
                 self._fail_stuck(msg)
         else:
             if (
-                self._real_quiet_since is not None
-                and now - self._real_quiet_since > ABSOLUTE_CAP_MS
+                now - (self._last_pane_activity_ms or 0) > ABSOLUTE_CAP_MS
                 and self._stuck_error is None
             ):
                 msg = (
-                    f"Exceeded {ABSOLUTE_CAP_MS // 60_000}-min absolute cap while "
-                    "pane/heartbeat silent; terminating stage."
+                    f"Exceeded {ABSOLUTE_CAP_MS // 60_000}-min pane-silence cap; stage was "
+                    "sustained only by heartbeat/CPU activity with no pane output."
                 )
                 self._fail_stuck(msg)
                 return

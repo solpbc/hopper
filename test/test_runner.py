@@ -444,7 +444,7 @@ class TestBaseRunnerActivityMonitor:
         runner._claude_proc.terminate.assert_called_once()
 
     def test_real_silence_absolute_cap_terminates_even_with_cpu(self, monkeypatch):
-        """The absolute cap is based on pane/heartbeat silence, not CPU activity."""
+        """The absolute cap is based on pane silence, not heartbeat or CPU activity."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
         monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 10_000)
@@ -454,7 +454,6 @@ class TestBaseRunnerActivityMonitor:
         runner._last_snapshot = "Hello World"
         runner._last_pane_activity_ms = 0
         runner._last_descendant_cpu_ms = 1000
-        runner._real_quiet_since = 0
         runner._claude_proc = MagicMock(pid=1234)
         runner._claude_proc.poll.return_value = None
 
@@ -469,8 +468,86 @@ class TestBaseRunnerActivityMonitor:
             runner._check_activity()
 
         assert runner._stuck_error is not None
-        assert "absolute cap" in runner._stuck_error
+        assert "pane-silence cap" in runner._stuck_error
         runner._claude_proc.terminate.assert_called_once()
+
+    def test_pane_silence_cap_terminates_with_fresh_heartbeat_without_cpu_probe(self, monkeypatch):
+        """Fresh heartbeats cannot hide a pane-silent stage from the absolute cap."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 10_000)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+
+        expected = (
+            "Exceeded 0-min pane-silence cap; stage was sustained only by heartbeat/CPU "
+            "activity with no pane output."
+        )
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch(
+                "hopper.runner.connect",
+                return_value={
+                    "lode": {
+                        "last_progress_at": 9_990,
+                        "last_progress_summary": "make ci — running 10s",
+                    }
+                },
+            ),
+            patch("hopper.runner._sum_descendant_cpu_ms") as mock_cpu,
+            patch.object(runner, "_fail_stuck") as mock_fail,
+        ):
+            runner._check_activity()
+
+        mock_cpu.assert_not_called()
+        mock_fail.assert_called_once_with(expected)
+
+    def test_refreshed_heartbeat_carries_pane_silent_stage_past_stuck_timeout(self, monkeypatch):
+        """Recurring progress prevents the ordinary stuck kill across enough quiet ticks."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 200)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 10_000)
+        now = [1_000]
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: now[0])
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "Hello World"
+        runner._last_pane_activity_ms = 0
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        def heartbeat(*args, **kwargs):
+            return {
+                "lode": {
+                    "last_progress_at": now[0] - 10,
+                    "last_progress_summary": "make ci — running",
+                }
+            }
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch("hopper.runner.connect", side_effect=heartbeat),
+            patch("hopper.runner._sum_descendant_cpu_ms", return_value=0) as mock_cpu,
+            patch.object(runner, "_fail_stuck") as mock_fail,
+        ):
+            for tick in range(1_000, 1_701, 100):
+                now[0] = tick
+                runner._check_activity()
+
+        mock_cpu.assert_not_called()
+        mock_fail.assert_not_called()
+        assert runner._stuck_since is None
+        assert not any(
+            event_type == "lode_set_state" and fields["state"] == "stuck"
+            for event_type, fields in emitted
+        )
 
     def test_parent_claude_idle_with_fresh_codex(self):
         """Fresh heartbeats keep the runner active even when the pane is older than 10 seconds."""

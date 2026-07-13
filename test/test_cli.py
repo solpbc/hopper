@@ -7,11 +7,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import hopper.code as hopper_code
 from hopper import __version__
 from hopper.cli import (
     cmd_backlog,
@@ -47,7 +49,9 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
+from hopper.lodes import save_lodes
 from hopper.projects import Project, load_projects, save_projects
+from hopper.server import Server
 
 LONG_SCOPE = "this is a stdin scope that is long enough to pass the minimum character validation"
 
@@ -4237,6 +4241,26 @@ def test_lode_restart_allows_force_when_active_pane_dead(capsys):
 # Tests for hop check — validation runner that preserves the command's exit status
 
 
+@pytest.fixture
+def check_server(tmp_path):
+    """Run a real server on a temporary socket for hop check heartbeats."""
+    socket_path = tmp_path / "check.sock"
+    server = Server(socket_path)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if socket_path.exists():
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError("Server did not start")
+
+    yield server, socket_path
+
+    server.stop()
+    thread.join(timeout=2)
+
+
 def test_check_help(capsys):
     """check --help shows help and returns 0."""
     result = cmd_check(["--help"])
@@ -4297,4 +4321,133 @@ def test_check_command_not_found_returns_127(capsys):
     """A missing executable returns 127 rather than a false 0."""
     result = cmd_check(["--", "hopper-no-such-command-xyzzy"])
     assert result == 127
+    assert "not found" in capsys.readouterr().err
+
+
+def test_check_heartbeats_over_real_socket_and_stops_after_child(
+    check_server, make_lode, monkeypatch, capsys
+):
+    """A pane-silent child reports progress only while it is running."""
+    server, socket_path = check_server
+    lode = make_lode(id="check-id", state="running", active=True)
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setattr("hopper.cli._socket", lambda: socket_path)
+    monkeypatch.setattr("hopper.code.HEARTBEAT_INTERVAL_SEC", 0.05)
+    command = [sys.executable, "-c", "import time; time.sleep(0.25); print('done')"]
+
+    result = cmd_check(["--", *command])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.out == "done\n"
+    assert f"hop check: `{' '.join(command)}` exited 0" in captured.err
+    deadline = time.monotonic() + 1
+    while server.lodes[0].get("last_progress_at") is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.lodes[0]["last_progress_at"] is not None
+    expected_prefix = hopper_code.truncate_progress_command(" ".join(command))
+    assert server.lodes[0]["last_progress_summary"].startswith(f"{expected_prefix} — running ")
+
+    # Drain any mutation already queued before stop() returned, then verify silence.
+    time.sleep(0.05)
+    last_progress_at = server.lodes[0]["last_progress_at"]
+    time.sleep(0.12)
+    assert server.lodes[0]["last_progress_at"] == last_progress_at
+
+
+def test_check_without_lode_does_not_construct_heartbeat(monkeypatch, capsys):
+    class UnexpectedHeartbeat:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("heartbeat constructed without HOPPER_LID")
+
+    monkeypatch.setattr("hopper.cli.hopper_code.ProgressHeartbeat", UnexpectedHeartbeat)
+
+    assert cmd_check(["--", sys.executable, "-c", "print('all good')"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "all good\n"
+    assert "exited 0" in captured.err
+
+
+def test_check_dead_socket_preserves_command_contract(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setattr("hopper.cli._socket", lambda: tmp_path / "missing.sock")
+    monkeypatch.setattr("hopper.code.HEARTBEAT_INTERVAL_SEC", 0.01)
+    command = [sys.executable, "-c", "import time; time.sleep(0.05); print('all good')"]
+
+    assert cmd_check(["--", *command]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "all good\n"
+    assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
+
+
+def test_check_heartbeat_construction_failure_preserves_contract(monkeypatch, capsys):
+    class BrokenHeartbeat:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("construction failed")
+
+    monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setattr("hopper.cli.hopper_code.ProgressHeartbeat", BrokenHeartbeat)
+    command = [sys.executable, "-c", "print('all good')"]
+
+    assert cmd_check(["--", *command]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "all good\n"
+    assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
+
+
+def test_check_heartbeat_lifecycle_failures_preserve_contract(monkeypatch, capsys):
+    class BrokenHeartbeat:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("start failed")
+
+        def stop(self):
+            raise RuntimeError("stop failed")
+
+    monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setattr("hopper.cli.hopper_code.ProgressHeartbeat", BrokenHeartbeat)
+    command = [sys.executable, "-c", "print('all good')"]
+
+    assert cmd_check(["--", *command]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "all good\n"
+    assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
+
+
+def test_check_heartbeat_emit_failure_preserves_contract(monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setattr("hopper.code.HEARTBEAT_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(
+        "hopper.cli.set_lode_progress", MagicMock(side_effect=RuntimeError("emit failed"))
+    )
+    command = [sys.executable, "-c", "import time; time.sleep(0.05); print('all good')"]
+
+    assert cmd_check(["--", *command]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "all good\n"
+    assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
+
+
+def test_check_command_not_found_stops_heartbeat(monkeypatch, capsys):
+    stopped = []
+
+    class TrackingHeartbeat:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            stopped.append(True)
+
+    monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setattr("hopper.cli.hopper_code.ProgressHeartbeat", TrackingHeartbeat)
+
+    assert cmd_check(["--", "hopper-no-such-command-heartbeat"]) == 127
+    assert stopped == [True]
     assert "not found" in capsys.readouterr().err

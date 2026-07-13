@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
@@ -14,10 +15,13 @@ from pathlib import Path
 
 import setproctitle
 
+import hopper.code as hopper_code
 from hopper import __version__, config
+from hopper.client import set_lode_progress
 from hopper.lodes import (
     STATUS_ERROR,
     STATUS_SHIPPED,
+    current_time_ms,
     find_lode_by_prefix,
     find_lodes_by_prefix,
     format_age,
@@ -26,6 +30,8 @@ from hopper.lodes import (
 from hopper.tmux import capture_pane, paste_buffer, send_keys
 
 STUCK_GRACE_MS = 120_000
+
+logger = logging.getLogger(__name__)
 
 
 def _socket() -> Path:
@@ -2643,16 +2649,45 @@ def cmd_check(args: list[str]) -> int:
         print("error: --lines must be non-negative")
         return 1
 
+    heartbeat = None
+    lode_id = get_hopper_lid()
+    if lode_id:
+        try:
+            started_at = current_time_ms()
+            command_text = " ".join(command)
+            heartbeat = hopper_code.ProgressHeartbeat(
+                lambda summary: set_lode_progress(_socket(), lode_id, summary),
+                lambda now_ms: (
+                    f"{hopper_code.truncate_progress_command(command_text)} — running "
+                    f"{hopper_code.format_progress_duration(now_ms - started_at)}"
+                ),
+                interval=hopper_code.HEARTBEAT_INTERVAL_SEC,
+            )
+        except Exception:
+            logger.debug("failed to create check heartbeat", exc_info=True)
+
     try:
-        proc = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except FileNotFoundError:
-        print(f"hop check: command not found: {command[0]}", file=sys.stderr)
-        return 127
+        if heartbeat:
+            try:
+                heartbeat.start()
+            except Exception:
+                logger.debug("failed to start check heartbeat", exc_info=True)
+        try:
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except FileNotFoundError:
+            print(f"hop check: command not found: {command[0]}", file=sys.stderr)
+            return 127
+    finally:
+        if heartbeat:
+            try:
+                heartbeat.stop()
+            except Exception:
+                logger.debug("failed to stop check heartbeat", exc_info=True)
 
     output = proc.stdout or ""
     total = len(output.splitlines())
