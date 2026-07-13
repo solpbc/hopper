@@ -228,6 +228,10 @@ class BaseRunner:
         # Completion tracking
         self._done = threading.Event()
         self._gated = threading.Event()
+        # Gate resume detector: the pane as it settled *after* the gate opened,
+        # and whether we have seen it hold still long enough to trust a change.
+        self._gate_snapshot: str | None = None
+        self._gate_armed = False
         self._setup_error: str | None = None
 
     def run(self) -> int:
@@ -468,10 +472,10 @@ class BaseRunner:
             self._done.set()
             logger.debug(f"{self._done_label} signal received")
         elif lode.get("state") == "gated":
-            self._gated.set()
+            self._open_gate()
             logger.debug(f"gate signal received lode={self.lode_id}")
         elif lode.get("state") == "running":
-            self._gated.clear()
+            self._clear_gate()
 
     def _wait_and_dismiss_claude(self) -> None:
         """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude.
@@ -535,6 +539,18 @@ class BaseRunner:
         while not self._monitor_stop.wait(MONITOR_INTERVAL):
             self._check_activity()
 
+    def _open_gate(self) -> None:
+        """Enter the gated state and disarm the pane resume detector."""
+        self._gate_snapshot = None
+        self._gate_armed = False
+        self._gated.set()
+
+    def _clear_gate(self) -> None:
+        """Leave the gated state and disarm the pane resume detector."""
+        self._gate_snapshot = None
+        self._gate_armed = False
+        self._gated.clear()
+
     def _check_activity(self) -> None:
         """Check tmux pane for activity and update state accordingly."""
         if not self._pane_id:
@@ -549,11 +565,30 @@ class BaseRunner:
                 logger.debug("Failed to capture pane, stopping monitor")
                 self._monitor_stop.set()
                 return
-            if snapshot != self._last_snapshot:
+            self._stuck_since = None
+            if not self._gate_armed:
+                # A gate's own output arrives AFTER the gate opens: `hop gate`
+                # prints "Gate set...", and Claude renders the end of its turn.
+                # Those are pane changes, but they are not an operator resuming
+                # anything -- so the resume detector must be armed against the
+                # pane as it SETTLES, never against the pane from before the
+                # gate. Re-baseline until the pane holds still across one
+                # interval; only then can a change mean "a human touched this".
+                #
+                # Arming can only be delayed, never skipped, so the worst case is
+                # a gate that only `hop gate feedback` can resume -- never a gate
+                # that silently drops its protection and lets the stuck-killer in.
+                if snapshot == self._gate_snapshot:
+                    self._gate_armed = True
+                self._gate_snapshot = snapshot
+                self._last_snapshot = snapshot
+                self._last_pane_activity_ms = current_time_ms()
+                return
+            if snapshot != self._gate_snapshot:
                 self._emit_state("running", "Gate resumed")
                 self._last_snapshot = snapshot
                 self._last_pane_activity_ms = current_time_ms()
-                self._gated.clear()
+                self._clear_gate()
             return
 
         snapshot = capture_pane(self._pane_id)
@@ -566,7 +601,7 @@ class BaseRunner:
             self._last_snapshot = snapshot
             self._stuck_since = None
             self._emit_state("gated", "Awaiting operator answer")
-            self._gated.set()
+            self._open_gate()
             return
 
         now = current_time_ms()
@@ -671,7 +706,7 @@ class BaseRunner:
 
         self._stuck_since = None
         self._emit_state("gated", self._format_park_status(reason))
-        self._gated.set()
+        self._open_gate()
 
     def _format_park_status(self, reason: str) -> str:
         """Prescriptive park status -- agents and operators both read this."""

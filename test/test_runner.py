@@ -1029,24 +1029,113 @@ class TestBaseRunnerActivityMonitor:
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
 
     def test_check_activity_while_gated_emits_running_on_pane_change(self):
-        """Gated monitor emits running and clears gate when pane changes."""
+        """Once armed against the settled pane, a pane change resumes the gate."""
         runner = self._make_runner()
         runner._pane_id = "%1"
-        runner._last_snapshot = "Hello World"
+        runner._open_gate()
+        # Armed against the pane as it settled after the gate opened.
+        runner._gate_snapshot = "Gate set. Review saved."
+        runner._gate_armed = True
+        runner._last_snapshot = "Gate set. Review saved."
 
         with (
-            patch.object(runner._gated, "is_set", return_value=True),
-            patch.object(runner._gated, "clear") as mock_clear,
-            patch("hopper.runner.capture_pane", return_value="Hello World 2"),
+            patch("hopper.runner.capture_pane", return_value="Gate set. Review saved.\n> go"),
             patch("hopper.runner.current_time_ms", return_value=12345),
             patch.object(runner, "_emit_state", return_value=True) as mock_emit,
         ):
             runner._check_activity()
 
         mock_emit.assert_called_once_with("running", "Gate resumed")
-        mock_clear.assert_called_once_with()
-        assert runner._last_snapshot == "Hello World 2"
+        assert not runner._gated.is_set()
+        assert runner._last_snapshot == "Gate set. Review saved.\n> go"
         assert runner._last_pane_activity_ms == 12345
+
+    def test_gate_is_not_resumed_by_its_own_output(self):
+        """A gate's own output must never read as an operator resume.
+
+        Regression: `hop gate` prints "Gate set..." and Claude renders the end of
+        its turn AFTER the gate opens. The monitor compared that against the
+        pre-gate pane, called it "Gate resumed", cleared the gate, and the now
+        unprotected (and correctly idle) stage was stuck-killed 350s later.
+        Lodes ymxf4qpm and imexf5si died this way on 2026-07-13.
+        """
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "codex turn done (20205 tok)"  # the pre-gate pane
+        runner._open_gate()
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Gate set. Review saved."),
+            patch("hopper.runner.current_time_ms", return_value=12345),
+            patch.object(runner, "_emit_state", return_value=True) as mock_emit,
+        ):
+            runner._check_activity()
+
+        # The gate holds. Nothing resumed; nothing was emitted.
+        assert runner._gated.is_set()
+        assert not runner._gate_armed
+        mock_emit.assert_not_called()
+
+    def test_gate_arms_only_after_the_pane_settles(self):
+        """The detector arms against the settled pane, not the pre-gate pane."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "codex turn done (20205 tok)"
+        runner._open_gate()
+
+        # Two ticks of the gate's own output, then the pane holds still.
+        panes = ["Gate set. Review saved.", "Gate set. Review saved.\nSession will be resumed."]
+        settled = "Gate set. Review saved.\nSession will be resumed."
+
+        with (
+            patch("hopper.runner.capture_pane", side_effect=[*panes, settled, settled]),
+            patch("hopper.runner.current_time_ms", return_value=12345),
+            patch.object(runner, "_emit_state", return_value=True) as mock_emit,
+        ):
+            runner._check_activity()  # baseline
+            runner._check_activity()  # pane still moving -> re-baseline
+            assert not runner._gate_armed
+            runner._check_activity()  # pane held still -> arm
+            assert runner._gate_armed
+            runner._check_activity()  # still unchanged -> stay gated
+
+        assert runner._gated.is_set()
+        mock_emit.assert_not_called()
+
+    def test_gated_stage_is_never_stuck_killed_while_it_waits(self, monkeypatch):
+        """An open gate protects a correctly-idle stage for as long as it waits.
+
+        This is the end-to-end shape of the 2026-07-13 incident: the agent opens a
+        review gate and idles at its prompt, exactly as instructed. The pane never
+        changes again. It must never be killed or parked for that.
+        """
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 200)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
+        now = [1_000]
+        monkeypatch.setattr("hopper.runner.current_time_ms", lambda: now[0])
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "codex turn done (20205 tok)"
+        runner._last_pane_activity_ms = 0
+        runner._open_gate()
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Gate set. Review saved."),
+            patch("hopper.runner.connect", return_value=None),
+            patch.object(runner, "_emit_state", return_value=True),
+            patch.object(runner, "_park_idle") as mock_park,
+            patch.object(runner, "_fail_stuck") as mock_fail,
+        ):
+            for tick in range(1_000, 5_001, 100):
+                now[0] = tick
+                runner._check_activity()
+
+        mock_park.assert_not_called()
+        mock_fail.assert_not_called()
+        assert runner._gated.is_set()
+        assert runner._stuck_since is None
 
     def test_check_activity_while_gated_dead_pane_sets_monitor_stop(self):
         """Gated monitor stops if pane capture fails."""
