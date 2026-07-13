@@ -85,12 +85,14 @@ def _paste_submit_verify(pane_id: str, text: str) -> tuple[bool, str]:
     send_keys(pane_id, "Enter")
     time.sleep(2)
     after = capture_pane(pane_id, plain=True)
+    if after is None:
+        return False, f"pane {pane_id} disappeared after feedback paste"
     if not _pane_has_pending_text(after, text):
         return True, _tail_text(after or "", 10)
     send_keys(pane_id, "Enter")
     time.sleep(0.2)
     retry_after = capture_pane(pane_id, plain=True)
-    submitted = not _pane_has_pending_text(retry_after, text)
+    submitted = retry_after is not None and not _pane_has_pending_text(retry_after, text)
     return submitted, _tail_text(retry_after or after or "", 10)
 
 
@@ -531,6 +533,98 @@ class Server:
                     logger.info(f"Lode {lode_id} archived")
                     self.broadcast({"type": "lode_archived", "lode": lode})
 
+        elif msg_type == "lode_pause":
+            lode_id = message.get("lode_id")
+            lode = self._find_lode(lode_id) if lode_id else None
+            if not lode:
+                if conn:
+                    self._send_response(
+                        conn, {"type": "error", "error": f"lode {lode_id} not found"}
+                    )
+                return
+            pid = lode.get("pid")
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            pane = lode.get("tmux_pane")
+            if pane:
+                from hopper.tmux import kill_pane
+
+                kill_pane(pane)
+            lode["state"] = "paused"
+            lode["status"] = "Paused by user; worktree retained"
+            lode["active"] = False
+            lode["tmux_pane"] = None
+            lode["pid"] = None
+            touch(lode)
+            save_lodes(self.lodes)
+            self.broadcast({"type": "lode_updated", "lode": lode})
+            if conn:
+                self._send_response(conn, {"type": "lode_paused", "lode": lode})
+
+        elif msg_type == "lode_resume":
+            lode_id = message.get("lode_id")
+            lode = self._find_lode(lode_id) if lode_id else None
+            if not lode:
+                if conn:
+                    self._send_response(
+                        conn, {"type": "error", "error": f"lode {lode_id} not found"}
+                    )
+                return
+            pane = lode.get("tmux_pane")
+            if lode.get("active") and pane and capture_pane(pane) is not None:
+                if conn:
+                    self._send_response(
+                        conn, {"type": "error", "error": f"lode {lode_id} is already active"}
+                    )
+                return
+            stale_pid = lode.get("pid")
+            if stale_pid:
+                try:
+                    os.kill(stale_pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            stage = lode.get("stage", "")
+            if stage not in STAGES:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {"type": "error", "error": f"lode {lode_id} stage {stage} cannot resume"},
+                    )
+                return
+            project = find_project(lode.get("project", ""))
+            if not project:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": f"project {lode.get('project', '')} not found",
+                        },
+                    )
+                return
+            pane_id = spawn_claude(lode_id, project.path, foreground=False)
+            if not pane_id:
+                if conn:
+                    self._send_response(
+                        conn, {"type": "error", "error": "failed to resume claude pane"}
+                    )
+                return
+            lode["state"] = "running"
+            lode["status"] = f"Resuming {stage}"
+            lode["active"] = False
+            lode["tmux_pane"] = pane_id
+            lode["pid"] = None
+            touch(lode)
+            save_lodes(self.lodes)
+            self.broadcast({"type": "lode_updated", "lode": lode})
+            if conn:
+                self._send_response(
+                    conn, {"type": "lode_resumed", "lode": lode, "tmux_pane": pane_id}
+                )
+
         elif msg_type == "lode_kill":
             lode_id = message.get("lode_id")
             if lode_id:
@@ -561,7 +655,6 @@ class Server:
                         self.archived_lodes.append(archived)
                         logger.info(f"Lode {lode_id} archived after kill")
                         self.broadcast({"type": "lode_archived", "lode": archived})
-                        self._cleanup_worktree(archived)
 
         elif msg_type == "lode_unarchive":
             lode_id = message.get("lode_id")
@@ -689,49 +782,51 @@ class Server:
             pane_id = lode.get("tmux_pane")
             pane_alive = bool(pane_id and capture_pane(pane_id) is not None)
             if not pane_alive:
-                project = find_project(lode.get("project", ""))
-                if not project:
-                    if conn:
-                        self._send_response(
-                            conn,
-                            {
-                                "type": "error",
-                                "error": f"project {lode.get('project', '')} not found",
-                            },
-                        )
-                    return
-
-                spawn_claude(lode_id, project.path, foreground=False)
-                pane_id = None
-                for _ in range(10):
-                    time.sleep(1)
-                    fresh = self._find_lode(lode_id)
-                    if fresh and fresh.get("active") and fresh.get("tmux_pane"):
-                        pane_id = fresh["tmux_pane"]
-                        break
-                if not pane_id:
-                    if conn:
-                        self._send_response(
-                            conn,
-                            {"type": "error", "error": "failed to respawn claude pane"},
-                        )
-                    return
+                updated = update_lode_state(
+                    self.lodes,
+                    lode_id,
+                    "gated",
+                    "Feedback blocked: pane unavailable",
+                )
+                if updated:
+                    self.broadcast({"type": "lode_updated", "lode": updated})
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                "pane unavailable; run `hop lode resume "
+                                f"{lode_id}`, wait for the prompt, then retry feedback"
+                            ),
+                        },
+                    )
+                return
 
             submitted, tail = _paste_submit_verify(pane_id, text)
-            updated = update_lode_state(self.lodes, lode_id, "running", "Feedback sent")
+            state = "running" if submitted else "gated"
+            status = (
+                "Feedback sent" if submitted else "Feedback not submitted; gate remains blocked"
+            )
+            updated = update_lode_state(self.lodes, lode_id, state, status)
             if updated:
                 self.broadcast({"type": "lode_updated", "lode": updated})
             if conn:
-                self._send_response(
-                    conn,
-                    {
+                if submitted:
+                    response = {
                         "type": "feedback_sent",
                         "lode_id": lode_id,
                         "tmux_pane": pane_id,
-                        "submitted": submitted,
+                        "submitted": True,
                         "tail": tail,
-                    },
-                )
+                    }
+                else:
+                    response = {
+                        "type": "error",
+                        "error": "feedback paste was not submitted; gate remains blocked",
+                        "tail": tail,
+                    }
+                self._send_response(conn, response)
 
         elif msg_type == "lode_promote_backlog":
             # Compound: create lode from backlog item, remove backlog item

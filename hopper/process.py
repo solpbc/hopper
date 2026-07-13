@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from hopper import config, prompt
@@ -67,15 +68,20 @@ def _run_setup_command(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            previous_sigterm = _install_setup_sigterm_handler(proc)
             try:
-                return_code = proc.wait(timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                _terminate_process_group(proc)
-                tail = _read_output_tail(output)
-                detail = f"Timed out after {int(timeout_sec)}s."
-                if tail:
-                    detail = f"{detail}\n{tail}"
-                return False, detail
+                try:
+                    return_code = proc.wait(timeout=timeout_sec)
+                except subprocess.TimeoutExpired:
+                    _terminate_process_group(proc)
+                    tail = _read_output_tail(output)
+                    detail = f"Timed out after {int(timeout_sec)}s."
+                    if tail:
+                        detail = f"{detail}\n{tail}"
+                    return False, detail
+            finally:
+                if previous_sigterm is not None:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
 
             if return_code != 0:
                 tail = _read_output_tail(output)
@@ -89,6 +95,23 @@ def _run_setup_command(
         return False, f"Command not found: {e.filename or command[0]}"
     except subprocess.SubprocessError as e:
         return False, str(e)
+
+
+def _install_setup_sigterm_handler(proc: subprocess.Popen):
+    """Ensure terminating the runner also terminates its setup process group."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate_setup(signum, frame) -> None:
+        _terminate_process_group(proc)
+        if callable(previous):
+            previous(signum, frame)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate_setup)
+    return previous
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:

@@ -409,6 +409,26 @@ def kill_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> bool:
     )
 
 
+def pause_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
+    """Pause a lode without archiving or removing its worktree."""
+    return send_message(
+        socket_path,
+        {"type": "lode_pause", "lode_id": lode_id},
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
+def resume_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
+    """Resume a paused or dead-pane lode with its existing stage session."""
+    return send_message(
+        socket_path,
+        {"type": "lode_resume", "lode_id": lode_id},
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
 def _fire_and_forget(socket_path: Path, msg: dict, timeout: float = 2.0) -> bool:
     """Send a message to the server without waiting for a response."""
     try:

@@ -68,6 +68,23 @@ def test_run_remote_inherits_stdin_when_none(monkeypatch):
     assert "input" not in calls[0]
 
 
+def test_run_remote_expands_preserved_tilde_on_remote(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_remote("fedora.local", ["project", "add", "~/src/my project"])
+
+    remote_command = calls[0][7]
+    assert '"$HOME"/' in remote_command
+    assert "'src/my project'" in remote_command
+    assert "~/src" not in remote_command
+
+
 def test_remote_registry_set_remove():
     set_remote("solstone-android", "suze.local")
 

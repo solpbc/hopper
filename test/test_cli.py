@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1528,6 +1529,39 @@ def test_lode_kill_happy(capsys):
     mock_kill.assert_called_once()
     out = capsys.readouterr().out
     assert "Killed lode test1234" in out
+    assert "worktree and branch retained" in out
+
+
+def test_lode_kill_reports_delivery_failure(capsys):
+    lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.kill_lode", return_value=False):
+                rc = cmd_lode(["kill", "test1234"])
+
+    assert rc == 1
+    assert "Failed to kill lode test1234" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("verb", "client_name", "response_type", "output"),
+    [
+        ("pause", "pause_lode", "lode_paused", "Paused lode test1234"),
+        ("resume", "resume_lode", "lode_resumed", "Resuming lode test1234"),
+    ],
+)
+def test_lode_pause_resume(verb, client_name, response_type, output, capsys):
+    response = {
+        "type": response_type,
+        "lode": {"id": "test1234"},
+        "tmux_pane": "%2",
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch(f"hopper.client.{client_name}", return_value=response) as operation:
+            assert cmd_lode([verb, "test1234"]) == 0
+
+    operation.assert_called_once()
+    assert output in capsys.readouterr().out
 
 
 def test_lode_kill_shipped(capsys):
@@ -3947,6 +3981,34 @@ def test_lode_status_not_found(capsys):
     assert "not found" in out.lower()
 
 
+def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
+    """A busy/unreachable host is not reported as a dead lode."""
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.list_lodes", return_value=[]):
+            with patch("hopper.client.list_archived_lodes", return_value=[]):
+                with patch(
+                    "hopper.cli._find_remote_lode",
+                    return_value=(None, "fedora.local [unreadable: fedora.local]"),
+                ):
+                    result = cmd_lode(["status", "busy-id"])
+
+    assert result == 2
+    assert "status unavailable" in capsys.readouterr().out.lower()
+
+
+def test_remote_lode_probe_classifies_timeout_as_unreadable():
+    from hopper.cli import _remote_lode_status
+
+    with patch(
+        "hopper.remote.run_remote",
+        side_effect=subprocess.TimeoutExpired(["ssh"], timeout=5),
+    ):
+        lode, state = _remote_lode_status("fedora.local", "busy-id")
+
+    assert lode is None
+    assert state == "unreadable"
+
+
 def test_backlog_ls_alias(capsys):
     """hop backlog ls works like hop backlog list."""
     from hopper.backlog import BacklogItem
@@ -4124,6 +4186,17 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
     assert rc == 0
     assert mock_remote.call_args.args[:2] == ("fedora.local", ["implement", "journal", "--json"])
     assert json.loads(capsys.readouterr().out)["host"] == "fedora.local"
+
+
+def test_main_rejects_locally_expanded_home_for_explicit_remote(monkeypatch, capsys):
+    local_path = str(Path.home() / "src" / "project")
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "fedora.local", "project", "add", local_path])
+
+    with patch("hopper.remote.run_remote") as mock_remote:
+        assert main() == 2
+
+    mock_remote.assert_not_called()
+    assert "quote the tilde" in capsys.readouterr().err
 
 
 def test_lode_create_json(capsys):

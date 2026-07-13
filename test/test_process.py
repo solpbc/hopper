@@ -7,6 +7,7 @@ import copy
 import io
 import logging
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -20,6 +21,7 @@ from hopper.process import (
     STAGES,
     ProcessRunner,
     _get_worktree_env,
+    _install_setup_sigterm_handler,
     _run_make_install,
     run_process,
 )
@@ -116,6 +118,22 @@ class TestRunMakeInstall:
         assert ok is False
         assert detail is not None
         assert "Timed out after 0s." in detail
+
+    def test_sigterm_handler_kills_setup_process_group(self):
+        """Killing a lode during setup also terminates make and its descendants."""
+        proc = MagicMock()
+        with (
+            patch("hopper.process.signal.getsignal", return_value=signal.SIG_DFL),
+            patch("hopper.process.signal.signal") as mock_signal,
+            patch("hopper.process._terminate_process_group") as mock_terminate,
+        ):
+            previous = _install_setup_sigterm_handler(proc)
+            handler = mock_signal.call_args.args[1]
+            with pytest.raises(SystemExit, match="143"):
+                handler(signal.SIGTERM, None)
+
+        assert previous == signal.SIG_DFL
+        mock_terminate.assert_called_once_with(proc)
 
 
 class TestStuckWorktreeSnapshot:

@@ -155,6 +155,37 @@ class TestBaseRunnerActivityMonitor:
         assert "No output for " in stuck_emissions[0][1]["status"]
         assert "s" in stuck_emissions[0][1]["status"]
 
+    def test_check_activity_gates_numbered_question_instead_of_killing(self):
+        """Claude AskUserQuestion UI is operator wait state, not a stuck stage."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "working"
+        runner._last_pane_activity_ms = current_time_ms() - 10 * 60_000
+        snapshot = (
+            "Which implementation should I use?\n"
+            "❯ 1. Keep compatibility\n"
+            "  2. Use the new format\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
+
+        emitted = []
+        mock_conn = MagicMock()
+        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
+        runner.connection = mock_conn
+
+        with patch("hopper.runner.capture_pane", return_value=snapshot):
+            runner._check_activity()
+
+        assert runner._gated.is_set()
+        assert runner._stuck_since is None
+        assert any(
+            event == "lode_set_state"
+            and body["state"] == "gated"
+            and body["status"] == "Awaiting operator answer"
+            for event, body in emitted
+        )
+        assert not any(body.get("state") == "stuck" for _, body in emitted)
+
     def test_check_activity_detects_running(self):
         """Monitor detects running state when pane content changes."""
         runner = self._make_runner()

@@ -22,7 +22,7 @@ def run_remote(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hop on a remote host over ssh and return the completed process."""
-    quoted_args = " ".join(shlex.quote(arg) for arg in hop_args)
+    quoted_args = " ".join(_quote_remote_arg(arg) for arg in hop_args)
     remote_command = 'export HOP_NO_ROUTE=1; exec "$HOME/.local/bin/hop"'
     if quoted_args:
         remote_command = f"{remote_command} {quoted_args}"
@@ -44,6 +44,15 @@ def run_remote(
     if stdin_text is not None:
         kwargs["input"] = stdin_text
     return subprocess.run(command, **kwargs)
+
+
+def _quote_remote_arg(arg: str) -> str:
+    """Quote one hop arg, expanding an explicitly preserved tilde remotely."""
+    if arg == "~":
+        return '"$HOME"'
+    if arg.startswith("~/"):
+        return f'"$HOME"/{shlex.quote(arg[2:])}'
+    return shlex.quote(arg)
 
 
 def remote_registry() -> dict[str, str]:

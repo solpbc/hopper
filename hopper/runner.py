@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -24,6 +25,17 @@ MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
 STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
 ABSOLUTE_CAP_MS = 60 * 60_000
+_QUESTION_SELECTOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.MULTILINE)
+_QUESTION_CHROME_RE = re.compile(
+    r"(?:↑/↓ to navigate|Esc to cancel|Enter to select|Type something)", re.IGNORECASE
+)
+
+
+def pane_needs_answer(snapshot: str) -> bool:
+    """Return whether a Claude pane is visibly waiting on a numbered answer."""
+    return bool(
+        snapshot and _QUESTION_SELECTOR_RE.search(snapshot) and _QUESTION_CHROME_RE.search(snapshot)
+    )
 
 
 def _parse_ps_time(raw: str) -> float | None:
@@ -490,6 +502,13 @@ class BaseRunner:
         if snapshot is None:
             logger.debug("Failed to capture pane, stopping monitor")
             self._monitor_stop.set()
+            return
+
+        if pane_needs_answer(snapshot):
+            self._last_snapshot = snapshot
+            self._stuck_since = None
+            self._emit_state("gated", "Awaiting operator answer")
+            self._gated.set()
             return
 
         now = current_time_ms()

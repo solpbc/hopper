@@ -718,7 +718,54 @@ def test_server_handles_lode_kill(socket_path, temp_config, make_lode):
     assert archived["pid"] is None
     mock_broadcast.assert_any_call({"type": "lode_updated", "lode": archived})
     mock_broadcast.assert_any_call({"type": "lode_archived", "lode": archived})
-    mock_cleanup.assert_called_once_with(archived)
+    mock_cleanup.assert_not_called()
+
+
+def test_server_pauses_lode_without_archiving(socket_path, temp_config, make_lode):
+    """Pause terminates the runner but retains the lode and worktree state."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state="running", active=True, tmux_pane="%1", pid=12345)
+    srv.lodes = [lode]
+    conn = MagicMock()
+
+    with (
+        patch("hopper.server.os.kill") as mock_os_kill,
+        patch("hopper.tmux.kill_pane", return_value=True) as mock_kill_pane,
+        patch.object(srv, "broadcast"),
+    ):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, conn)
+
+    mock_os_kill.assert_called_once_with(12345, signal.SIGTERM)
+    mock_kill_pane.assert_called_once_with("%1")
+    assert srv.archived_lodes == []
+    assert srv.lodes[0]["state"] == "paused"
+    assert srv.lodes[0]["active"] is False
+    assert _decode_mock_response(conn)["type"] == "lode_paused"
+
+
+def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config, make_lode):
+    """Resume spawns the preserved stage session without resetting it."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", stage="refine", state="paused", active=False, project="proj")
+    srv.lodes = [lode]
+    conn = MagicMock()
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/fake/repo", name="proj"),
+        ),
+        patch("hopper.server.spawn_claude", return_value="%2") as mock_spawn,
+        patch.object(srv, "broadcast"),
+    ):
+        srv._handle_mutation({"type": "lode_resume", "lode_id": "test-id"}, conn)
+
+    mock_spawn.assert_called_once_with("test-id", "/fake/repo", foreground=False)
+    assert srv.lodes[0]["state"] == "running"
+    assert srv.lodes[0]["status"] == "Resuming refine"
+    response = _decode_mock_response(conn)
+    assert response["type"] == "lode_resumed"
+    assert response["tmux_pane"] == "%2"
 
 
 def test_server_handles_lode_kill_missing_process(socket_path, temp_config, make_lode):
@@ -1665,8 +1712,8 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     assert response["submitted"] is True
 
 
-def test_lode_send_feedback_dead_pane_respawns(socket_path, make_lode):
-    """Dead pane feedback respawns Claude and sends feedback to the new pane."""
+def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
+    """Dead pane feedback stays gated and requires an explicit resume."""
     srv = Server(socket_path)
     lode = make_lode(
         id="test-id",
@@ -1678,38 +1725,29 @@ def test_lode_send_feedback_dead_pane_respawns(socket_path, make_lode):
     srv.lodes = [lode]
     conn = MagicMock()
 
-    def fake_spawn(_lode_id, _project_path, foreground=False):
-        assert foreground is False
-        lode["active"] = True
-        lode["tmux_pane"] = "%2"
-
     with (
-        patch(
-            "hopper.server.find_project",
-            return_value=Project(path="/fake/repo", name="proj"),
-        ),
         patch("hopper.server.capture_pane", return_value=None),
-        patch("hopper.server.spawn_claude", side_effect=fake_spawn) as mock_spawn,
+        patch("hopper.server.spawn_claude") as mock_spawn,
         patch("hopper.server.paste_buffer", return_value=True) as mock_paste_buffer,
         patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
-        patch("hopper.server.time.sleep"),
     ):
         srv._handle_mutation(
             {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Please revise"},
             conn,
         )
 
-    mock_spawn.assert_called_once_with("test-id", "/fake/repo", foreground=False)
-    mock_paste_buffer.assert_called_once_with("%2", "Please revise")
-    assert [call.args for call in mock_send_keys.call_args_list] == [("%2", "Enter")]
+    mock_spawn.assert_not_called()
+    mock_paste_buffer.assert_not_called()
+    mock_send_keys.assert_not_called()
+    assert srv.lodes[0]["state"] == "gated"
+    assert srv.lodes[0]["status"] == "Feedback blocked: pane unavailable"
     response = _decode_mock_response(conn)
-    assert response["type"] == "feedback_sent"
-    assert response["tmux_pane"] == "%2"
-    assert response["submitted"] is True
+    assert response["type"] == "error"
+    assert "hop lode resume test-id" in response["error"]
 
 
-def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
-    """Respawn failure returns an error response without sending keys."""
+def test_lode_send_feedback_unverified_paste_remains_gated(socket_path, make_lode):
+    """A paste race cannot advance the lode to running."""
     srv = Server(socket_path)
     srv.lodes = [
         make_lode(
@@ -1717,19 +1755,14 @@ def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
             stage="refine",
             state="gated",
             project="proj",
-            tmux_pane="%dead",
+            tmux_pane="%1",
         )
     ]
     conn = MagicMock()
 
     with (
-        patch(
-            "hopper.server.find_project",
-            return_value=Project(path="/fake/repo", name="proj"),
-        ),
-        patch("hopper.server.capture_pane", return_value=None),
-        patch("hopper.server.spawn_claude"),
-        patch("hopper.server.paste_buffer") as mock_paste_buffer,
+        patch("hopper.server.capture_pane", return_value="prompt ready"),
+        patch("hopper.server.paste_buffer", return_value=False) as mock_paste_buffer,
         patch("hopper.server.send_keys", return_value=True) as mock_send_keys,
         patch("hopper.server.time.sleep"),
     ):
@@ -1738,11 +1771,36 @@ def test_lode_send_feedback_respawn_failure(socket_path, make_lode):
             conn,
         )
 
+    mock_paste_buffer.assert_called_once_with("%1", "Please revise")
     mock_send_keys.assert_not_called()
-    mock_paste_buffer.assert_not_called()
+    assert srv.lodes[0]["state"] == "gated"
+    assert srv.lodes[0]["status"] == "Feedback not submitted; gate remains blocked"
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
-    assert response["error"] == "failed to respawn claude pane"
+    assert "gate remains blocked" in response["error"]
+
+
+def test_lode_send_feedback_pane_disappears_after_paste(socket_path, make_lode):
+    """A pane death after paste cannot be mistaken for successful submission."""
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
+    conn = MagicMock()
+
+    with (
+        patch("hopper.server.capture_pane", side_effect=["prompt ready", None]),
+        patch("hopper.server.paste_buffer", return_value=True),
+        patch("hopper.server.send_keys", return_value=True),
+        patch("hopper.server.time.sleep"),
+    ):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Please revise"},
+            conn,
+        )
+
+    assert srv.lodes[0]["state"] == "gated"
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert "gate remains blocked" in response["error"]
 
 
 def test_lode_send_feedback_missing_lode(socket_path):
