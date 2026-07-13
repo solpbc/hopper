@@ -262,30 +262,36 @@ def load_archived_lodes() -> list[dict]:
     return lodes
 
 
+def _write_jsonl_atomic(path: Path, items: list[dict]) -> None:
+    """Atomically write a complete JSONL snapshot using a writer-unique temp file."""
+    # Unique temps prevent concurrent writers from corrupting each other's
+    # snapshots, but writes remain last-writer-wins. A live-server
+    # `hop project rename` can still lose updates; this is sound only because
+    # the flock singleton removes server-vs-server concurrency.
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w") as f:
+            for item in items:
+                f.write(json.dumps(item) + "\n")
+            f.flush()
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def save_archived_lodes(lodes: list[dict]) -> None:
     """Atomically save archived lodes to JSONL file."""
-    archived_file = config.hopper_dir() / "archived.jsonl"
-    archived_file.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_path = archived_file.with_suffix(".jsonl.tmp")
-    with open(tmp_path, "w") as f:
-        for lode in lodes:
-            f.write(json.dumps(lode) + "\n")
-
-    os.replace(tmp_path, archived_file)
+    _write_jsonl_atomic(config.hopper_dir() / "archived.jsonl", lodes)
 
 
 def save_lodes(lodes: list[dict]) -> None:
     """Atomically save lodes to JSONL file."""
-    lodes_file = config.hopper_dir() / "active.jsonl"
-    lodes_file.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_path = lodes_file.with_suffix(".jsonl.tmp")
-    with open(tmp_path, "w") as f:
-        for lode in lodes:
-            f.write(json.dumps(lode) + "\n")
-
-    os.replace(tmp_path, lodes_file)
+    _write_jsonl_atomic(config.hopper_dir() / "active.jsonl", lodes)
 
 
 def _generate_lode_id(lodes: list[dict]) -> str:

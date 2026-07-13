@@ -4,9 +4,15 @@
 """Tests for lode management."""
 
 import json
+import os
 import shutil
+import socket
 import subprocess
+import sys
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -330,20 +336,160 @@ def test_unarchive_lode_not_found(temp_config):
     assert result is None
 
 
-def test_atomic_save(temp_config):
-    """Test that save is atomic (no temp file left behind)."""
+@pytest.mark.parametrize(
+    ("saver", "filename"),
+    [(save_lodes, "active.jsonl"), (save_archived_lodes, "archived.jsonl")],
+)
+def test_atomic_save(temp_config, saver, filename):
+    """Successful active and archived snapshots leave no temporary file."""
     lodes_list = [
         {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
     ]
-    save_lodes(lodes_list)
+    saver(lodes_list)
 
-    # No .tmp file should exist
-    tmp_file = temp_config / "active.jsonl.tmp"
-    assert not tmp_file.exists()
+    assert not list(temp_config.glob(f"{filename}.*.tmp"))
+    assert (temp_config / filename).read_text() == json.dumps(lodes_list[0]) + "\n"
 
-    # Main file should exist
-    main_file = temp_config / "active.jsonl"
-    assert main_file.exists()
+
+@pytest.mark.parametrize(
+    ("saver", "filename"),
+    [(save_lodes, "active.jsonl"), (save_archived_lodes, "archived.jsonl")],
+)
+@pytest.mark.parametrize("phase", ["write", "flush", "close"])
+def test_atomic_save_cleans_temp_after_stream_failure(temp_config, saver, filename, phase):
+    """Write, flush, and close failures remove only the writer's temp and re-raise."""
+    temp_path = temp_config / f"{filename}.fixed.tmp"
+    temp_path.write_text("partial")
+    stream = MagicMock()
+    context = MagicMock()
+    context.__enter__.return_value = stream
+    error = OSError(f"{phase} failed")
+    if phase == "write":
+        stream.write.side_effect = error
+    elif phase == "flush":
+        stream.flush.side_effect = error
+    else:
+        context.__exit__.side_effect = error
+
+    with (
+        patch("hopper.lodes.uuid.uuid4", return_value=SimpleNamespace(hex="fixed")),
+        patch("builtins.open", return_value=context),
+    ):
+        with pytest.raises(OSError) as exc_info:
+            saver([{"id": "payload"}])
+
+    assert exc_info.value is error
+    assert not temp_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("saver", "filename"),
+    [(save_lodes, "active.jsonl"), (save_archived_lodes, "archived.jsonl")],
+)
+def test_atomic_save_cleans_temp_after_replace_failure(temp_config, saver, filename):
+    """A failed replacement is attempted once, cleaned up, and re-raised."""
+    error = OSError("replace failed")
+    with (
+        patch("hopper.lodes.uuid.uuid4", return_value=SimpleNamespace(hex="fixed")),
+        patch("hopper.lodes.os.replace", side_effect=error) as mock_replace,
+    ):
+        with pytest.raises(OSError) as exc_info:
+            saver([{"id": "payload"}])
+
+    assert exc_info.value is error
+    mock_replace.assert_called_once()
+    assert not (temp_config / f"{filename}.fixed.tmp").exists()
+
+
+def test_concurrent_save_lodes_processes_use_independent_temps(tmp_path):
+    """Regression: blocked-at-replace writers fail on unpatched main's shared temp."""
+    child_code = r"""
+import json
+import socket
+import sys
+
+import hopper.lodes as lodes
+
+host, port, payload_json = sys.argv[1:]
+control = socket.create_connection((host, int(port)), timeout=10)
+control_file = control.makefile("rwb", buffering=0)
+control_file.write(b"READY\n")
+assert control_file.readline() == b"GO\n"
+original_replace = lodes.os.replace
+
+def synchronized_replace(source, target):
+    control_file.write(b"REPLACE_READY\n")
+    assert control_file.readline() == b"RELEASE\n"
+    original_replace(source, target)
+
+lodes.os.replace = synchronized_replace
+lodes.save_lodes(json.loads(payload_json))
+control_file.write(b"DONE\n")
+"""
+    xdg_home = tmp_path / "xdg"
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(10)
+    host, port = listener.getsockname()
+    payloads = [
+        [{"id": "writer-a", "value": "A" * 4096}],
+        [{"id": "writer-b", "value": "B" * 4096}],
+    ]
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = str(xdg_home)
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in [repo_root, env.get("PYTHONPATH", "")] if part
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", child_code, host, str(port), json.dumps(payload)],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for payload in payloads
+    ]
+    controls = []
+    files = []
+    try:
+        for _ in processes:
+            connection, _ = listener.accept()
+            connection.settimeout(10)
+            controls.append(connection)
+            files.append(connection.makefile("rwb", buffering=0))
+
+        assert [file.readline() for file in files] == [b"READY\n", b"READY\n"]
+        for file in files:
+            file.write(b"GO\n")
+        assert [file.readline() for file in files] == [
+            b"REPLACE_READY\n",
+            b"REPLACE_READY\n",
+        ]
+        for file in files:
+            file.write(b"RELEASE\n")
+        assert [file.readline() for file in files] == [b"DONE\n", b"DONE\n"]
+
+        results = [process.communicate(timeout=10) for process in processes]
+        assert [process.returncode for process in processes] == [0, 0], results
+    finally:
+        for file in files:
+            file.close()
+        for connection in controls:
+            connection.close()
+        listener.close()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    target = xdg_home / "hopper" / "active.jsonl"
+    expected_payloads = {(json.dumps(payload[0]) + "\n").encode("utf-8") for payload in payloads}
+    assert target.read_bytes() in expected_payloads
+    assert not list((xdg_home / "hopper").glob("active.jsonl*.tmp"))
 
 
 def test_get_lode_dir(temp_config):
