@@ -6,8 +6,17 @@
 import logging
 import os
 import subprocess
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+class Liveness(Enum):
+    """Observed liveness of a recorded tmux pane."""
+
+    ALIVE = "alive"
+    GONE = "gone"
+    UNKNOWN = "unknown"
 
 
 def is_inside_tmux() -> bool:
@@ -33,6 +42,24 @@ def get_tmux_sessions() -> list[str]:
         return [s.strip() for s in result.stdout.strip().split("\n") if s.strip()]
     except FileNotFoundError:
         return []
+
+
+def pane_liveness(pane_id: str) -> Liveness:
+    """Return whether a pane is alive, gone, or uncheckable."""
+    try:
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", pane_id],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return Liveness.UNKNOWN
+
+    if result.returncode == 0:
+        return Liveness.ALIVE
+    if result.stderr.strip().startswith("can't find pane"):
+        return Liveness.GONE
+    return Liveness.UNKNOWN
 
 
 def new_window(

@@ -5,7 +5,10 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from hopper.tmux import (
+    Liveness,
     capture_pane,
     get_current_pane_id,
     get_current_tmux_location,
@@ -13,10 +16,54 @@ from hopper.tmux import (
     is_inside_tmux,
     is_tmux_server_running,
     kill_pane,
+    pane_liveness,
     paste_buffer,
     rename_window,
     send_keys,
 )
+
+
+class TestPaneLiveness:
+    def test_alive_on_success(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stderr = ""
+
+            assert pane_liveness("%1") is Liveness.ALIVE
+
+        mock_run.assert_called_once_with(
+            ["tmux", "has-session", "-t", "%1"],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_gone_only_for_missing_pane(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stderr = "can't find pane: %9\n"
+
+            assert pane_liveness("%9") is Liveness.GONE
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "no server running on /tmp/tmux/default\n",
+            "error connecting to /tmp/tmux/default (No such file or directory)\n",
+            "permission denied\n",
+            "unexpected tmux failure\n",
+        ],
+    )
+    def test_unknown_for_other_tmux_failures(self, stderr):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stderr = stderr
+
+            assert pane_liveness("%1") is Liveness.UNKNOWN
+
+    @pytest.mark.parametrize("error", [FileNotFoundError(), PermissionError()])
+    def test_unknown_when_tmux_cannot_execute(self, error):
+        with patch("subprocess.run", side_effect=error):
+            assert pane_liveness("%1") is Liveness.UNKNOWN
 
 
 class TestIsInsideTmux:

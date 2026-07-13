@@ -96,6 +96,27 @@ def test_lode_to_row_uses_progress_summary_when_active():
     assert row.status_text == "codex thinking"
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        "spawn refused: tmux unreachable — run hop check abcd1234",
+        "spawn failed: tmux could not create a runner pane — run hop check abcd1234",
+    ],
+)
+def test_lode_to_row_spawn_status_overrides_stale_progress(status):
+    session = {
+        "id": "abcd1234",
+        "stage": "refine",
+        "created_at": 1000,
+        "state": "running",
+        "status": status,
+        "last_progress_summary": "stale runner progress",
+        "active": True,
+    }
+
+    assert lode_to_row(session).status_text == status
+
+
 def test_lode_to_row_stuck():
     """Stuck session has stuck status indicator."""
     session = {
@@ -744,14 +765,19 @@ async def test_archive_view_enter_unarchives_and_spawns(make_lode):
         archived_lodes=[make_lode(id="arch0001")],
     )
     app = HopperApp(server=server)
-    with patch("hopper.tui.spawn_claude", return_value=True) as mock_spawn:
-        async with app.run_test() as pilot:
-            await pilot.press("left")
-            assert app._archive_view is True
-            await pilot.press("enter")
+    async with app.run_test() as pilot:
+        await pilot.press("left")
+        assert app._archive_view is True
+        await pilot.press("enter")
 
-    assert server.events == [{"type": "lode_unarchive", "lode_id": "arch0001"}]
-    mock_spawn.assert_called_once_with("arch0001", None)
+    assert server.events == [
+        {
+            "type": "lode_unarchive",
+            "lode_id": "arch0001",
+            "spawn": True,
+            "foreground": False,
+        }
+    ]
     assert app._archive_view is False
 
 
@@ -2666,7 +2692,7 @@ async def test_mill_review_save_writes_file(temp_config):
 
 @pytest.mark.asyncio
 async def test_mill_review_process_spawns_refine(monkeypatch, temp_config):
-    """Process from review should write file and spawn refine in background."""
+    """Process writes the file and enqueues a background spawn."""
     from textual.widgets import TextArea
 
     from hopper.lodes import get_lode_dir
@@ -2683,13 +2709,6 @@ async def test_mill_review_process_spawns_refine(monkeypatch, temp_config):
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "mill_out.md").write_text("Mill output content")
 
-    spawned = []
-    monkeypatch.setattr(
-        "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=False: spawned.append(
-            {"sid": sid, "path": path, "fg": foreground}
-        ),
-    )
     monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
 
     server = MockServer([session])
@@ -2708,31 +2727,24 @@ async def test_mill_review_process_spawns_refine(monkeypatch, temp_config):
 
         # File should be updated
         assert (session_dir / "mill_out.md").read_text() == "Edited for processing"
-        # Should have spawned refine in background
-        assert len(spawned) == 1
-        assert spawned[0]["sid"] == session["id"]
-        assert spawned[0]["fg"] is False
+        assert server.events == [
+            {"type": "lode_spawn", "lode_id": session["id"], "foreground": False}
+        ]
 
 
 @pytest.mark.asyncio
 async def test_enter_on_non_ready_refine_spawns_directly(monkeypatch, temp_config):
-    """Enter on a refine session that is NOT ready should spawn directly."""
+    """Enter on an inactive refine session enqueues a background spawn."""
     session = {"id": "aaaa1111", "stage": "refine", "state": "running", "created_at": 1000}
-    spawned = []
-    monkeypatch.setattr(
-        "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=False: spawned.append({"sid": sid}),
-    )
     monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
 
     server = MockServer([session])
     app = HopperApp(server=server)
     async with app.run_test() as pilot:
         await pilot.press("enter")
-        # Should spawn directly, not open modal
-        assert not isinstance(app.screen, type(None))
-        assert len(spawned) == 1
-        assert spawned[0]["sid"] == session["id"]
+        assert server.events == [
+            {"type": "lode_spawn", "lode_id": session["id"], "foreground": False}
+        ]
 
 
 # Tests for LegendScreen
@@ -2943,7 +2955,7 @@ async def test_enter_on_ship_ready_opens_ship_review(temp_config):
 
 @pytest.mark.asyncio
 async def test_ship_review_ship_spawns_ship(monkeypatch, temp_config):
-    """Ship from review should spawn ship in background."""
+    """Ship from review should enqueue a background spawn."""
     from hopper.lodes import get_lode_dir
     from hopper.tui import ShipReviewScreen
 
@@ -2958,13 +2970,6 @@ async def test_ship_review_ship_spawns_ship(monkeypatch, temp_config):
     worktree = session_dir / "worktree"
     worktree.mkdir(parents=True, exist_ok=True)
 
-    spawned = []
-    monkeypatch.setattr(
-        "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=False: spawned.append(
-            {"sid": sid, "path": path, "fg": foreground}
-        ),
-    )
     monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
 
     server = MockServer([session])
@@ -2977,9 +2982,9 @@ async def test_ship_review_ship_spawns_ship(monkeypatch, temp_config):
             # Ship is focused by default
             await pilot.press("enter")
 
-            assert len(spawned) == 1
-            assert spawned[0]["sid"] == session["id"]
-            assert spawned[0]["fg"] is False
+            assert server.events == [
+                {"type": "lode_spawn", "lode_id": session["id"], "foreground": False}
+            ]
 
 
 @pytest.mark.asyncio
@@ -2999,13 +3004,6 @@ async def test_ship_review_refine_changes_stage_and_spawns(monkeypatch, temp_con
     worktree = session_dir / "worktree"
     worktree.mkdir(parents=True, exist_ok=True)
 
-    spawned = []
-    monkeypatch.setattr(
-        "hopper.tui.spawn_claude",
-        lambda sid, path, foreground=False: spawned.append(
-            {"sid": sid, "path": path, "fg": foreground}
-        ),
-    )
     monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
 
     server = MockServer([session])
@@ -3167,6 +3165,33 @@ def test_review_gate_on_dismiss_noop(temp_config):
 
     assert server.events == []
     assert isinstance(mock_push.call_args.args[0], GateReviewScreen)
+
+
+def test_review_gate_reopen_enqueues_foreground_spawn(temp_config):
+    from hopper.lodes import get_lode_dir
+
+    lode = {
+        "id": "gate1234",
+        "stage": "refine",
+        "state": "gated",
+        "created_at": 1000,
+        "tmux_pane": "%9",
+    }
+    lode_dir = get_lode_dir(lode["id"])
+    lode_dir.mkdir(parents=True, exist_ok=True)
+    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
+    server = MockServer([lode])
+    app = HopperApp(server=server)
+
+    with (
+        patch("hopper.tui.capture_pane", return_value=None),
+        patch.object(app, "push_screen") as mock_push,
+    ):
+        app._review_gate(lode)
+        callback = mock_push.call_args.args[1]
+        callback("reopen")
+
+    assert server.events == [{"type": "lode_spawn", "lode_id": "gate1234", "foreground": True}]
 
 
 @pytest.mark.asyncio

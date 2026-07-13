@@ -32,7 +32,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from hopper.backlog import BacklogItem
-from hopper.claude import spawn_claude, switch_to_pane
+from hopper.claude import switch_to_pane
 from hopper.git import get_diff_stat
 from hopper.lodes import (
     STATUS_DISCONNECTED,
@@ -117,7 +117,8 @@ def lode_to_row(lode: dict) -> Row:
     stage = lode.get("stage", "mill")
     status_text = lode.get("status", "")
     progress_text = lode.get("last_progress_summary", "")
-    if lode.get("active") and progress_text:
+    spawn_status = status_text.startswith(("spawn refused: ", "spawn failed: "))
+    if lode.get("active") and progress_text and not spawn_status:
         status_text = progress_text
 
     return Row(
@@ -1988,13 +1989,15 @@ class HopperApp(App):
                     break
             if not lode:
                 return
-            lode_project = lode.get("project", "")
-            project = find_project(lode_project) if lode_project else None
-            project_path = project.path if project else None
             if self.server:
-                self.server.enqueue({"type": "lode_unarchive", "lode_id": lode_id})
-            if not spawn_claude(lode_id, project_path):
-                self.notify("Failed to spawn tmux window", severity="error")
+                self.server.enqueue(
+                    {
+                        "type": "lode_unarchive",
+                        "lode_id": lode_id,
+                        "spawn": True,
+                        "foreground": False,
+                    }
+                )
             self.set_archive_view(False)
             return
         key = str(event.row_key.value)
@@ -2034,17 +2037,19 @@ class HopperApp(App):
                 self.notify("Failed to switch to window", severity="error")
         elif lode.get("stage") == "refine" and lode.get("state") == "ready":
             # Mill complete, ready for refine - review before starting
-            self._review_mill_output(lode, project_path)
+            self._review_mill_output(lode)
         elif lode.get("state") == "gated":
             # Lode paused at gate - show gate review modal
             self._review_gate(lode)
         elif lode.get("stage") == "ship" and lode.get("state") == "ready":
             # Refine complete, ready to ship - review changes before shipping
-            self._review_ship(lode, project_path)
+            self._review_ship(lode)
         else:
             # Lode is not active - spawn runner based on stage
-            if not spawn_claude(lode["id"], project_path):
-                self.notify("Failed to spawn tmux window", severity="error")
+            if self.server:
+                self.server.enqueue(
+                    {"type": "lode_spawn", "lode_id": lode["id"], "foreground": False}
+                )
 
         self.refresh_table()
 
@@ -2179,7 +2184,7 @@ class HopperApp(App):
 
         self.push_screen(BacklogEditScreen(initial_text=item.description), on_edit_result)
 
-    def _review_mill_output(self, lode: dict, project_path: str | None) -> None:
+    def _review_mill_output(self, lode: dict) -> None:
         """Open the mill output review modal for a refine-ready lode."""
         mill_path = get_lode_dir(lode["id"]) / "mill_out.md"
         if not mill_path.exists():
@@ -2196,8 +2201,10 @@ class HopperApp(App):
             tmp_path = mill_path.with_suffix(".md.tmp")
             tmp_path.write_text(text)
             os.replace(tmp_path, mill_path)
-            if action == "process":
-                spawn_claude(lode["id"], project_path, foreground=False)
+            if action == "process" and self.server:
+                self.server.enqueue(
+                    {"type": "lode_spawn", "lode_id": lode["id"], "foreground": False}
+                )
             self.refresh_table()
 
         self.push_screen(MillReviewScreen(initial_text=mill_text), on_review_result)
@@ -2221,14 +2228,14 @@ class HopperApp(App):
                 if not switch_to_pane(pane_id):
                     self.notify("Failed to switch to pane", severity="error")
             elif result == "reopen":
-                project = find_project(lode.get("project", ""))
-                project_path = project.path if project else None
-                if not spawn_claude(lode["id"], project_path, foreground=True):
-                    self.notify("Failed to respawn Claude pane", severity="error")
+                if self.server:
+                    self.server.enqueue(
+                        {"type": "lode_spawn", "lode_id": lode["id"], "foreground": True}
+                    )
 
         self.push_screen(GateReviewScreen(gate_text, pane_alive), on_review_result)
 
-    def _review_ship(self, lode: dict, project_path: str | None) -> None:
+    def _review_ship(self, lode: dict) -> None:
         """Open the ship review modal for a ship-ready lode."""
         worktree_path = get_worktree_dir(lode["id"])
         if not worktree_path.is_dir():
@@ -2240,8 +2247,10 @@ class HopperApp(App):
         def on_review_result(result: str | None) -> None:
             if result is None:
                 return  # Cancelled
-            if result == "ship":
-                spawn_claude(lode["id"], project_path, foreground=False)
+            if result == "ship" and self.server:
+                self.server.enqueue(
+                    {"type": "lode_spawn", "lode_id": lode["id"], "foreground": False}
+                )
             elif result == "refine":
                 if self.server:
                     self.server.enqueue({"type": "lode_resume_refine", "lode_id": lode["id"]})

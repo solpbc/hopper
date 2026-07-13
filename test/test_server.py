@@ -24,11 +24,14 @@ from hopper.config import save_config
 from hopper.lodes import save_archived_lodes, save_lodes
 from hopper.projects import Project, touch_project
 from hopper.server import (
+    PROGRESS_REJECT_STATES,
     Server,
     ServerLockHeld,
+    SpawnOutcome,
     get_git_hash,
     start_server_with_tui,
 )
+from hopper.tmux import Liveness
 
 
 class TestGetGitHash:
@@ -518,34 +521,534 @@ thread.join(timeout=2)
                 process.communicate()
 
 
+def test_startup_reconciliation_alive_preserves_identity_and_clears_refusal(socket_path, make_lode):
+    lode = make_lode(
+        id="alive-id",
+        active=True,
+        tmux_pane="%1",
+        pid=1234,
+        status="spawn refused: tmux unreachable — run hop check alive-id",
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.save_lodes") as mock_save,
+    ):
+        server._reconcile_startup_lodes()
+
+    assert lode["active"] is True
+    assert lode["tmux_pane"] == "%1"
+    assert lode["pid"] == 1234
+    assert lode["status"] == ""
+    assert lode["updated_at"] == 1000
+    mock_save.assert_called_once_with(server.lodes)
+
+
+def test_startup_reconciliation_gone_clears_identity(socket_path, make_lode):
+    lode = make_lode(id="gone-id", active=True, tmux_pane="%2", pid=2345)
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+        patch("hopper.server.save_lodes") as mock_save,
+    ):
+        server._reconcile_startup_lodes()
+
+    assert lode["active"] is False
+    assert lode["tmux_pane"] is None
+    assert lode["pid"] is None
+    assert lode["updated_at"] == 1000
+    mock_save.assert_called_once_with(server.lodes)
+
+
+def test_startup_reconciliation_unknown_preserves_identity_and_warns(
+    socket_path, make_lode, caplog
+):
+    lode = make_lode(
+        id="unknown-id",
+        state="running",
+        active=True,
+        tmux_pane="%3",
+        pid=3456,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    caplog.set_level(logging.WARNING)
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN),
+        patch("hopper.server.save_lodes") as mock_save,
+    ):
+        server._reconcile_startup_lodes()
+
+    assert lode["state"] == "running"
+    assert lode["active"] is True
+    assert lode["tmux_pane"] == "%3"
+    assert lode["pid"] == 3456
+    assert lode["status"] == "spawn refused: tmux unreachable — run hop check unknown-id"
+    assert lode["updated_at"] == 1000
+    assert "unknown-id" in caplog.text
+    mock_save.assert_called_once_with(server.lodes)
+
+
+def test_startup_reconciliation_without_pane_clears_unsupported_identity(socket_path, make_lode):
+    lode = make_lode(id="no-pane", active=True, tmux_pane=None, pid=4567)
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.pane_liveness") as mock_liveness,
+        patch("hopper.server.save_lodes") as mock_save,
+    ):
+        server._reconcile_startup_lodes()
+
+    mock_liveness.assert_not_called()
+    assert lode["active"] is False
+    assert lode["tmux_pane"] is None
+    assert lode["pid"] is None
+    assert lode["updated_at"] == 1000
+    mock_save.assert_called_once_with(server.lodes)
+
+
+def test_startup_reconciliation_mixed_lodes_saves_once(socket_path, make_lode):
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(id="alive-id", active=True, tmux_pane="%1", pid=1),
+        make_lode(id="gone-id", active=True, tmux_pane="%2", pid=2),
+        make_lode(id="unknown-id", active=True, tmux_pane="%3", pid=3),
+        make_lode(id="no-pane", active=True, pid=4),
+    ]
+
+    with (
+        patch(
+            "hopper.server.pane_liveness",
+            side_effect=[Liveness.ALIVE, Liveness.GONE, Liveness.UNKNOWN],
+        ),
+        patch("hopper.server.save_lodes") as mock_save,
+    ):
+        server._reconcile_startup_lodes()
+
+    mock_save.assert_called_once_with(server.lodes)
+
+
+def test_gated_spawn_without_recorded_pane_spawns(socket_path, make_lode):
+    server = Server(socket_path)
+    lode = make_lode(id="fresh-id", active=False, tmux_pane=None, pid=None)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.spawn_claude", return_value="%10") as mock_spawn,
+        patch.object(server, "broadcast") as mock_broadcast,
+    ):
+        outcome, pane = server._gated_spawn(lode, "/repo", foreground=False)
+
+    assert outcome is SpawnOutcome.SPAWNED
+    assert pane == "%10"
+    assert lode["tmux_pane"] == "%10"
+    assert lode["active"] is False
+    assert lode["pid"] is None
+    mock_spawn.assert_called_once_with("fresh-id", "/repo", foreground=False)
+    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
+
+
+def test_gated_spawn_alive_refuses_even_when_active_is_false(socket_path, make_lode, caplog):
+    lode = make_lode(
+        id="incident-id",
+        stage="ship",
+        state="running",
+        status="Ship ready",
+        active=False,
+        tmux_pane="%11",
+        pid=1111,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    caplog.set_level(logging.WARNING)
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.spawn_claude") as mock_spawn,
+    ):
+        outcome, pane = server._gated_spawn(
+            lode,
+            "/repo",
+            spawn_updates={"stage": "refine", "state": "running"},
+        )
+
+    assert outcome is SpawnOutcome.ALREADY_LIVE
+    assert pane is None
+    mock_spawn.assert_not_called()
+    assert lode["stage"] == "ship"
+    assert lode["state"] == "running"
+    assert lode["active"] is False
+    assert lode["tmux_pane"] == "%11"
+    assert lode["pid"] == 1111
+    assert lode["updated_at"] == 1000
+    assert lode["status"] == ("spawn refused: runner already live in pane %11 — attach instead")
+    assert lode["state"] not in PROGRESS_REJECT_STATES
+    assert "attach instead of spawning" in caplog.text
+
+
+def test_gated_spawn_gone_clears_stale_identity_then_spawns(socket_path, make_lode):
+    lode = make_lode(id="gone-id", active=True, tmux_pane="%12", pid=1212)
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+        patch("hopper.server.spawn_claude", return_value="%13") as mock_spawn,
+    ):
+        outcome, pane = server._gated_spawn(lode, "/repo")
+
+    assert outcome is SpawnOutcome.SPAWNED
+    assert pane == "%13"
+    assert lode["active"] is False
+    assert lode["tmux_pane"] == "%13"
+    assert lode["pid"] is None
+    mock_spawn.assert_called_once()
+
+
+def test_gated_spawn_unknown_preserves_identity_and_refuses(socket_path, make_lode, caplog):
+    lode = make_lode(
+        id="unknown-id",
+        state="running",
+        active=True,
+        tmux_pane="%14",
+        pid=1414,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    caplog.set_level(logging.WARNING)
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN),
+        patch("hopper.server.spawn_claude") as mock_spawn,
+    ):
+        outcome, pane = server._gated_spawn(lode, "/repo")
+
+    assert outcome is SpawnOutcome.REFUSED_UNKNOWN
+    assert pane is None
+    mock_spawn.assert_not_called()
+    assert lode["state"] == "running"
+    assert lode["active"] is True
+    assert lode["tmux_pane"] == "%14"
+    assert lode["pid"] == 1414
+    assert lode["updated_at"] == 1000
+    assert lode["status"] == "spawn refused: tmux unreachable — run hop check unknown-id"
+    assert "unknown-id" in caplog.text
+
+
+def test_gated_spawn_failure_sets_visible_status(socket_path, make_lode, caplog):
+    lode = make_lode(id="failed-id")
+    server = Server(socket_path)
+    server.lodes = [lode]
+    caplog.set_level(logging.ERROR)
+
+    with patch("hopper.server.spawn_claude", return_value=None):
+        outcome, pane = server._gated_spawn(lode, None)
+
+    assert outcome is SpawnOutcome.FAILED
+    assert pane is None
+    assert lode["status"].startswith("spawn failed: ")
+    assert "hop check failed-id" in lode["status"]
+    assert "failed-id" in caplog.text
+
+
+def test_two_queued_spawn_requests_create_one_runner(socket_path, make_lode):
+    lode = make_lode(id="queued-id", project="proj")
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.find_project", return_value=None),
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.spawn_claude", return_value="%20") as mock_spawn,
+    ):
+        event_thread = threading.Thread(target=server._event_loop, daemon=True)
+        event_thread.start()
+        server.enqueue({"type": "lode_spawn", "lode_id": "queued-id"})
+        server.enqueue({"type": "lode_spawn", "lode_id": "queued-id"})
+
+        deadline = time.monotonic() + 2
+        while not lode["status"].startswith("spawn refused: ") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        server.stop_event.set()
+        event_thread.join(timeout=1)
+
+    mock_spawn.assert_called_once_with("queued-id", None, foreground=False)
+    assert lode["tmux_pane"] == "%20"
+
+
+def test_lode_spawn_action_passes_foreground_to_gate(socket_path, make_lode):
+    lode = make_lode(id="action-id", project="proj")
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
+        patch.object(server, "_gated_spawn") as mock_gate,
+    ):
+        server._handle_mutation(
+            {"type": "lode_spawn", "lode_id": "action-id", "foreground": True},
+            None,
+        )
+
+    mock_gate.assert_called_once_with(lode, "/repo", foreground=True)
+
+
+def test_unarchive_and_spawn_is_one_server_action(socket_path, make_lode):
+    lode = make_lode(id="restore-id", project="proj")
+    lode["archived_at"] = 2000
+    server = Server(socket_path)
+    server.archived_lodes = [lode]
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
+        patch.object(server, "_gated_spawn") as mock_gate,
+    ):
+        server._handle_mutation(
+            {
+                "type": "lode_unarchive",
+                "lode_id": "restore-id",
+                "spawn": True,
+                "foreground": False,
+            },
+            None,
+        )
+
+    assert server.archived_lodes == []
+    assert server.lodes == [lode]
+    assert "archived_at" not in lode
+    mock_gate.assert_called_once_with(lode, "/repo", foreground=False)
+
+
+def test_resume_refine_applies_updates_before_allowed_spawn(socket_path, make_lode):
+    lode = make_lode(id="refine-id", stage="ship", state="ready", project="proj")
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    def assert_updated_before_spawn(*args, **kwargs):
+        assert lode["stage"] == "refine"
+        assert lode["state"] == "running"
+        assert lode["status"] == "Resuming refine"
+        return "%21"
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
+        patch("hopper.server.spawn_claude", side_effect=assert_updated_before_spawn),
+    ):
+        server._handle_mutation({"type": "lode_resume_refine", "lode_id": "refine-id"}, None)
+
+    assert lode["stage"] == "refine"
+    assert lode["state"] == "running"
+    assert lode["tmux_pane"] == "%21"
+    assert lode["runs"]["refine"]["started_at"] > 0
+
+
+def test_resume_refine_refusal_leaves_stage_and_state_unchanged(socket_path, make_lode):
+    lode = make_lode(
+        id="refine-id",
+        stage="ship",
+        state="ready",
+        project="proj",
+        active=False,
+        tmux_pane="%22",
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch("hopper.server.find_project", return_value=None),
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.spawn_claude") as mock_spawn,
+    ):
+        server._handle_mutation({"type": "lode_resume_refine", "lode_id": "refine-id"}, None)
+
+    mock_spawn.assert_not_called()
+    assert lode["stage"] == "ship"
+    assert lode["state"] == "ready"
+    assert lode["tmux_pane"] == "%22"
+
+
+def test_resume_uses_gate_without_signaling_recorded_pid(socket_path, make_lode):
+    lode = make_lode(
+        id="resume-id",
+        stage="refine",
+        state="paused",
+        project="proj",
+        active=False,
+        tmux_pane="%dead",
+        pid=4242,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+        patch("hopper.server.spawn_claude", return_value="%26"),
+        patch("hopper.server.os.kill") as mock_kill,
+    ):
+        server._handle_mutation(
+            {"type": "lode_resume", "lode_id": "resume-id"},
+            None,
+        )
+
+    mock_kill.assert_not_called()
+    assert lode["state"] == "running"
+    assert lode["tmux_pane"] == "%26"
+    assert lode["pid"] is None
+
+
+def test_fresh_backlog_promotion_spawns_through_gate(socket_path):
+    item = BacklogItem(
+        id="backlog1",
+        project="proj",
+        description="Fresh work",
+        created_at=1000,
+    )
+    server = Server(socket_path)
+    server.backlog = [item]
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
+        patch("hopper.server.spawn_claude", return_value="%23") as mock_spawn,
+    ):
+        lode = server._promote_backlog_item(item)
+
+    assert lode["tmux_pane"] == "%23"
+    mock_spawn.assert_called_once_with(lode["id"], "/repo", foreground=False)
+
+
+def test_fresh_lode_create_spawns_through_gate(socket_path):
+    server = Server(socket_path)
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
+        patch("hopper.server.spawn_claude", return_value="%24") as mock_spawn,
+    ):
+        server._handle_mutation(
+            {"type": "lode_create", "project": "proj", "scope": "work", "spawn": True},
+            None,
+        )
+
+    lode = server.lodes[0]
+    assert lode["tmux_pane"] == "%24"
+    mock_spawn.assert_called_once_with(lode["id"], "/repo", foreground=False)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "spawn refused: tmux unreachable — run hop check register-id",
+        "spawn failed: tmux could not create a runner pane — run hop check register-id",
+    ],
+)
+def test_runner_registration_clears_spawn_status(socket_path, make_lode, status):
+    lode = make_lode(id="register-id", status=status)
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    server._register_lode_client("register-id", MagicMock(), tmux_pane="%25", pid=2525)
+
+    assert lode["status"] == ""
+    assert lode["active"] is True
+    assert lode["tmux_pane"] == "%25"
+    assert lode["pid"] == 2525
+
+
+def test_spawn_claude_has_one_production_caller():
+    hopper_dir = Path(__file__).resolve().parents[1] / "hopper"
+    source = (hopper_dir / "server.py").read_text()
+    assert source.count("spawn_claude(") == 1
+    assert sum(path.read_text().count("spawn_claude(") for path in hopper_dir.glob("*.py")) == 2
+
+
 def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
     """Server startup migrates shipped lodes from active to archived."""
-    shipped_lode = make_lode(id="test-id", stage="shipped")
+    shipped_lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        active=True,
+        tmux_pane="%1",
+        pid=1234,
+    )
     save_lodes([shipped_lode])
 
     srv = Server(socket_path)
-    thread = threading.Thread(target=srv.start, daemon=True)
-    thread.start()
+    with patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE):
+        thread = threading.Thread(target=srv.start, daemon=True)
+        thread.start()
 
-    try:
-        assert srv.ready.wait(5), "Server did not start"
+        try:
+            assert srv.ready.wait(5), "Server did not start"
 
-        assert srv.lodes == []
-        assert len(srv.archived_lodes) == 1
-        assert srv.archived_lodes[0]["id"] == "test-id"
-        assert "archived_at" in srv.archived_lodes[0]
+            assert srv.lodes == []
+            assert len(srv.archived_lodes) == 1
+            assert srv.archived_lodes[0]["id"] == "test-id"
+            assert "archived_at" in srv.archived_lodes[0]
 
-        archived_file = temp_config / "archived.jsonl"
-        assert archived_file.exists()
-        archived_entries = [
-            json.loads(line) for line in archived_file.read_text().splitlines() if line.strip()
-        ]
-        assert len(archived_entries) == 1
-        assert archived_entries[0]["id"] == "test-id"
-        assert "archived_at" in archived_entries[0]
-    finally:
-        srv.stop()
-        thread.join(timeout=2)
+            archived_file = temp_config / "archived.jsonl"
+            assert archived_file.exists()
+            archived_entries = [
+                json.loads(line) for line in archived_file.read_text().splitlines() if line.strip()
+            ]
+            assert len(archived_entries) == 1
+            assert archived_entries[0]["id"] == "test-id"
+            assert "archived_at" in archived_entries[0]
+        finally:
+            srv.stop()
+            thread.join(timeout=2)
+
+
+def test_startup_archives_shipped_lode_when_tmux_is_unknown(
+    socket_path, temp_config, make_lode, caplog
+):
+    """UNKNOWN runner evidence does not block lock-held shipped auto-archive."""
+    shipped_lode = make_lode(
+        id="unknown-shipped",
+        stage="shipped",
+        active=True,
+        tmux_pane="%9",
+        pid=9999,
+    )
+    save_lodes([shipped_lode])
+    server = Server(socket_path)
+    caplog.set_level(logging.WARNING)
+
+    with patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN):
+        thread = threading.Thread(target=server.start, daemon=True)
+        thread.start()
+        try:
+            assert server.ready.wait(5), "Server did not start"
+            assert server.lodes == []
+            assert server.archived_lodes[0]["id"] == "unknown-shipped"
+            assert server.archived_lodes[0]["status"].startswith("spawn refused: ")
+            assert "unknown-shipped" in caplog.text
+        finally:
+            server.stop()
+            thread.join(timeout=2)
 
 
 def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode):
@@ -1216,7 +1719,7 @@ def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, ma
         )
     ]
 
-    with patch("hopper.server.spawn_claude") as mock_spawn:
+    with patch("hopper.server.spawn_claude", return_value="%30") as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -1361,7 +1864,7 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
     )
     server.backlog = [newer, older]
 
-    with patch("hopper.server.spawn_claude") as mock_spawn:
+    with patch("hopper.server.spawn_claude", return_value="%31") as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -1426,7 +1929,7 @@ def test_auto_promote_chains_multiple_queued_items(socket_path, server, temp_con
     )
     server.backlog = [item_c, item_b, item_a]  # intentionally out of order
 
-    with patch("hopper.server.spawn_claude") as mock_spawn:
+    with patch("hopper.server.spawn_claude", return_value="%32") as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -1678,7 +2181,7 @@ def test_auto_spawn_on_disconnect(socket_path, server, temp_config, make_lode):
 
     with (
         patch("hopper.server.find_project") as mock_find,
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value="%33") as mock_spawn,
     ):
         mock_find.return_value = MagicMock(path="/some/path")
 
