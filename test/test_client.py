@@ -251,7 +251,7 @@ def test_set_lode_progress_sends_message(server, socket_path):
 
 def test_set_lode_progress_rejected_for_error_lode(server, socket_path):
     """The real socket path leaves heartbeat fields unchanged for dead lodes."""
-    session = {
+    rejected_session = {
         "id": "test-id",
         "stage": "mill",
         "created_at": 1000,
@@ -260,16 +260,30 @@ def test_set_lode_progress_rejected_for_error_lode(server, socket_path):
         "last_progress_at": 123,
         "last_progress_summary": "existing",
     }
-    server.lodes = [session]
+    accepted_session = {
+        "id": "accepted-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "state": "running",
+    }
+    server.lodes = [rejected_session, accepted_session]
 
     result = set_lode_progress(socket_path, "test-id", "zombie")
     assert result is True
+    result = set_lode_progress(socket_path, "accepted-id", "alive")
+    assert result is True
 
-    time.sleep(0.1)
+    for _ in range(100):
+        if accepted_session.get("last_progress_at") is not None:
+            break
+        time.sleep(0.01)
+    else:
+        raise TimeoutError("Server did not process accepted progress heartbeat")
 
-    assert server.lodes[0]["last_progress_at"] == 123
-    assert server.lodes[0]["last_progress_summary"] == "existing"
-    assert server.lodes[0]["updated_at"] == 1000
+    assert accepted_session["last_progress_summary"] == "alive"
+    assert rejected_session["last_progress_at"] == 123
+    assert rejected_session["last_progress_summary"] == "existing"
+    assert rejected_session["updated_at"] == 1000
 
 
 def test_set_lode_progress_bogus_socket_returns_false():

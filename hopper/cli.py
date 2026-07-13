@@ -1885,7 +1885,7 @@ def cmd_lode(args: list[str]) -> int:
             print(f"Cannot restart: lode {lode_id} stage is {stage}")
             return 1
         started = bool(lode.get("claude", {}).get(stage, {}).get("started"))
-        if started and not parsed.force:
+        if started and not parsed.force and lode.get("state") != "error":
             print(f"Lode {lode_id} has been started (claude[{stage}].started=True).")
             print("Restarting discards in-progress work.")
             print("Pass --force to override:")

@@ -148,7 +148,7 @@ class TestPsCpuHelpers:
         with patch("hopper.runner.subprocess.run", return_value=result):
             assert _descendant_pids(10) == [11, 12]
 
-    def test_descendant_pids_returns_empty_on_ps_failure(self):
+    def test_descendant_pids_returns_empty_and_warns_on_ps_failure(self, caplog):
         failed = MagicMock(returncode=1, stdout="")
 
         with patch("hopper.runner.subprocess.run", return_value=failed):
@@ -157,6 +157,12 @@ class TestPsCpuHelpers:
             assert _descendant_pids(10) == []
         with patch("hopper.runner.subprocess.run", side_effect=subprocess.SubprocessError):
             assert _descendant_pids(10) == []
+
+        assert caplog.messages == [
+            "ps failed; descendant cleanup degraded to parent-only (exit code 1)",
+            "ps failed; descendant cleanup degraded to parent-only (FileNotFoundError: )",
+            "ps failed; descendant cleanup degraded to parent-only (SubprocessError: )",
+        ]
 
 
 class TestDescendantTermination:
@@ -212,7 +218,7 @@ class TestDescendantTermination:
 
         mock_kill.assert_called_once_with(2001, signal.SIGTERM)
 
-    def test_permission_errors_are_tolerated(self):
+    def test_permission_errors_are_tolerated_and_logged(self, caplog):
         runner = self._make_runner()
         runner._claude_proc.terminate.side_effect = PermissionError
         runner._claude_proc.wait.side_effect = [
@@ -234,6 +240,12 @@ class TestDescendantTermination:
             call(2001, 0),
             call(2001, signal.SIGKILL),
         ]
+        for message in (
+            "Permission denied sending SIGTERM to descendant pid=2001",
+            "Permission denied probing descendant pid=2001",
+            "Permission denied sending SIGKILL to descendant pid=2001",
+        ):
+            assert message in caplog.messages
 
 
 class TestBaseRunnerActivityMonitor:
@@ -372,6 +384,23 @@ class TestBaseRunnerActivityMonitor:
                 "so no snapshot was created. Restart with: hop lode restart test-session",
             )
         ]
+
+    def test_run_claude_stuck_recovery_wait_timeout_returns_current_error(self, caplog):
+        runner = self._make_runner()
+        runner._stuck_error = "stuck reason"
+        proc = MagicMock(returncode=1, stderr=None)
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], None)),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+            patch("hopper.runner.STUCK_FAILURE_WAIT_SEC", 0),
+        ):
+            result = runner._run_claude()
+
+        assert result == (1, "stuck reason")
+        assert "timed out waiting for stuck recovery lode=test-session" in caplog.messages
 
     def test_subprocess_env_disables_claude_auto_memory(self):
         """Managed Hopper stages disable Claude Code auto-memory."""

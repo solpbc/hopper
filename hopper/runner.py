@@ -91,9 +91,15 @@ def _descendant_pids(root_pid: int) -> list[int]:
             capture_output=True,
             text=True,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            f"ps failed; descendant cleanup degraded to parent-only ({type(exc).__name__}: {exc})"
+        )
         return []
     if result.returncode != 0:
+        logger.warning(
+            f"ps failed; descendant cleanup degraded to parent-only (exit code {result.returncode})"
+        )
         return []
 
     children: dict[int, list[int]] = {}
@@ -681,15 +687,19 @@ class BaseRunner:
         descendants = _descendant_pids(proc.pid)
         try:
             proc.terminate()
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             pass
+        except PermissionError:
+            logger.debug(f"Permission denied terminating Claude process pid={proc.pid}")
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             try:
                 proc.kill()
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
+            except PermissionError:
+                logger.debug(f"Permission denied killing Claude process pid={proc.pid}")
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -702,7 +712,7 @@ class BaseRunner:
             except ProcessLookupError:
                 continue
             except PermissionError:
-                pass
+                logger.warning(f"Permission denied sending SIGTERM to descendant pid={pid}")
             survivors.append(pid)
 
         deadline = time.monotonic() + DESCENDANT_TERM_GRACE_SEC
@@ -717,7 +727,7 @@ class BaseRunner:
                 except ProcessLookupError:
                     continue
                 except PermissionError:
-                    pass
+                    logger.warning(f"Permission denied probing descendant pid={pid}")
                 alive.append(pid)
             survivors = alive
             if survivors:
@@ -726,5 +736,7 @@ class BaseRunner:
         for pid in survivors:
             try:
                 os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
+            except PermissionError:
+                logger.warning(f"Permission denied sending SIGKILL to descendant pid={pid}")

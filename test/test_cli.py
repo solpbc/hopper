@@ -1435,6 +1435,24 @@ def test_lode_restart_force_proceeds_when_started(capsys):
     assert "Restarting mill for test1234" in capsys.readouterr().out
 
 
+def test_lode_restart_error_proceeds_when_started_without_force(capsys):
+    """An inactive failed stage can restart without forcing work discard."""
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "claude": {"mill": {"started": True}},
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
+                result = cmd_lode(["restart", "test1234"])
+    assert result == 0
+    mock_restart.assert_called_once()
+    assert "Restarting mill for test1234" in capsys.readouterr().out
+
+
 def test_lode_log_happy(temp_config, capsys):
     log_file = temp_config / "activity.log"
     log_file.write_text(
