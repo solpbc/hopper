@@ -237,7 +237,7 @@ def test_set_lode_state_sends_message(server, socket_path):
 
 def test_set_lode_progress_sends_message(server, socket_path):
     """set_lode_progress updates heartbeat fields through the server."""
-    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "running"}
     server.lodes = [session]
 
     result = set_lode_progress(socket_path, "test-id", "codex thinking")
@@ -247,6 +247,29 @@ def test_set_lode_progress_sends_message(server, socket_path):
 
     assert server.lodes[0]["last_progress_summary"] == "codex thinking"
     assert server.lodes[0]["last_progress_at"] is not None
+
+
+def test_set_lode_progress_rejected_for_error_lode(server, socket_path):
+    """The real socket path leaves heartbeat fields unchanged for dead lodes."""
+    session = {
+        "id": "test-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "updated_at": 1000,
+        "state": "error",
+        "last_progress_at": 123,
+        "last_progress_summary": "existing",
+    }
+    server.lodes = [session]
+
+    result = set_lode_progress(socket_path, "test-id", "zombie")
+    assert result is True
+
+    time.sleep(0.1)
+
+    assert server.lodes[0]["last_progress_at"] == 123
+    assert server.lodes[0]["last_progress_summary"] == "existing"
+    assert server.lodes[0]["updated_at"] == 1000
 
 
 def test_set_lode_progress_bogus_socket_returns_false():

@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from hopper.client import HopperConnection, connect
@@ -24,6 +25,8 @@ MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
 STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
 ABSOLUTE_CAP_MS = 60 * 60_000
+DESCENDANT_TERM_GRACE_SEC = 5.0
+DESCENDANT_POLL_INTERVAL_SEC = 0.1
 
 
 def _parse_ps_time(raw: str) -> float | None:
@@ -49,6 +52,48 @@ def _parse_ps_time(raw: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def _walk_descendant_pids(root_pid: int, children: dict[int, list[int]]) -> list[int]:
+    """Walk a parent-to-children map, excluding root_pid from the result."""
+    descendants: list[int] = []
+    seen = {root_pid}
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        descendants.append(pid)
+        stack.extend(children.get(pid, []))
+    return descendants
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Return all descendant process IDs of root_pid."""
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return _walk_descendant_pids(root_pid, children)
 
 
 def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
@@ -84,16 +129,7 @@ def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
         children.setdefault(ppid, []).append(pid)
         times[pid] = parsed
 
-    total = 0.0
-    seen = {root_pid}
-    stack = list(children.get(root_pid, []))
-    while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        total += times.get(pid, 0.0)
-        stack.extend(children.get(pid, []))
+    total = sum(times.get(pid, 0.0) for pid in _walk_descendant_pids(root_pid, children))
     return int(total * 1000)
 
 
@@ -570,12 +606,53 @@ class BaseRunner:
         if proc is None or proc.poll() is not None:
             return
 
-        proc.terminate()
+        descendants = _descendant_pids(proc.pid)
+        try:
+            proc.terminate()
+        except (ProcessLookupError, PermissionError):
+            pass
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                proc.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logger.debug("Claude process did not exit after SIGKILL")
+
+        survivors = []
+        for pid in descendants:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass
+            survivors.append(pid)
+
+        deadline = time.monotonic() + DESCENDANT_TERM_GRACE_SEC
+        while survivors:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            alive = []
+            for pid in survivors:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    pass
+                alive.append(pid)
+            survivors = alive
+            if survivors:
+                time.sleep(min(DESCENDANT_POLL_INTERVAL_SEC, remaining))
+
+        for pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass

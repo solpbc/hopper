@@ -725,7 +725,7 @@ def test_set_lode_claude_started_invalid_stage(temp_config):
 
 
 def test_reset_lode_claude_stage(temp_config):
-    """reset_lode_claude_stage resets session and started flag, then touches timestamp."""
+    """reset_lode_claude_stage resets session, start, and heartbeat fields."""
     lodes_list = [
         {
             "id": "testid11",
@@ -733,6 +733,8 @@ def test_reset_lode_claude_stage(temp_config):
             "created_at": 1000,
             "updated_at": 1000,
             "state": "running",
+            "last_progress_at": 900,
+            "last_progress_summary": "codex running",
             "claude": {"mill": {"session_id": "session-1", "started": True}},
         }
     ]
@@ -743,12 +745,16 @@ def test_reset_lode_claude_stage(temp_config):
     assert updated is not None
     assert updated["claude"]["mill"]["started"] is False
     assert updated["claude"]["mill"]["session_id"] != "session-1"
+    assert updated["last_progress_at"] is None
+    assert updated["last_progress_summary"] == ""
     uuid.UUID(updated["claude"]["mill"]["session_id"])
     assert updated["updated_at"] > 1000
 
     loaded = load_lodes()
     assert loaded[0]["claude"]["mill"]["started"] is False
     assert loaded[0]["claude"]["mill"]["session_id"] != "session-1"
+    assert loaded[0]["last_progress_at"] is None
+    assert loaded[0]["last_progress_summary"] == ""
 
 
 def test_reset_lode_claude_stage_not_found(temp_config):

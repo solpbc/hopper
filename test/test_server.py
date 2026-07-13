@@ -4,6 +4,7 @@
 """Tests for the hopper server."""
 
 import json
+import logging
 import signal
 import socket
 import threading
@@ -586,7 +587,7 @@ def test_server_handles_lode_set_state(socket_path, server, temp_config, make_lo
 
 def test_server_handles_lode_set_progress(socket_path, server, temp_config, make_lode):
     """Server stores truncated progress heartbeats and broadcasts lode_updated."""
-    lode = make_lode(id="test-id")
+    lode = make_lode(id="test-id", state="running")
     server.lodes = [lode]
     save_lodes(server.lodes)
 
@@ -614,6 +615,61 @@ def test_server_handles_lode_set_progress(socket_path, server, temp_config, make
     assert server.lodes[0]["last_progress_at"] is not None
 
     client.close()
+
+
+@pytest.mark.parametrize("state", ["running", "stuck", "audit"])
+def test_server_accepts_progress_for_live_states(socket_path, make_lode, state):
+    """Running, stuck, and freeform task states accept progress heartbeats."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state=state)
+    srv.lodes = [lode]
+
+    with (
+        patch("hopper.server.save_lodes") as mock_save,
+        patch.object(srv, "broadcast") as mock_broadcast,
+    ):
+        srv._handle_mutation(
+            {"type": "lode_set_progress", "lode_id": "test-id", "summary": "working"},
+            None,
+        )
+
+    assert lode["last_progress_at"] is not None
+    assert lode["last_progress_summary"] == "working"
+    mock_save.assert_called_once_with(srv.lodes)
+    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
+
+
+@pytest.mark.parametrize("state", ["new", "gated", "ready", "completed", "error"])
+def test_server_rejects_progress_for_terminal_or_inactive_states(
+    socket_path, make_lode, state, caplog
+):
+    """Zombie heartbeats cannot mutate, persist, or broadcast inactive lodes."""
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        state=state,
+        updated_at=234,
+        last_progress_at=123,
+        last_progress_summary="existing",
+    )
+    srv.lodes = [lode]
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="hopper.server"),
+        patch("hopper.server.save_lodes") as mock_save,
+        patch.object(srv, "broadcast") as mock_broadcast,
+    ):
+        srv._handle_mutation(
+            {"type": "lode_set_progress", "lode_id": "test-id", "summary": "zombie"},
+            None,
+        )
+
+    assert lode["last_progress_at"] == 123
+    assert lode["last_progress_summary"] == "existing"
+    assert lode["updated_at"] == 234
+    mock_save.assert_not_called()
+    mock_broadcast.assert_not_called()
+    assert f"Ignoring progress heartbeat for lode test-id in state={state}" in caplog.messages
 
 
 def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lode):

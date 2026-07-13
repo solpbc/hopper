@@ -3,12 +3,19 @@
 
 """Tests for the base runner module."""
 
+import signal
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from hopper.lodes import current_time_ms
-from hopper.runner import BaseRunner, _parse_ps_time, _sum_descendant_cpu_ms, extract_error_message
+from hopper.runner import (
+    BaseRunner,
+    _descendant_pids,
+    _parse_ps_time,
+    _sum_descendant_cpu_ms,
+    extract_error_message,
+)
 
 
 class TestExtractErrorMessage:
@@ -108,6 +115,123 @@ class TestPsCpuHelpers:
         with patch("hopper.runner.subprocess.run", side_effect=subprocess.SubprocessError):
             assert _sum_descendant_cpu_ms(10) is None
         assert _sum_descendant_cpu_ms(None) is None
+
+    def test_descendant_pids_walks_nested_tree_and_skips_bad_rows(self):
+        result = MagicMock(returncode=0)
+        result.stdout = "\n".join(
+            [
+                "10 1",
+                "11 10",
+                "12 11",
+                "13 10",
+                "bad row",
+                "14 nope",
+                "15 11 extra",
+            ]
+        )
+
+        with patch("hopper.runner.subprocess.run", return_value=result) as mock_run:
+            assert _descendant_pids(10) == [13, 11, 12]
+
+        mock_run.assert_called_once_with(
+            ["ps", "-Ao", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_descendant_pids_cycle_does_not_loop_or_include_root(self):
+        result = MagicMock(returncode=0)
+        result.stdout = "\n".join(["10 12", "11 10", "12 11"])
+
+        with patch("hopper.runner.subprocess.run", return_value=result):
+            assert _descendant_pids(10) == [11, 12]
+
+    def test_descendant_pids_returns_empty_on_ps_failure(self):
+        failed = MagicMock(returncode=1, stdout="")
+
+        with patch("hopper.runner.subprocess.run", return_value=failed):
+            assert _descendant_pids(10) == []
+        with patch("hopper.runner.subprocess.run", side_effect=FileNotFoundError):
+            assert _descendant_pids(10) == []
+        with patch("hopper.runner.subprocess.run", side_effect=subprocess.SubprocessError):
+            assert _descendant_pids(10) == []
+
+
+class TestDescendantTermination:
+    def _make_runner(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._claude_proc = MagicMock(pid=1234)
+        runner._claude_proc.poll.return_value = None
+        return runner
+
+    def test_descendants_get_term_then_survivors_get_kill(self):
+        runner = self._make_runner()
+        runner._claude_proc.wait.side_effect = [
+            subprocess.TimeoutExpired("claude", 5),
+            None,
+        ]
+        events = []
+
+        def descendants(pid):
+            events.append(("collect", pid))
+            return [2001, 2002]
+
+        runner._claude_proc.terminate.side_effect = lambda: events.append(("parent-term", 1234))
+
+        def send_signal(pid, sig):
+            events.append(("signal", pid, sig))
+            if sig == 0 and pid == 2001:
+                raise ProcessLookupError
+
+        with (
+            patch("hopper.runner._descendant_pids", side_effect=descendants),
+            patch("hopper.runner.os.kill", side_effect=send_signal),
+            patch("hopper.runner.time.monotonic", side_effect=[0.0, 0.0, 6.0]),
+            patch("hopper.runner.time.sleep"),
+        ):
+            runner._terminate_claude_process()
+
+        assert events[:2] == [("collect", 1234), ("parent-term", 1234)]
+        runner._claude_proc.kill.assert_called_once()
+        assert runner._claude_proc.wait.call_args_list == [call(timeout=5), call(timeout=5)]
+        assert ("signal", 2001, signal.SIGTERM) in events
+        assert ("signal", 2002, signal.SIGTERM) in events
+        assert ("signal", 2001, signal.SIGKILL) not in events
+        assert ("signal", 2002, signal.SIGKILL) in events
+
+    def test_already_dead_descendant_is_tolerated(self):
+        runner = self._make_runner()
+
+        with (
+            patch("hopper.runner._descendant_pids", return_value=[2001]),
+            patch("hopper.runner.os.kill", side_effect=ProcessLookupError) as mock_kill,
+        ):
+            runner._terminate_claude_process()
+
+        mock_kill.assert_called_once_with(2001, signal.SIGTERM)
+
+    def test_permission_errors_are_tolerated(self):
+        runner = self._make_runner()
+        runner._claude_proc.terminate.side_effect = PermissionError
+        runner._claude_proc.wait.side_effect = [
+            subprocess.TimeoutExpired("claude", 5),
+            None,
+        ]
+        runner._claude_proc.kill.side_effect = PermissionError
+
+        with (
+            patch("hopper.runner._descendant_pids", return_value=[2001]),
+            patch("hopper.runner.os.kill", side_effect=PermissionError) as mock_kill,
+            patch("hopper.runner.time.monotonic", side_effect=[0.0, 0.0, 6.0]),
+            patch("hopper.runner.time.sleep"),
+        ):
+            runner._terminate_claude_process()
+
+        assert mock_kill.call_args_list == [
+            call(2001, signal.SIGTERM),
+            call(2001, 0),
+            call(2001, signal.SIGKILL),
+        ]
 
 
 class TestBaseRunnerActivityMonitor:
