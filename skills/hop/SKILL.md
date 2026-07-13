@@ -239,11 +239,32 @@ dialog. Recovery: `hop lode answer <lode-id> 1` (accepts the prompt); the
 lode then proceeds normally, and later lodes on the same project don't hit
 it again.
 
+**Long output-silent test runs can still be killed at ~351s (open bug).** A stage
+that sits inside a long, quiet command — a full `make ci` on a large suite is the
+canonical case — can be killed with `No output or progress for 351s` even while
+the test run is burning CPU. That 351s is structural, not tuned: `IDLE_THRESHOLD`
+(50s) + `STUCK_FAIL_THRESHOLD` (300s). Descendant-CPU credit exists precisely to
+cover this and is supposed to prevent it, but was observed not to apply
+(2026-07-12, lode `4x676kjo`, ship stage, twice). Recovery: **don't re-run the
+stage from scratch** — a stuck-kill auto-snapshots the worktree to the lode
+branch, so the work is already committed there; finish the ship by hand (merge +
+verify). Root-cause spike is tracked in the extro repo (`cto/roadmap.md`).
+
+**`hop check` does not protect liveness — it makes the pane quieter.** `hop check`
+buffers stdout+stderr and prints only the tail *after* the command exits. Its job
+is preserving the real exit status (killing the `| tail` false-green), and it does
+that well — but it produces **zero** pane output for the entire run, so it removes
+pane activity rather than supplying it. It does not defend against the timeout
+above; it depends on descendant-CPU credit working. If you need pane activity
+during a long gate, stream the output.
+
 Hopper's liveness model uses pane-diff activity, in-flight Codex exec
 heartbeats, and descendant-process CPU activity. Pane and heartbeat silence are
 the real foreground signals; descendant CPU can keep a lode `running` while
-background work is active. If pane and heartbeat stay silent for 60 minutes,
-Hopper applies an absolute cap even if descendant CPU is still accruing.
+background work is active. Heartbeats are event-driven, so a single long exec
+emits none — inside one long command, descendant CPU is the *only* defense. If
+pane and heartbeat stay silent for 60 minutes, Hopper applies an absolute cap
+even if descendant CPU is still accruing.
 
 If a senior Claude stage stays stuck past the runner timeout, Hopper terminates
 it, marks the lode `error`, and releases `active` so `hop restart <id>` can
