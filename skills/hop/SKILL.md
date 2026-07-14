@@ -280,9 +280,13 @@ error); `hop lode status <id>` surfaces the record. Worktree cleanup also
 refuses to destroy a dirty worktree; it retains the path and logs a warning
 instead.
 
-Refine setup also bounds `make install` and Codex bootstrap. If setup hits its
-timeout, the lode errors with the captured output tail instead of remaining
-active at "Running make install...".
+Refine setup bounds `make install` with a 20-minute **inactivity** timeout and a
+60-minute absolute cap. Command output and descendant CPU count as progress on
+every host; Linux also observes process-tree I/O. A moving artifact download
+can therefore cross 20 minutes while a wedged download still fails. The lode
+error distinguishes inactivity from the absolute cap and includes the captured
+output tail instead of remaining active at "Running make install...". Codex
+bootstrap is bounded separately.
 
 `hop code` prints a `CODEX TURN FAILED` banner when the backend fails a turn.
 Usage-limit failures are fleet-wide because Hopper uses one shared Codex seat

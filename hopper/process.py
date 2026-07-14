@@ -9,6 +9,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from hopper import config, prompt
@@ -23,11 +24,13 @@ from hopper.git import (
     quarantine_dirty_repo,
 )
 from hopper.lodes import get_lode_dir, get_worktree_dir, slugify
-from hopper.runner import BaseRunner
+from hopper.runner import BaseRunner, _descendant_pids, _sum_descendant_cpu_ms
 
 logger = logging.getLogger(__name__)
 
-SETUP_COMMAND_TIMEOUT_SEC = 20 * 60
+SETUP_COMMAND_IDLE_TIMEOUT_SEC = 20 * 60
+SETUP_COMMAND_ABSOLUTE_TIMEOUT_SEC = 60 * 60
+SETUP_MONITOR_INTERVAL_SEC = 5.0
 SETUP_OUTPUT_TAIL_BYTES = 64 * 1024
 SETUP_OUTPUT_TAIL_LINES = 20
 QUARANTINE_STATUS = "Quarantined dirty project repo to branch {branch}; continuing"
@@ -39,7 +42,7 @@ def _has_makefile(worktree_path: Path) -> bool:
 
 
 def _run_make_install(
-    worktree_path: Path, timeout_sec: float = SETUP_COMMAND_TIMEOUT_SEC
+    worktree_path: Path, timeout_sec: float = SETUP_COMMAND_IDLE_TIMEOUT_SEC
 ) -> tuple[bool, str | None]:
     """Run 'make install' in the worktree to set up project tooling.
 
@@ -56,9 +59,10 @@ def _run_setup_command(
     cwd: Path,
     *,
     timeout_sec: float,
+    absolute_timeout_sec: float = SETUP_COMMAND_ABSOLUTE_TIMEOUT_SEC,
     env: dict | None = None,
 ) -> tuple[bool, str | None]:
-    """Run a setup command with a timeout and bounded captured output."""
+    """Run a setup command with idle and absolute bounds plus a bounded output tail."""
     try:
         with tempfile.TemporaryFile() as output:
             proc = subprocess.Popen(
@@ -71,15 +75,58 @@ def _run_setup_command(
             )
             previous_sigterm = _install_setup_sigterm_handler(proc)
             try:
-                try:
-                    return_code = proc.wait(timeout=timeout_sec)
-                except subprocess.TimeoutExpired:
-                    _terminate_process_group(proc)
-                    tail = _read_output_tail(output)
-                    detail = f"Timed out after {int(timeout_sec)}s."
-                    if tail:
-                        detail = f"{detail}\n{tail}"
-                    return False, detail
+                started_at = time.monotonic()
+                last_progress_at = started_at
+                output_size = output.tell()
+                cpu_ms = _sum_descendant_cpu_ms(proc.pid)
+                io_chars = _sum_process_tree_io_chars(proc.pid)
+
+                while True:
+                    return_code = proc.poll()
+                    if return_code is not None:
+                        break
+
+                    now = time.monotonic()
+                    idle_for = now - last_progress_at
+                    total_for = now - started_at
+                    if total_for >= absolute_timeout_sec:
+                        _terminate_process_group(proc)
+                        detail = (
+                            f"Setup exceeded the {int(absolute_timeout_sec)}s total cap; "
+                            f"last progress was {int(idle_for)}s ago."
+                        )
+                        return False, _append_output_tail(detail, output)
+                    if idle_for >= timeout_sec:
+                        _terminate_process_group(proc)
+                        detail = (
+                            f"No setup progress for {int(timeout_sec)}s "
+                            f"(ran {int(total_for)}s total)."
+                        )
+                        return False, _append_output_tail(detail, output)
+
+                    wait_for = min(
+                        SETUP_MONITOR_INTERVAL_SEC,
+                        timeout_sec - idle_for,
+                        absolute_timeout_sec - total_for,
+                    )
+                    try:
+                        return_code = proc.wait(timeout=max(0.0, wait_for))
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+
+                    next_output_size = output.tell()
+                    next_cpu_ms = _sum_descendant_cpu_ms(proc.pid)
+                    next_io_chars = _sum_process_tree_io_chars(proc.pid)
+                    if (
+                        next_output_size != output_size
+                        or _changed_metric(cpu_ms, next_cpu_ms)
+                        or _changed_metric(io_chars, next_io_chars)
+                    ):
+                        last_progress_at = time.monotonic()
+                    output_size = next_output_size
+                    cpu_ms = next_cpu_ms
+                    io_chars = next_io_chars
             finally:
                 if previous_sigterm is not None:
                     signal.signal(signal.SIGTERM, previous_sigterm)
@@ -96,6 +143,41 @@ def _run_setup_command(
         return False, f"Command not found: {e.filename or command[0]}"
     except subprocess.SubprocessError as e:
         return False, str(e)
+
+
+def _changed_metric(previous: int | None, current: int | None) -> bool:
+    """Return whether an available cumulative activity metric changed."""
+    return previous is not None and current is not None and previous != current
+
+
+def _sum_process_tree_io_chars(root_pid: int) -> int | None:
+    """Return Linux character I/O for a process tree, or None when unavailable."""
+    total = 0
+    observed = False
+    for pid in [root_pid, *_descendant_pids(root_pid)]:
+        try:
+            lines = (Path("/proc") / str(pid) / "io").read_text().splitlines()
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+        values: dict[str, int] = {}
+        for line in lines:
+            key, separator, raw_value = line.partition(":")
+            if not separator:
+                continue
+            try:
+                values[key] = int(raw_value.strip())
+            except ValueError:
+                continue
+        if "rchar" in values or "wchar" in values:
+            total += values.get("rchar", 0) + values.get("wchar", 0)
+            observed = True
+    return total if observed else None
+
+
+def _append_output_tail(detail: str, output) -> str:
+    """Append bounded command output to a setup failure detail."""
+    tail = _read_output_tail(output)
+    return f"{detail}\n{tail}" if tail else detail
 
 
 def _install_setup_sigterm_handler(proc: subprocess.Popen):

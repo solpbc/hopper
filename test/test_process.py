@@ -10,6 +10,7 @@ import logging
 import shutil
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -24,6 +25,7 @@ from hopper.process import (
     _get_worktree_env,
     _install_setup_sigterm_handler,
     _run_make_install,
+    _run_setup_command,
     run_process,
 )
 
@@ -111,14 +113,52 @@ class TestRunMakeInstall:
         assert "Error 7" in detail
 
     def test_times_out_and_kills_process_group(self, tmp_path):
-        """Long make install runs time out instead of leaving the lode active."""
+        """Output-silent make install is bounded by inactivity."""
         (tmp_path / "Makefile").write_text("install:\n\t@sleep 30\n")
 
         ok, detail = _run_make_install(tmp_path, timeout_sec=0.1)
 
         assert ok is False
         assert detail is not None
-        assert "Timed out after 0s." in detail
+        assert "No setup progress for 0s" in detail
+
+    def test_process_io_extends_idle_bound(self, tmp_path):
+        """A quiet downloader stays alive while its process-tree I/O advances."""
+        command = [sys.executable, "-c", "import time; time.sleep(0.25)"]
+
+        with (
+            patch("hopper.process._sum_descendant_cpu_ms", return_value=None),
+            patch(
+                "hopper.process._sum_process_tree_io_chars",
+                side_effect=[100, 200, 300, 400],
+            ),
+        ):
+            ok, detail = _run_setup_command(command, tmp_path, timeout_sec=0.1)
+
+        assert ok is True
+        assert detail is None
+
+    def test_absolute_cap_stops_continuously_active_setup(self, tmp_path):
+        """Progress cannot keep a setup command alive past the absolute cap."""
+        command = [sys.executable, "-c", "import time; time.sleep(30)"]
+
+        with (
+            patch("hopper.process._sum_descendant_cpu_ms", return_value=None),
+            patch(
+                "hopper.process._sum_process_tree_io_chars",
+                side_effect=[100, 200, 300, 400],
+            ),
+        ):
+            ok, detail = _run_setup_command(
+                command,
+                tmp_path,
+                timeout_sec=0.2,
+                absolute_timeout_sec=0.15,
+            )
+
+        assert ok is False
+        assert detail is not None
+        assert "total cap" in detail
 
     def test_sigterm_handler_kills_setup_process_group(self):
         """Killing a lode during setup also terminates make and its descendants."""
@@ -868,7 +908,10 @@ class TestRefineStage:
             patch("hopper.process._has_makefile", return_value=True),
             patch(
                 "hopper.process._run_make_install",
-                return_value=(False, "Timed out after 1200s.\npytest output tail"),
+                return_value=(
+                    False,
+                    "No setup progress for 1200s (ran 1200s total).\npytest output tail",
+                ),
             ),
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -878,7 +921,11 @@ class TestRefineStage:
             "lode_set_state",
             lode_id="test-id",
             state="error",
-            status="Failed to run make install.\nTimed out after 1200s.\npytest output tail",
+            status=(
+                "Failed to run make install.\n"
+                "No setup progress for 1200s (ran 1200s total).\n"
+                "pytest output tail"
+            ),
         )
 
     def test_no_makefile_skips_make_install(self, tmp_path):
