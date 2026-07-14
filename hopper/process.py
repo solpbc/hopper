@@ -34,6 +34,8 @@ SETUP_MONITOR_INTERVAL_SEC = 5.0
 SETUP_OUTPUT_TAIL_BYTES = 64 * 1024
 SETUP_OUTPUT_TAIL_LINES = 20
 QUARANTINE_STATUS = "Quarantined dirty project repo to branch {branch}; continuing"
+DEFAULT_INSTALL_TARGET = "install"
+HOPPER_INSTALL_TARGET = "hopper-install"
 
 
 def _has_makefile(worktree_path: Path) -> bool:
@@ -41,16 +43,36 @@ def _has_makefile(worktree_path: Path) -> bool:
     return (worktree_path / "Makefile").exists()
 
 
+def _make_install_target(worktree_path: Path) -> str:
+    """Prefer a project's lean Hopper bootstrap target when it declares one."""
+    try:
+        lines = (worktree_path / "Makefile").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return DEFAULT_INSTALL_TARGET
+
+    target_prefix = f"{HOPPER_INSTALL_TARGET}:"
+    for raw_line in lines:
+        if raw_line.startswith("\t"):
+            continue
+        line = raw_line.lstrip()
+        if line.startswith(target_prefix) and not line[len(target_prefix) :].startswith("="):
+            return HOPPER_INSTALL_TARGET
+    return DEFAULT_INSTALL_TARGET
+
+
 def _run_make_install(
-    worktree_path: Path, timeout_sec: float = SETUP_COMMAND_IDLE_TIMEOUT_SEC
+    worktree_path: Path,
+    timeout_sec: float = SETUP_COMMAND_IDLE_TIMEOUT_SEC,
+    *,
+    target: str = DEFAULT_INSTALL_TARGET,
 ) -> tuple[bool, str | None]:
-    """Run 'make install' in the worktree to set up project tooling.
+    """Run the selected Make target in the worktree to set up project tooling.
 
     Returns (ok, detail). detail is a tail of command output on failure.
     """
-    ok, detail = _run_setup_command(["make", "install"], worktree_path, timeout_sec=timeout_sec)
+    ok, detail = _run_setup_command(["make", target], worktree_path, timeout_sec=timeout_sec)
     if not ok:
-        logger.error(f"make install failed: {detail or 'unknown error'}")
+        logger.error(f"make {target} failed: {detail or 'unknown error'}")
     return ok, detail
 
 
@@ -397,28 +419,35 @@ class ProcessRunner(BaseRunner):
             self.lode_branch = branch_name
             logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
 
-        # Set up environment via make install if project has a Makefile
+        # Set up the environment via the project's selected Make target.
         if _has_makefile(self.worktree_path):
             has_venv = (self.worktree_path / ".venv").is_dir()
             has_node = (self.worktree_path / "node_modules").is_dir()
             needs_install = not has_venv and not has_node
             if needs_install:
-                set_lode_status(self.socket_path, self.lode_id, "Running make install...")
-                logger.debug(f"make install start lode={self.lode_id}")
-                print(f"Running make install for {self.lode_id}...")
+                install_target = _make_install_target(self.worktree_path)
+                set_lode_status(
+                    self.socket_path,
+                    self.lode_id,
+                    f"Running make {install_target}...",
+                )
+                logger.debug(f"make {install_target} start lode={self.lode_id}")
+                print(f"Running make {install_target} for {self.lode_id}...")
             if needs_install:
-                install_ok, install_detail = _run_make_install(self.worktree_path)
+                install_ok, install_detail = _run_make_install(
+                    self.worktree_path, target=install_target
+                )
             else:
                 install_ok, install_detail = True, None
             if not install_ok:
-                self._setup_error = "Failed to run make install."
+                self._setup_error = f"Failed to run make {install_target}."
                 if install_detail:
                     self._setup_error = f"{self._setup_error}\n{install_detail}"
                 print(self._setup_error)
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
             if needs_install:
-                logger.debug(f"make install complete lode={self.lode_id}")
+                logger.debug(f"make {install_target} complete lode={self.lode_id}")
             self.use_env = True
 
         self._cwd = str(self.worktree_path)

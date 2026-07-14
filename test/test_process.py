@@ -24,6 +24,7 @@ from hopper.process import (
     ProcessRunner,
     _get_worktree_env,
     _install_setup_sigterm_handler,
+    _make_install_target,
     _run_make_install,
     _run_setup_command,
     run_process,
@@ -97,6 +98,58 @@ def test_ship_next_stage_is_shipped():
 
 
 class TestRunMakeInstall:
+    def test_prefers_declared_hopper_install_target(self, tmp_path):
+        """A project can keep runtime provisioning out of lode bootstrap."""
+        (tmp_path / "Makefile").write_text(
+            "install:\n\t@echo full > selected\nhopper-install:\n\t@echo lean > selected\n"
+        )
+
+        target = _make_install_target(tmp_path)
+        ok, detail = _run_make_install(tmp_path, target=target)
+
+        assert target == "hopper-install"
+        assert ok is True
+        assert detail is None
+        assert (tmp_path / "selected").read_text().strip() == "lean"
+
+    def test_falls_back_when_hopper_install_target_is_absent(self, tmp_path):
+        """Existing Make projects retain the full install target contract."""
+        (tmp_path / "Makefile").write_text(
+            "# hopper-install: documentation only\ninstall:\n\t@echo full > selected\n"
+        )
+
+        target = _make_install_target(tmp_path)
+        ok, detail = _run_make_install(tmp_path, target=target)
+
+        assert target == "install"
+        assert ok is True
+        assert detail is None
+        assert (tmp_path / "selected").read_text().strip() == "full"
+
+    def test_detects_compact_hopper_install_rule(self, tmp_path):
+        """Valid target syntax does not require whitespace after the colon."""
+        (tmp_path / "Makefile").write_text(
+            "bootstrap:\n\t@true\nhopper-install:bootstrap\n\t@true\n"
+        )
+
+        assert _make_install_target(tmp_path) == "hopper-install"
+
+    def test_declared_hopper_install_failure_does_not_fall_back(self, tmp_path):
+        """A broken lean target fails loudly instead of provisioning a runtime."""
+        (tmp_path / "Makefile").write_text(
+            "install:\n\t@echo full > selected\n"
+            "hopper-install:\n\t@echo lean failed >&2\n\t@exit 9\n"
+        )
+
+        target = _make_install_target(tmp_path)
+        ok, detail = _run_make_install(tmp_path, target=target)
+
+        assert target == "hopper-install"
+        assert ok is False
+        assert detail is not None
+        assert "lean failed" in detail
+        assert not (tmp_path / "selected").exists()
+
     def test_returns_output_tail_on_failure(self, tmp_path):
         """make install failures include the command output tail."""
         (tmp_path / "Makefile").write_text(
@@ -874,6 +927,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process._has_makefile", return_value=True),
+            patch("hopper.process._make_install_target", return_value="install"),
             patch("hopper.process._run_make_install", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
@@ -890,6 +944,40 @@ class TestRefineStage:
             call(runner.socket_path, runner.lode_id, "Running make install..."),
             call(runner.socket_path, runner.lode_id, "Bootstrapping Codex..."),
         ]
+
+    def test_first_run_uses_declared_hopper_install_target(self, tmp_path):
+        """Refine surfaces and executes the project's lean bootstrap target."""
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
+        (session_dir / "mill_out.md").write_text("Build the widget")
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", state="ready", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process._has_makefile", return_value=True),
+            patch("hopper.process._make_install_target", return_value="hopper-install"),
+            patch("hopper.process._run_make_install", return_value=(True, None)) as mock_install,
+            patch("hopper.process.prompt.load", return_value="loaded prompt"),
+            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
+            patch("hopper.process.set_codex_thread_id", return_value=True),
+            patch("hopper.process.set_lode_status") as mock_status,
+            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            exit_code = runner.run()
+
+        assert exit_code == 0
+        mock_install.assert_called_once_with(runner.worktree_path, target="hopper-install")
+        assert (
+            call(runner.socket_path, runner.lode_id, "Running make hopper-install...")
+            in mock_status.call_args_list
+        )
 
     def test_make_install_failure_includes_detail(self, tmp_path):
         """Refine setup emits captured setup detail when make install fails."""

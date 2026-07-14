@@ -280,13 +280,19 @@ error); `hop lode status <id>` surfaces the record. Worktree cleanup also
 refuses to destroy a dirty worktree; it retains the path and logs a warning
 instead.
 
-Refine setup bounds `make install` with a 20-minute **inactivity** timeout and a
-60-minute absolute cap. Command output and descendant CPU count as progress on
-every host; Linux also observes process-tree I/O. A moving artifact download
+On a fresh Make-based worktree, refine setup prefers `make hopper-install` when
+the project declares that target and otherwise falls back to `make install`.
+Use `hopper-install` for the dependencies and agent tooling needed to edit and
+run unit CI; keep host runtime provisioning and large model/artifact downloads
+in the project's normal install target.
+
+The selected setup target is bounded by a 20-minute **inactivity** timeout and
+a 60-minute absolute cap. Command output and descendant CPU count as progress
+on every host; Linux also observes process-tree I/O. A moving artifact download
 can therefore cross 20 minutes while a wedged download still fails. The lode
 error distinguishes inactivity from the absolute cap and includes the bounded
-output tail instead of remaining active at "Running make install...". Codex
-bootstrap is bounded separately.
+output tail instead of remaining active at the setup status. Codex bootstrap
+is bounded separately.
 
 `hop code` prints a `CODEX TURN FAILED` banner when the backend fails a turn.
 Usage-limit failures are fleet-wide because Hopper uses one shared Codex seat
