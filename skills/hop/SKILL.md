@@ -192,7 +192,7 @@ hop check -- make test
 hop check -n 20 -- make ci          # keep only the last 20 lines of output
 ```
 
-`hop check` captures combined stdout+stderr, prints the trailing lines, then
+`hop check` buffers combined stdout+stderr, prints the trailing lines, then
 prints `hop check: `<cmd>` exited N` and returns N. A non-zero exit is a failed
 check. Runs locally in the current directory; does not need the server.
 
@@ -234,7 +234,7 @@ cat feedback.md | hop feedback <lode-id> -
 
 ```bash
 hop ping                            # check server connectivity
-hop screenshot                      # capture TUI window as ANSI text
+hop screenshot                      # render TUI window as ANSI text
 hop lode peek <lode-id>             # plain-text tail of the lode pane
 hop lode nudge <lode-id>            # submit "continue" via buffer paste
 hop lode nudge <lode-id> --text "..."
@@ -284,7 +284,7 @@ Refine setup bounds `make install` with a 20-minute **inactivity** timeout and a
 60-minute absolute cap. Command output and descendant CPU count as progress on
 every host; Linux also observes process-tree I/O. A moving artifact download
 can therefore cross 20 minutes while a wedged download still fails. The lode
-error distinguishes inactivity from the absolute cap and includes the captured
+error distinguishes inactivity from the absolute cap and includes the bounded
 output tail instead of remaining active at "Running make install...". Codex
 bootstrap is bounded separately.
 
