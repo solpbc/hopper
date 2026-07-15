@@ -3,10 +3,15 @@
 
 """Client-side remote hopper helpers."""
 
+import fcntl
 import json
 import os
 import shlex
 import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 from hopper import config
 from hopper.lodes import current_time_ms
@@ -85,9 +90,27 @@ def remove_remote(project: str) -> bool:
     return True
 
 
-def remote_lode_cache_path():
+def remote_lode_cache_path() -> Path:
     """Return the remote lode cache path."""
     return config.hopper_dir() / "remote-lodes.json"
+
+
+def remote_lode_cache_lock_path() -> Path:
+    """Return the lock path for remote lode cache transactions."""
+    return config.hopper_dir() / "remote-lodes.lock"
+
+
+@contextmanager
+def _lode_cache_lock() -> Iterator[None]:
+    """Serialize short remote lode cache transactions across processes."""
+    lock_path = remote_lode_cache_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        lock_file.close()
 
 
 def load_lode_cache() -> dict[str, dict]:
@@ -109,9 +132,19 @@ def save_lode_cache(cache: dict[str, dict]) -> None:
     data_dir = config.hopper_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     path = remote_lode_cache_path()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=data_dir)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def prune_lode_cache(cache: dict[str, dict], now_ms: int | None = None) -> dict[str, dict]:
@@ -135,10 +168,22 @@ def remember_lode(
 ) -> None:
     """Remember where a remote lode lives."""
     now = current_time_ms()
-    cache = prune_lode_cache(load_lode_cache(), now)
-    cache[lode_id] = {
-        "host": host,
-        "project": project,
-        "created_ms": created_ms if created_ms is not None else now,
-    }
-    save_lode_cache(cache)
+    with _lode_cache_lock():
+        cache = prune_lode_cache(load_lode_cache(), now)
+        existing = cache.get(lode_id)
+        if existing and existing.get("host") == host:
+            return
+
+        if existing and "created_ms" in existing:
+            created = existing["created_ms"]
+        elif existing and "created_at" in existing:
+            created = existing["created_at"]
+        else:
+            created = created_ms if created_ms is not None else now
+        cache[lode_id] = {
+            "host": host,
+            "project": project,
+            "created_ms": created,
+            "last_seen_ms": now,
+        }
+        save_lode_cache(cache)
