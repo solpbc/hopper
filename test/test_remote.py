@@ -164,6 +164,18 @@ def test_remember_lode_host_change_preserves_created_ms(temp_config, monkeypatch
     }
 
 
+def test_remember_lode_rejects_corrupt_cache_without_rewriting(temp_config):
+    config.hopper_dir().mkdir(parents=True, exist_ok=True)
+    cache_path = temp_config / "remote-lodes.json"
+    corrupt = '{"existing": '
+    cache_path.write_text(corrupt)
+
+    with pytest.raises(ValueError):
+        remember_lode("newid", "fedora.local", "journal")
+
+    assert cache_path.read_text() == corrupt
+
+
 def test_concurrent_remember_lode_processes_preserve_complete_cache(tmp_path):
     """Concurrent cache transactions serialize their read/merge/publish steps."""
     child_code = r"""

@@ -375,6 +375,21 @@ def test_two_consecutive_not_found_win_observer_boundary(monkeypatch, capsys):
     assert payload["source"] == "fedora.local"
 
 
+def test_not_found_human_output_includes_inspection_guidance(monkeypatch, capsys):
+    initial = snapshot(host="fedora.local")
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        {"abc123": initial},
+        {"abc123": [(None, "absent"), (None, "absent")]},
+        publish=False,
+    )
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "source=fedora.local" in out
+    assert "Inspect with: hop lode status abc123" in out
+
+
 def test_not_found_streak_resets_on_observer_failure(monkeypatch, capsys):
     initial = snapshot(host="fedora.local")
     rc, _ = run_remote_wait(
@@ -620,6 +635,8 @@ def test_observer_failure_reports_latest_valid_snapshot(monkeypatch, capsys, jso
         assert "stage=refine state=design active=True" in captured.out
         assert "status=Later durable status source=fedora.local" in captured.out
         assert "observed_age_s=75.000" in captured.out
+        assert "Check status with: hop lode status abc123" in captured.out
+        assert "Retry with: hop wait abc123" in captured.out
 
 
 @pytest.mark.parametrize("initial_state", ["running", "shipped"])
@@ -671,6 +688,30 @@ def test_cache_read_failure_warns_once_and_shipped_still_succeeds(monkeypatch, c
     captured = capsys.readouterr()
     assert captured.err.count("warning: could not read remote lode cache") == 1
     assert "abc123 shipped" in captured.out
+
+
+def test_jsonl_cache_warning_stays_on_stderr(monkeypatch, capsys):
+    initial = snapshot(host="fedora.local", stage="shipped", active=False)
+    monkeypatch.setattr(wait.remote, "load_lode_cache", lambda: {})
+    monkeypatch.setattr(
+        wait.remote,
+        "remember_lode",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("read-only cache")),
+    )
+
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        {"abc123": initial},
+        {"abc123": [(initial, "found")]},
+        json_output=True,
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert [json.loads(line)["outcome"] for line in lines] == ["shipped"]
+    assert "warning:" not in captured.out
+    assert captured.err.count("warning: could not update remote lode cache") == 1
 
 
 def test_unchanged_remote_mapping_is_not_republished(monkeypatch):
@@ -765,6 +806,38 @@ def test_remote_worker_join_is_bounded_and_logs_timeout(caplog):
     assert "did not stop before join timeout" in caplog.text
 
 
+def test_keyboard_interrupt_returns_130_and_joins_remote_workers(monkeypatch):
+    initial = snapshot(host="fedora.local")
+    stopped_workers = []
+    original_stop = wait._stop_remote_workers
+
+    monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wait, "_publish_remote_mappings", lambda records: None)
+    monkeypatch.setattr(
+        wait,
+        "_condition_wait",
+        lambda condition, timeout: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    def stop_workers(state):
+        original_stop(state)
+        stopped_workers.extend(state["workers"].values())
+
+    monkeypatch.setattr(wait, "_stop_remote_workers", stop_workers)
+
+    rc = wait.wait_for_lodes(
+        Path("server.sock"),
+        ["abc123"],
+        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
+        find_remote=lambda lid: (initial, "fedora.local"),
+        probe_remote=lambda host, lid, timeout: (initial, "found"),
+    )
+
+    assert rc == 130
+    assert len(stopped_workers) == 1
+    assert all(not thread.is_alive() for thread in stopped_workers)
+
+
 def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monkeypatch, capsys):
     initials = {
         "ship123": snapshot(lid="ship123", host="one.local"),
@@ -797,6 +870,32 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
     assert rc == 4
     assert capsys.readouterr().out.count("ship123 shipped") == 1
     assert not any(thread.name.startswith("wait-remote-") for thread in threading.enumerate())
+
+
+def test_jsonl_multi_lode_boundary_emits_independently_parseable_lines(monkeypatch, capsys):
+    initials = {
+        "ship123": snapshot(lid="ship123", stage="shipped", active=False),
+        "error123": snapshot(lid="error123", state="error", status="Failed"),
+    }
+    monkeypatch.setattr(
+        wait.client,
+        "get_lode",
+        lambda socket_path, lid: dict(initials[lid]),
+    )
+
+    rc = wait.wait_for_lodes(
+        Path("server.sock"),
+        list(initials),
+        json_output=True,
+        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
+        find_remote=lambda lid: (None, ""),
+        probe_remote=lambda *args, **kwargs: (None, "unreadable"),
+    )
+
+    assert rc == 1
+    lines = capsys.readouterr().out.splitlines()
+    payloads = [json.loads(line) for line in lines]
+    assert [payload["outcome"] for payload in payloads] == ["shipped", "error"]
 
 
 def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):

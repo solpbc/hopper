@@ -127,6 +127,18 @@ def load_lode_cache() -> dict[str, dict]:
     return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
 
 
+def _load_lode_cache_strict() -> dict[str, dict]:
+    """Load the cache for mutation, preserving failures instead of hiding them."""
+    path = remote_lode_cache_path()
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Remote lode cache at {path} is not a JSON object")
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
 def save_lode_cache(cache: dict[str, dict]) -> None:
     """Save the lode id -> host cache atomically."""
     data_dir = config.hopper_dir()
@@ -169,7 +181,7 @@ def remember_lode(
     """Remember where a remote lode lives."""
     now = current_time_ms()
     with _lode_cache_lock():
-        cache = prune_lode_cache(load_lode_cache(), now)
+        cache = prune_lode_cache(_load_lode_cache_strict(), now)
         existing = cache.get(lode_id)
         if existing and existing.get("host") == host:
             return

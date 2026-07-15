@@ -2081,7 +2081,11 @@ def test_lode_wait_error(capsys):
                 with patch("hopper.client.HopperConnection", return_value=mock_conn):
                     result = cmd_lode(["wait", "abc123"])
     assert result == 1
-    assert "✗ abc123 error: Failed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "✗ abc123 error: Failed" in out
+    assert "stage=mill state=error active=True status=Failed source=local" in out
+    assert "observed_age_s=" in out
+    assert "Restart with: hop lode restart abc123" in out
 
 
 def test_wait_exits_2_on_gate_transition(capsys):
@@ -3872,6 +3876,7 @@ def test_wait_help_shows_wait(capsys):
     assert "--observer-timeout" in out
     assert "Seconds without a valid status observation" in out
     assert "failing (0=disabled)" in out
+    assert "Status reconciliation interval seconds" in out
 
 
 def test_lode_wait_help_shows_observer_timeout(capsys):
@@ -3879,6 +3884,7 @@ def test_lode_wait_help_shows_observer_timeout(capsys):
     out = capsys.readouterr().out
     assert "--observer-timeout" in out
     assert "Seconds without a valid status observation" in out
+    assert "Status reconciliation interval seconds" in out
 
 
 def test_show_help_shows_show(capsys):
@@ -4210,6 +4216,26 @@ def test_find_remote_lode_can_skip_cache_publish():
 
     assert found == lode
     remember.assert_not_called()
+
+
+@pytest.mark.parametrize("cached", [True, False], ids=["cache-hit", "fan-out"])
+def test_find_remote_lode_survives_cache_publish_failure(cached, caplog):
+    from hopper.cli import _find_remote_lode
+
+    lode = {
+        "id": "remote123",
+        "host": "fedora.local",
+        "project": "journal",
+    }
+    cache = {"remote123": {"host": "fedora.local"}} if cached else {}
+    with patch("hopper.remote.load_lode_cache", return_value=cache):
+        with patch("hopper.remote.remote_registry", return_value={"journal": "fedora.local"}):
+            with patch("hopper.cli._remote_lode_status", return_value=(lode, "found")):
+                with patch("hopper.remote.remember_lode", side_effect=ValueError("bad cache")):
+                    found, _ = _find_remote_lode("remote123")
+
+    assert found == lode
+    assert "Could not update remote lode cache for remote123 on fedora.local" in caplog.text
 
 
 def test_backlog_ls_alias(capsys):

@@ -362,7 +362,7 @@ def _run_remote_cli(
     remember_project: str | None = None,
 ) -> int:
     """Run a remote hop command and mirror its result locally."""
-    from hopper.remote import remember_lode, run_remote
+    from hopper.remote import run_remote
 
     print(f"→ {host} ({reason})", file=sys.stderr)
     try:
@@ -391,8 +391,23 @@ def _run_remote_cli(
             if match:
                 lode_id = match.group(1)
         if isinstance(lode_id, str) and lode_id:
-            remember_lode(lode_id, host, remember_project)
+            _remember_lode_route(lode_id, host, remember_project)
     return result.returncode
+
+
+def _remember_lode_route(lode_id: str, host: str, project: str = "") -> None:
+    """Best-effort cache a remote lode route without failing its command."""
+    from hopper.remote import remember_lode
+
+    try:
+        remember_lode(lode_id, host, project)
+    except Exception as error:
+        logger.warning(
+            "Could not update remote lode cache for %s on %s: %s",
+            lode_id,
+            host,
+            error,
+        )
 
 
 @command("up", "Start the server and TUI")
@@ -1553,7 +1568,7 @@ def _remote_lode_status(host: str, lode_id: str, timeout: float = 5.0) -> tuple[
 
 def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dict | None, str]:
     """Find a lode on configured remote hosts using cache, then fan-out."""
-    from hopper.remote import load_lode_cache, remember_lode, remote_registry
+    from hopper.remote import load_lode_cache, remote_registry
 
     registry = remote_registry()
     hosts = sorted(set(registry.values()))
@@ -1569,7 +1584,7 @@ def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dic
             unreadable.add(host)
         if lode:
             if remember_result:
-                remember_lode(lode["id"], host, lode.get("project", ""))
+                _remember_lode_route(lode["id"], host, lode.get("project", ""))
             return lode, ", ".join(checked)
 
     remaining_hosts = [host for host in hosts if host not in checked]
@@ -1608,7 +1623,7 @@ def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dic
     if found:
         lode = found[0]
         if remember_result:
-            remember_lode(lode["id"], lode["host"], lode.get("project", ""))
+            _remember_lode_route(lode["id"], lode["host"], lode.get("project", ""))
         return lode, ", ".join(sorted(set(checked)))
     summary = ", ".join(sorted(set(checked)))
     if unreadable:
@@ -1757,7 +1772,9 @@ def cmd_lode(args: list[str]) -> int:
     wait_p = subs.add_parser("wait", help="Wait for lode to ship", exit_on_error=False)
     wait_p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
     wait_p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
-    wait_p.add_argument("--poll", type=float, default=30, help="Remote poll interval seconds")
+    wait_p.add_argument(
+        "--poll", type=float, default=30, help="Status reconciliation interval seconds"
+    )
     wait_p.add_argument(
         "--observer-timeout",
         type=float,
@@ -2334,7 +2351,9 @@ def cmd_wait(args: list[str]) -> int:
         p = make_parser("wait", "Wait for a lode to ship (alias for lode wait)")
         p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
         p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
-        p.add_argument("--poll", type=float, default=30, help="Remote poll interval seconds")
+        p.add_argument(
+            "--poll", type=float, default=30, help="Status reconciliation interval seconds"
+        )
         p.add_argument(
             "--observer-timeout",
             type=float,

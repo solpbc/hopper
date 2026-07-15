@@ -85,18 +85,14 @@ def _new_record(lid: str, snapshot: dict, source: str, observed_ts: float, order
         "latest_snapshot": snapshot,
         "latest_snapshot_ts": observed_ts,
         "last_valid_ts": observed_ts,
-        "observer_started_ts": observed_ts,
         "next_reconcile_ts": observed_ts,
         "reconcile_requested": False,
         "stuck_since": stuck_since,
         "stuck_recheck_pending": False,
         "stuck_confirmed": False,
         "consecutive_failures": 0,
-        "last_failure_key": None,
         "warned_failure_key": None,
         "not_found_count": 0,
-        "finished": False,
-        "reported_outcomes": set(),
     }
 
 
@@ -283,7 +279,6 @@ def _record_observer_failure(record: dict, kind: str, detail: str, failure_key: 
     """Track a failure streak and return at most one warning per repeated failure."""
     record["not_found_count"] = 0
     record["consecutive_failures"] += 1
-    record["last_failure_key"] = failure_key
     if record["consecutive_failures"] < 2 or record["warned_failure_key"] == failure_key:
         return None
     record["warned_failure_key"] = failure_key
@@ -310,7 +305,6 @@ def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | 
         record["latest_snapshot_ts"] = observed_ts
         record["last_valid_ts"] = observed_ts
         record["consecutive_failures"] = 0
-        record["last_failure_key"] = None
         record["warned_failure_key"] = None
         record["not_found_count"] = 0
         if snapshot["state"] == "stuck":
@@ -327,7 +321,6 @@ def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | 
 
     if kind == "absent":
         record["consecutive_failures"] = 0
-        record["last_failure_key"] = None
         record["warned_failure_key"] = None
         record["not_found_count"] += 1
         return None
@@ -415,8 +408,7 @@ def _next_deadline(state: dict) -> float:
         record = state["records"][lid]
         deadlines.append(record["next_reconcile_ts"])
         if state["observer_timeout_s"] > 0:
-            anchor = record["last_valid_ts"] or record["observer_started_ts"]
-            deadlines.append(anchor + state["observer_timeout_s"])
+            deadlines.append(record["last_valid_ts"] + state["observer_timeout_s"])
         if record["stuck_since"] is not None and not record["stuck_recheck_pending"]:
             deadlines.append(record["stuck_since"] + STUCK_GRACE_MS / 1000.0)
     return min(deadlines)
@@ -435,15 +427,14 @@ def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
         elif record["stuck_confirmed"]:
             outcome, code = "stuck", 3
         elif state["observer_timeout_s"] > 0 and now >= (
-            (record["last_valid_ts"] or record["observer_started_ts"]) + state["observer_timeout_s"]
+            record["last_valid_ts"] + state["observer_timeout_s"]
         ):
             outcome, code = "observer_unavailable", 4
         elif state["overall_deadline"] is not None and now >= state["overall_deadline"]:
             outcome, code = "timeout", 4
         else:
             continue
-        if outcome not in record["reported_outcomes"]:
-            outcomes.append({"record": record, "outcome": outcome, "code": code})
+        outcomes.append({"record": record, "outcome": outcome, "code": code})
     return outcomes
 
 
@@ -513,6 +504,7 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
         print(f"{STATUS_SHIPPED} {lid} shipped{suffix}")
     elif outcome == "error":
         print(f"{STATUS_ERROR} {lid} error: {snapshot['status']}")
+        print(f"  {_snapshot_summary(record, now)}")
         print(f"Lode {lid} entered error state. Restart with: hop lode restart {lid}")
     elif outcome == "gated":
         print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
@@ -523,8 +515,11 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
         print(_stuck_diagnostic(snapshot))
     elif outcome == "not_found":
         print(f"Lode '{lid}' not found ({_snapshot_summary(record, now)})")
+        print(f"Inspect with: hop lode status {lid}")
     elif outcome == "observer_unavailable":
         print(f"Status observer unavailable for {lid} ({_snapshot_summary(record, now)})")
+        print(f"Check status with: hop lode status {lid}")
+        print(f"Retry with: hop wait {lid}")
 
 
 def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | None:
@@ -545,11 +540,8 @@ def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | Non
         else:
             _emit_outcome(record, outcome, state["json_output"], now)
         with state["condition"]:
-            record["reported_outcomes"].add(outcome)
-            record["finished"] = True
             state["pending"].discard(record["id"])
         result = max(result, item["code"])
-    state["result_code"] = max(state["result_code"], result)
     return result if result else None
 
 
@@ -577,7 +569,7 @@ def wait_for_lodes(
         return 1
     _publish_remote_mappings(records)
 
-    start_ts = min(record["observer_started_ts"] for record in records.values())
+    start_ts = min(record["last_valid_ts"] for record in records.values())
     condition = threading.Condition()
     state = {
         "condition": condition,
@@ -591,7 +583,6 @@ def wait_for_lodes(
         "stop_event": threading.Event(),
         "workers": {},
         "connection": None,
-        "result_code": 0,
         "shutdown": False,
         "json_output": json_output,
     }
@@ -645,7 +636,7 @@ def wait_for_lodes(
                 deadline = _next_deadline(state)
                 _condition_wait(condition, max(0.0, deadline - _monotonic()))
     except KeyboardInterrupt:
-        return state["result_code"]
+        return 130
     finally:
         with condition:
             state["shutdown"] = True
