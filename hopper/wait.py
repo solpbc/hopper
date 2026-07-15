@@ -113,14 +113,20 @@ def _resolve_targets(
     for order, raw_id in enumerate(raw_ids):
         lode = client.get_lode(socket_path, raw_id)
         error = None
+        local_unavailable = None
         if not lode:
             lode, error = lookup_local(socket_path, raw_id)
-            if error and not error.startswith("Lode '"):
+            if error and error.startswith("Lode status unavailable"):
+                local_unavailable = error
+            elif error and not error.startswith("Lode '"):
                 _initial_error(error, json_output)
                 return None
         if not lode:
             lode, checked = find_remote(raw_id)
             if not lode:
+                if local_unavailable:
+                    _initial_error(local_unavailable, json_output)
+                    return None
                 suffix = (
                     f" Checked remote hosts: {checked}."
                     if checked

@@ -228,6 +228,49 @@ def _exchange_message(
         return response
 
 
+def _exchange_message_until_type(
+    socket_path: Path,
+    message: dict,
+    response_types: set[str],
+    timeout: float = 2.0,
+) -> dict:
+    """Exchange one message, skipping JSONL broadcasts until a response arrives."""
+    deadline = time.monotonic() + timeout
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+
+        def set_remaining_timeout() -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            sock.settimeout(remaining)
+
+        set_remaining_timeout()
+        sock.connect(str(socket_path))
+
+        line = json.dumps(message) + "\n"
+        set_remaining_timeout()
+        sock.sendall(line.encode("utf-8"))
+
+        buffer = b""
+        while True:
+            while b"\n" in buffer:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                response_line, buffer = buffer.split(b"\n", 1)
+                response = json.loads(response_line.decode("utf-8"))
+                if not isinstance(response, dict):
+                    raise InvalidServerResponse("server response is not a JSON object")
+                if response.get("type") in response_types:
+                    return response
+
+            set_remaining_timeout()
+            data = sock.recv(4096)
+            if not data:
+                raise ConnectionError("server closed connection before responding")
+            buffer += data
+
+
 def send_message(
     socket_path: Path,
     message: dict,
@@ -358,6 +401,61 @@ def get_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
     if response is None:
         return None
     return response.get("lode")
+
+
+def read_lode_snapshot(socket_path: Path, prefix: str, timeout: float = 2.0) -> tuple[str, object]:
+    """Resolve an active or archived lode prefix without collapsing failures."""
+    try:
+        response = _exchange_message_until_type(
+            socket_path,
+            {"type": "lode_snapshot", "prefix": prefix},
+            {"lode_snapshot", "error"},
+            timeout=timeout,
+        )
+    except (FileNotFoundError, ConnectionRefusedError):
+        return "unavailable", f"server not running at {socket_path}"
+    except (TimeoutError, BlockingIOError):
+        return "unavailable", f"server did not respond within {timeout:g}s"
+    except (OSError, UnicodeError, json.JSONDecodeError, InvalidServerResponse) as error:
+        return "unavailable", f"server exchange failed: {error}"
+
+    if response is None:
+        return "unavailable", "server returned no response"
+    if response.get("type") != "lode_snapshot":
+        return "unavailable", f"unexpected response type: {response.get('type')!r}"
+
+    result = response.get("result")
+    if not isinstance(result, str) or result not in {"found", "absent", "ambiguous"}:
+        return "unavailable", f"invalid lode_snapshot result: {result!r}"
+
+    if result == "found":
+        lode = response.get("lode")
+        if not isinstance(lode, dict):
+            return "unavailable", "found result missing lode object"
+        lode_id = lode.get("id")
+        if not isinstance(lode_id, str):
+            return "unavailable", "found lode has invalid id"
+        if not lode_id.startswith(prefix):
+            return "unavailable", f"found lode id does not match prefix '{prefix}'"
+        if "matches" in response:
+            return "unavailable", "found result contains ambiguous matches"
+        return "found", lode
+
+    if result == "absent":
+        if "lode" in response or "matches" in response:
+            return "unavailable", "absent result contains lode data"
+        return "absent", None
+
+    matches = response.get("matches")
+    if not isinstance(matches, list) or not all(isinstance(match, str) for match in matches):
+        return "unavailable", "ambiguous result has invalid matches"
+    if len(matches) < 2:
+        return "unavailable", "ambiguous result has fewer than two matches"
+    if any(not match.startswith(prefix) for match in matches):
+        return "unavailable", f"ambiguous match does not match prefix '{prefix}'"
+    if "lode" in response:
+        return "unavailable", "ambiguous result contains lode data"
+    return "ambiguous", matches
 
 
 def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:

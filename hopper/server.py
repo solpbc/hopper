@@ -38,6 +38,7 @@ from hopper.lodes import (
     archive_lode,
     create_lode,
     current_time_ms,
+    find_lodes_by_prefix,
     get_worktree_dir,
     load_archived_lodes,
     load_lodes,
@@ -60,6 +61,7 @@ from hopper.tmux import Liveness, capture_pane, pane_liveness, paste_buffer, sen
 logger = logging.getLogger(__name__)
 
 PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "completed", "error"})
+LISTEN_BACKLOG = 64
 
 
 class ServerLockHeld(RuntimeError):
@@ -400,7 +402,7 @@ class Server:
         try:
             self.server_socket.bind(str(self.socket_path))
             self._socket_bound = True
-            self.server_socket.listen(5)
+            self.server_socket.listen(LISTEN_BACKLOG)
             self.ready.set()
             self.server_socket.settimeout(1.0)
 
@@ -655,11 +657,42 @@ class Server:
         return lode
 
     def _handle_mutation(self, message: dict, conn: socket.socket | None) -> None:
-        """Handle a state-mutating message. Runs on the event loop thread."""
+        """Handle a serialized state message. Runs on the event loop thread."""
         msg_type = message.get("type")
 
         if msg_type == "_client_disconnect":
             self._on_client_disconnect(conn)
+
+        elif msg_type == "lode_snapshot":
+            prefix = message.get("prefix")
+            if not isinstance(prefix, str):
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": "lode_snapshot requires a string prefix",
+                        },
+                    )
+                return
+
+            matches = find_lodes_by_prefix(self.lodes + self.archived_lodes, prefix)
+            if not matches:
+                response = {"type": "lode_snapshot", "result": "absent"}
+            elif len(matches) == 1:
+                response = {
+                    "type": "lode_snapshot",
+                    "result": "found",
+                    "lode": dict(matches[0]),
+                }
+            else:
+                response = {
+                    "type": "lode_snapshot",
+                    "result": "ambiguous",
+                    "matches": [match["id"] for match in matches],
+                }
+            if conn:
+                self._send_response(conn, response)
 
         elif msg_type == "lode_register":
             lode_id = message.get("lode_id")
@@ -1166,10 +1199,10 @@ class Server:
             logger.debug(f"Failed to send response: {e}")
 
     def _event_loop(self) -> None:
-        """Dedicated thread that serializes all state mutations.
+        """Dedicated thread that serializes state mutations and snapshot reads.
 
         Dequeues (message, conn) pairs and processes them one at a time,
-        ensuring no concurrent access to lode/backlog state or save_lodes.
+        ensuring no concurrent access to serialized lode/backlog state or save_lodes.
         """
         while not self.stop_event.is_set():
             try:

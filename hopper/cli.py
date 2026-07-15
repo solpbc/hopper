@@ -21,7 +21,6 @@ from hopper.client import set_lode_progress
 from hopper.lodes import (
     current_time_ms,
     find_lode_by_prefix,
-    find_lodes_by_prefix,
     format_age,
     get_lode_dir,
     lode_icon,
@@ -504,10 +503,19 @@ def cmd_status(args: list[str]) -> int:
         parser.print_usage()
         return 1
 
+    lode_id = get_hopper_lid()
+    if not lode_id and parsed.title is None and len(parsed.text) == 1:
+        lookup_id = parsed.text[0]
+        lode, error = _lookup_lode(_socket(), lookup_id)
+        if error:
+            print(error)
+            return 1
+        print(format_lode_detail(lode))
+        return 0
+
     if err := require_server():
         return err
 
-    lode_id = get_hopper_lid()
     if not lode_id:
         # Outside a lode — look up a specific lode by ID/prefix
         if parsed.title is not None:
@@ -516,17 +524,9 @@ def cmd_status(args: list[str]) -> int:
         if not parsed.text:
             print("HOPPER_LID not set. Run this from within a hopper lode.")
             return 1
-        # First arg is the lode ID/prefix
-        lookup_id = parsed.text[0]
         if len(parsed.text) > 1:
             print("Too many arguments. Usage: hop status <lode-id>")
             return 1
-        lode, error = _lookup_lode(_socket(), lookup_id)
-        if error:
-            print(error)
-            return 1
-        print(format_lode_detail(lode))
-        return 0
 
     if err := validate_hopper_lid():
         return err
@@ -1530,19 +1530,14 @@ def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
     """Look up a lode by ID prefix across active and archived lodes."""
     import hopper.client as client
 
-    active_lodes = client.list_lodes(socket_path)
-    archived_lodes = client.list_archived_lodes(socket_path)
-    all_lodes = active_lodes + archived_lodes
-
-    lode = find_lode_by_prefix(all_lodes, prefix)
-    if lode:
-        return lode, None
-
-    matches = find_lodes_by_prefix(all_lodes, prefix)
-    if len(matches) > 1:
-        ids = ", ".join(match["id"] for match in matches)
-        return None, f"Ambiguous prefix '{prefix}', matches: {ids}"
-    return None, f"Lode '{prefix}' not found."
+    result, payload = client.read_lode_snapshot(socket_path, prefix)
+    if result == "found":
+        return payload, None
+    if result == "ambiguous":
+        return None, f"Ambiguous prefix '{prefix}', matches: {', '.join(payload)}"
+    if result == "absent":
+        return None, f"Lode '{prefix}' not found."
+    return None, f"Lode status unavailable for '{prefix}': {payload}"
 
 
 def _remote_lode_status(host: str, lode_id: str, timeout: float = 5.0) -> tuple[dict | None, str]:
@@ -1634,11 +1629,21 @@ def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dic
 def _lookup_lode_with_remote(socket_path, prefix: str) -> tuple[dict | None, str | None]:
     """Look up a lode locally, then on configured remote hosts."""
     lode, error = _lookup_lode(socket_path, prefix)
-    if lode or (error and not error.startswith("Lode '")):
+    remote_eligible = error and (
+        error.startswith("Lode '") or error.startswith("Lode status unavailable")
+    )
+    if lode or (error and not remote_eligible):
         return lode, error
+    local_unavailable = error if error and error.startswith("Lode status unavailable") else None
     remote_lode, checked = _find_remote_lode(prefix)
     if remote_lode:
         return remote_lode, None
+    if local_unavailable:
+        if "[unreadable:" in checked:
+            return None, f"{local_unavailable}. Remote probes: {checked}."
+        if checked:
+            return None, f"{local_unavailable}. Checked remote hosts: {checked}."
+        return None, f"{local_unavailable}. No remote hosts configured."
     if "[unreadable:" in checked:
         return None, f"Lode status unavailable for '{prefix}'. Remote probes: {checked}."
     suffix = f" Checked remote hosts: {checked}." if checked else " No remote hosts configured."
@@ -2245,19 +2250,7 @@ def cmd_lode(args: list[str]) -> int:
         return 0 if submitted else 1
 
     if subcommand in ("status", "show"):
-        err = require_server()
-        if err:
-            remote_lode, checked = _find_remote_lode(parsed.lode_id)
-            if not remote_lode:
-                if "[unreadable:" in checked:
-                    print(
-                        f"Lode status unavailable for '{parsed.lode_id}'. Remote probes: {checked}."
-                    )
-                    return 2
-                return err
-            lode, error = remote_lode, None
-        else:
-            lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)
+        lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)
         if error:
             print(error)
             return 2 if error.startswith("Lode status unavailable") else 1

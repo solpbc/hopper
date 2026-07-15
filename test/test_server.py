@@ -18,12 +18,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import hopper.server as hopper_server
 from hopper.backlog import BacklogItem
-from hopper.client import send_message
+from hopper.client import read_lode_snapshot, send_message
 from hopper.config import save_config
 from hopper.lodes import save_archived_lodes, save_lodes
 from hopper.projects import Project, touch_project
 from hopper.server import (
+    LISTEN_BACKLOG,
     PROGRESS_REJECT_STATES,
     Server,
     ServerLockHeld,
@@ -111,6 +113,245 @@ def _decode_mock_response(conn: MagicMock) -> dict:
     """Decode the last JSON response sent through a mocked socket."""
     payload = conn.sendall.call_args.args[0].decode("utf-8").strip()
     return json.loads(payload)
+
+
+def test_server_lode_snapshot_found_absent_and_ambiguous(socket_path, make_lode):
+    active = make_lode(id="same-active", active=True)
+    other_active = make_lode(id="active-only", active=True)
+    archived = make_lode(id="same-archived", active=False)
+    other_archived = make_lode(id="archived-only", active=False)
+    server = Server(socket_path)
+    server.lodes = [active, other_active]
+    server.archived_lodes = [archived, other_archived]
+    conn = MagicMock()
+
+    with (
+        patch.object(server, "_send_response") as send_response,
+        patch.object(server, "broadcast") as broadcast,
+        patch("hopper.server.save_lodes") as save_active,
+    ):
+        server._handle_mutation({"type": "lode_snapshot", "prefix": "active-o"}, conn)
+        found = send_response.call_args.args[1]
+        assert found == {"type": "lode_snapshot", "result": "found", "lode": other_active}
+        assert found["lode"] is not other_active
+        found["lode"]["status"] = "changed"
+        assert other_active["status"] == ""
+
+        send_response.reset_mock()
+        server._handle_mutation({"type": "lode_snapshot", "prefix": "archived-o"}, conn)
+        assert send_response.call_args.args[1]["lode"]["id"] == "archived-only"
+
+        send_response.reset_mock()
+        server._handle_mutation({"type": "lode_snapshot", "prefix": "missing"}, conn)
+        assert send_response.call_args.args[1] == {"type": "lode_snapshot", "result": "absent"}
+
+        send_response.reset_mock()
+        server._handle_mutation({"type": "lode_snapshot", "prefix": "same-"}, conn)
+        assert send_response.call_args.args[1] == {
+            "type": "lode_snapshot",
+            "result": "ambiguous",
+            "matches": ["same-active", "same-archived"],
+        }
+
+    broadcast.assert_not_called()
+    save_active.assert_not_called()
+    assert server.lodes == [active, other_active]
+    assert server.archived_lodes == [archived, other_archived]
+
+
+@pytest.mark.parametrize("prefix", [None, 1, [], {}], ids=["missing", "integer", "list", "dict"])
+def test_server_lode_snapshot_rejects_invalid_prefix(socket_path, prefix):
+    server = Server(socket_path)
+    conn = MagicMock()
+    message = {"type": "lode_snapshot"}
+    if prefix is not None:
+        message["prefix"] = prefix
+
+    server._handle_mutation(message, conn)
+
+    assert _decode_mock_response(conn) == {
+        "type": "error",
+        "error": "lode_snapshot requires a string prefix",
+        "ts": _decode_mock_response(conn)["ts"],
+    }
+
+
+def test_server_lode_snapshot_empty_prefix_is_valid(socket_path, make_lode):
+    server = Server(socket_path)
+    server.lodes = [make_lode(id="only-lode")]
+    conn = MagicMock()
+
+    server._handle_mutation({"type": "lode_snapshot", "prefix": ""}, conn)
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "lode_snapshot"
+    assert response["result"] == "found"
+    assert response["lode"]["id"] == "only-lode"
+
+
+def _run_snapshot_burst(socket_path: Path, prefixes: list[str]) -> list[tuple[str, object]]:
+    barrier = threading.Barrier(len(prefixes) + 1)
+    results: list[tuple[str, object] | BaseException | None] = [None] * len(prefixes)
+
+    def read_snapshot(index: int, prefix: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            results[index] = read_lode_snapshot(socket_path, prefix, timeout=5)
+        except BaseException as error:
+            results[index] = error
+
+    threads = [
+        threading.Thread(target=read_snapshot, args=(index, prefix), daemon=True)
+        for index, prefix in enumerate(prefixes)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert not [result for result in results if isinstance(result, BaseException)]
+    assert all(result is not None for result in results)
+    return results
+
+
+def test_lode_snapshot_handles_twelve_simultaneous_clients(socket_path, server, make_lode):
+    active = [make_lode(id=f"active-{index:02d}", active=True) for index in range(6)]
+    archived = [make_lode(id=f"archived-{index:02d}", active=False) for index in range(6)]
+    server.lodes = active
+    server.archived_lodes = archived
+    targets = [lode["id"] for pair in zip(active, archived) for lode in pair]
+
+    results = _run_snapshot_burst(socket_path, targets)
+
+    assert len(results) == 12
+    for target, result in zip(targets, results):
+        assert result[0] == "found"
+        assert result[1]["id"] == target
+
+
+def test_server_uses_configured_listen_backlog(socket_path, monkeypatch):
+    assert LISTEN_BACKLOG == 64
+    assert LISTEN_BACKLOG >= 32
+    real_socket = socket.socket
+    listen_calls = []
+
+    class SocketProxy:
+        def __init__(self, *args, **kwargs):
+            self._socket = real_socket(*args, **kwargs)
+
+        def listen(self, backlog):
+            listen_calls.append(backlog)
+            return self._socket.listen(backlog)
+
+        def __getattr__(self, name):
+            return getattr(self._socket, name)
+
+    monkeypatch.setattr(hopper_server.socket, "socket", SocketProxy)
+    server = Server(socket_path)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    assert server.ready.wait(5), "Server did not start"
+
+    try:
+        assert listen_calls == [LISTEN_BACKLOG]
+    finally:
+        server.stop()
+        thread.join(timeout=2)
+
+
+def test_parallel_lode_snapshots_do_not_write_state(socket_path, server, temp_config, make_lode):
+    active = [
+        make_lode(id="active-only", active=True),
+        make_lode(id="shared-active", active=True),
+    ]
+    archived = [
+        make_lode(id="archived-only", active=False),
+        make_lode(id="shared-archived", active=False),
+    ]
+    server.lodes = active
+    server.archived_lodes = archived
+    save_lodes(active)
+    save_archived_lodes(archived)
+    active_path = temp_config / "active.jsonl"
+    archived_path = temp_config / "archived.jsonl"
+    active_before = active_path.read_bytes()
+    archived_before = archived_path.read_bytes()
+    cases = [
+        ("active-o", "found", "active-only"),
+        ("archived-o", "found", "archived-only"),
+        ("missing", "absent", None),
+        ("shared-", "ambiguous", ["shared-active", "shared-archived"]),
+    ] * 6
+
+    with patch.object(server, "broadcast") as broadcast:
+        results = _run_snapshot_burst(socket_path, [case[0] for case in cases])
+
+    for (_, expected_result, expected_payload), result in zip(cases, results):
+        assert result[0] == expected_result
+        if expected_result == "found":
+            assert result[1]["id"] == expected_payload
+        else:
+            assert result[1] == expected_payload
+    assert active_path.read_bytes() == active_before
+    assert archived_path.read_bytes() == archived_before
+    broadcast.assert_not_called()
+
+
+def test_lode_snapshot_serializes_with_archive_transition(
+    socket_path, server, make_lode, monkeypatch
+):
+    lode = make_lode(id="transition-id", active=True)
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    before = read_lode_snapshot(socket_path, "transition")
+    assert before[0] == "found"
+    assert before[1]["id"] == "transition-id"
+
+    real_archive_lode = hopper_server.archive_lode
+    mid_transition = threading.Event()
+    release_transition = threading.Event()
+
+    def blocking_archive_lode(lodes, lode_id):
+        archived = real_archive_lode(lodes, lode_id)
+        mid_transition.set()
+        assert release_transition.wait(5)
+        return archived
+
+    monkeypatch.setattr(hopper_server, "archive_lode", blocking_archive_lode)
+    send_message(socket_path, {"type": "lode_archive", "lode_id": "transition-id"})
+    assert mid_transition.wait(5), "archive did not reach the transition pause"
+    result = []
+
+    def read_during_transition():
+        result.append(read_lode_snapshot(socket_path, "transition", timeout=5))
+
+    snapshot_thread = threading.Thread(target=read_during_transition, daemon=True)
+    snapshot_thread.start()
+    deadline = time.time() + 5
+    snapshot_queued = False
+    while time.time() < deadline:
+        with server.event_queue.mutex:
+            snapshot_queued = any(
+                message.get("type") == "lode_snapshot"
+                for message, _conn in server.event_queue.queue
+            )
+        if snapshot_queued:
+            break
+        time.sleep(0.01)
+
+    try:
+        assert snapshot_queued
+        assert result == []
+    finally:
+        release_transition.set()
+
+    snapshot_thread.join(timeout=10)
+    assert not snapshot_thread.is_alive()
+    assert result[0][0] == "found"
+    assert result[0][1]["id"] == "transition-id"
+    assert server.lodes == []
+    assert [archived["id"] for archived in server.archived_lodes] == ["transition-id"]
 
 
 def test_lode_create_disabled_project_noop_without_conn(socket_path):

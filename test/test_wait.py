@@ -292,6 +292,41 @@ def test_read_local_snapshot_distinguishes_absent_from_unreadable(
     assert wait.read_local_snapshot(Path("server.sock"), "abc123") == (expected, None)
 
 
+def test_initial_local_unavailable_can_resolve_remotely(monkeypatch):
+    remote_snapshot = snapshot(host="fedora.local")
+    monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
+
+    records = wait._resolve_targets(
+        Path("server.sock"),
+        ["abc123"],
+        False,
+        lookup_local=lambda socket_path, lid: (
+            None,
+            f"Lode status unavailable for '{lid}': server not running",
+        ),
+        find_remote=lambda lid: (remote_snapshot, "fedora.local"),
+    )
+
+    assert records["abc123"]["remote"] is True
+    assert records["abc123"]["host"] == "fedora.local"
+
+
+def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
+    monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
+    error = "Lode status unavailable for 'abc123': server not running"
+
+    records = wait._resolve_targets(
+        Path("server.sock"),
+        ["abc123"],
+        False,
+        lookup_local=lambda socket_path, lid: (None, error),
+        find_remote=lambda lid: (None, "fedora.local"),
+    )
+
+    assert records is None
+    assert capsys.readouterr().out == f"{error}\n"
+
+
 def test_local_event_is_only_a_reconciliation_hint(monkeypatch, capsys):
     initial = snapshot()
     authoritative = [

@@ -3,6 +3,7 @@
 
 """Tests for the hopper client."""
 
+import json
 import os
 import socket
 import threading
@@ -14,6 +15,7 @@ import pytest
 
 from hopper.client import (
     HopperConnection,
+    InvalidServerResponse,
     connect,
     get_gate,
     list_archived_lodes,
@@ -21,6 +23,7 @@ from hopper.client import (
     ping,
     probe_server,
     read_archived_lodes,
+    read_lode_snapshot,
     send_gate_feedback,
     send_message,
     set_lode_branch,
@@ -131,6 +134,208 @@ def test_read_archived_lodes_returns_none_when_unreachable(socket_path):
 def test_read_archived_lodes_rejects_malformed_response(socket_path, response):
     with patch("hopper.client.send_message", return_value=response):
         assert read_archived_lodes(socket_path) is None
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            {"type": "lode_snapshot", "result": "found", "lode": {"id": "abc123"}},
+            ("found", {"id": "abc123"}),
+        ),
+        ({"type": "lode_snapshot", "result": "absent"}, ("absent", None)),
+        (
+            {"type": "lode_snapshot", "result": "ambiguous", "matches": ["abc123", "abc999"]},
+            ("ambiguous", ["abc123", "abc999"]),
+        ),
+    ],
+)
+def test_read_lode_snapshot_classifies_valid_results(socket_path, response, expected):
+    with patch("hopper.client._exchange_message_until_type", return_value=response) as exchange:
+        assert read_lode_snapshot(socket_path, "abc") == expected
+
+    exchange.assert_called_once_with(
+        socket_path,
+        {"type": "lode_snapshot", "prefix": "abc"},
+        {"lode_snapshot", "error"},
+        timeout=2.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_reason"),
+    [
+        (FileNotFoundError(), "server not running at {socket_path}"),
+        (ConnectionRefusedError(), "server not running at {socket_path}"),
+        (TimeoutError(), "server did not respond within 3s"),
+        (BlockingIOError(), "server did not respond within 3s"),
+        (OSError("broken socket"), "server exchange failed: broken socket"),
+        (UnicodeError("bad unicode"), "server exchange failed: bad unicode"),
+        (
+            json.JSONDecodeError("bad json", "x", 0),
+            "server exchange failed: bad json: line 1 column 1 (char 0)",
+        ),
+        (InvalidServerResponse("not an object"), "server exchange failed: not an object"),
+    ],
+)
+def test_read_lode_snapshot_maps_transport_failures_to_unavailable(
+    socket_path, error, expected_reason
+):
+    with patch("hopper.client._exchange_message_until_type", side_effect=error):
+        result = read_lode_snapshot(socket_path, "abc", timeout=3)
+
+    assert result == ("unavailable", expected_reason.format(socket_path=socket_path))
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_reason"),
+    [
+        (None, "server returned no response"),
+        ({"type": "error", "error": "bad prefix"}, "unexpected response type: 'error'"),
+        ({"result": "absent"}, "unexpected response type: None"),
+        ({"type": "lode_snapshot"}, "invalid lode_snapshot result: None"),
+        (
+            {"type": "lode_snapshot", "result": 1},
+            "invalid lode_snapshot result: 1",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "unknown"},
+            "invalid lode_snapshot result: 'unknown'",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "found"},
+            "found result missing lode object",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "found", "lode": []},
+            "found result missing lode object",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "found", "lode": {}},
+            "found lode has invalid id",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "found", "lode": {"id": 1}},
+            "found lode has invalid id",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "found", "lode": {"id": "other"}},
+            "found lode id does not match prefix 'abc'",
+        ),
+        (
+            {
+                "type": "lode_snapshot",
+                "result": "found",
+                "lode": {"id": "abc123"},
+                "matches": [],
+            },
+            "found result contains ambiguous matches",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "absent", "lode": None},
+            "absent result contains lode data",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "absent", "matches": []},
+            "absent result contains lode data",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "ambiguous"},
+            "ambiguous result has invalid matches",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "ambiguous", "matches": "abc"},
+            "ambiguous result has invalid matches",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "ambiguous", "matches": ["abc", 1]},
+            "ambiguous result has invalid matches",
+        ),
+        (
+            {"type": "lode_snapshot", "result": "ambiguous", "matches": ["abc"]},
+            "ambiguous result has fewer than two matches",
+        ),
+        (
+            {
+                "type": "lode_snapshot",
+                "result": "ambiguous",
+                "matches": ["abc123", "other"],
+            },
+            "ambiguous match does not match prefix 'abc'",
+        ),
+        (
+            {
+                "type": "lode_snapshot",
+                "result": "ambiguous",
+                "matches": ["abc123", "abc999"],
+                "lode": None,
+            },
+            "ambiguous result contains lode data",
+        ),
+    ],
+)
+def test_read_lode_snapshot_rejects_malformed_responses(socket_path, response, expected_reason):
+    with patch("hopper.client._exchange_message_until_type", return_value=response):
+        assert read_lode_snapshot(socket_path, "abc") == ("unavailable", expected_reason)
+
+
+def _read_lode_snapshot_from_chunks(socket_path, chunks):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+
+    def respond():
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(4096)
+            for chunk in chunks:
+                conn.sendall(chunk)
+
+    thread = threading.Thread(target=respond)
+    thread.start()
+    try:
+        return read_lode_snapshot(socket_path, "abc", timeout=0.2)
+    finally:
+        thread.join(timeout=1)
+        listener.close()
+
+
+def test_read_lode_snapshot_skips_broadcast_before_response(socket_path):
+    broadcast = json.dumps({"type": "lode_archived", "lode": {"id": "other"}})
+    response = json.dumps({"type": "lode_snapshot", "result": "found", "lode": {"id": "abc123"}})
+
+    result = _read_lode_snapshot_from_chunks(
+        socket_path,
+        [(broadcast + "\n" + response[:20]).encode(), (response[20:] + "\n").encode()],
+    )
+
+    assert result == ("found", {"id": "abc123"})
+
+
+def test_read_lode_snapshot_rejects_broadcast_only_stream(socket_path):
+    broadcast = json.dumps({"type": "lode_archived", "lode": {"id": "other"}})
+
+    result = _read_lode_snapshot_from_chunks(socket_path, [(broadcast + "\n").encode()])
+
+    assert result == (
+        "unavailable",
+        "server exchange failed: server closed connection before responding",
+    )
+
+
+def test_read_lode_snapshot_rejects_terminal_error(socket_path):
+    error = json.dumps({"type": "error", "error": "bad prefix"})
+
+    result = _read_lode_snapshot_from_chunks(socket_path, [(error + "\n").encode()])
+
+    assert result == ("unavailable", "unexpected response type: 'error'")
+
+
+def test_read_lode_snapshot_rejects_non_json_line(socket_path):
+    result = _read_lode_snapshot_from_chunks(socket_path, [b"not-json\n"])
+
+    assert result[0] == "unavailable"
+    assert str(result[1]).startswith("server exchange failed: Expecting value:")
 
 
 def test_ping_success(server, socket_path):
