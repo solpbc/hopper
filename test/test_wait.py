@@ -595,6 +595,169 @@ def test_remote_stuck_confirms_on_poll_after_grace(monkeypatch, capsys):
     assert "abc123 stuck: No output" in capsys.readouterr().out
 
 
+def test_remote_stuck_human_uses_remote_peek_without_local_capture(monkeypatch, capsys):
+    initial = snapshot(
+        host="fedora.local",
+        state="stuck",
+        status="Initial wedge",
+        tmux_pane="%83",
+    )
+    confirmed = snapshot(
+        host="fedora.local",
+        stage="refine",
+        state="stuck",
+        status="Confirmed wedge",
+        tmux_pane="%83",
+    )
+
+    def fail_capture(target):
+        raise AssertionError(f"unexpected local pane capture: {target}")
+
+    monkeypatch.setattr(wait, "capture_pane", fail_capture)
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        {"abc123": initial},
+        {"abc123": [(confirmed, "found")]},
+        publish=False,
+    )
+
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "fedora.local" in out
+    assert "%83" in out
+    assert "hop -H fedora.local lode peek abc123" in out
+    assert "stage=refine" in out
+    assert "state=stuck" in out
+    assert "active=True" in out
+    assert "status=Confirmed wedge" in out
+    assert "source=fedora.local" in out
+    assert "observed_age_s=" in out
+    assert "Initial wedge" not in out
+
+
+def test_remote_stuck_human_without_pane_uses_remote_peek(monkeypatch, capsys):
+    stuck = snapshot(host="fedora.local", state="stuck", status="Confirmed wedge")
+
+    def fail_capture(target):
+        raise AssertionError(f"unexpected local pane capture: {target}")
+
+    monkeypatch.setattr(wait, "capture_pane", fail_capture)
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        {"abc123": stuck},
+        {"abc123": [(stuck, "found")]},
+        publish=False,
+    )
+
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "source=fedora.local" in out
+    assert "pane: <unknown>" in out
+    assert "hop -H fedora.local lode peek abc123" in out
+
+
+def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch, capsys):
+    initial = snapshot(
+        host="fedora.local",
+        state="stuck",
+        status="Initial wedge",
+        tmux_pane="%83",
+    )
+    confirmed = snapshot(
+        host="fedora.local",
+        stage="refine",
+        state="stuck",
+        status="Confirmed wedge",
+        tmux_pane="%83",
+    )
+
+    def fail_capture(target):
+        raise AssertionError(f"unexpected local pane capture: {target}")
+
+    monkeypatch.setattr(wait, "capture_pane", fail_capture)
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        {"abc123": initial},
+        {"abc123": [(confirmed, "found")]},
+        json_output=True,
+        publish=False,
+    )
+
+    assert rc == 3
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.splitlines()]
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert set(payload) == {
+        "id",
+        "outcome",
+        "stage",
+        "state",
+        "status",
+        "active",
+        "source",
+        "observed_age_s",
+        "host",
+    }
+    assert payload["outcome"] == "stuck"
+    assert payload["source"] == "fedora.local"
+    assert payload["host"] == "fedora.local"
+    assert payload["stage"] == "refine"
+    assert payload["state"] == "stuck"
+    assert payload["status"] == "Confirmed wedge"
+    assert "fedora.local" in captured.err
+    assert "%83" in captured.err
+    assert "hop -H fedora.local lode peek abc123" in captured.err
+    assert "--- last 50 lines" not in captured.err
+    assert "Inspect with" not in captured.out
+
+
+def test_local_stuck_human_captures_only_last_50_pane_lines(monkeypatch, capsys):
+    stuck = snapshot(state="stuck", status="Local wedge", tmux_pane="%7")
+    pane_capture = "\n".join(f"line {number}" for number in range(1, 61))
+    captured_targets = []
+
+    def capture(target):
+        captured_targets.append(target)
+        return pane_capture
+
+    monkeypatch.setattr(wait, "capture_pane", capture)
+    rc, _, _ = run_local_wait(
+        monkeypatch,
+        stuck,
+        [("found", stuck), ("found", stuck)],
+    )
+
+    assert rc == 3
+    assert captured_targets == ["%7"]
+    out_lines = capsys.readouterr().out.splitlines()
+    start = out_lines.index("  --- last 50 lines of pane ---") + 1
+    end = out_lines.index("  --- end pane ---")
+    assert out_lines[start:end] == [f"  line {number}" for number in range(11, 61)]
+    assert "  line 10" not in out_lines[start:end]
+    assert "  line 11" in out_lines[start:end]
+    assert "  line 60" in out_lines[start:end]
+    assert any(
+        "stage=mill state=stuck active=True status=Local wedge source=local observed_age_s=" in line
+        for line in out_lines
+    )
+
+
+def test_gated_human_output_includes_latest_snapshot_summary(monkeypatch, capsys):
+    gated = snapshot(state="gated", status="Review required")
+    rc, _, _ = run_local_wait(monkeypatch, gated)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "hop gate show abc123" in out
+    assert "stage=mill" in out
+    assert "state=gated" in out
+    assert "active=True" in out
+    assert "status=Review required" in out
+    assert "source=local" in out
+    assert "observed_age_s=" in out
+
+
 @pytest.mark.parametrize("json_output", [False, True], ids=["human", "jsonl"])
 def test_observer_failure_reports_latest_valid_snapshot(monkeypatch, capsys, json_output):
     initial = snapshot(host="fedora.local", status="Initial")

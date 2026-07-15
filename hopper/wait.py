@@ -460,12 +460,19 @@ def _json_event(record: dict, outcome: str, now: float) -> dict:
     return event
 
 
-def _stuck_diagnostic(snapshot: dict) -> str:
-    """Format a stuck snapshot with a bounded pane tail."""
-    lid = snapshot["id"]
+def _stuck_diagnostic(record: dict, now: float) -> str:
+    """Format a stuck record with source-appropriate inspection guidance."""
+    snapshot = record["latest_snapshot"]
+    lid = record["id"]
     status = snapshot["status"]
     lines = [f"{STATUS_ERROR} {lid} stuck: {status}" if status else f"{STATUS_ERROR} {lid} stuck"]
+    lines.append(f"  {_snapshot_summary(record, now)}")
     tmux_pane = snapshot.get("tmux_pane")
+    if record["remote"]:
+        lines.append(f"  host: {record['host']}")
+        lines.append(f"  pane: {tmux_pane or '<unknown>'}")
+        lines.append(f"Inspect with: hop -H {record['host']} lode peek {lid}")
+        return "\n".join(lines)
     if not tmux_pane:
         lines.append("  pane: <unknown>")
         return "\n".join(lines)
@@ -496,7 +503,7 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
     if json_output:
         print(json.dumps(_json_event(record, outcome, now)))
         if outcome == "stuck":
-            print(_stuck_diagnostic(snapshot), file=sys.stderr)
+            print(_stuck_diagnostic(record, now), file=sys.stderr)
         return
     if outcome == "shipped":
         title = snapshot.get("title", "")
@@ -508,11 +515,12 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
         print(f"Lode {lid} entered error state. Restart with: hop lode restart {lid}")
     elif outcome == "gated":
         print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
+        print(f"  {_snapshot_summary(record, now)}")
     elif outcome == "inactive":
         print(f"Lode '{lid}' is not active ({_snapshot_summary(record, now)})")
         print(f"Recover with: hop lode resume {lid} or hop lode restart {lid}")
     elif outcome == "stuck":
-        print(_stuck_diagnostic(snapshot))
+        print(_stuck_diagnostic(record, now))
     elif outcome == "not_found":
         print(f"Lode '{lid}' not found ({_snapshot_summary(record, now)})")
         print(f"Inspect with: hop lode status {lid}")
