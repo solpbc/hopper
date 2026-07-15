@@ -19,8 +19,6 @@ import hopper.code as hopper_code
 from hopper import __version__, config
 from hopper.client import set_lode_progress
 from hopper.lodes import (
-    STATUS_ERROR,
-    STATUS_SHIPPED,
     current_time_ms,
     find_lode_by_prefix,
     find_lodes_by_prefix,
@@ -29,8 +27,6 @@ from hopper.lodes import (
     lode_icon,
 )
 from hopper.tmux import capture_pane, paste_buffer, send_keys
-
-STUCK_GRACE_MS = 120_000
 
 logger = logging.getLogger(__name__)
 
@@ -1555,7 +1551,7 @@ def _remote_lode_status(host: str, lode_id: str, timeout: float = 5.0) -> tuple[
     return lode, "found"
 
 
-def _find_remote_lode(prefix: str) -> tuple[dict | None, str]:
+def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dict | None, str]:
     """Find a lode on configured remote hosts using cache, then fan-out."""
     from hopper.remote import load_lode_cache, remember_lode, remote_registry
 
@@ -1572,7 +1568,8 @@ def _find_remote_lode(prefix: str) -> tuple[dict | None, str]:
         if probe_state == "unreadable":
             unreadable.add(host)
         if lode:
-            remember_lode(lode["id"], host, lode.get("project", ""))
+            if remember_result:
+                remember_lode(lode["id"], host, lode.get("project", ""))
             return lode, ", ".join(checked)
 
     remaining_hosts = [host for host in hosts if host not in checked]
@@ -1610,7 +1607,8 @@ def _find_remote_lode(prefix: str) -> tuple[dict | None, str]:
 
     if found:
         lode = found[0]
-        remember_lode(lode["id"], lode["host"], lode.get("project", ""))
+        if remember_result:
+            remember_lode(lode["id"], lode["host"], lode.get("project", ""))
         return lode, ", ".join(sorted(set(checked)))
     summary = ", ".join(sorted(set(checked)))
     if unreadable:
@@ -1760,6 +1758,12 @@ def cmd_lode(args: list[str]) -> int:
     wait_p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
     wait_p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
     wait_p.add_argument("--poll", type=float, default=30, help="Remote poll interval seconds")
+    wait_p.add_argument(
+        "--observer-timeout",
+        type=float,
+        default=300,
+        help="Seconds without a valid status observation before failing (0=disabled)",
+    )
     wait_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSONL")
     status_p = subs.add_parser("status", help="Show a lode's status", exit_on_error=False)
     status_p.add_argument("lode_id", help="Lode ID to show")
@@ -2052,296 +2056,19 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand == "wait":
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        lode_ids = parsed.lode_id
-        server_err = require_server()
-        local_available = not server_err
-        json_output = getattr(parsed, "json_output", False)
-        poll_interval = max(10.0, float(getattr(parsed, "poll", 30) or 30))
+        from hopper.wait import wait_for_lodes
 
-        def _shipped_line(lid: str, title: str) -> str:
-            if title:
-                return f"{STATUS_SHIPPED} {lid} shipped ({title})"
-            return f"{STATUS_SHIPPED} {lid} shipped"
-
-        def _error_line(lid: str, status: str) -> str:
-            return f"{STATUS_ERROR} {lid} error: {status}"
-
-        def _stuck_diagnostic(lid: str, status: str, tmux_pane: str | None) -> str:
-            if status:
-                lines = [f"{STATUS_ERROR} {lid} stuck: {status}"]
-            else:
-                lines = [f"{STATUS_ERROR} {lid} stuck"]
-            if not tmux_pane:
-                lines.append("  pane: <unknown>")
-                return "\n".join(lines)
-
-            lines.append(f"  pane: {tmux_pane}")
-            lines.append("  --- last 50 lines of pane ---")
-            pane_capture = capture_pane(tmux_pane)
-            if pane_capture:
-                pane_lines = pane_capture.split("\n")[-50:]
-                lines.extend(f"  {line}" for line in pane_lines)
-            else:
-                lines.append("  <pane capture failed>")
-            lines.append("  --- end pane ---")
-            return "\n".join(lines)
-
-        def _event(lode: dict, outcome: str) -> dict:
-            event = {
-                "id": lode.get("id", ""),
-                "outcome": outcome,
-                "stage": lode.get("stage", ""),
-                "state": lode.get("state", ""),
-                "status": lode.get("status", ""),
-            }
-            if lode.get("host"):
-                event["host"] = lode["host"]
-            return event
-
-        def _print_terminal(lode: dict, outcome: str) -> None:
-            lid = lode.get("id", "")
-            if json_output:
-                print(json.dumps(_event(lode, outcome)))
-                if outcome == "stuck":
-                    print(
-                        _stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")),
-                        file=sys.stderr,
-                    )
-                return
-            if outcome == "shipped":
-                print(_shipped_line(lid, lode.get("title", "")))
-            elif outcome == "error":
-                print(_error_line(lid, lode.get("status", "")))
-            elif outcome == "gated":
-                print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
-            elif outcome == "stuck":
-                print(_stuck_diagnostic(lid, lode.get("status", ""), lode.get("tmux_pane")))
-            elif outcome == "timeout":
-                print(f"Timed out waiting for lode(s): {lid}")
-
-        def _terminal(lode: dict) -> tuple[str, int] | None:
-            if lode.get("state") == "error":
-                return "error", 1
-            if lode.get("state") == "gated":
-                return "gated", 2
-            if lode.get("state") == "stuck":
-                return "stuck", 3
-            if lode.get("stage") == "shipped":
-                return "shipped", 0
-            return None
-
-        resolved: dict[str, dict] = {}
-        pending: set[str] = set()
-        pending_remote: dict[str, str] = {}
-        stuck_timers: dict[str, threading.Timer] = {}
-
-        for raw_id in lode_ids:
-            lode = client.get_lode(socket_path, raw_id) if local_available else None
-            if not lode and local_available:
-                lode, error = _lookup_lode(socket_path, raw_id)
-                if error and not error.startswith("Lode '"):
-                    print(error)
-                    return 1
-            if not lode:
-                remote_lode, checked = _find_remote_lode(raw_id)
-                if remote_lode:
-                    lode = remote_lode
-                else:
-                    suffix = (
-                        f" Checked remote hosts: {checked}."
-                        if checked
-                        else " No remote hosts configured."
-                    )
-                    print(f"Lode '{raw_id}' not found.{suffix}")
-                    return 1
-
-            if lode:
-                lid = lode["id"]
-                terminal = _terminal(lode)
-                if terminal and terminal[0] == "error":
-                    print(_format_lode_error(lode))
-                    return 1
-                if terminal and terminal[0] == "stuck":
-                    _print_terminal(lode, "stuck")
-                    return 3
-                if terminal and terminal[0] == "gated":
-                    _print_terminal(lode, "gated")
-                    return 2
-                if terminal and terminal[0] == "shipped":
-                    resolved[lid] = lode
-                elif not lode.get("active"):
-                    print(f"Lode '{raw_id}' is not active")
-                    return 1
-                else:
-                    resolved[lid] = lode
-                    pending.add(lid)
-                    if lode.get("host"):
-                        pending_remote[lid] = lode["host"]
-
-        for lid, lode in resolved.items():
-            if lid not in pending:
-                _print_terminal(lode, "shipped")
-
-        if not pending:
-            return 0
-
-        done = threading.Event()
-        result = [0]
-        lock = threading.Lock()
-
-        def _cancel_stuck_timer(lid: str) -> None:
-            timer = stuck_timers.pop(lid, None)
-            if timer is not None:
-                timer.cancel()
-
-        def _on_grace_expired(lid: str) -> None:
-            if done.is_set():
-                return
-            try:
-                current = client.get_lode(socket_path, lid)
-            except Exception:
-                return
-            if not current or current.get("state") != "stuck":
-                return
-            _print_terminal(current, "stuck")
-            result[0] = 3
-            done.set()
-
-        def _finish(lid: str, lode: dict, outcome: str, code: int) -> None:
-            with lock:
-                if lid not in pending:
-                    return
-                _cancel_stuck_timer(lid)
-                pending.discard(lid)
-                pending_remote.pop(lid, None)
-                _print_terminal(lode, outcome)
-                result[0] = max(result[0], code)
-                if code != 0 or not pending:
-                    done.set()
-
-        def on_message(message: dict) -> None:
-            msg_type = message.get("type")
-            if msg_type not in ("lode_updated", "lode_archived"):
-                return
-            msg_lode = message.get("lode", {})
-            lid = msg_lode.get("id")
-            if lid not in pending:
-                return
-            state = msg_lode.get("state")
-            if msg_type == "lode_updated" and state == "stuck":
-                if lid not in stuck_timers:
-                    timer = threading.Timer(STUCK_GRACE_MS / 1000.0, _on_grace_expired, args=[lid])
-                    timer.daemon = True
-                    timer.start()
-                    stuck_timers[lid] = timer
-                return
-            _cancel_stuck_timer(lid)
-            if msg_lode.get("state") == "error":
-                _finish(lid, msg_lode, "error", 1)
-            elif msg_lode.get("state") == "gated":
-                _finish(lid, msg_lode, "gated", 2)
-            elif msg_lode.get("stage") == "shipped" or msg_type == "lode_archived":
-                _finish(lid, msg_lode, "shipped", 0)
-
-        def _remote_poll_lode(lid: str, host: str) -> None:
-            from hopper.remote import remember_lode, run_remote
-
-            prior: tuple[str, str, str] | None = None
-            stuck_since: float | None = None
-            consecutive_failures = 0
-            while not done.is_set() and lid in pending:
-                try:
-                    remote_result = run_remote(
-                        host,
-                        ["lode", "status", lid, "--json"],
-                        timeout=max(5.0, min(poll_interval, 30.0)),
-                    )
-                except (OSError, subprocess.TimeoutExpired) as e:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 2:
-                        print(f"remote poll failed for {lid} on {host}: {e}", file=sys.stderr)
-                    done.wait(5 if consecutive_failures == 1 else poll_interval)
-                    continue
-
-                if remote_result.returncode != 0:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 2:
-                        detail = (remote_result.stderr or remote_result.stdout).strip()
-                        print(f"remote poll failed for {lid} on {host}: {detail}", file=sys.stderr)
-                    done.wait(5 if consecutive_failures == 1 else poll_interval)
-                    continue
-
-                consecutive_failures = 0
-                try:
-                    lode = json.loads(remote_result.stdout)
-                except json.JSONDecodeError:
-                    done.wait(poll_interval)
-                    continue
-                if not isinstance(lode, dict):
-                    done.wait(poll_interval)
-                    continue
-                lode["host"] = host
-                remember_lode(lode.get("id", lid), host, lode.get("project", ""))
-                signature = (
-                    str(lode.get("stage", "")),
-                    str(lode.get("state", "")),
-                    str(lode.get("status", "")),
-                )
-                if prior is None:
-                    prior = signature
-                elif signature != prior and not json_output:
-                    print(format_lode_line(lode))
-                    prior = signature
-
-                terminal = _terminal(lode)
-                if terminal and terminal[0] == "stuck":
-                    if stuck_since is None:
-                        stuck_since = time.monotonic()
-                    if (time.monotonic() - stuck_since) * 1000 >= STUCK_GRACE_MS:
-                        _finish(lid, lode, "stuck", 3)
-                        return
-                else:
-                    stuck_since = None
-                if terminal and terminal[0] != "stuck":
-                    _finish(lid, lode, terminal[0], terminal[1])
-                    return
-                done.wait(poll_interval)
-
-        remote_threads = [
-            threading.Thread(target=_remote_poll_lode, args=(lid, host), daemon=True)
-            for lid, host in pending_remote.items()
-        ]
-        for thread in remote_threads:
-            thread.start()
-
-        conn = (
-            client.HopperConnection(socket_path)
-            if local_available and (pending - set(pending_remote))
-            else None
+        return wait_for_lodes(
+            socket_path,
+            parsed.lode_id,
+            timeout_s=parsed.timeout,
+            poll_s=parsed.poll,
+            observer_timeout_s=parsed.observer_timeout,
+            json_output=parsed.json_output,
+            lookup_local=_lookup_lode,
+            find_remote=lambda prefix: _find_remote_lode(prefix, remember_result=False),
+            probe_remote=_remote_lode_status,
         )
-        try:
-            if conn:
-                conn.start(callback=on_message)
-            timeout = parsed.timeout or None
-            completed = done.wait(timeout=timeout)
-            if not completed:
-                remaining_lodes = [resolved[lid] for lid in sorted(pending) if lid in resolved]
-                if json_output:
-                    for lode in remaining_lodes:
-                        print(json.dumps(_event(lode, "timeout")))
-                else:
-                    remaining = ", ".join(lode.get("id", "") for lode in remaining_lodes)
-                    print(f"Timed out waiting for lode(s): {remaining}")
-                result[0] = 4
-        except KeyboardInterrupt:
-            pass
-        finally:
-            for timer in list(stuck_timers.values()):
-                timer.cancel()
-            stuck_timers.clear()
-            if conn:
-                conn.stop()
-        return result[0]
 
     if subcommand == "log":
         import json as json_mod
@@ -2608,6 +2335,12 @@ def cmd_wait(args: list[str]) -> int:
         p.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
         p.add_argument("--timeout", type=float, default=0, help="Timeout in seconds (0=forever)")
         p.add_argument("--poll", type=float, default=30, help="Remote poll interval seconds")
+        p.add_argument(
+            "--observer-timeout",
+            type=float,
+            default=300,
+            help="Seconds without a valid status observation before failing (0=disabled)",
+        )
         p.add_argument("--json", dest="json_output", action="store_true", help="Output JSONL")
         try:
             parse_args(p, args)

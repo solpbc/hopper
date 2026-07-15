@@ -1904,6 +1904,7 @@ def test_lode_wait_shipped(capsys):
         "status": "Working...",
         "active": True,
     }
+    shipped = {**lode, "stage": "shipped", "status": "Done", "title": "Done task"}
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=lode):
             mock_conn = MagicMock()
@@ -1922,8 +1923,9 @@ def test_lode_wait_shipped(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc123"])
     assert result == 0
     assert "✓ abc123 shipped (Done task)" in capsys.readouterr().out
 
@@ -1938,6 +1940,7 @@ def test_lode_wait_shipped_no_title(capsys):
         "active": True,
         "title": "",
     }
+    shipped = {**lode, "stage": "shipped"}
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=lode):
             mock_conn = MagicMock()
@@ -1946,8 +1949,9 @@ def test_lode_wait_shipped_no_title(capsys):
                 callback({"type": "lode_updated", "lode": {**lode, "stage": "shipped"}})
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc123"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ abc123 shipped" in out
@@ -2007,6 +2011,7 @@ def test_lode_wait_prefix_match(capsys):
         "status": "Working",
         "active": True,
     }
+    shipped = {**lode, "stage": "shipped", "status": "Done", "title": "Prefix task"}
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=None):
             with patch("hopper.client.list_lodes", return_value=[lode]):
@@ -2027,8 +2032,9 @@ def test_lode_wait_prefix_match(capsys):
                         )
 
                     mock_conn.start = fake_start
-                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                        result = cmd_lode(["wait", "abc"])
+                    with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
+                        with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                            result = cmd_lode(["wait", "abc"])
     assert result == 0
     assert "✓ abc12345 shipped (Prefix task)" in capsys.readouterr().out
 
@@ -2060,6 +2066,7 @@ def test_lode_wait_error(capsys):
         "status": "Working",
         "active": True,
     }
+    failed = {**lode, "state": "error", "status": "Failed"}
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=lode):
             mock_conn = MagicMock()
@@ -2070,8 +2077,9 @@ def test_lode_wait_error(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.wait.read_local_snapshot", return_value=("found", failed)):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc123"])
     assert result == 1
     assert "✗ abc123 error: Failed" in capsys.readouterr().out
 
@@ -2085,6 +2093,7 @@ def test_wait_exits_2_on_gate_transition(capsys):
         "status": "Working",
         "active": True,
     }
+    gated = {**lode, "state": "gated", "status": "Gate"}
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", return_value=lode):
             mock_conn = MagicMock()
@@ -2095,8 +2104,9 @@ def test_wait_exits_2_on_gate_transition(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.wait.read_local_snapshot", return_value=("found", gated)):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc123"])
     assert result == 2
     assert "Lode abc123 is gated. Review with: hop gate show abc123" in capsys.readouterr().out
 
@@ -2119,7 +2129,37 @@ def test_lode_wait_error_state_at_start(capsys):
     assert "hop lode restart abc123" in out
 
 
-def test_wait_stuck_at_start(capsys):
+def _run_scripted_cli_wait(monkeypatch, initial_by_id, observations_by_id, args):
+    now = [0.0]
+    queues = {lid: list(items) for lid, items in observations_by_id.items()}
+    latest = dict(initial_by_id)
+    connection = MagicMock()
+
+    def get_lode(socket_path, lid, timeout=2.0):
+        return initial_by_id.get(lid)
+
+    def read_snapshot(socket_path, lid):
+        if queues.get(lid):
+            latest[lid] = queues[lid].pop(0)
+        return "found", latest[lid]
+
+    def start(callback, on_connect=None):
+        if on_connect:
+            on_connect()
+
+    def condition_wait(condition, timeout):
+        now[0] += timeout
+
+    connection.start = start
+    monkeypatch.setattr("hopper.client.get_lode", get_lode)
+    monkeypatch.setattr("hopper.client.HopperConnection", lambda socket_path: connection)
+    monkeypatch.setattr("hopper.wait.read_local_snapshot", read_snapshot)
+    monkeypatch.setattr("hopper.wait._monotonic", lambda: now[0])
+    monkeypatch.setattr("hopper.wait._condition_wait", condition_wait)
+    return cmd_lode(["wait", *args]), now[0]
+
+
+def test_wait_stuck_at_start(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2128,11 +2168,15 @@ def test_wait_stuck_at_start(capsys):
         "status": "No output for 60s",
         "tmux_pane": "hopper:7",
     }
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.cli.capture_pane", return_value="line1\nline2\nline3"):
-                result = cmd_lode(["wait", "abc123"])
+    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane: "line1\nline2\nline3")
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [lode, lode]},
+        ["abc123"],
+    )
     assert result == 3
+    assert elapsed == 120
     out = capsys.readouterr().out
     assert "✗ abc123 stuck: No output for 60s" in out
     assert "  pane: hopper:7" in out
@@ -2141,7 +2185,7 @@ def test_wait_stuck_at_start(capsys):
     assert "  --- end pane ---" in out
 
 
-def test_wait_stuck_at_start_no_pane(capsys):
+def test_wait_stuck_at_start_no_pane(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2150,18 +2194,23 @@ def test_wait_stuck_at_start_no_pane(capsys):
         "status": "No output for 60s",
         "tmux_pane": None,
     }
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.cli.capture_pane") as mock_capture:
-                result = cmd_lode(["wait", "abc123"])
+    mock_capture = MagicMock()
+    monkeypatch.setattr("hopper.wait.capture_pane", mock_capture)
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [lode, lode]},
+        ["abc123"],
+    )
     assert result == 3
+    assert elapsed == 120
     out = capsys.readouterr().out
     assert "  pane: <unknown>" in out
     assert "  --- last 50 lines of pane ---" not in out
     mock_capture.assert_not_called()
 
 
-def test_wait_stuck_at_start_capture_fails(capsys):
+def test_wait_stuck_at_start_capture_fails(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2170,18 +2219,22 @@ def test_wait_stuck_at_start_capture_fails(capsys):
         "status": "No output for 60s",
         "tmux_pane": "hopper:7",
     }
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.cli.capture_pane", return_value=None):
-                result = cmd_lode(["wait", "abc123"])
+    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane: None)
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [lode, lode]},
+        ["abc123"],
+    )
     assert result == 3
+    assert elapsed == 120
     out = capsys.readouterr().out
     assert "  --- last 50 lines of pane ---" in out
     assert "  <pane capture failed>" in out
     assert "  --- end pane ---" in out
 
 
-def test_wait_stuck_at_start_empty_status(capsys):
+def test_wait_stuck_at_start_empty_status(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2190,15 +2243,19 @@ def test_wait_stuck_at_start_empty_status(capsys):
         "status": "",
         "tmux_pane": None,
     }
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
-            result = cmd_lode(["wait", "abc123"])
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [lode, lode]},
+        ["abc123"],
+    )
     assert result == 3
+    assert elapsed == 120
     first_line = capsys.readouterr().out.splitlines()[0]
     assert first_line == "✗ abc123 stuck"
 
 
-def test_wait_stuck_at_start_pane_truncated_to_50(capsys):
+def test_wait_stuck_at_start_pane_truncated_to_50(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2208,18 +2265,22 @@ def test_wait_stuck_at_start_pane_truncated_to_50(capsys):
         "tmux_pane": "hopper:7",
     }
     pane_capture = "\n".join(f"line{i}" for i in range(75))
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.cli.capture_pane", return_value=pane_capture):
-                result = cmd_lode(["wait", "abc123"])
+    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane: pane_capture)
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [lode, lode]},
+        ["abc123"],
+    )
     assert result == 3
+    assert elapsed == 120
     out_lines = capsys.readouterr().out.splitlines()
     start = out_lines.index("  --- last 50 lines of pane ---") + 1
     end = out_lines.index("  --- end pane ---")
     assert out_lines[start:end] == [f"  line{i}" for i in range(25, 75)]
 
 
-def test_wait_stuck_transition_grace_expires(capsys):
+def test_wait_stuck_transition_grace_expires(monkeypatch, capsys):
     initial_lode = {
         "id": "abc123",
         "active": True,
@@ -2233,26 +2294,22 @@ def test_wait_stuck_transition_grace_expires(capsys):
         "status": "No output for 60s",
         "tmux_pane": "hopper:7",
     }
-    with patch("hopper.cli.STUCK_GRACE_MS", 50):
-        with patch("hopper.cli.require_server", return_value=0):
-            with patch("hopper.client.get_lode", side_effect=[initial_lode, stuck_lode]):
-                with patch("hopper.cli.capture_pane", return_value="line1"):
-                    mock_conn = MagicMock()
-
-                    def fake_start(callback, on_connect=None):
-                        callback({"type": "lode_updated", "lode": stuck_lode})
-                        time.sleep(0.15)
-
-                    mock_conn.start = fake_start
-                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                        result = cmd_lode(["wait", "abc123", "--timeout", "1"])
+    monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 50)
+    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane: "line1")
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": initial_lode},
+        {"abc123": [stuck_lode, stuck_lode]},
+        ["abc123", "--timeout", "1"],
+    )
     assert result == 3
+    assert elapsed == pytest.approx(0.05)
     out = capsys.readouterr().out
     assert "✗ abc123 stuck: No output for 60s" in out
     assert "  line1" in out
 
 
-def test_wait_stuck_transition_recovers_within_grace(capsys):
+def test_wait_stuck_transition_recovers_within_grace(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2263,21 +2320,13 @@ def test_wait_stuck_transition_recovers_within_grace(capsys):
     stuck_lode = {**lode, "state": "stuck", "status": "No output for 60s"}
     running_lode = {**lode, "state": "running", "status": "Claude running"}
     shipped_lode = {**lode, "stage": "shipped", "status": "Done"}
-    with patch("hopper.cli.STUCK_GRACE_MS", 200):
-        with patch("hopper.cli.require_server", return_value=0):
-            with patch("hopper.client.get_lode", return_value=lode):
-                mock_conn = MagicMock()
-
-                def fake_start(callback, on_connect=None):
-                    callback({"type": "lode_updated", "lode": stuck_lode})
-                    time.sleep(0.05)
-                    callback({"type": "lode_updated", "lode": running_lode})
-                    time.sleep(0.05)
-                    callback({"type": "lode_updated", "lode": shipped_lode})
-
-                mock_conn.start = fake_start
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc123"])
+    monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 200)
+    result, _ = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [stuck_lode, running_lode, shipped_lode]},
+        ["abc123"],
+    )
     assert result == 0
     out = capsys.readouterr().out
     assert "stuck:" not in out
@@ -2285,7 +2334,7 @@ def test_wait_stuck_transition_recovers_within_grace(capsys):
     assert "✓ abc123 shipped" in out
 
 
-def test_wait_stuck_flap_rearms(capsys):
+def test_wait_stuck_flap_rearms(monkeypatch, capsys):
     initial_lode = {
         "id": "abc123",
         "active": True,
@@ -2300,30 +2349,21 @@ def test_wait_stuck_flap_rearms(capsys):
         "tmux_pane": "hopper:7",
     }
     running_lode = {**initial_lode, "state": "running", "status": "Claude running"}
-    with patch("hopper.cli.STUCK_GRACE_MS", 100):
-        with patch("hopper.cli.require_server", return_value=0):
-            with patch("hopper.client.get_lode", side_effect=[initial_lode, stuck_lode]):
-                with patch("hopper.cli.capture_pane", return_value="line1"):
-                    mock_conn = MagicMock()
-
-                    def fake_start(callback, on_connect=None):
-                        callback({"type": "lode_updated", "lode": stuck_lode})
-                        time.sleep(0.03)
-                        callback({"type": "lode_updated", "lode": running_lode})
-                        time.sleep(0.03)
-                        callback({"type": "lode_updated", "lode": stuck_lode})
-                        time.sleep(0.12)
-
-                    mock_conn.start = fake_start
-                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                        result = cmd_lode(["wait", "abc123", "--timeout", "1"])
+    monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 100)
+    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane: "line1")
+    result, _ = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": initial_lode},
+        {"abc123": [stuck_lode, running_lode, stuck_lode, stuck_lode]},
+        ["abc123", "--timeout", "60"],
+    )
     assert result == 3
     out = capsys.readouterr().out
     assert out.count("✗ abc123 stuck: No output for 60s") == 1
     assert out.count("  --- last 50 lines of pane ---") == 1
 
 
-def test_wait_stuck_multi_lode_first_wins(capsys):
+def test_wait_stuck_multi_lode_first_wins(monkeypatch, capsys):
     stuck_lode = {
         "id": "aaa111",
         "active": True,
@@ -2332,20 +2372,28 @@ def test_wait_stuck_multi_lode_first_wins(capsys):
         "status": "No output for 60s",
         "tmux_pane": "hopper:7",
     }
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=stuck_lode) as mock_get_lode:
-            with patch("hopper.cli.capture_pane", return_value="line1"):
-                with patch("hopper.client.HopperConnection") as mock_conn_cls:
-                    result = cmd_lode(["wait", "aaa111", "bbb222"])
+    running_lode = {
+        "id": "bbb222",
+        "active": True,
+        "stage": "refine",
+        "state": "running",
+        "status": "Working",
+    }
+    monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 50)
+    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane: "line1")
+    result, _ = _run_scripted_cli_wait(
+        monkeypatch,
+        {"aaa111": stuck_lode, "bbb222": running_lode},
+        {"aaa111": [stuck_lode, stuck_lode], "bbb222": [running_lode]},
+        ["aaa111", "bbb222"],
+    )
     assert result == 3
     out = capsys.readouterr().out
     assert "✗ aaa111 stuck: No output for 60s" in out
     assert "bbb222" not in out
-    assert mock_get_lode.call_count == 1
-    mock_conn_cls.assert_not_called()
 
 
-def test_wait_timeout_shorter_than_grace(capsys):
+def test_wait_timeout_shorter_than_grace(monkeypatch, capsys):
     lode = {
         "id": "abc123",
         "active": True,
@@ -2354,18 +2402,15 @@ def test_wait_timeout_shorter_than_grace(capsys):
         "status": "Working",
     }
     stuck_lode = {**lode, "state": "stuck", "status": "No output for 60s"}
-    with patch("hopper.cli.STUCK_GRACE_MS", 200):
-        with patch("hopper.cli.require_server", return_value=0):
-            with patch("hopper.client.get_lode", return_value=lode):
-                mock_conn = MagicMock()
-
-                def fake_start(callback, on_connect=None):
-                    callback({"type": "lode_updated", "lode": stuck_lode})
-
-                mock_conn.start = fake_start
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc123", "--timeout", "0.05"])
+    monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 200)
+    result, elapsed = _run_scripted_cli_wait(
+        monkeypatch,
+        {"abc123": lode},
+        {"abc123": [stuck_lode]},
+        ["abc123", "--timeout", "0.05"],
+    )
     assert result == 4
+    assert elapsed == pytest.approx(0.05)
     out = capsys.readouterr().out
     assert "Timed out waiting for lode(s): abc123" in out
     assert "✗ abc123 stuck" not in out
@@ -2441,6 +2486,11 @@ def test_lode_wait_multi_all_ship(capsys):
             return lode2
         return None
 
+    shipped = {
+        "aaa111": {**lode1, "stage": "shipped", "title": "First"},
+        "bbb222": {**lode2, "stage": "shipped", "title": "Second"},
+    }
+
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", side_effect=fake_get_lode):
             mock_conn = MagicMock()
@@ -2460,8 +2510,12 @@ def test_lode_wait_multi_all_ship(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222"])
+            with patch(
+                "hopper.wait.read_local_snapshot",
+                side_effect=lambda socket_path, lid: ("found", shipped[lid]),
+            ):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "aaa111", "bbb222"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ aaa111 shipped (First)" in out
@@ -2492,6 +2546,11 @@ def test_lode_wait_multi_one_errors(capsys):
             return lode2
         return None
 
+    current = {
+        "aaa111": {**lode1, "state": "error", "status": "Crashed"},
+        "bbb222": lode2,
+    }
+
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", side_effect=fake_get_lode):
             mock_conn = MagicMock()
@@ -2505,8 +2564,12 @@ def test_lode_wait_multi_one_errors(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222"])
+            with patch(
+                "hopper.wait.read_local_snapshot",
+                side_effect=lambda socket_path, lid: ("found", current[lid]),
+            ):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "aaa111", "bbb222"])
     assert result == 1
     out = capsys.readouterr().out
     assert "✗ aaa111 error: Crashed" in out
@@ -2538,6 +2601,12 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
             return pending_lode
         return None
 
+    finished_pending = {
+        **pending_lode,
+        "stage": "shipped",
+        "title": "Still going",
+    }
+
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.get_lode", side_effect=fake_get_lode):
             mock_conn = MagicMock()
@@ -2551,8 +2620,9 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222"])
+            with patch("hopper.wait.read_local_snapshot", return_value=("found", finished_pending)):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "aaa111", "bbb222"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ aaa111 shipped (Already done)" in out
@@ -3799,6 +3869,16 @@ def test_wait_help_shows_wait(capsys):
     out = capsys.readouterr().out
     assert "hop wait" in out
     assert "--timeout" in out
+    assert "--observer-timeout" in out
+    assert "Seconds without a valid status observation" in out
+    assert "failing (0=disabled)" in out
+
+
+def test_lode_wait_help_shows_observer_timeout(capsys):
+    assert cmd_lode(["wait", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "--observer-timeout" in out
+    assert "Seconds without a valid status observation" in out
 
 
 def test_show_help_shows_show(capsys):
@@ -4100,6 +4180,36 @@ def test_remote_lode_probe_classifies_timeout_as_unreadable():
 
     assert lode is None
     assert state == "unreadable"
+
+
+@pytest.mark.parametrize("stdout", ["{", "[]", "{}"])
+def test_remote_lode_probe_classifies_malformed_output_as_unreadable(stdout):
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+    with patch("hopper.remote.run_remote", return_value=result):
+        lode, state = _remote_lode_status("fedora.local", "busy-id")
+
+    assert lode is None
+    assert state == "unreadable"
+
+
+def test_find_remote_lode_can_skip_cache_publish():
+    from hopper.cli import _find_remote_lode
+
+    lode = {
+        "id": "remote123",
+        "host": "fedora.local",
+        "project": "journal",
+    }
+    with patch("hopper.remote.load_lode_cache", return_value={}):
+        with patch("hopper.remote.remote_registry", return_value={"journal": "fedora.local"}):
+            with patch("hopper.cli._remote_lode_status", return_value=(lode, "found")):
+                with patch("hopper.remote.remember_lode") as remember:
+                    found, _ = _find_remote_lode("remote123", remember_result=False)
+
+    assert found == lode
+    remember.assert_not_called()
 
 
 def test_backlog_ls_alias(capsys):

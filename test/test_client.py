@@ -16,9 +16,11 @@ from hopper.client import (
     HopperConnection,
     connect,
     get_gate,
+    list_archived_lodes,
     lode_exists,
     ping,
     probe_server,
+    read_archived_lodes,
     send_gate_feedback,
     send_message,
     set_lode_branch,
@@ -104,6 +106,31 @@ def test_connect_with_lode_id_not_found(server, socket_path):
     assert result is not None
     assert result["lode_found"] is False
     assert result["lode"] is None
+
+
+@pytest.mark.parametrize("lodes", [[], [{"id": "archived-id"}]])
+def test_read_archived_lodes_preserves_valid_lists(socket_path, lodes):
+    response = {"type": "archived_list", "lodes": lodes}
+    with patch("hopper.client.send_message", return_value=response):
+        assert read_archived_lodes(socket_path) == lodes
+
+
+def test_read_archived_lodes_returns_none_when_unreachable(socket_path):
+    with patch("hopper.client.send_message", return_value=None):
+        assert read_archived_lodes(socket_path) is None
+        assert list_archived_lodes(socket_path) == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"type": "wrong", "lodes": []},
+        {"type": "archived_list", "lodes": "not-a-list"},
+    ],
+)
+def test_read_archived_lodes_rejects_malformed_response(socket_path, response):
+    with patch("hopper.client.send_message", return_value=response):
+        assert read_archived_lodes(socket_path) is None
 
 
 def test_ping_success(server, socket_path):

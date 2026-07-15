@@ -370,8 +370,8 @@ def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
     return []
 
 
-def list_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
-    """List all archived lodes from the server."""
+def read_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
+    """Read archived lodes, preserving an unreachable server as None."""
     response = send_message(
         socket_path,
         {"type": "archived_list"},
@@ -379,8 +379,14 @@ def list_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
         wait_for_response=True,
     )
     if response and response.get("type") == "archived_list":
-        return response.get("lodes", [])
-    return []
+        lodes = response.get("lodes")
+        return lodes if isinstance(lodes, list) else None
+    return None
+
+
+def list_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
+    """List archived lodes, returning an empty list when unavailable."""
+    return read_archived_lodes(socket_path, timeout=timeout) or []
 
 
 def create_lode(

@@ -75,21 +75,30 @@ Block until one or more lodes ship **(outside lode only)**:
 hop wait <lode-id>
 hop wait <id1> <id2> <id3>
 hop wait <lode-id> --timeout 300
+hop wait <lode-id> --observer-timeout 300
 hop wait <lode-id> --poll 30 --json
 ```
 
-Prints a status line as each lode resolves. Exit codes are disambiguated:
-`0` all shipped, `1` error/not-found/not-active, `2` gated, `3` stuck,
-`4` timeout. For remote lodes, `hop wait` polls remote status internally at the
-configured `--poll` interval and applies the same terminal-state rules. Do not
-hand-roll SSH polling loops for remote lodes.
+`--timeout` limits the whole wait. `--observer-timeout` limits how long the
+latest valid authoritative status may go stale; set either to `0` to disable
+that limit. Socket events only accelerate reconciliation: durable active or
+archived status decides every outcome. Remote lodes are reconciled at the
+configured `--poll` interval. Do not hand-roll SSH polling loops for them.
+
+Shipped lodes print once. In a multi-lode wait, the first nonzero outcome stops
+the command after any sibling terminal outcomes already known at that boundary
+are printed. Exit codes are disambiguated: `0` all shipped, `1`
+error/not-found/inactive, `2` gated, `3` stuck, and `4` overall timeout or
+observer unavailable. With `--json`, stdout is JSONL with outcomes `shipped`,
+`error`, `not_found`, `inactive`, `gated`, `stuck`, `timeout`, and
+`observer_unavailable`; diagnostics remain on stderr.
 
 ### Reading the status — three traps
 
 `hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `completed`, `error`, `gated`).
 
 1. **`state: completed` is a STAGE boundary, not the finish.** State flips to `completed` at the end of *each* stage (mill done, refine done, ship done), then the next stage begins. **The only terminal success signal is `stage: shipped`** — key your loop on that, never on `state: completed`.
-2. **Debounce `stuck` — one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` itself waits ~2 min before treating stuck as terminal. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
+2. **Debounce `stuck` — one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` waits ~2 min before treating stuck as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
 3. **`hop wait` timeout is exit `4`, not gate.** Gate is exit `2`; wrappers can now branch cleanly.
 
 Watch live status events for a lode **(outside lode only)**:
