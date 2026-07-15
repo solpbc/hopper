@@ -323,6 +323,43 @@ def test_read_lode_snapshot_rejects_broadcast_only_stream(socket_path):
     )
 
 
+def test_read_lode_snapshot_deadline_survives_live_broadcast_stream(socket_path):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    stop = threading.Event()
+    broadcasts_sent = []
+    broadcast = (json.dumps({"type": "lode_updated"}) + "\n").encode()
+
+    def stream_broadcasts():
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(4096)
+            while not stop.is_set():
+                try:
+                    conn.sendall(broadcast)
+                except OSError:
+                    break
+                broadcasts_sent.append(None)
+                stop.wait(0.02)
+
+    thread = threading.Thread(target=stream_broadcasts, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        result = read_lode_snapshot(socket_path, "abc", timeout=0.3)
+        elapsed = time.monotonic() - started
+    finally:
+        stop.set()
+        listener.close()
+        thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(broadcasts_sent) >= 2
+    assert result == ("unavailable", "server did not respond within 0.3s")
+    assert elapsed < 2
+
+
 def test_read_lode_snapshot_rejects_terminal_error(socket_path):
     error = json.dumps({"type": "error", "error": "bad prefix"})
 

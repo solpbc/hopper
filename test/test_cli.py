@@ -3719,8 +3719,9 @@ def test_status_outside_lode_not_found(capsys):
         result = cmd_status(["bad_id"])
     require.assert_not_called()
     assert result == 1
-    out = capsys.readouterr().out
-    assert "not found" in out.lower()
+    captured = capsys.readouterr()
+    assert captured.out == "Lode 'bad_id' not found.\n"
+    assert captured.err == ""
 
 
 def test_status_outside_lode_title_rejected(capsys):
@@ -3929,6 +3930,38 @@ def test_show_delegates_to_lode_show(capsys):
     assert "abc123" in out
 
 
+def test_show_alias_absent_has_exact_message(capsys):
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.cli._find_remote_lode", return_value=(None, "")),
+    ):
+        result = cmd_show(["missing"])
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert captured.out == "Lode 'missing' not found. No remote hosts configured.\n"
+    assert captured.err == ""
+
+
+def test_show_alias_unavailable_has_exact_message(capsys):
+    with (
+        patch(
+            "hopper.client.read_lode_snapshot",
+            return_value=("unavailable", "server not running at /tmp/server.sock"),
+        ),
+        patch("hopper.cli._find_remote_lode", return_value=(None, "")),
+    ):
+        result = cmd_show(["missing"])
+
+    assert result == 2
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Lode status unavailable for 'missing': server not running at /tmp/server.sock. "
+        "No remote hosts configured.\n"
+    )
+    assert captured.err == ""
+
+
 def test_restart_delegates_to_lode_restart(capsys):
     """hop restart delegates to hop lode restart."""
     lode = {
@@ -4015,24 +4048,36 @@ def test_lode_status_uses_one_snapshot_exchange(capsys, make_lode):
     lode = make_lode(id="abc12345", active=True)
     exchanges = []
 
-    def exchange(socket_path, message, response_types, timeout=2.0):
-        exchanges.append((socket_path, message, response_types, timeout))
+    def exchange(socket_path, message, timeout=2.0, wait_for_response=False):
+        exchanges.append(("_exchange_message", socket_path, message, timeout, wait_for_response))
+        return None
+
+    def exchange_until_type(socket_path, message, response_types, timeout=2.0):
+        exchanges.append(
+            ("_exchange_message_until_type", socket_path, message, timeout, response_types)
+        )
         return {"type": "lode_snapshot", "result": "found", "lode": lode}
 
     with (
-        patch("hopper.client._exchange_message_until_type", side_effect=exchange),
+        patch("hopper.client._exchange_message", side_effect=exchange) as basic_exchange,
+        patch(
+            "hopper.client._exchange_message_until_type",
+            side_effect=exchange_until_type,
+        ) as typed_exchange,
+        patch("hopper.client.socket.socket") as socket_constructor,
         patch("hopper.cli._find_remote_lode") as find_remote,
     ):
         assert cmd_lode(["status", "abc12345"]) == 0
 
-    assert [message["type"] for _path, message, _types, _timeout in exchanges] == ["lode_snapshot"]
-    assert exchanges[0][1] == {"type": "lode_snapshot", "prefix": "abc12345"}
-    assert exchanges[0][2] == {"lode_snapshot", "error"}
-    assert not [
-        message
-        for _path, message, _types, _timeout in exchanges
-        if message["type"] in {"ping", "lode_list", "archived_list"}
-    ]
+    assert len(exchanges) == 1
+    transport, _path, message, timeout, response_types = exchanges[0]
+    assert transport == "_exchange_message_until_type"
+    assert message == {"type": "lode_snapshot", "prefix": "abc12345"}
+    assert timeout == 2.0
+    assert response_types == {"lode_snapshot", "error"}
+    basic_exchange.assert_not_called()
+    typed_exchange.assert_called_once()
+    socket_constructor.assert_not_called()
     find_remote.assert_not_called()
     assert "abc12345" in capsys.readouterr().out
 
@@ -4131,10 +4176,9 @@ def test_lode_show_ambiguous_prefix(capsys):
     ):
         result = cmd_lode(["show", "abc"])
     assert result == 1
-    out = capsys.readouterr().out
-    assert "Ambiguous prefix 'abc'" in out
-    assert "abc12345" in out
-    assert "abc99999" in out
+    captured = capsys.readouterr()
+    assert captured.out == "Ambiguous prefix 'abc', matches: abc12345, abc99999\n"
+    assert captured.err == ""
 
 
 def test_lode_show_not_found(capsys):
@@ -4143,8 +4187,9 @@ def test_lode_show_not_found(capsys):
         with patch("hopper.cli._find_remote_lode", return_value=(None, "")):
             result = cmd_lode(["show", "bad_id"])
     assert result == 1
-    out = capsys.readouterr().out
-    assert "not found" in out.lower()
+    captured = capsys.readouterr()
+    assert captured.out == "Lode 'bad_id' not found. No remote hosts configured.\n"
+    assert captured.err == ""
 
 
 def test_lode_show_subcommand(capsys):
@@ -4169,16 +4214,20 @@ def test_lode_show_subcommand(capsys):
 def test_lode_status_not_found(capsys):
     """hop lode status <id> errors when not found."""
     with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
-        with patch("hopper.cli._find_remote_lode", return_value=(None, "")):
+        with patch("hopper.cli._find_remote_lode", return_value=(None, "fedora.local")):
             result = cmd_lode(["status", "bad_id"])
     assert result == 1
-    out = capsys.readouterr().out
-    assert "not found" in out.lower()
+    captured = capsys.readouterr()
+    assert captured.out == "Lode 'bad_id' not found. Checked remote hosts: fedora.local.\n"
+    assert captured.err == ""
 
 
 def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
     """A busy/unreachable host is not reported as a dead lode."""
-    with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
+    with patch(
+        "hopper.client.read_lode_snapshot",
+        return_value=("unavailable", "server did not respond within 2s"),
+    ):
         with patch(
             "hopper.cli._find_remote_lode",
             return_value=(None, "fedora.local [unreadable: fedora.local]"),
@@ -4186,7 +4235,12 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
             result = cmd_lode(["status", "busy-id"])
 
     assert result == 2
-    assert "status unavailable" in capsys.readouterr().out.lower()
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Lode status unavailable for 'busy-id': server did not respond within 2s. "
+        "Remote probes: fedora.local [unreadable: fedora.local].\n"
+    )
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize(
@@ -4300,10 +4354,12 @@ def test_lode_status_local_unavailable_remote_absent_exits_2(capsys):
         result = cmd_lode(["status", "abc"])
 
     assert result == 2
-    assert capsys.readouterr().out == (
+    captured = capsys.readouterr()
+    assert captured.out == (
         "Lode status unavailable for 'abc': server not running at /tmp/server.sock. "
         "Checked remote hosts: fedora.local.\n"
     )
+    assert captured.err == ""
 
 
 def test_outside_status_local_unavailable_prints_honest_error(capsys):
@@ -4318,9 +4374,11 @@ def test_outside_status_local_unavailable_prints_honest_error(capsys):
 
     assert result == 1
     require.assert_not_called()
-    assert capsys.readouterr().out == (
+    captured = capsys.readouterr()
+    assert captured.out == (
         "Lode status unavailable for 'abc': server not running at /tmp/server.sock\n"
     )
+    assert captured.err == ""
 
 
 def test_remote_lode_probe_classifies_timeout_as_unreadable():
@@ -4564,7 +4622,9 @@ def test_lode_status_json_includes_recovery_without_mutating_lode(capsys, make_l
     with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
         assert cmd_lode(["status", "test-id", "--json"]) == 0
 
-    assert json.loads(capsys.readouterr().out)["recovery"] == recovery
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {**lode, "recovery": recovery}
+    assert captured.err == ""
     assert "recovery" not in lode
 
 
@@ -4691,9 +4751,9 @@ def test_lode_status_json_remote(capsys):
         with patch("hopper.cli._find_remote_lode", return_value=(remote_lode, "fedora.local")):
             assert cmd_lode(["status", "remote123", "--json"]) == 0
 
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["id"] == "remote123"
-    assert payload["host"] == "fedora.local"
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == remote_lode
+    assert captured.err == ""
 
 
 def test_lode_list_json_envelope(capsys):
