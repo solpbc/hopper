@@ -16,7 +16,8 @@ Present a concise but complete action plan:
 - Clear sequence if order matters
 - Any risks or open questions
 
-Planning only - no implementation yet. Ready for review before proceeding. Thanks!
+Planning only - no implementation and no validation commands. Ready for review
+before proceeding. Thanks!
 
 ---
 

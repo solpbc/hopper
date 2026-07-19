@@ -74,7 +74,8 @@ D) Define acceptance criteria + validation
   - UI: specify screenshot tool usage and which page/state to capture.
   - Data pipelines: specify spot checks on real data (or best available fixtures) and what to verify.
   - Scripts: require dry-run mode + summary counts by reason, and idempotence expectations.
-  - Tests: specify what to run and where tests should be added/updated (or explicit "no test needed" if task says so).
+  - Tests: specify the smallest focused commands that prove the behavior and where tests should be added/updated (or explicit "no test needed" if the task says so).
+  - Do not add `make ci` or another full repository gate mechanically. Include a full gate during refine only for changes to CI/test infrastructure, shared fixtures, packaging or dependencies, broad cross-cutting contracts, or when a clean baseline is necessary to diagnose the task. State why it is needed. Ship owns the mandatory final full gate.
 
 E) Produce the scoped prompt
 The prompt must include:
@@ -83,11 +84,11 @@ The prompt must include:
 3. Current system map (facts only): key files + what they do + key call sites
 4. Constraints / preferences (from task + repo conventions)
 5. Guidance by stage (only for stages the senior engineer should run — simple tasks may only need implement + commit):
-   - prep: what to investigate, what questions to answer
-   - design: what decisions are required, what constraints to enforce
-   - implement: explicit do's/don'ts (e.g., "no backward compat," "update all callers," "delete dead code")
-   - audit: what to look for (cleanup, naming consistency, remove legacy, doc hygiene)
-   - commit: commit expectations (formatting, tests, no stray files)
+   - prep: what to investigate and what questions to answer; request a test baseline only when necessary
+   - design: what decisions are required and what constraints to enforce; no implementation or validation
+   - implement: explicit do's/don'ts plus focused validation commands and any justified full-gate exception
+   - audit: what to review (cleanup, naming consistency, remove legacy, doc hygiene); no test-suite reruns
+   - commit: accepted-tree expectations (message, clean status, no stray files); no implementation or validation
    If $Name's task requires a review gate (detected in step A), include a gate instruction in the stage guidance telling the senior engineer to pause after the relevant stage (typically design) and submit a review doc for $Name's approval before continuing:
    ```
    hop gate <<'EOF'
@@ -97,6 +98,10 @@ The prompt must include:
    The session will be paused until $Name reviews and resumes it.
 6. Acceptance Criteria (Definition of Done)
 7. Validation steps (commands, screenshots, spot check instructions)
+
+Do not use "`make ci` passes" as generic acceptance boilerplate. Validation
+commands belong in the validation steps and must follow the focused-first policy
+above.
 
 F) Resolve ambiguities
 Before finalizing, resolve any ambiguity yourself by examining the repo. If you truly cannot resolve an ambiguity from the code and context alone:

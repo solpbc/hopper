@@ -15,6 +15,10 @@ Review the area described below thoroughly. Trace through all logic paths until 
 
 For each finding, note: what, where (file:line), and why it's an issue.
 
+This is read-only review. Inspection commands are fine; do not modify files or
+rerun test suites or CI. Fixes belong in a follow-up implement stage, which
+owns their validation.
+
 ## Output
 
 Present a categorized summary of issues found:

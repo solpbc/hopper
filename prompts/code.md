@@ -17,7 +17,7 @@ These are internalized, not optional:
 - **DRY** — don't duplicate logic. Reuse what exists.
 - **Clean breaks** — when updating, update all callers. Remove dead code. No compatibility shims unless directed.
 - **Consistency** — match existing naming, patterns, and conventions in the codebase.
-- **Verify your work** — run relevant tests, each through `hop check` (e.g. `hop check -- make test`) so a truncated log can't hide a failure: it exits with the command's real status. Check that your changes do what was asked.
+- **Verify proportionally** — during implementation, run the narrowest relevant checks requested by the senior or repository, each through `hop check` so a truncated log cannot hide a failure. Do not choose a full repository gate yourself. Prep runs tests only for an explicitly requested baseline or reproduction; design, commit, and audit do not run tests.
 
 ## Output
 

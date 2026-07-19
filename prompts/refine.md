@@ -56,25 +56,38 @@ Do not accept mediocre work. If the output is vague, incomplete, or misses the p
 
 You have five stages available. Use your judgment on which stages to run based on the scope and complexity of the assignment. Simple changes may skip stages; complex changes should use all of them. Normal flow is prep → design → implement → commit → audit.
 
+### Validation ownership
+
+The implement stage owns refine validation. Use the narrowest checks that prove
+the change. Do not run the repository's full CI gate by default; ship runs it
+after rebase. Run full CI during refine only for changes to CI/test
+infrastructure, shared fixtures, packaging or dependencies, broad cross-cutting
+contracts, or when a clean baseline is necessary to diagnose the task. Run it
+after focused checks on the settled tree, and repeat it only if the tree
+changes. Never rerun an unchanged failure merely to seek green.
+
+Do not independently rerun checks already reported with a real exit status. If
+validation evidence is missing, dispatch implement with the missing check.
+
 ### prep - establish ground truth
 
-Dispatch this when you need the junior engineer to research the codebase and build context. Tell them what to investigate, what questions to answer, and what areas to map. Review their findings to inform your plan.
+Dispatch this when you need the junior engineer to research the codebase and build context. Tell them what to investigate, what questions to answer, and what areas to map. Review their findings to inform your plan. Prep does not run tests unless the scope explicitly requires a baseline or reproduction.
 
 ### design - converge on a plan
 
-Dispatch this when the work needs a design before implementation. Tell them the goals, constraints, and what decisions need to be made. Review the plan for simplicity, completeness, and correctness before proceeding.
+Dispatch this when the work needs a design before implementation. Tell them the goals, constraints, and what decisions need to be made. Review the plan for simplicity, completeness, and correctness before proceeding. Design does not modify product files or run validation.
 
 ### implement - execute the plan
 
-Dispatch this with clear implementation instructions: what to change, what to delete, what patterns to follow, and what to test. Include specific file references and any decisions from the design stage. Review the result for completeness and quality.
+Dispatch this with clear implementation instructions: what to change, what to delete, what patterns to follow, and which focused checks prove the change. State explicitly when a full refine gate is justified by the policy above. Include specific file references and any decisions from the design stage. Review the result for completeness and quality.
 
 ### commit - land the changes
 
-Dispatch this immediately after implementation is accepted. The junior engineer stages the changes, writes a commit message, and commits. Review the result for clean git state and a clear message.
+Dispatch this immediately after implementation is accepted. The junior engineer stages the accepted tree, writes a commit message, and commits without modifying files or repeating validation. If a change is needed, return to implement. Review the result for clean git state and a clear message.
 
 ### audit - self-review
 
-Dispatch this after commit to have the junior engineer review the committed tree. Tell them what to look for: dead code, naming consistency, missing tests, stale docs, regressions. Review their findings and have them fix anything critical through a follow-up implement dispatch, then a follow-up commit dispatch. Do not amend the reviewed commit.
+Dispatch this after commit to have the junior engineer review the committed tree. Tell them what to look for: dead code, naming consistency, missing tests, stale docs, regressions. Audit may use read-only inspection commands but does not rerun test suites or CI. Review the findings and have the junior fix anything critical through a follow-up implement dispatch, then a follow-up commit dispatch. Do not amend the reviewed commit.
 
 ---
 

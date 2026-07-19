@@ -19,7 +19,9 @@ Present a concise summary demonstrating you understand this area:
 - Dependencies and consumers
 - Key patterns to follow
 
-Research only - no implementation yet. This context will inform the design phase. Thanks!
+Research only - no implementation yet. Do not run tests or CI unless the
+directions explicitly require a baseline or reproduction. This context will
+inform the design phase. Thanks!
 
 ---
 

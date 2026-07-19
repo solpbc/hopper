@@ -50,15 +50,15 @@ If the rebase has conflicts:
 
 ### 3. Validate
 
-Look for a Makefile, CI config, or test setup. Run whatever validation is available:
-- `make test` or equivalent test command
-- `make ci` or equivalent lint/format command
+Run the repository's canonical full validation gate exactly once after rebase.
+Prefer `make ci` when it exists; otherwise use the repository's documented full
+equivalent. Inspect the target first and do not separately run commands already
+included by it. Every ship requires a successful full gate.
 
-Run every check through `hop check` so a failure can never be misreported as success:
+Run the gate through `hop check` so a failure can never be misreported as success:
 
 ```
 hop check -- make ci
-hop check -- make test
 ```
 
 `hop check` runs the command, prints only the last lines of its output (so a long log does not flood this session), and — critically — exits with the command's **real** status and prints an explicit `exited N` summary. A non-zero exit is a failed check; do not land the branch on it.
