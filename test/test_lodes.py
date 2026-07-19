@@ -1050,6 +1050,24 @@ def test_update_lode_state_records_started_at(temp_config):
     assert "stopped_at" not in runs["mill"]
 
 
+def test_update_lode_state_repeated_running_preserves_timer(temp_config):
+    """Repeated running updates within one stage preserve its original start."""
+    started_at = current_time_ms() - 5000
+    lodes_list = [
+        {
+            "id": "testid11",
+            "stage": "refine",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "running",
+            "runs": {"refine": {"started_at": started_at}},
+        }
+    ]
+    save_lodes(lodes_list)
+    update_lode_state(lodes_list, "testid11", "running", "Codex stage complete")
+    assert lodes_list[0]["runs"]["refine"] == {"started_at": started_at}
+
+
 def test_update_lode_state_records_stopped_at(temp_config):
     """update_lode_state records stopped_at when state becomes ready."""
     now = current_time_ms()

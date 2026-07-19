@@ -449,7 +449,9 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
                 runs = lode.setdefault("runs", {})
                 now = current_time_ms()
                 if state == "running":
-                    runs[stage] = {"started_at": now}
+                    stage_run = runs.get(stage, {})
+                    if "started_at" not in stage_run or "stopped_at" in stage_run:
+                        runs[stage] = {"started_at": now}
                 elif state in ("error", "ready"):
                     stage_run = runs.get(stage, {})
                     if "started_at" in stage_run:
