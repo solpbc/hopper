@@ -20,7 +20,8 @@ import pytest
 
 import hopper.server as hopper_server
 from hopper.backlog import BacklogItem
-from hopper.client import read_lode_snapshot, send_message
+from hopper.client import HopperConnection, read_lode_snapshot, send_message
+from hopper.client import create_lode as request_lode_creation
 from hopper.config import save_config
 from hopper.lodes import save_archived_lodes, save_lodes
 from hopper.projects import Project, touch_project
@@ -115,6 +116,15 @@ def _decode_mock_response(conn: MagicMock) -> dict:
     return json.loads(payload)
 
 
+def _mock_client(server: Server) -> MagicMock:
+    """Register a mocked connection with its required write lock."""
+    conn = MagicMock()
+    with server.lock:
+        server.clients.append(conn)
+        server.write_locks[conn] = threading.Lock()
+    return conn
+
+
 def test_server_lode_snapshot_found_absent_and_ambiguous(socket_path, make_lode):
     active = make_lode(id="same-active", active=True)
     other_active = make_lode(id="active-only", active=True)
@@ -123,7 +133,7 @@ def test_server_lode_snapshot_found_absent_and_ambiguous(socket_path, make_lode)
     server = Server(socket_path)
     server.lodes = [active, other_active]
     server.archived_lodes = [archived, other_archived]
-    conn = MagicMock()
+    conn = _mock_client(server)
 
     with (
         patch.object(server, "_send_response") as send_response,
@@ -162,7 +172,7 @@ def test_server_lode_snapshot_found_absent_and_ambiguous(socket_path, make_lode)
 @pytest.mark.parametrize("prefix", [None, 1, [], {}], ids=["missing", "integer", "list", "dict"])
 def test_server_lode_snapshot_rejects_invalid_prefix(socket_path, prefix):
     server = Server(socket_path)
-    conn = MagicMock()
+    conn = _mock_client(server)
     message = {"type": "lode_snapshot"}
     if prefix is not None:
         message["prefix"] = prefix
@@ -179,7 +189,7 @@ def test_server_lode_snapshot_rejects_invalid_prefix(socket_path, prefix):
 def test_server_lode_snapshot_empty_prefix_is_valid(socket_path, make_lode):
     server = Server(socket_path)
     server.lodes = [make_lode(id="only-lode")]
-    conn = MagicMock()
+    conn = _mock_client(server)
 
     server._handle_mutation({"type": "lode_snapshot", "prefix": ""}, conn)
 
@@ -187,6 +197,62 @@ def test_server_lode_snapshot_empty_prefix_is_valid(socket_path, make_lode):
     assert response["type"] == "lode_snapshot"
     assert response["result"] == "found"
     assert response["lode"]["id"] == "only-lode"
+
+
+def test_read_only_handlers_echo_thread_local_exchange_ids(socket_path):
+    server = Server(socket_path)
+    connections = [_mock_client(server), _mock_client(server)]
+    barrier = threading.Barrier(2)
+
+    def find_lode(_lode_id):
+        barrier.wait(timeout=5)
+        return None
+
+    threads = []
+    with patch.object(server, "_find_lode", side_effect=find_lode):
+        for index, conn in enumerate(connections):
+            message = {
+                "type": "connect",
+                "lode_id": f"lode-{index}",
+                "exchange_id": f"exchange-{index}",
+            }
+            thread = threading.Thread(
+                target=server._handle_read_only,
+                args=(message, conn),
+                daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+    assert [_decode_mock_response(conn)["exchange_id"] for conn in connections] == [
+        "exchange-0",
+        "exchange-1",
+    ]
+
+
+def test_mutation_responses_echo_exchange_id_and_clear_prior_value(socket_path):
+    server = Server(socket_path)
+    conn = _mock_client(server)
+
+    server._handle_mutation(
+        {"type": "lode_snapshot", "prefix": "missing", "exchange_id": "success-id"},
+        conn,
+    )
+    assert _decode_mock_response(conn)["exchange_id"] == "success-id"
+
+    server._handle_mutation(
+        {"type": "lode_snapshot", "exchange_id": "error-id"},
+        conn,
+    )
+    error_response = _decode_mock_response(conn)
+    assert error_response["type"] == "error"
+    assert error_response["exchange_id"] == "error-id"
+
+    server._handle_mutation({"type": "lode_snapshot"}, conn)
+    assert "exchange_id" not in _decode_mock_response(conn)
 
 
 def _run_snapshot_burst(socket_path: Path, prefixes: list[str]) -> list[tuple[str, object]]:
@@ -352,6 +418,138 @@ def test_lode_snapshot_serializes_with_archive_transition(
     assert result[0][1]["id"] == "transition-id"
     assert server.lodes == []
     assert [archived["id"] for archived in server.archived_lodes] == ["transition-id"]
+
+
+def test_concurrent_lode_create_responses_are_causally_bound(
+    socket_path, server, temp_config, monkeypatch
+):
+    real_create_lode = hopper_server.create_lode
+    real_enqueue_event = server._enqueue_event
+    real_send_to_clients = server._send_to_clients
+    a_create_started = threading.Event()
+    b_enqueued = threading.Event()
+    release_a = threading.Event()
+    a_broadcast_delivered = threading.Event()
+    results = {}
+
+    def controlled_create_lode(lodes, project, scope=""):
+        if scope == "scope-a":
+            a_create_started.set()
+            assert release_a.wait(5), "B was not connected and enqueued"
+        elif scope == "scope-b":
+            assert a_broadcast_delivered.wait(5), "A broadcast was not delivered"
+        return real_create_lode(lodes, project, scope)
+
+    def observed_enqueue(message, conn=None):
+        real_enqueue_event(message, conn)
+        if message.get("type") == "lode_create" and message.get("scope") == "scope-b":
+            b_enqueued.set()
+
+    def observed_send_to_clients(message):
+        real_send_to_clients(message)
+        if message.get("type") == "lode_created" and message["lode"].get("scope") == "scope-a":
+            a_broadcast_delivered.set()
+
+    monkeypatch.setattr(hopper_server, "create_lode", controlled_create_lode)
+    monkeypatch.setattr(server, "_enqueue_event", observed_enqueue)
+    monkeypatch.setattr(server, "_send_to_clients", observed_send_to_clients)
+
+    def create(name, project, scope):
+        results[name] = request_lode_creation(
+            socket_path,
+            project,
+            scope,
+            spawn=False,
+            timeout=5,
+        )
+
+    a_thread = threading.Thread(
+        target=create,
+        args=("a", "project-a", "scope-a"),
+        daemon=True,
+    )
+    a_thread.start()
+    assert a_create_started.wait(5), "A did not reach create_lode"
+
+    b_thread = threading.Thread(
+        target=create,
+        args=("b", "project-b", "scope-b"),
+        daemon=True,
+    )
+    b_thread.start()
+    assert b_enqueued.wait(5), "B was not enqueued"
+    with server.lock:
+        assert len(server.clients) == 2
+    release_a.set()
+
+    a_thread.join(timeout=10)
+    b_thread.join(timeout=10)
+    assert not a_thread.is_alive()
+    assert not b_thread.is_alive()
+
+    assert results["a"]["scope"] == "scope-a"
+    assert results["b"]["scope"] == "scope-b"
+    assert results["a"]["id"] != results["b"]["id"]
+    assert results["b"]["id"] != results["a"]["id"]
+    assert {(lode["project"], lode["scope"]) for lode in server.lodes} == {
+        ("project-a", "scope-a"),
+        ("project-b", "scope-b"),
+    }
+    assert len(server.lodes) == 2
+
+
+def test_persistent_subscriber_and_one_shot_commands_are_isolated(socket_path, server, temp_config):
+    subscriber_ready = threading.Event()
+    broadcasts_received = threading.Event()
+    broadcasts = []
+    connection = HopperConnection(socket_path)
+
+    def callback(message):
+        if message.get("type") == "pong":
+            subscriber_ready.set()
+        elif message.get("type") == "lode_created":
+            broadcasts.append(message["lode"]["scope"])
+            if len(broadcasts) >= 2:
+                broadcasts_received.set()
+
+    connection.start(
+        callback=callback,
+        on_connect=lambda: connection.emit("ping"),
+    )
+    assert subscriber_ready.wait(5), "persistent subscriber did not connect"
+
+    barrier = threading.Barrier(3)
+    results = {}
+
+    def create(name, scope):
+        barrier.wait(timeout=5)
+        results[name] = request_lode_creation(
+            socket_path,
+            f"project-{name}",
+            scope,
+            spawn=False,
+            timeout=5,
+        )
+
+    threads = [
+        threading.Thread(target=create, args=("a", "subscriber-a"), daemon=True),
+        threading.Thread(target=create, args=("b", "subscriber-b"), daemon=True),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        assert broadcasts_received.wait(5), "subscriber missed a create broadcast"
+    finally:
+        connection.stop()
+
+    assert results["a"]["scope"] == "subscriber-a"
+    assert results["b"]["scope"] == "subscriber-b"
+    assert results["a"]["id"] != results["b"]["id"]
+    assert sorted(broadcasts) == ["subscriber-a", "subscriber-b"]
 
 
 def test_lode_create_disabled_project_noop_without_conn(socket_path):
@@ -1688,6 +1886,154 @@ def test_server_broadcast_queues_valid_message():
     assert msg["data"] == "hello"
 
 
+def test_server_broadcast_removes_exchange_id_from_wire(socket_path):
+    server = Server(socket_path)
+    conn = _mock_client(server)
+    message = {"type": "test", "exchange_id": "must-not-leak"}
+
+    server._send_to_clients(message)
+
+    payload = json.loads(conn.sendall.call_args.args[0].decode().strip())
+    assert payload["type"] == "test"
+    assert "exchange_id" not in payload
+    assert "exchange_id" not in message
+
+
+def test_server_write_locks_follow_client_lifecycle(socket_path):
+    server = Server(socket_path)
+    handler_conn = MagicMock()
+    recv_entered = threading.Event()
+    release_recv = threading.Event()
+
+    def recv(_size):
+        recv_entered.set()
+        assert release_recv.wait(5)
+        return b""
+
+    handler_conn.recv.side_effect = recv
+    handler_thread = threading.Thread(
+        target=server._handle_client,
+        args=(handler_conn,),
+        daemon=True,
+    )
+    handler_thread.start()
+    assert recv_entered.wait(5)
+    with server.lock:
+        assert server.clients == [handler_conn]
+        assert set(server.clients) == set(server.write_locks)
+    release_recv.set()
+    handler_thread.join(timeout=5)
+    assert not handler_thread.is_alive()
+    with server.lock:
+        assert server.clients == []
+        assert server.write_locks == {}
+
+    dead_conn = _mock_client(server)
+    dead_conn.sendall.side_effect = OSError("dead client")
+    server._send_to_clients({"type": "test"})
+    with server.lock:
+        assert dead_conn not in server.clients
+        assert dead_conn not in server.write_locks
+    dead_conn.close.assert_called_once()
+
+    stop_conn = _mock_client(server)
+    server.stop()
+    assert server.clients == []
+    assert server.write_locks == {}
+    stop_conn.close.assert_called_once()
+
+
+def test_server_write_lock_preserves_jsonl_framing_at_sub_line_granularity(socket_path):
+    class InstrumentedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._counter_lock = threading.Lock()
+            self.attempts = 0
+            self.second_attempted = threading.Event()
+
+        def __enter__(self):
+            with self._counter_lock:
+                self.attempts += 1
+                if self.attempts == 2:
+                    self.second_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            self._lock.release()
+
+    class ChunkedSocket:
+        def __init__(self, sock):
+            self.sock = sock
+            self._counter_lock = threading.Lock()
+            self.send_calls = 0
+            self.first_chunk_written = threading.Event()
+            self.release_first_write = threading.Event()
+            self.second_send_entered = threading.Event()
+
+        def settimeout(self, timeout):
+            self.sock.settimeout(timeout)
+
+        def sendall(self, data):
+            with self._counter_lock:
+                self.send_calls += 1
+                call_number = self.send_calls
+            if call_number == 1:
+                split_at = max(1, len(data) // 2)
+                self.sock.sendall(data[:split_at])
+                self.first_chunk_written.set()
+                assert self.release_first_write.wait(5)
+                self.sock.sendall(data[split_at:])
+                return
+            self.second_send_entered.set()
+            self.sock.sendall(data)
+
+    server = Server(socket_path)
+    sender, receiver = socket.socketpair()
+    conn = ChunkedSocket(sender)
+    write_lock = InstrumentedLock()
+    with server.lock:
+        server.clients.append(conn)
+        server.write_locks[conn] = write_lock
+
+    response_thread = threading.Thread(
+        target=server._send_response,
+        args=(conn, {"type": "direct", "value": "response"}),
+        daemon=True,
+    )
+    response_thread.start()
+    assert conn.first_chunk_written.wait(5)
+
+    broadcast_thread = threading.Thread(
+        target=server._send_to_clients,
+        args=({"type": "broadcast", "value": "update"},),
+        daemon=True,
+    )
+    broadcast_thread.start()
+    assert write_lock.second_attempted.wait(5)
+    assert not conn.second_send_entered.is_set()
+    conn.release_first_write.set()
+
+    response_thread.join(timeout=5)
+    broadcast_thread.join(timeout=5)
+    assert not response_thread.is_alive()
+    assert not broadcast_thread.is_alive()
+    assert conn.second_send_entered.is_set()
+
+    receiver.settimeout(2)
+    wire = b""
+    while wire.count(b"\n") < 2:
+        wire += receiver.recv(4096)
+    lines = wire.splitlines()
+    messages = [json.loads(line) for line in lines]
+    assert len(messages) == 2
+    assert {message["type"] for message in messages} == {"direct", "broadcast"}
+    assert [message["value"] for message in messages] == ["response", "update"]
+
+    sender.close()
+    receiver.close()
+
+
 def test_server_sends_shutdown_to_clients(socket_path):
     """Server sends shutdown message to connected clients on stop."""
     srv = Server(socket_path)
@@ -2059,7 +2405,7 @@ def test_server_pauses_lode_without_archiving(socket_path, temp_config, make_lod
     srv = Server(socket_path)
     lode = make_lode(id="test-id", state="running", active=True, tmux_pane="%1", pid=12345)
     srv.lodes = [lode]
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     with (
         patch("hopper.server.os.kill") as mock_os_kill,
@@ -2081,7 +2427,7 @@ def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config
     srv = Server(socket_path)
     lode = make_lode(id="test-id", stage="refine", state="paused", active=False, project="proj")
     srv.lodes = [lode]
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     with (
         patch(
@@ -2112,7 +2458,7 @@ def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config
 def test_server_resume_failure_response_is_prescriptive(socket_path, make_lode, outcome, guidance):
     server = Server(socket_path)
     server.lodes = [make_lode(id="test-id", stage="refine", state="paused", project="proj")]
-    conn = MagicMock()
+    conn = _mock_client(server)
 
     with (
         patch(
@@ -2298,7 +2644,7 @@ def test_lode_promote_backlog_disabled_sends_promote_error(socket_path):
         created_at=1000,
     )
     srv.backlog = [item]
-    conn = MagicMock()
+    conn = _mock_client(srv)
     disabled = Project(path="/fake/repo", name="P", disabled=True, disabled_reason="wip")
 
     with (
@@ -3046,7 +3392,7 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     """Alive pane feedback sends text plus Enter and resumes running state."""
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     with (
         patch("hopper.server.capture_pane", return_value="prompt ready"),
@@ -3083,7 +3429,7 @@ def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
         tmux_pane="%dead",
     )
     srv.lodes = [lode]
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     with (
         patch("hopper.server.capture_pane", return_value=None),
@@ -3118,7 +3464,7 @@ def test_lode_send_feedback_unverified_paste_remains_gated(socket_path, make_lod
             tmux_pane="%1",
         )
     ]
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     with (
         patch("hopper.server.capture_pane", return_value="prompt ready"),
@@ -3144,7 +3490,7 @@ def test_lode_send_feedback_pane_disappears_after_paste(socket_path, make_lode):
     """A pane death after paste cannot be mistaken for successful submission."""
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     with (
         patch("hopper.server.capture_pane", side_effect=["prompt ready", None]),
@@ -3166,7 +3512,7 @@ def test_lode_send_feedback_pane_disappears_after_paste(socket_path, make_lode):
 def test_lode_send_feedback_missing_lode(socket_path):
     """Missing lode feedback request returns an error response."""
     srv = Server(socket_path)
-    conn = MagicMock()
+    conn = _mock_client(srv)
 
     srv._handle_mutation(
         {"type": "lode_send_feedback", "lode_id": "missing", "text": "feedback"},

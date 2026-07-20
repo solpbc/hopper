@@ -9,6 +9,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -205,39 +206,19 @@ def _exchange_message(
     wait_for_response: bool = False,
 ) -> dict | None:
     """Exchange one message with the server, raising transport/protocol errors."""
+    if wait_for_response:
+        exchange_id = uuid.uuid4().hex
+        message["exchange_id"] = exchange_id
+        deadline = time.monotonic() + timeout
+
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect(str(socket_path))
-
-        line = json.dumps(message) + "\n"
-        sock.sendall(line.encode("utf-8"))
-
         if not wait_for_response:
+            sock.settimeout(timeout)
+            sock.connect(str(socket_path))
+
+            line = json.dumps(message) + "\n"
+            sock.sendall(line.encode("utf-8"))
             return None
-
-        buffer = ""
-        while "\n" not in buffer:
-            data = sock.recv(4096)
-            if not data:
-                raise ConnectionError("server closed connection before responding")
-            buffer += data.decode("utf-8")
-        response_line, _ = buffer.split("\n", 1)
-        response = json.loads(response_line)
-        if not isinstance(response, dict):
-            raise InvalidServerResponse("server response is not a JSON object")
-        return response
-
-
-def _exchange_message_until_type(
-    socket_path: Path,
-    message: dict,
-    response_types: set[str],
-    timeout: float = 2.0,
-) -> dict:
-    """Exchange one message, skipping JSONL broadcasts until a response arrives."""
-    deadline = time.monotonic() + timeout
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
 
         def set_remaining_timeout() -> None:
             remaining = deadline - time.monotonic()
@@ -261,7 +242,7 @@ def _exchange_message_until_type(
                 response = json.loads(response_line.decode("utf-8"))
                 if not isinstance(response, dict):
                     raise InvalidServerResponse("server response is not a JSON object")
-                if response.get("type") in response_types:
+                if response.get("exchange_id") == exchange_id:
                     return response
 
             set_remaining_timeout()
@@ -406,11 +387,11 @@ def get_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
 def read_lode_snapshot(socket_path: Path, prefix: str, timeout: float = 2.0) -> tuple[str, object]:
     """Resolve an active or archived lode prefix without collapsing failures."""
     try:
-        response = _exchange_message_until_type(
+        response = _exchange_message(
             socket_path,
             {"type": "lode_snapshot", "prefix": prefix},
-            {"lode_snapshot", "error"},
             timeout=timeout,
+            wait_for_response=True,
         )
     except (FileNotFoundError, ConnectionRefusedError):
         return "unavailable", f"server not running at {socket_path}"

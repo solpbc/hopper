@@ -169,7 +169,9 @@ class Server:
         self.git_hash = get_git_hash()
         self.started_at = current_time_ms()
         self.clients: list[socket.socket] = []
+        self.write_locks: dict[socket.socket, threading.Lock] = {}
         self.lock = threading.RLock()
+        self._request_context = threading.local()
         self.stop_event = threading.Event()
         self.server_socket: socket.socket | None = None
         self.broadcast_queue: queue.Queue = queue.Queue(maxsize=10000)
@@ -444,6 +446,7 @@ class Server:
         """
         with self.lock:
             self.clients.append(conn)
+            self.write_locks[conn] = threading.Lock()
 
         logger.debug(f"Client connected ({len(self.clients)} total)")
 
@@ -478,6 +481,7 @@ class Server:
             with self.lock:
                 if conn in self.clients:
                     self.clients.remove(conn)
+                self.write_locks.pop(conn, None)
             try:
                 conn.close()
             except Exception:
@@ -605,6 +609,7 @@ class Server:
 
     def _handle_read_only(self, message: dict, conn: socket.socket) -> None:
         """Handle read-only messages inline (from any client thread)."""
+        self._request_context.exchange_id = message.get("exchange_id")
         msg_type = message.get("type")
 
         if msg_type == "connect":
@@ -658,6 +663,7 @@ class Server:
 
     def _handle_mutation(self, message: dict, conn: socket.socket | None) -> None:
         """Handle a serialized state message. Runs on the event loop thread."""
+        self._request_context.exchange_id = message.get("exchange_id")
         msg_type = message.get("type")
 
         if msg_type == "_client_disconnect":
@@ -1192,9 +1198,18 @@ class Server:
         """Send a response directly to a client."""
         if "ts" not in message:
             message["ts"] = current_time_ms()
+        exchange_id = getattr(self._request_context, "exchange_id", None)
+        if exchange_id is not None:
+            message["exchange_id"] = exchange_id
         response = json.dumps(message) + "\n"
+        with self.lock:
+            write_lock = self.write_locks.get(conn)
+        if write_lock is None:
+            logger.debug("Failed to send response: client disconnected")
+            return
         try:
-            conn.sendall(response.encode("utf-8"))
+            with write_lock:
+                conn.sendall(response.encode("utf-8"))
         except Exception as e:
             logger.debug(f"Failed to send response: {e}")
 
@@ -1238,19 +1253,21 @@ class Server:
 
     def _send_to_clients(self, message: dict) -> None:
         """Send a message to all connected clients."""
+        message.pop("exchange_id", None)
         if "ts" not in message:
             message["ts"] = current_time_ms()
 
         data = (json.dumps(message) + "\n").encode("utf-8")
 
         with self.lock:
-            clients_to_send = list(self.clients)
+            clients_to_send = [(client, self.write_locks[client]) for client in self.clients]
 
         dead_clients = []
-        for client in clients_to_send:
+        for client, write_lock in clients_to_send:
             try:
-                client.settimeout(2.0)
-                client.sendall(data)
+                with write_lock:
+                    client.settimeout(2.0)
+                    client.sendall(data)
             except Exception as e:
                 logger.debug(f"Failed to send to client: {e}")
                 dead_clients.append(client)
@@ -1260,6 +1277,7 @@ class Server:
                 for client in dead_clients:
                     if client in self.clients:
                         self.clients.remove(client)
+                    self.write_locks.pop(client, None)
                     try:
                         client.close()
                     except Exception:
@@ -1296,6 +1314,7 @@ class Server:
                 except Exception:
                     pass
             self.clients.clear()
+            self.write_locks.clear()
 
         # Signal threads to stop
         self.stop_event.set()

@@ -4050,33 +4050,22 @@ def test_lode_status_uses_one_snapshot_exchange(capsys, make_lode):
 
     def exchange(socket_path, message, timeout=2.0, wait_for_response=False):
         exchanges.append(("_exchange_message", socket_path, message, timeout, wait_for_response))
-        return None
-
-    def exchange_until_type(socket_path, message, response_types, timeout=2.0):
-        exchanges.append(
-            ("_exchange_message_until_type", socket_path, message, timeout, response_types)
-        )
         return {"type": "lode_snapshot", "result": "found", "lode": lode}
 
     with (
-        patch("hopper.client._exchange_message", side_effect=exchange) as basic_exchange,
-        patch(
-            "hopper.client._exchange_message_until_type",
-            side_effect=exchange_until_type,
-        ) as typed_exchange,
+        patch("hopper.client._exchange_message", side_effect=exchange) as snapshot_exchange,
         patch("hopper.client.socket.socket") as socket_constructor,
         patch("hopper.cli._find_remote_lode") as find_remote,
     ):
         assert cmd_lode(["status", "abc12345"]) == 0
 
     assert len(exchanges) == 1
-    transport, _path, message, timeout, response_types = exchanges[0]
-    assert transport == "_exchange_message_until_type"
+    transport, _path, message, timeout, wait_for_response = exchanges[0]
+    assert transport == "_exchange_message"
     assert message == {"type": "lode_snapshot", "prefix": "abc12345"}
     assert timeout == 2.0
-    assert response_types == {"lode_snapshot", "error"}
-    basic_exchange.assert_not_called()
-    typed_exchange.assert_called_once()
+    assert wait_for_response is True
+    snapshot_exchange.assert_called_once()
     socket_constructor.assert_not_called()
     find_remote.assert_not_called()
     assert "abc12345" in capsys.readouterr().out

@@ -16,6 +16,7 @@ import pytest
 from hopper.client import (
     HopperConnection,
     InvalidServerResponse,
+    _exchange_message,
     connect,
     get_gate,
     list_archived_lodes,
@@ -38,6 +39,49 @@ from hopper.server import Server
 def socket_path(tmp_path):
     """Provide a temporary socket path."""
     return tmp_path / "test.sock"
+
+
+def _read_request(conn: socket.socket) -> dict:
+    """Read one complete JSONL request from a handcrafted listener."""
+    buffer = b""
+    while b"\n" not in buffer:
+        data = conn.recv(4096)
+        if not data:
+            raise ConnectionError("client closed before sending a request")
+        buffer += data
+    line, _ = buffer.split(b"\n", 1)
+    return json.loads(line.decode("utf-8"))
+
+
+def _exchange_with_responder(socket_path, responder, *, wait=True, timeout=0.2):
+    """Run one client exchange against a handcrafted response callback."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    requests = []
+
+    def respond():
+        conn, _ = listener.accept()
+        with conn:
+            request = _read_request(conn)
+            requests.append(request)
+            responder(conn, request)
+
+    thread = threading.Thread(target=respond)
+    thread.start()
+    try:
+        result = _exchange_message(
+            socket_path,
+            {"type": "ping"},
+            timeout=timeout,
+            wait_for_response=wait,
+        )
+    finally:
+        thread.join(timeout=1)
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+    assert not thread.is_alive()
+    return result, requests[0]
 
 
 @pytest.fixture
@@ -151,14 +195,14 @@ def test_read_archived_lodes_rejects_malformed_response(socket_path, response):
     ],
 )
 def test_read_lode_snapshot_classifies_valid_results(socket_path, response, expected):
-    with patch("hopper.client._exchange_message_until_type", return_value=response) as exchange:
+    with patch("hopper.client._exchange_message", return_value=response) as exchange:
         assert read_lode_snapshot(socket_path, "abc") == expected
 
     exchange.assert_called_once_with(
         socket_path,
         {"type": "lode_snapshot", "prefix": "abc"},
-        {"lode_snapshot", "error"},
         timeout=2.0,
+        wait_for_response=True,
     )
 
 
@@ -181,7 +225,7 @@ def test_read_lode_snapshot_classifies_valid_results(socket_path, response, expe
 def test_read_lode_snapshot_maps_transport_failures_to_unavailable(
     socket_path, error, expected_reason
 ):
-    with patch("hopper.client._exchange_message_until_type", side_effect=error):
+    with patch("hopper.client._exchange_message", side_effect=error):
         result = read_lode_snapshot(socket_path, "abc", timeout=3)
 
     assert result == ("unavailable", expected_reason.format(socket_path=socket_path))
@@ -275,11 +319,11 @@ def test_read_lode_snapshot_maps_transport_failures_to_unavailable(
     ],
 )
 def test_read_lode_snapshot_rejects_malformed_responses(socket_path, response, expected_reason):
-    with patch("hopper.client._exchange_message_until_type", return_value=response):
+    with patch("hopper.client._exchange_message", return_value=response):
         assert read_lode_snapshot(socket_path, "abc") == ("unavailable", expected_reason)
 
 
-def _read_lode_snapshot_from_chunks(socket_path, chunks):
+def _read_lode_snapshot_from_chunks(socket_path, build_chunks):
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     listener.listen(1)
@@ -287,8 +331,8 @@ def _read_lode_snapshot_from_chunks(socket_path, chunks):
     def respond():
         conn, _ = listener.accept()
         with conn:
-            conn.recv(4096)
-            for chunk in chunks:
+            request = _read_request(conn)
+            for chunk in build_chunks(request["exchange_id"]):
                 conn.sendall(chunk)
 
     thread = threading.Thread(target=respond)
@@ -302,12 +346,22 @@ def _read_lode_snapshot_from_chunks(socket_path, chunks):
 
 def test_read_lode_snapshot_skips_broadcast_before_response(socket_path):
     broadcast = json.dumps({"type": "lode_archived", "lode": {"id": "other"}})
-    response = json.dumps({"type": "lode_snapshot", "result": "found", "lode": {"id": "abc123"}})
 
-    result = _read_lode_snapshot_from_chunks(
-        socket_path,
-        [(broadcast + "\n" + response[:20]).encode(), (response[20:] + "\n").encode()],
-    )
+    def build_chunks(exchange_id):
+        response = json.dumps(
+            {
+                "type": "lode_snapshot",
+                "result": "found",
+                "lode": {"id": "abc123"},
+                "exchange_id": exchange_id,
+            }
+        )
+        return [
+            (broadcast + "\n" + response[:20]).encode(),
+            (response[20:] + "\n").encode(),
+        ]
+
+    result = _read_lode_snapshot_from_chunks(socket_path, build_chunks)
 
     assert result == ("found", {"id": "abc123"})
 
@@ -315,7 +369,9 @@ def test_read_lode_snapshot_skips_broadcast_before_response(socket_path):
 def test_read_lode_snapshot_rejects_broadcast_only_stream(socket_path):
     broadcast = json.dumps({"type": "lode_archived", "lode": {"id": "other"}})
 
-    result = _read_lode_snapshot_from_chunks(socket_path, [(broadcast + "\n").encode()])
+    result = _read_lode_snapshot_from_chunks(
+        socket_path, lambda _exchange_id: [(broadcast + "\n").encode()]
+    )
 
     assert result == (
         "unavailable",
@@ -334,7 +390,7 @@ def test_read_lode_snapshot_deadline_survives_live_broadcast_stream(socket_path)
     def stream_broadcasts():
         conn, _ = listener.accept()
         with conn:
-            conn.recv(4096)
+            _read_request(conn)
             while not stop.is_set():
                 try:
                     conn.sendall(broadcast)
@@ -361,15 +417,17 @@ def test_read_lode_snapshot_deadline_survives_live_broadcast_stream(socket_path)
 
 
 def test_read_lode_snapshot_rejects_terminal_error(socket_path):
-    error = json.dumps({"type": "error", "error": "bad prefix"})
+    def build_chunks(exchange_id):
+        error = json.dumps({"type": "error", "error": "bad prefix", "exchange_id": exchange_id})
+        return [(error + "\n").encode()]
 
-    result = _read_lode_snapshot_from_chunks(socket_path, [(error + "\n").encode()])
+    result = _read_lode_snapshot_from_chunks(socket_path, build_chunks)
 
     assert result == ("unavailable", "unexpected response type: 'error'")
 
 
 def test_read_lode_snapshot_rejects_non_json_line(socket_path):
-    result = _read_lode_snapshot_from_chunks(socket_path, [b"not-json\n"])
+    result = _read_lode_snapshot_from_chunks(socket_path, lambda _exchange_id: [b"not-json\n"])
 
     assert result[0] == "unavailable"
     assert str(result[1]).startswith("server exchange failed: Expecting value:")
@@ -437,9 +495,17 @@ def test_probe_server_classifies_handcrafted_responses(socket_path, payload, exp
     def respond():
         conn, _ = listener.accept()
         with conn:
-            conn.recv(4096)
+            request = _read_request(conn)
             if payload:
-                conn.sendall(payload)
+                try:
+                    response = json.loads(payload)
+                except json.JSONDecodeError:
+                    correlated_payload = payload
+                else:
+                    if isinstance(response, dict):
+                        response["exchange_id"] = request["exchange_id"]
+                    correlated_payload = (json.dumps(response) + "\n").encode()
+                conn.sendall(correlated_payload)
 
     thread = threading.Thread(target=respond)
     thread.start()
@@ -466,6 +532,110 @@ def test_send_message_no_response(server, socket_path):
     """Send message without waiting for response."""
     result = send_message(socket_path, {"type": "test"}, wait_for_response=False)
     assert result is None
+
+
+def test_exchange_id_attached_only_to_waited_requests(socket_path):
+    def echo(conn, request):
+        response = {"type": "pong", "exchange_id": request["exchange_id"]}
+        conn.sendall((json.dumps(response) + "\n").encode())
+
+    first_response, first_request = _exchange_with_responder(socket_path, echo)
+    second_response, second_request = _exchange_with_responder(socket_path, echo)
+    no_wait_response, no_wait_request = _exchange_with_responder(
+        socket_path, lambda _conn, _request: None, wait=False
+    )
+
+    first_id = first_request["exchange_id"]
+    second_id = second_request["exchange_id"]
+    assert len(first_id) == 32
+    assert len(second_id) == 32
+    assert int(first_id, 16) >= 0
+    assert int(second_id, 16) >= 0
+    assert first_id != second_id
+    assert first_response["exchange_id"] == first_id
+    assert second_response["exchange_id"] == second_id
+    assert no_wait_response is None
+    assert "exchange_id" not in no_wait_request
+
+
+def test_exchange_skips_same_type_broadcast_before_own_response(socket_path):
+    def respond(conn, request):
+        broadcast = {"type": "pong", "source": "broadcast"}
+        response = {
+            "type": "pong",
+            "source": "response",
+            "exchange_id": request["exchange_id"],
+        }
+        conn.sendall((json.dumps(broadcast) + "\n" + json.dumps(response) + "\n").encode())
+
+    response, _request = _exchange_with_responder(socket_path, respond)
+
+    assert response["source"] == "response"
+
+
+def test_exchange_skips_missing_and_different_ids(socket_path):
+    def respond(conn, request):
+        candidates = [
+            {"type": "pong", "source": "missing"},
+            {"type": "pong", "source": "different", "exchange_id": "other"},
+            {"type": "pong", "source": "own", "exchange_id": request["exchange_id"]},
+        ]
+        conn.sendall(("".join(json.dumps(item) + "\n" for item in candidates)).encode())
+
+    response, _request = _exchange_with_responder(socket_path, respond)
+
+    assert response["source"] == "own"
+
+
+def test_exchange_absolute_deadline_survives_continuous_nonmatching_responses(socket_path):
+    responses_sent = []
+
+    def respond(conn, _request):
+        candidate = (json.dumps({"type": "pong", "exchange_id": "other"}) + "\n").encode()
+        while True:
+            try:
+                conn.sendall(candidate)
+            except OSError:
+                return
+            responses_sent.append(None)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _exchange_with_responder(socket_path, respond, timeout=0.1)
+    elapsed = time.monotonic() - started
+
+    assert responses_sent
+    assert elapsed < 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_type"),
+    [
+        (b"not-json\n", json.JSONDecodeError),
+        (b"[]\n", InvalidServerResponse),
+    ],
+)
+def test_exchange_fails_closed_on_malformed_frames(socket_path, payload, error_type):
+    def respond(conn, _request):
+        conn.sendall(payload)
+
+    with pytest.raises(error_type):
+        _exchange_with_responder(socket_path, respond)
+
+
+@pytest.mark.parametrize("response_type", ["error", "promote_error"])
+def test_exchange_returns_matching_id_regardless_of_response_type(socket_path, response_type):
+    def respond(conn, request):
+        response = {
+            "type": response_type,
+            "error": "expected failure",
+            "exchange_id": request["exchange_id"],
+        }
+        conn.sendall((json.dumps(response) + "\n").encode())
+
+    response, _request = _exchange_with_responder(socket_path, respond)
+
+    assert response["type"] == response_type
 
 
 def test_send_message_connection_failure():
