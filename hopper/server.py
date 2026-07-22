@@ -56,12 +56,16 @@ from hopper.lodes import (
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
-from hopper.tmux import Liveness, capture_pane, pane_liveness, paste_buffer, send_keys
+from hopper.tmux import Liveness, capture_pane, get_pane_pid, pane_liveness, paste_buffer, send_keys
 
 logger = logging.getLogger(__name__)
 
 PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "completed", "error"})
 LISTEN_BACKLOG = 64
+PAUSE_TERM_GRACE_SEC = 0.75
+PAUSE_KILL_GRACE_SEC = 0.5
+PAUSE_PROCESS_POLL_SEC = 0.02
+PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
 
 
 class ServerLockHeld(RuntimeError):
@@ -78,6 +82,93 @@ class SpawnOutcome(Enum):
 
 
 SPAWN_STATUS_PREFIXES = ("spawn refused: ", "spawn failed: ")
+
+
+def _process_group_has_live_members(process_group: int) -> bool | None:
+    """Return whether a process group has non-zombie members, or None if unknown."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pgid=,stat="],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_GROUP_STATUS_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.error("cannot inspect runner process group %s: %s", process_group, error)
+        return None
+    if result.returncode != 0:
+        logger.error(
+            "cannot inspect runner process group %s: ps exited %s: %s",
+            process_group,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        raw_group, status = fields
+        try:
+            member_group = int(raw_group)
+        except ValueError:
+            continue
+        if member_group == process_group and not status.startswith("Z"):
+            return True
+    return False
+
+
+def _process_group_exited(process_group: int, timeout: float) -> bool:
+    """Wait until a process group has no live members, failing closed when unknown."""
+    deadline = time.monotonic() + timeout
+    while True:
+        live_members = _process_group_has_live_members(process_group)
+        if live_members is False:
+            return True
+        if live_members is None:
+            return False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(PAUSE_PROCESS_POLL_SEC, remaining))
+
+
+def _terminate_runner_process_group(pid: int) -> bool:
+    """Terminate a runner and every child that can retain its Claude session."""
+    try:
+        process_group = os.getpgid(pid)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        logger.error("cannot inspect runner pid %s: permission denied", pid)
+        return False
+
+    if process_group == os.getpgrp():
+        logger.error(
+            "refusing to terminate runner pid %s in hopper server process group %s",
+            pid,
+            process_group,
+        )
+        return False
+
+    for shutdown_signal, grace in (
+        (signal.SIGTERM, PAUSE_TERM_GRACE_SEC),
+        (signal.SIGKILL, PAUSE_KILL_GRACE_SEC),
+    ):
+        try:
+            os.killpg(process_group, shutdown_signal)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            logger.error("cannot signal runner process group %s: permission denied", process_group)
+            return False
+        if _process_group_exited(process_group, grace):
+            return True
+
+    logger.error("runner process group %s remained alive after SIGKILL", process_group)
+    return False
 
 
 def _set_spawn_refusal(lode: dict, message: str) -> bool:
@@ -791,12 +882,26 @@ class Server:
                     )
                 return
             pid = lode.get("pid")
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
             pane = lode.get("tmux_pane")
+            runner_pid = pid or (get_pane_pid(pane) if pane else None)
+            if pane and runner_pid is None and pane_liveness(pane) is not Liveness.GONE:
+                error = (
+                    f"lode {lode_id} runner identity is unknown; pause refused because "
+                    "tmux cannot prove the existing pane is gone"
+                )
+                logger.error(error)
+                if conn:
+                    self._send_response(conn, {"type": "error", "error": error})
+                return
+            if runner_pid and not _terminate_runner_process_group(runner_pid):
+                error = (
+                    f"lode {lode_id} runner did not exit; pause refused so resume cannot "
+                    "collide with the existing stage session"
+                )
+                logger.error(error)
+                if conn:
+                    self._send_response(conn, {"type": "error", "error": error})
+                return
             if pane:
                 from hopper.tmux import kill_pane
 

@@ -62,6 +62,24 @@ def pane_liveness(pane_id: str) -> Liveness:
     return Liveness.UNKNOWN
 
 
+def get_pane_pid(target: str) -> int | None:
+    """Return the root process ID for a tmux pane, or None when unavailable."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def new_window(
     command: str,
     cwd: str | None = None,

@@ -2408,18 +2408,143 @@ def test_server_pauses_lode_without_archiving(socket_path, temp_config, make_lod
     conn = _mock_client(srv)
 
     with (
-        patch("hopper.server.os.kill") as mock_os_kill,
+        patch("hopper.server._terminate_runner_process_group", return_value=True) as mock_terminate,
         patch("hopper.tmux.kill_pane", return_value=True) as mock_kill_pane,
         patch.object(srv, "broadcast"),
     ):
         srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, conn)
 
-    mock_os_kill.assert_called_once_with(12345, signal.SIGTERM)
+    mock_terminate.assert_called_once_with(12345)
     mock_kill_pane.assert_called_once_with("%1")
     assert srv.archived_lodes == []
     assert srv.lodes[0]["state"] == "paused"
     assert srv.lodes[0]["active"] is False
     assert _decode_mock_response(conn)["type"] == "lode_paused"
+
+
+def test_server_refuses_pause_until_runner_process_group_exits(socket_path, temp_config, make_lode):
+    """Pause keeps runner identity intact when quiescence cannot be proven."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state="running", active=True, tmux_pane="%1", pid=12345)
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server._terminate_runner_process_group", return_value=False),
+        patch("hopper.tmux.kill_pane") as mock_kill_pane,
+    ):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, conn)
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert "pause refused" in response["error"]
+    assert srv.lodes[0]["state"] == "running"
+    assert srv.lodes[0]["active"] is True
+    assert srv.lodes[0]["tmux_pane"] == "%1"
+    assert srv.lodes[0]["pid"] == 12345
+    mock_kill_pane.assert_not_called()
+
+
+def test_server_quiesces_pidless_live_pane_before_pausing(socket_path, temp_config, make_lode):
+    """The spawn-before-registration window still terminates the whole pane group."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state="running", active=False, tmux_pane="%1", pid=None)
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server.get_pane_pid", return_value=54321),
+        patch("hopper.server._terminate_runner_process_group", return_value=True) as mock_terminate,
+        patch("hopper.tmux.kill_pane", return_value=True),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, conn)
+
+    mock_terminate.assert_called_once_with(54321)
+    assert srv.lodes[0]["state"] == "paused"
+    assert _decode_mock_response(conn)["type"] == "lode_paused"
+
+
+def test_server_refuses_pidless_pause_when_tmux_liveness_is_unknown(
+    socket_path, temp_config, make_lode
+):
+    """Pause never clears an uninspectable pane that may still hold the stage session."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state="running", active=False, tmux_pane="%1", pid=None)
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server.get_pane_pid", return_value=None),
+        patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN),
+        patch("hopper.server._terminate_runner_process_group") as mock_terminate,
+        patch("hopper.tmux.kill_pane") as mock_kill_pane,
+    ):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, conn)
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert "runner identity is unknown" in response["error"]
+    assert srv.lodes[0]["state"] == "running"
+    assert srv.lodes[0]["tmux_pane"] == "%1"
+    mock_terminate.assert_not_called()
+    mock_kill_pane.assert_not_called()
+
+
+def test_terminate_runner_process_group_waits_for_clean_exit():
+    """A normal pause terminates the whole pane group and waits for its exit."""
+    with (
+        patch("hopper.server.os.getpgid", return_value=4567),
+        patch("hopper.server.os.getpgrp", return_value=7654),
+        patch("hopper.server.os.killpg") as mock_killpg,
+        patch("hopper.server._process_group_exited", return_value=True) as mock_exited,
+    ):
+        assert hopper_server._terminate_runner_process_group(12345) is True
+
+    mock_killpg.assert_called_once_with(4567, signal.SIGTERM)
+    mock_exited.assert_called_once_with(4567, hopper_server.PAUSE_TERM_GRACE_SEC)
+
+
+def test_terminate_runner_process_group_hard_kills_after_grace():
+    """A runner that ignores SIGTERM is killed before pause can acknowledge success."""
+    with (
+        patch("hopper.server.os.getpgid", return_value=4567),
+        patch("hopper.server.os.getpgrp", return_value=7654),
+        patch("hopper.server.os.killpg") as mock_killpg,
+        patch("hopper.server._process_group_exited", side_effect=[False, True]) as mock_exited,
+    ):
+        assert hopper_server._terminate_runner_process_group(12345) is True
+
+    assert mock_killpg.call_args_list == [
+        ((4567, signal.SIGTERM),),
+        ((4567, signal.SIGKILL),),
+    ]
+    assert mock_exited.call_args_list == [
+        ((4567, hopper_server.PAUSE_TERM_GRACE_SEC),),
+        ((4567, hopper_server.PAUSE_KILL_GRACE_SEC),),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("process_table", "expected"),
+    [
+        (" 4567 S\n 4567 Z\n 7654 R\n", True),
+        (" 4567 Z\n 7654 R\n", False),
+        (" 7654 R\n", False),
+    ],
+)
+def test_process_group_liveness_ignores_zombies(process_table, expected):
+    """Exited runners cannot block pause merely because their parent has not reaped them."""
+    result = subprocess.CompletedProcess([], 0, stdout=process_table, stderr="")
+    with patch("hopper.server.subprocess.run", return_value=result) as mock_run:
+        assert hopper_server._process_group_has_live_members(4567) is expected
+
+    mock_run.assert_called_once_with(
+        ["ps", "-axo", "pgid=,stat="],
+        capture_output=True,
+        text=True,
+        timeout=hopper_server.PROCESS_GROUP_STATUS_TIMEOUT_SEC,
+    )
 
 
 def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config, make_lode):

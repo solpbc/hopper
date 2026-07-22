@@ -12,6 +12,7 @@ from hopper.tmux import (
     capture_pane,
     get_current_pane_id,
     get_current_tmux_location,
+    get_pane_pid,
     get_tmux_sessions,
     is_inside_tmux,
     is_tmux_server_running,
@@ -21,6 +22,36 @@ from hopper.tmux import (
     rename_window,
     send_keys,
 )
+
+
+class TestGetPanePid:
+    def test_returns_pane_root_pid(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "12345\n"
+
+            assert get_pane_pid("%7") == 12345
+
+        mock_run.assert_called_once_with(
+            ["tmux", "display-message", "-p", "-t", "%7", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize("stdout", ["", "not-a-pid\n"])
+    def test_returns_none_for_invalid_pid(self, stdout):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = stdout
+
+            assert get_pane_pid("%7") is None
+
+    def test_returns_none_when_tmux_fails(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stdout = ""
+
+            assert get_pane_pid("%7") is None
 
 
 class TestPaneLiveness:
