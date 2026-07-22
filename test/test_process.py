@@ -566,15 +566,16 @@ class TestMillStage:
         ]
 
     def test_new_session_uses_session_id_and_prompt(self):
-        """New session uses --session-id and prompt."""
+        """New session is durably marked started as soon as its process exists."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        emitted = []
 
         with (
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="mill", state="new"),
             ),
-            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
             ) as mock_popen,
@@ -586,6 +587,19 @@ class TestMillStage:
         assert cmd[0] == "claude"
         assert cmd[2:4] == ["--session-id", CLAUDE_SESSIONS["mill"]["session_id"]]
         assert len(cmd) == 5  # claude, skip, --session-id, id, prompt
+        started_index = next(
+            index for index, event in enumerate(emitted) if event[0] == "lode_set_claude_started"
+        )
+        running_index = next(
+            index
+            for index, event in enumerate(emitted)
+            if event[0] == "lode_set_state" and event[1]["state"] == "running"
+        )
+        assert started_index < running_index
+        assert emitted[started_index][1] == {
+            "lode_id": "test-id",
+            "claude_stage": "mill",
+        }
 
     def test_sets_cwd_to_project_dir(self, tmp_path):
         """Runner sets cwd to project directory."""

@@ -300,10 +300,6 @@ class BaseRunner:
                 exit_code, error_msg = self._run_claude()
                 logger.info(f"claude exited lode={self.lode_id} exit_code={exit_code}")
 
-                # Mark this stage's Claude session as started
-                if self.is_first_run and exit_code != 127:
-                    self._emit_claude_started()
-
                 if exit_code == 127:
                     logger.error(
                         f"claude error lode={self.lode_id} exit_code={exit_code}: {error_msg}"
@@ -389,6 +385,8 @@ class BaseRunner:
             )
             self._claude_proc = proc
 
+            if self.is_first_run:
+                self._emit_claude_started()
             self._emit_state("running", "Claude running")
             self._start_monitor()
 
