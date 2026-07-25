@@ -471,7 +471,6 @@ class BaseRunner:
         lode = message.get("lode", {})
         if lode.get("id") != self.lode_id:
             return
-        self._gate_epoch = lode.get("gate_epoch", 0)
         if lode.get("state") == "completed":
             self._done.set()
             logger.debug(f"{self._done_label} signal received")
@@ -480,6 +479,9 @@ class BaseRunner:
             logger.debug(f"gate signal received lode={self.lode_id}")
         elif lode.get("state") == "running":
             self._clear_gate()
+        # Adopt the epoch only after state handling disarms the gate detector. Until then,
+        # an armed monitor must emit the old epoch so the server rejects a stale resume.
+        self._gate_epoch = lode.get("gate_epoch", 0)
 
     def _wait_and_dismiss_claude(self) -> None:
         """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude.

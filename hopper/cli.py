@@ -29,6 +29,15 @@ from hopper.tmux import capture_pane, paste_buffer, send_keys
 
 logger = logging.getLogger(__name__)
 
+_GATE_FEEDBACK_DESCRIPTION = (
+    "Send feedback to a gated lode. Exit 0 means Claude accepted a new user turn. "
+    "Any reported failure leaves the lode gated and Hopper prints a safe next action.\n\n"
+    "Forms:\n"
+    '  hop gate feedback <lode_id> "<response>"\n'
+    "  hop gate feedback <lode_id> < file.md\n"
+    "  hop gate feedback <lode_id> - < file.md"
+)
+
 
 def _socket() -> Path:
     """Return the server socket path (late-binding, safe for tests)."""
@@ -1050,17 +1059,9 @@ def _cmd_gate_feedback(args: list[str]) -> int:
     """Send feedback to a gated lode."""
     import hopper.client as client
 
-    description = (
-        "Send feedback to a gated lode. Exit 0 means Claude accepted a new user turn. "
-        "On failure, the lode remains gated and Hopper prints a safe next action.\n\n"
-        "Forms:\n"
-        '  hop gate feedback <lode_id> "<response>"\n'
-        "  hop gate feedback <lode_id> < file.md\n"
-        "  hop gate feedback <lode_id> - < file.md"
-    )
     parser = make_parser(
         "gate feedback",
-        description,
+        _GATE_FEEDBACK_DESCRIPTION,
     )
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     parser.add_argument("lode_id", help="Lode ID to send feedback to")
@@ -2305,15 +2306,7 @@ def cmd_submit(args: list[str]) -> int:
 def cmd_feedback(args: list[str]) -> int:
     """Alias for hop gate feedback."""
     if "-h" in args or "--help" in args:
-        description = (
-            "Send feedback to a gated lode. Exit 0 means Claude accepted a new user turn. "
-            "On failure, the lode remains gated and Hopper prints a safe next action.\n\n"
-            "Forms:\n"
-            '  hop gate feedback <lode_id> "<response>"\n'
-            "  hop gate feedback <lode_id> < file.md\n"
-            "  hop gate feedback <lode_id> - < file.md"
-        )
-        p = make_parser("feedback", description)
+        p = make_parser("feedback", _GATE_FEEDBACK_DESCRIPTION)
         p.formatter_class = argparse.RawDescriptionHelpFormatter
         p.add_argument("lode_id", help="Lode ID to send feedback to")
         p.add_argument("text", nargs="?", help="Feedback text")

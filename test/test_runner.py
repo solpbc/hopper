@@ -1180,6 +1180,30 @@ class TestBaseRunnerServerMessages:
 
         assert runner._gate_epoch == 9
 
+    def test_on_server_message_disarms_gate_before_adopting_epoch(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._gate_epoch = 4
+        runner._gated.set()
+        runner._gate_armed = True
+        observed = []
+        open_gate = runner._open_gate
+
+        def observe_then_open_gate():
+            observed.append((runner._gate_epoch, runner._gate_armed))
+            open_gate()
+
+        with patch.object(runner, "_open_gate", side_effect=observe_then_open_gate):
+            runner._on_server_message(
+                {
+                    "type": "lode_updated",
+                    "lode": {"id": "test-session", "state": "gated", "gate_epoch": 9},
+                }
+            )
+
+        assert observed == [(4, True)]
+        assert runner._gate_epoch == 9
+        assert not runner._gate_armed
+
     def test_on_server_message_defaults_missing_gate_epoch_to_zero(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._gate_epoch = 9

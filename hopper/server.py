@@ -81,6 +81,9 @@ _FEEDBACK_POLL_INTERVAL = 0.25
 _FEEDBACK_IDLE_POLL_COUNT = 12
 _FEEDBACK_SETTLE_POLL_COUNT = 4
 _FEEDBACK_ACCEPTANCE_POLL_COUNT = 12
+_FEEDBACK_IDLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_IDLE_POLL_COUNT
+_FEEDBACK_SETTLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_SETTLE_POLL_COUNT
+_FEEDBACK_ACCEPTANCE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_ACCEPTANCE_POLL_COUNT
 
 _FEEDBACK_FAILURES = {
     "pane_unavailable": (
@@ -93,9 +96,10 @@ _FEEDBACK_FAILURES = {
     "idle_timeout": (
         "busy",
         "Feedback blocked: pane busy",
-        "Feedback was not sent because pane {pane} did not become idle within 3.0s. No "
-        "feedback was pasted or submitted, and Hopper does not know when the pane will be "
-        "ready. Wait for the current turn to finish, then retry the same feedback.",
+        f"Feedback was not sent because pane {{pane}} did not become idle within "
+        f"{_FEEDBACK_IDLE_WAIT_SECONDS:.1f}s. No feedback was pasted or submitted, and "
+        "Hopper does not know when the pane will be ready. Wait for the current turn to "
+        "finish, then retry the same feedback.",
     ),
     "paste_failed": (
         "not_sent",
@@ -103,13 +107,21 @@ _FEEDBACK_FAILURES = {
         "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
         "was submitted. Retry the same feedback.",
     ),
+    "paste_failed_unknown": (
+        "unverified",
+        "Feedback outcome unknown; inspect pane",
+        "Hopper could not complete the paste into pane {pane}, but some feedback text may "
+        "have reached the pane. The delivery outcome is unknown. Inspect with `hop lode "
+        "peek {lode_id}` before deciding whether to retry; do not paste the feedback again "
+        "unless the pane proves it was not accepted or staged.",
+    ),
     "paste_not_staged": (
         "unverified",
         "Feedback outcome unknown; inspect pane",
         "Hopper pasted feedback into pane {pane}, but no new user turn was observed within "
-        "1.0s. The delivery outcome is unknown. Inspect with `hop lode peek {lode_id}` "
-        "before deciding whether to retry; do not paste the feedback again unless the pane "
-        "proves it was not accepted or staged.",
+        f"{_FEEDBACK_SETTLE_WAIT_SECONDS:.1f}s. The delivery outcome is unknown. Inspect "
+        "with `hop lode peek {lode_id}` before deciding whether to retry; do not paste the "
+        "feedback again unless the pane proves it was not accepted or staged.",
     ),
     "pane_lost_after_paste": (
         "unverified",
@@ -131,9 +143,10 @@ _FEEDBACK_FAILURES = {
         "unverified",
         "Feedback outcome unknown; inspect pane",
         "Hopper pressed Enter in pane {pane}, but did not observe the required "
-        "idle-to-processing transition within 3.0s. The delivery outcome is unknown. "
-        "Inspect with `hop lode peek {lode_id}` before deciding whether to retry; do not "
-        "paste the feedback again unless the pane proves it was not accepted or staged.",
+        f"idle-to-processing transition within {_FEEDBACK_ACCEPTANCE_WAIT_SECONDS:.1f}s. "
+        "The delivery outcome is unknown. Inspect with `hop lode peek {lode_id}` before "
+        "deciding whether to retry; do not paste the feedback again unless the pane proves "
+        "it was not accepted or staged.",
     ),
     "pane_lost_after_submit": (
         "unverified",
@@ -277,14 +290,27 @@ def _deliver_gate_feedback(pane_id: str | None, text: str) -> tuple[str, str | N
     if latest_capture is None:
         return "pane_unavailable", None
 
+    pre_paste_input = None
     for _ in range(_FEEDBACK_IDLE_POLL_COUNT):
         time.sleep(_FEEDBACK_POLL_INTERVAL)
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return "pane_unavailable", latest_capture
+        latest_capture = capture
         if classify_pane_phase(pane_title(pane_id)) is PanePhase.IDLE:
+            pre_paste_input = read_pane_input(latest_capture)
             break
     else:
         return "idle_timeout", latest_capture
 
     if not paste_buffer(pane_id, text):
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return "paste_failed_unknown", latest_capture
+        latest_capture = capture
+        post_paste_input = read_pane_input(latest_capture)
+        if pre_paste_input is None or post_paste_input != pre_paste_input:
+            return "paste_failed_unknown", latest_capture
         return "paste_failed", latest_capture
 
     for _ in range(_FEEDBACK_SETTLE_POLL_COUNT):
@@ -1301,7 +1327,7 @@ class Server:
                 state = "running"
                 status = "Feedback accepted"
             else:
-                _outcome, status, _message_template = _FEEDBACK_FAILURES[reason]
+                outcome, status, message_template = _FEEDBACK_FAILURES[reason]
                 state = "gated"
             updated = update_lode_state(self.lodes, lode_id, state, status)
             if updated:
@@ -1314,7 +1340,6 @@ class Server:
                         "tmux_pane": pane_id,
                     }
                 else:
-                    outcome, _status, message_template = _FEEDBACK_FAILURES[reason]
                     response = {
                         "type": "error",
                         "error": message_template.format(

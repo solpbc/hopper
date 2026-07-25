@@ -224,8 +224,8 @@ hop code <stage>                      # run prompts/<stage>.md via Codex
 ## Responding to a gate
 
 - Use these after a lode prints a gate banner and waits for your reply. Exit 0 from
-  `hop gate feedback` means Claude accepted a new user turn; any failure leaves the
-  lode gated and prints a safe next action.
+  `hop gate feedback` means Claude accepted a new user turn; any reported failure
+  leaves the lode gated and prints a safe next action.
 - If failure says the delivery outcome is unknown, run `hop lode peek <lode-id>`
   before deciding whether to retry; never resend blindly. `hop feedback <lode-id>`
   is an alias with the same contract and input forms.
