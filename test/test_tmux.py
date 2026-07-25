@@ -9,7 +9,9 @@ import pytest
 
 from hopper.tmux import (
     Liveness,
+    PanePhase,
     capture_pane,
+    classify_pane_phase,
     get_current_pane_id,
     get_current_tmux_location,
     get_pane_pid,
@@ -18,10 +20,44 @@ from hopper.tmux import (
     is_tmux_server_running,
     kill_pane,
     pane_liveness,
+    pane_title,
     paste_buffer,
+    read_pane_input,
     rename_window,
     send_keys,
 )
+
+# Constructed by trimming the real prep capture while retaining its verified U+2500 rules,
+# U+276F prompt, U+00A0 spacing, and processing content.
+PROCESSING_EMPTY_INPUT_CAPTURE = (
+    """\
+● Running 1 shell command · 2m 45s…
+  ⎿  $ hop code prep <<'EOF'
+
+· Clauding…
+
+────────────────────
+❯"""
+    "\u00a0\n"
+    """────────────────────
+  ⏵⏵ bypass permissions on
+"""
+)
+
+# Constructed from the scope §4.5 staged text and the prep-verified U+2500/U+276F/U+00A0
+# input-box structure.
+IDLE_STAGED_INPUT_CAPTURE = """\
+────────────────────
+❯ gate 1 approved, let's keep it moving
+────────────────────
+"""
+
+# Constructed from the prep-verified U+2500 rule, U+276F prompt, and U+00A0 spacing.
+IDLE_PASTED_PLACEHOLDER_CAPTURE = """\
+────────────────────
+❯ [Pasted text #1 +40 lines]
+────────────────────
+"""
 
 
 class TestGetPanePid:
@@ -52,6 +88,84 @@ class TestGetPanePid:
             mock_run.return_value.stdout = ""
 
             assert get_pane_pid("%7") is None
+
+
+class TestPaneTitle:
+    def test_returns_nonempty_title(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "✳ Ready for input\n"
+
+            assert pane_title("%7") == "✳ Ready for input"
+
+        mock_run.assert_called_once_with(
+            ["tmux", "display-message", "-p", "-t", "%7", "#{pane_title}"],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_blank_is_none_even_on_status_zero(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "\n"
+
+            assert pane_title("%99999") is None
+
+    @pytest.mark.parametrize("returncode", [1, 2])
+    def test_failure_is_none(self, returncode):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = returncode
+            mock_run.return_value.stdout = "ignored"
+
+            assert pane_title("%7") is None
+
+    @pytest.mark.parametrize("error", [FileNotFoundError(), PermissionError()])
+    def test_execution_failure_is_none(self, error):
+        with patch("subprocess.run", side_effect=error):
+            assert pane_title("%7") is None
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("✳ Ready", PanePhase.IDLE),
+        ("⠀ Thinking", PanePhase.PROCESSING),
+        ("⠐ Thinking", PanePhase.PROCESSING),
+        ("⣿ Thinking", PanePhase.PROCESSING),
+        (None, PanePhase.UNKNOWN),
+        ("", PanePhase.UNKNOWN),
+        ("extro", PanePhase.UNKNOWN),
+        ("★ Other", PanePhase.UNKNOWN),
+    ],
+)
+def test_classify_pane_phase_literal_titles(title, expected):
+    assert classify_pane_phase(title) is expected
+
+
+class TestReadPaneInput:
+    def test_real_processing_capture_has_empty_input(self):
+        assert read_pane_input(PROCESSING_EMPTY_INPUT_CAPTURE) == ""
+
+    def test_scope_idle_capture_has_staged_input(self):
+        assert read_pane_input(IDLE_STAGED_INPUT_CAPTURE) == (
+            "gate 1 approved, let's keep it moving"
+        )
+
+    def test_constructed_placeholder_is_staged(self):
+        assert read_pane_input(IDLE_PASTED_PLACEHOLDER_CAPTURE) == ("[Pasted text #1 +40 lines]")
+
+    def test_uses_last_complete_input_box(self):
+        combined = IDLE_STAGED_INPUT_CAPTURE + PROCESSING_EMPTY_INPUT_CAPTURE
+        assert read_pane_input(combined) == ""
+
+    def test_no_prompt_returns_none(self):
+        # Constructed from the verified U+2500 layout with its U+276F prompt removed.
+        capture = "───\nstatus only\n───\n"
+        assert read_pane_input(capture) is None
+
+    def test_incomplete_box_returns_none(self):
+        # Constructed from the verified layout with only one U+2500 rule.
+        assert read_pane_input("───\n❯ staged\n") is None
 
 
 class TestPaneLiveness:

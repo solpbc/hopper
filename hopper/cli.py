@@ -1051,7 +1051,9 @@ def _cmd_gate_feedback(args: list[str]) -> int:
     import hopper.client as client
 
     description = (
-        "Send feedback to a gated lode. Forms:\n"
+        "Send feedback to a gated lode. Exit 0 means Claude accepted a new user turn. "
+        "On failure, the lode remains gated and Hopper prints a safe next action.\n\n"
+        "Forms:\n"
         '  hop gate feedback <lode_id> "<response>"\n'
         "  hop gate feedback <lode_id> < file.md\n"
         "  hop gate feedback <lode_id> - < file.md"
@@ -1075,7 +1077,7 @@ def _cmd_gate_feedback(args: list[str]) -> int:
     text = sys.stdin.read() if parsed.text in (None, "-") else parsed.text
     if not text.strip():
         print(
-            "Error: no feedback provided. Use one of:\n"
+            "Error: no feedback provided. No pane was touched. Use one of:\n"
             '  hop gate feedback <lode_id> "<response>"\n'
             "  hop gate feedback <lode_id> < file.md\n"
             "  hop gate feedback <lode_id> - < file.md",
@@ -1097,26 +1099,33 @@ def _cmd_gate_feedback(args: list[str]) -> int:
     response = client.send_gate_feedback(_socket(), parsed.lode_id, text)
     if response and response.get("type") == "feedback_sent":
         print(f"Feedback sent to {parsed.lode_id} (pane {response.get('tmux_pane', '')})")
-        if not response.get("submitted", True):
-            print("Warning: feedback paste was not verified as submitted.", file=sys.stderr)
-            tail = response.get("tail", "")
-            if tail:
-                print(tail, file=sys.stderr)
         return 0
 
-    error = (
-        response.get("error", "failed to send feedback") if response else "failed to send feedback"
-    )
-    remote_lode, checked = _find_remote_lode(parsed.lode_id)
-    if remote_lode:
-        return _run_remote_cli(
-            remote_lode["host"],
-            ["gate", "feedback", parsed.lode_id, "-"],
-            reason=f"lode {remote_lode['id']}",
-            stdin_text=text,
+    if response is None:
+        error = (
+            "The feedback request returned no response. The delivery outcome is unknown and "
+            "the lode may still be gated. Inspect with `hop lode peek "
+            f"{parsed.lode_id}` before deciding whether to retry; do not resend the feedback "
+            "blindly."
         )
-    suffix = f" Checked remote hosts: {checked}." if checked else ""
-    print(f"Error: {error}.{suffix}")
+    else:
+        error = response.get("error", "Feedback failed without a recovery message.")
+        if response.get("outcome") == "unknown_lode":
+            remote_lode, checked = _find_remote_lode(parsed.lode_id)
+            if remote_lode:
+                return _run_remote_cli(
+                    remote_lode["host"],
+                    ["gate", "feedback", parsed.lode_id, "-"],
+                    reason=f"lode {remote_lode['id']}",
+                    stdin_text=text,
+                )
+            if checked:
+                error = f"{error} Checked remote hosts: {checked}."
+    print(error, file=sys.stderr)
+    if response and response.get("outcome") == "unverified" and response.get("tail"):
+        print("--- pane tail ---", file=sys.stderr)
+        print(response["tail"], file=sys.stderr)
+        print("--- end pane tail ---", file=sys.stderr)
     return 1
 
 
@@ -2288,12 +2297,18 @@ def cmd_submit(args: list[str]) -> int:
     return cmd_lode(["create"] + args)
 
 
-@command("feedback", "Send feedback to a gated lode (alias for gate feedback)", group="aliases")
+@command(
+    "feedback",
+    "Send verified feedback to a gated lode (alias for gate feedback)",
+    group="aliases",
+)
 def cmd_feedback(args: list[str]) -> int:
     """Alias for hop gate feedback."""
     if "-h" in args or "--help" in args:
         description = (
-            "Send feedback to a gated lode. Forms:\n"
+            "Send feedback to a gated lode. Exit 0 means Claude accepted a new user turn. "
+            "On failure, the lode remains gated and Hopper prints a safe next action.\n\n"
+            "Forms:\n"
             '  hop gate feedback <lode_id> "<response>"\n'
             "  hop gate feedback <lode_id> < file.md\n"
             "  hop gate feedback <lode_id> - < file.md"

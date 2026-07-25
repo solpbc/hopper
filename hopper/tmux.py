@@ -19,6 +19,14 @@ class Liveness(Enum):
     UNKNOWN = "unknown"
 
 
+class PanePhase(Enum):
+    """Claude pane activity phase inferred from its tmux title."""
+
+    IDLE = "idle"
+    PROCESSING = "processing"
+    UNKNOWN = "unknown"
+
+
 def is_inside_tmux() -> bool:
     """Check if currently running inside a tmux session."""
     return "TMUX" in os.environ
@@ -78,6 +86,54 @@ def get_pane_pid(target: str) -> int | None:
         return int(result.stdout.strip())
     except ValueError:
         return None
+
+
+def pane_title(target: str) -> str | None:
+    """Return a pane's non-empty tmux title, or None when unavailable."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_title}"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def classify_pane_phase(title: str | None) -> PanePhase:
+    """Classify a Claude pane title without guessing on unrecognized titles."""
+    if not title:
+        return PanePhase.UNKNOWN
+    marker = title[0]
+    if marker == "\u2733":
+        return PanePhase.IDLE
+    if "\u2800" <= marker <= "\u28ff":
+        return PanePhase.PROCESSING
+    return PanePhase.UNKNOWN
+
+
+def read_pane_input(pane_text: str) -> str | None:
+    """Read input after the prompt in the final complete Claude input box."""
+    lines = pane_text.splitlines()
+    rules = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip() and set(line.strip()) == {"\u2500"}
+    ]
+    if len(rules) < 2:
+        return None
+
+    top, bottom = rules[-2:]
+    if bottom <= top + 1:
+        return None
+    for line in reversed(lines[top + 1 : bottom]):
+        prompt_line = line.lstrip()
+        if prompt_line.startswith("\u276f"):
+            return prompt_line[1:].lstrip("\u00a0").strip()
+    return None
 
 
 def new_window(

@@ -3519,6 +3519,95 @@ def test_feedback_alias_treats_dash_as_stdin_sentinel(capsys):
     assert mock_send.call_args.args[1:] == ("gate1234", "approved, ship it")
 
 
+def test_gate_feedback_unknown_lode_may_fall_back_remote():
+    response = {
+        "type": "error",
+        "outcome": "unknown_lode",
+        "error": "Lode gate1234 was not found on this server.",
+    }
+    remote = {"id": "gate1234", "host": "remote.example"}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.send_gate_feedback", return_value=response),
+        patch("hopper.cli._find_remote_lode", return_value=(remote, "remote.example")),
+        patch("hopper.cli._run_remote_cli", return_value=0) as mock_remote,
+    ):
+        assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 0
+
+    mock_remote.assert_called_once_with(
+        "remote.example",
+        ["gate", "feedback", "gate1234", "-"],
+        reason="lode gate1234",
+        stdin_text="Needs work",
+    )
+
+
+@pytest.mark.parametrize("outcome", ["pane_unavailable", "busy", "not_sent", "unverified"])
+def test_gate_feedback_local_delivery_failure_never_probes_remote(outcome, capsys):
+    response = {"type": "error", "outcome": outcome, "error": "Safe local recovery."}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.send_gate_feedback", return_value=response),
+        patch("hopper.cli._find_remote_lode") as mock_find_remote,
+    ):
+        assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
+
+    mock_find_remote.assert_not_called()
+    assert capsys.readouterr().err == "Safe local recovery.\n"
+
+
+def test_gate_feedback_unverified_prints_framed_pane_tail(capsys):
+    response = {
+        "type": "error",
+        "outcome": "unverified",
+        "error": "Feedback outcome unknown; inspect pane.",
+        "tail": "first pane line\nlast pane line",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.send_gate_feedback", return_value=response),
+    ):
+        assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
+
+    assert capsys.readouterr().err == (
+        "Feedback outcome unknown; inspect pane.\n"
+        "--- pane tail ---\n"
+        "first pane line\n"
+        "last pane line\n"
+        "--- end pane tail ---\n"
+    )
+
+
+def test_gate_feedback_not_sent_does_not_print_pane_tail(capsys):
+    response = {
+        "type": "error",
+        "outcome": "not_sent",
+        "error": "Feedback was not submitted; retry safely.",
+        "tail": "staged pane content",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.send_gate_feedback", return_value=response),
+    ):
+        assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
+
+    assert capsys.readouterr().err == "Feedback was not submitted; retry safely.\n"
+
+
+def test_gate_feedback_missing_response_never_probes_remote(capsys):
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.send_gate_feedback", return_value=None),
+        patch("hopper.cli._find_remote_lode") as mock_find_remote,
+    ):
+        assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
+
+    mock_find_remote.assert_not_called()
+    error = capsys.readouterr().err
+    assert "delivery outcome is unknown" in error
+    assert "hop lode peek gate1234" in error
+
+
 def test_gate_no_server(capsys):
     """gate returns error when server is not running."""
     with patch("hopper.client.probe_server", return_value="down"):
@@ -4794,6 +4883,24 @@ def test_lode_answer_restricts_choice(capsys):
                 assert cmd_lode(["answer", "abc123", "10"]) == 1
 
     assert "choice must be a digit" in capsys.readouterr().out
+
+
+def test_lode_answer_uses_send_keys_without_buffer_paste(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+            with patch("hopper.cli.capture_pane", side_effect=["prompt", "prompt", "done"]):
+                with patch("hopper.cli.paste_buffer") as mock_paste:
+                    with patch("hopper.cli.send_keys", return_value=True) as mock_send:
+                        with patch("hopper.cli.time.sleep"):
+                            assert cmd_lode(["answer", "abc123", "1"]) == 0
+
+    mock_paste.assert_not_called()
+    assert [call.args for call in mock_send.call_args_list] == [
+        ("%1", "1"),
+        ("%1", "Enter"),
+    ]
+    assert "submitted" in capsys.readouterr().out
 
 
 def test_lode_restart_allows_force_when_active_pane_dead(capsys):

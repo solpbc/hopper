@@ -232,6 +232,7 @@ class BaseRunner:
         # and whether we have seen it hold still long enough to trust a change.
         self._gate_snapshot: str | None = None
         self._gate_armed = False
+        self._gate_epoch = 0
         self._setup_error: str | None = None
 
     def run(self) -> int:
@@ -426,15 +427,19 @@ class BaseRunner:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
 
-    def _emit_state(self, state: str, status: str) -> bool:
+    def _emit_state(
+        self,
+        state: str,
+        status: str,
+        *,
+        gate_epoch: int | None = None,
+    ) -> bool:
         """Emit state change to server via persistent connection."""
         if self.connection:
-            emitted = self.connection.emit(
-                "lode_set_state",
-                lode_id=self.lode_id,
-                state=state,
-                status=status,
-            )
+            fields = {"lode_id": self.lode_id, "state": state, "status": status}
+            if gate_epoch is not None:
+                fields["gate_epoch"] = gate_epoch
+            emitted = self.connection.emit("lode_set_state", **fields)
             logger.debug(f"Emitted state: {state}, status: {status}")
             return emitted
         return False
@@ -466,6 +471,7 @@ class BaseRunner:
         lode = message.get("lode", {})
         if lode.get("id") != self.lode_id:
             return
+        self._gate_epoch = lode.get("gate_epoch", 0)
         if lode.get("state") == "completed":
             self._done.set()
             logger.debug(f"{self._done_label} signal received")
@@ -583,7 +589,11 @@ class BaseRunner:
                 self._last_pane_activity_ms = current_time_ms()
                 return
             if snapshot != self._gate_snapshot:
-                self._emit_state("running", "Gate resumed")
+                self._emit_state(
+                    "running",
+                    "Gate resumed",
+                    gate_epoch=self._gate_epoch,
+                )
                 self._last_snapshot = snapshot
                 self._last_pane_activity_ms = current_time_ms()
                 self._clear_gate()

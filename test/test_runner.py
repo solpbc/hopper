@@ -1036,6 +1036,7 @@ class TestBaseRunnerActivityMonitor:
         # Armed against the pane as it settled after the gate opened.
         runner._gate_snapshot = "Gate set. Review saved."
         runner._gate_armed = True
+        runner._gate_epoch = 7
         runner._last_snapshot = "Gate set. Review saved."
 
         with (
@@ -1045,7 +1046,7 @@ class TestBaseRunnerActivityMonitor:
         ):
             runner._check_activity()
 
-        mock_emit.assert_called_once_with("running", "Gate resumed")
+        mock_emit.assert_called_once_with("running", "Gate resumed", gate_epoch=7)
         assert not runner._gated.is_set()
         assert runner._last_snapshot == "Gate set. Review saved.\n> go"
         assert runner._last_pane_activity_ms == 12345
@@ -1166,6 +1167,31 @@ class TestBaseRunnerServerMessages:
         runner._on_server_message(msg)
 
         assert runner._done.is_set()
+
+    def test_on_server_message_records_gate_epoch(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+
+        runner._on_server_message(
+            {
+                "type": "lode_updated",
+                "lode": {"id": "test-session", "state": "gated", "gate_epoch": 9},
+            }
+        )
+
+        assert runner._gate_epoch == 9
+
+    def test_on_server_message_defaults_missing_gate_epoch_to_zero(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._gate_epoch = 9
+
+        runner._on_server_message(
+            {
+                "type": "lode_updated",
+                "lode": {"id": "test-session", "state": "running"},
+            }
+        )
+
+        assert runner._gate_epoch == 0
 
     def test_on_server_message_ignores_other_lodes(self):
         """Callback ignores messages for other sessions."""

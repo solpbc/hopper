@@ -56,7 +56,18 @@ from hopper.lodes import (
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
-from hopper.tmux import Liveness, capture_pane, get_pane_pid, pane_liveness, paste_buffer, send_keys
+from hopper.tmux import (
+    Liveness,
+    PanePhase,
+    capture_pane,
+    classify_pane_phase,
+    get_pane_pid,
+    pane_liveness,
+    pane_title,
+    paste_buffer,
+    read_pane_input,
+    send_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +77,74 @@ PAUSE_TERM_GRACE_SEC = 0.75
 PAUSE_KILL_GRACE_SEC = 0.5
 PAUSE_PROCESS_POLL_SEC = 0.02
 PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
+_FEEDBACK_POLL_INTERVAL = 0.25
+_FEEDBACK_IDLE_POLL_COUNT = 12
+_FEEDBACK_SETTLE_POLL_COUNT = 4
+_FEEDBACK_ACCEPTANCE_POLL_COUNT = 12
+
+_FEEDBACK_FAILURES = {
+    "pane_unavailable": (
+        "pane_unavailable",
+        "Feedback blocked: pane unavailable",
+        "Feedback was not sent because pane {pane} is unavailable. No feedback was pasted "
+        "or submitted. Run `hop lode resume {lode_id}`, wait for the prompt, then retry "
+        "the same feedback.",
+    ),
+    "idle_timeout": (
+        "busy",
+        "Feedback blocked: pane busy",
+        "Feedback was not sent because pane {pane} did not become idle within 3.0s. No "
+        "feedback was pasted or submitted, and Hopper does not know when the pane will be "
+        "ready. Wait for the current turn to finish, then retry the same feedback.",
+    ),
+    "paste_failed": (
+        "not_sent",
+        "Feedback not sent; gate remains blocked",
+        "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
+        "was submitted. Retry the same feedback.",
+    ),
+    "paste_not_staged": (
+        "unverified",
+        "Feedback outcome unknown; inspect pane",
+        "Hopper pasted feedback into pane {pane}, but no new user turn was observed within "
+        "1.0s. The delivery outcome is unknown. Inspect with `hop lode peek {lode_id}` "
+        "before deciding whether to retry; do not paste the feedback again unless the pane "
+        "proves it was not accepted or staged.",
+    ),
+    "pane_lost_after_paste": (
+        "unverified",
+        "Feedback outcome unknown; inspect pane",
+        "Hopper pasted feedback into pane {pane}, but the pane became unavailable before a "
+        "new user turn was observed. The delivery outcome is unknown. Run `hop lode resume "
+        "{lode_id}`, then inspect with `hop lode peek {lode_id}` before deciding whether to "
+        "retry; do not paste the feedback again unless the pane proves it was not accepted "
+        "or staged.",
+    ),
+    "submit_failed": (
+        "not_sent",
+        "Feedback not sent; gate remains blocked",
+        "Feedback was not submitted because Hopper could not press Enter in pane {pane}. "
+        "The feedback is still staged. Inspect with `hop lode peek {lode_id}`, then submit "
+        "it once instead of pasting it again.",
+    ),
+    "acceptance_timeout": (
+        "unverified",
+        "Feedback outcome unknown; inspect pane",
+        "Hopper pressed Enter in pane {pane}, but did not observe the required "
+        "idle-to-processing transition within 3.0s. The delivery outcome is unknown. "
+        "Inspect with `hop lode peek {lode_id}` before deciding whether to retry; do not "
+        "paste the feedback again unless the pane proves it was not accepted or staged.",
+    ),
+    "pane_lost_after_submit": (
+        "unverified",
+        "Feedback outcome unknown; inspect pane",
+        "Hopper pressed Enter in pane {pane}, then the pane became unavailable before "
+        "acceptance could be verified. The delivery outcome is unknown. Run `hop lode "
+        "resume {lode_id}`, then inspect with `hop lode peek {lode_id}` before deciding "
+        "whether to retry; do not paste the feedback again unless the pane proves it was "
+        "not accepted or staged.",
+    ),
+}
 
 
 class ServerLockHeld(RuntimeError):
@@ -189,44 +268,51 @@ def _clear_spawn_refusal(lode: dict) -> bool:
     return True
 
 
-def _tail_text(text: str, lines: int = 10) -> str:
-    """Return the last N lines of text."""
-    return "\n".join(text.splitlines()[-lines:])
+def _deliver_gate_feedback(pane_id: str | None, text: str) -> tuple[str, str | None]:
+    """Deliver feedback once and return (reason, latest pane capture)."""
+    if not pane_id:
+        return "pane_unavailable", None
 
+    latest_capture = capture_pane(pane_id, plain=True)
+    if latest_capture is None:
+        return "pane_unavailable", None
 
-def _submission_tail(text: str) -> str:
-    """Return a small tail used to check whether pasted input remains pending."""
-    compact = " ".join(text.strip().split())
-    return compact[-80:] if compact else ""
+    for _ in range(_FEEDBACK_IDLE_POLL_COUNT):
+        time.sleep(_FEEDBACK_POLL_INTERVAL)
+        if classify_pane_phase(pane_title(pane_id)) is PanePhase.IDLE:
+            break
+    else:
+        return "idle_timeout", latest_capture
 
-
-def _pane_has_pending_text(pane_text: str | None, submitted_text: str) -> bool:
-    """Heuristic for whether submitted text still appears on the input line."""
-    if not pane_text:
-        return False
-    tail = _submission_tail(submitted_text)
-    if not tail:
-        return False
-    compact_tail = " ".join(_tail_text(pane_text, 5).split())
-    return tail in compact_tail
-
-
-def _paste_submit_verify(pane_id: str, text: str) -> tuple[bool, str]:
-    """Paste text into a pane, press Enter, and verify submission."""
     if not paste_buffer(pane_id, text):
-        return False, f"failed to paste into {pane_id}"
-    send_keys(pane_id, "Enter")
-    time.sleep(2)
-    after = capture_pane(pane_id, plain=True)
-    if after is None:
-        return False, f"pane {pane_id} disappeared after feedback paste"
-    if not _pane_has_pending_text(after, text):
-        return True, _tail_text(after or "", 10)
-    send_keys(pane_id, "Enter")
-    time.sleep(0.2)
-    retry_after = capture_pane(pane_id, plain=True)
-    submitted = retry_after is not None and not _pane_has_pending_text(retry_after, text)
-    return submitted, _tail_text(retry_after or after or "", 10)
+        return "paste_failed", latest_capture
+
+    for _ in range(_FEEDBACK_SETTLE_POLL_COUNT):
+        time.sleep(_FEEDBACK_POLL_INTERVAL)
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return "pane_lost_after_paste", latest_capture
+        latest_capture = capture
+        phase = classify_pane_phase(pane_title(pane_id))
+        if phase is PanePhase.PROCESSING:
+            return "auto_submitted", latest_capture
+        if phase is PanePhase.IDLE and read_pane_input(latest_capture):
+            break
+    else:
+        return "paste_not_staged", latest_capture
+
+    if not send_keys(pane_id, "Enter"):
+        return "submit_failed", latest_capture
+
+    for _ in range(_FEEDBACK_ACCEPTANCE_POLL_COUNT):
+        time.sleep(_FEEDBACK_POLL_INTERVAL)
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return "pane_lost_after_submit", latest_capture
+        latest_capture = capture
+        if classify_pane_phase(pane_title(pane_id)) is PanePhase.PROCESSING:
+            return "enter_accepted", latest_capture
+    return "acceptance_timeout", latest_capture
 
 
 def get_git_hash() -> str | None:
@@ -1038,6 +1124,17 @@ class Server:
             state = message.get("state")
             status = message.get("status", "")
             if lode_id and state:
+                lode = self._find_lode(lode_id)
+                message_epoch = message.get("gate_epoch")
+                current_epoch = lode.get("gate_epoch", 0) if lode else 0
+                if lode and "gate_epoch" in message and message_epoch != current_epoch:
+                    logger.info(
+                        "Dropping stale state update lode=%s gate_epoch=%s current_gate_epoch=%s",
+                        lode_id,
+                        message_epoch,
+                        current_epoch,
+                    )
+                    return
                 lode = update_lode_state(self.lodes, lode_id, state, status)
                 if lode:
                     logger.info(f"Lode {lode_id} state={state} status={status}")
@@ -1164,64 +1261,70 @@ class Server:
             text = message.get("text", "")
             if not lode_id:
                 if conn:
-                    self._send_response(conn, {"type": "error", "error": "missing lode_id"})
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                "No lode ID was provided. No pane was touched. Supply a lode "
+                                "ID, then retry."
+                            ),
+                            "outcome": "unknown_lode",
+                        },
+                    )
                 return
 
             lode = self._find_lode(lode_id)
             if not lode:
                 if conn:
                     self._send_response(
-                        conn, {"type": "error", "error": f"lode {lode_id} not found"}
-                    )
-                return
-
-            pane_id = lode.get("tmux_pane")
-            pane_alive = bool(pane_id and capture_pane(pane_id) is not None)
-            if not pane_alive:
-                updated = update_lode_state(
-                    self.lodes,
-                    lode_id,
-                    "gated",
-                    "Feedback blocked: pane unavailable",
-                )
-                if updated:
-                    self.broadcast({"type": "lode_updated", "lode": updated})
-                if conn:
-                    self._send_response(
                         conn,
                         {
                             "type": "error",
                             "error": (
-                                "pane unavailable; run `hop lode resume "
-                                f"{lode_id}`, wait for the prompt, then retry feedback"
+                                f"Lode {lode_id} was not found on this server. No pane was "
+                                "touched. Check the lode ID, then retry."
                             ),
+                            "outcome": "unknown_lode",
                         },
                     )
                 return
 
-            submitted, tail = _paste_submit_verify(pane_id, text)
-            state = "running" if submitted else "gated"
-            status = (
-                "Feedback sent" if submitted else "Feedback not submitted; gate remains blocked"
-            )
+            pane_id = lode.get("tmux_pane")
+            reason, latest_capture = _deliver_gate_feedback(pane_id, text)
+            accepted = reason in {"auto_submitted", "enter_accepted"}
+            paste_attempted = reason not in {"pane_unavailable", "idle_timeout"}
+            if paste_attempted:
+                lode["gate_epoch"] = lode.get("gate_epoch", 0) + 1
+
+            if accepted:
+                state = "running"
+                status = "Feedback accepted"
+            else:
+                _outcome, status, _message_template = _FEEDBACK_FAILURES[reason]
+                state = "gated"
             updated = update_lode_state(self.lodes, lode_id, state, status)
             if updated:
                 self.broadcast({"type": "lode_updated", "lode": updated})
             if conn:
-                if submitted:
+                if accepted:
                     response = {
                         "type": "feedback_sent",
                         "lode_id": lode_id,
                         "tmux_pane": pane_id,
-                        "submitted": True,
-                        "tail": tail,
                     }
                 else:
+                    outcome, _status, message_template = _FEEDBACK_FAILURES[reason]
                     response = {
                         "type": "error",
-                        "error": "feedback paste was not submitted; gate remains blocked",
-                        "tail": tail,
+                        "error": message_template.format(
+                            pane=pane_id or "<unknown>",
+                            lode_id=lode_id,
+                        ),
+                        "outcome": outcome,
                     }
+                    if latest_capture is not None:
+                        response["tail"] = "\n".join(latest_capture.splitlines()[-10:])
                 self._send_response(conn, response)
 
         elif msg_type == "lode_promote_backlog":
