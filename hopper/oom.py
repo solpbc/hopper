@@ -7,6 +7,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import time
 from enum import Enum
 from pathlib import Path
 
@@ -21,6 +22,10 @@ OOM_SCORE_DEGRADED_WARNING = (
     "this lode has no Hopper-managed OOM protection."
 )
 SYSTEMCTL_TIMEOUT_SEC = 1.0
+# Keep this below GUARDED_DISCONNECT_HOLD_SEC = 2.0 in hopper/server.py so the
+# supervisor normally reports the settled result within the live server hold.
+SCOPE_RESULT_SETTLE_SEC = 1.5
+SCOPE_RESULT_POLL_SEC = 0.05
 
 
 class OomCapability(Enum):
@@ -99,7 +104,12 @@ def launch_scope(argv: list[str]) -> int:
     return subprocess.run(argv).returncode
 
 
-def read_scope_result(systemctl: str, unit_name: str) -> str | None:
+def read_scope_result(
+    systemctl: str,
+    unit_name: str,
+    *,
+    timeout: float = SYSTEMCTL_TIMEOUT_SEC,
+) -> str | None:
     """Read a scope's authoritative Result property."""
     try:
         result = subprocess.run(
@@ -113,7 +123,7 @@ def read_scope_result(systemctl: str, unit_name: str) -> str | None:
             ],
             capture_output=True,
             text=True,
-            timeout=SYSTEMCTL_TIMEOUT_SEC,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -121,6 +131,28 @@ def read_scope_result(systemctl: str, unit_name: str) -> str | None:
         return None
     value = result.stdout.strip()
     return value or None
+
+
+def settle_scope_result(systemctl: str, unit_name: str) -> str | None:
+    """Wait briefly for a failed scope's authoritative Result property to settle.
+
+    None and "success" are treated as transient because the caller invokes this
+    only after a nonzero worker exit.
+    """
+    deadline = time.monotonic() + SCOPE_RESULT_SETTLE_SEC
+    result = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result
+        result = read_scope_result(
+            systemctl,
+            unit_name,
+            timeout=min(SYSTEMCTL_TIMEOUT_SEC, remaining),
+        )
+        if result not in (None, "success"):
+            return result
+        time.sleep(min(SCOPE_RESULT_POLL_SEC, remaining))
 
 
 def release_scope(systemctl: str, unit_name: str) -> bool:

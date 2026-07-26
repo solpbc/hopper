@@ -788,7 +788,10 @@ def run_process_supervisor(lode_id: str, socket_path: Path) -> int:
         logger.warning("failed to launch guarded systemd scope", exc_info=True)
         return run_process(lode_id, socket_path, expect_scope=False)
 
-    unit_result = oom.read_scope_result(systemctl, unit_name)
+    if worker_returncode == 0:
+        unit_result = oom.read_scope_result(systemctl, unit_name)
+    else:
+        unit_result = oom.settle_scope_result(systemctl, unit_name)
     acknowledgement = report_lode_run_result(
         socket_path,
         lode_id,

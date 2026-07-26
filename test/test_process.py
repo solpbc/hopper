@@ -1982,6 +1982,29 @@ class TestProcessingLog:
 
 
 class TestOomBoundary:
+    class _ScopeResultClock:
+        def __init__(self, reads):
+            self.now = 0.0
+            self.reads = reads
+            self.read_count = 0
+            self.sleeps = []
+            self.read_calls = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, duration):
+            self.sleeps.append(duration)
+            self.now += duration
+
+        def read_scope_result(self, systemctl, unit_name, *, timeout):
+            self.read_calls.append((systemctl, unit_name, self.now, timeout))
+            index = min(self.read_count, len(self.reads) - 1)
+            result, consumed = self.reads[index]
+            self.read_count += 1
+            self.now += min(consumed, timeout)
+            return result
+
     def test_pane_command_is_identical_when_guard_environment_is_present(self):
         with patch("hopper.claude.new_window", return_value="%1") as new_window:
             spawn_claude("test-id", "/repo")
@@ -2069,7 +2092,7 @@ class TestOomBoundary:
         monkeypatch.setattr(
             oom,
             "read_scope_result",
-            lambda systemctl, unit_name: (
+            lambda systemctl, unit_name, *, timeout=oom.SYSTEMCTL_TIMEOUT_SEC: (
                 events.append(("read", systemctl, unit_name)) or "oom-kill"
             ),
         )
@@ -2096,7 +2119,11 @@ class TestOomBoundary:
         monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
         monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
         monkeypatch.setattr(oom, "launch_scope", lambda argv: 137)
-        monkeypatch.setattr(oom, "read_scope_result", lambda *args: "oom-kill")
+        monkeypatch.setattr(
+            oom,
+            "read_scope_result",
+            lambda systemctl, unit_name, *, timeout=oom.SYSTEMCTL_TIMEOUT_SEC: "oom-kill",
+        )
         monkeypatch.setattr("hopper.process.report_lode_run_result", lambda *args: None)
         release = MagicMock()
         monkeypatch.setattr(oom, "release_scope", release)
@@ -2134,7 +2161,11 @@ class TestOomBoundary:
         monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
         monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
         monkeypatch.setattr(oom, "launch_scope", lambda argv: 1)
-        monkeypatch.setattr(oom, "read_scope_result", lambda *args: "exit-code")
+        monkeypatch.setattr(
+            oom,
+            "read_scope_result",
+            lambda systemctl, unit_name, *, timeout=oom.SYSTEMCTL_TIMEOUT_SEC: "exit-code",
+        )
         monkeypatch.setattr(
             "hopper.process.report_lode_run_result",
             lambda *args: {"durable": True, "disposition": "not-found"},
@@ -2144,6 +2175,184 @@ class TestOomBoundary:
 
         assert run_process_supervisor("archived-id", Path("server.sock")) == 1
         release.assert_called_once_with("systemctl", unit)
+
+    @pytest.mark.parametrize("transient_result", ["success", None])
+    def test_nonzero_exit_reports_delayed_oom_before_releasing(self, monkeypatch, transient_result):
+        generation = "1" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        events = []
+        clock = self._ScopeResultClock([(transient_result, 0.0), ("oom-kill", 0.0)])
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(
+            oom,
+            "launch_scope",
+            lambda argv: events.append(("launch", argv)) or 137,
+        )
+        monkeypatch.setattr(oom.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(oom.time, "sleep", clock.sleep)
+
+        def read_scope_result(systemctl, unit_name, *, timeout):
+            events.append(("read", systemctl, unit_name))
+            return clock.read_scope_result(systemctl, unit_name, timeout=timeout)
+
+        monkeypatch.setattr(oom, "read_scope_result", read_scope_result)
+        monkeypatch.setattr(
+            "hopper.process.report_lode_run_result",
+            lambda *args: events.append(("report", args)) or {"durable": True},
+        )
+        monkeypatch.setattr(
+            oom,
+            "release_scope",
+            lambda systemctl, unit_name: events.append(("release", systemctl, unit_name)) or True,
+        )
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 0
+        assert [event[0] for event in events] == [
+            "launch",
+            "read",
+            "read",
+            "report",
+            "release",
+        ]
+        assert events[3][1][4:] == ("oom-kill", 137)
+        assert events[4][1:] == ("systemctl", unit)
+        assert clock.sleeps == pytest.approx([oom.SCOPE_RESULT_POLL_SEC])
+        assert [call[3] for call in clock.read_calls] == pytest.approx(
+            [oom.SYSTEMCTL_TIMEOUT_SEC, oom.SYSTEMCTL_TIMEOUT_SEC]
+        )
+
+    def test_nonzero_exit_reports_exit_code_without_delay(self, monkeypatch):
+        generation = "2" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        clock = self._ScopeResultClock([("exit-code", 0.0)])
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(oom, "launch_scope", lambda argv: 1)
+        monkeypatch.setattr(oom.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(oom.time, "sleep", clock.sleep)
+        monkeypatch.setattr(oom, "read_scope_result", clock.read_scope_result)
+        report = MagicMock(return_value={"durable": True})
+        monkeypatch.setattr("hopper.process.report_lode_run_result", report)
+        release = MagicMock(return_value=True)
+        monkeypatch.setattr(oom, "release_scope", release)
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 1
+        assert clock.read_count == 1
+        assert [call[3] for call in clock.read_calls] == pytest.approx([oom.SYSTEMCTL_TIMEOUT_SEC])
+        assert clock.sleeps == []
+        report.assert_called_once_with(
+            Path("server.sock"),
+            "test-id",
+            generation,
+            unit,
+            "exit-code",
+            1,
+        )
+        assert report.call_args.args[4] != "oom-kill"
+        release.assert_called_once_with("systemctl", unit)
+
+    @pytest.mark.parametrize("stable_result", ["success", None])
+    def test_nonzero_exit_reports_stable_transient_result_at_deadline(
+        self, monkeypatch, stable_result
+    ):
+        generation = "3" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        clock = self._ScopeResultClock([(stable_result, 0.0)])
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(oom, "launch_scope", lambda argv: 137)
+        monkeypatch.setattr(oom.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(oom.time, "sleep", clock.sleep)
+        monkeypatch.setattr(oom, "read_scope_result", clock.read_scope_result)
+        report = MagicMock(return_value={"durable": stable_result == "success"})
+        monkeypatch.setattr("hopper.process.report_lode_run_result", report)
+        release = MagicMock()
+        monkeypatch.setattr(oom, "release_scope", release)
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 137
+        report.assert_called_once_with(
+            Path("server.sock"),
+            "test-id",
+            generation,
+            unit,
+            stable_result,
+            137,
+        )
+        assert report.call_args.args[4] != "oom-kill"
+        release.assert_not_called()
+        assert clock.now == pytest.approx(oom.SCOPE_RESULT_SETTLE_SEC)
+        assert all(call[2] < oom.SCOPE_RESULT_SETTLE_SEC for call in clock.read_calls)
+        assert all(0 < call[3] <= oom.SYSTEMCTL_TIMEOUT_SEC for call in clock.read_calls)
+        assert clock.sleeps
+        assert all(sleep <= oom.SCOPE_RESULT_POLL_SEC for sleep in clock.sleeps)
+
+    def test_delayed_scope_reads_never_exceed_remaining_budget(self, monkeypatch):
+        clock = self._ScopeResultClock([(None, 1.0)])
+        monkeypatch.setattr(oom.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(oom.time, "sleep", clock.sleep)
+        monkeypatch.setattr(oom, "read_scope_result", clock.read_scope_result)
+
+        assert oom.settle_scope_result("systemctl", "hopper-test.scope") is None
+        assert clock.read_count == 2
+        assert [call[2] for call in clock.read_calls] == pytest.approx([0.0, 1.05])
+        assert [call[3] for call in clock.read_calls] == pytest.approx([1.0, 0.45])
+        assert clock.sleeps == pytest.approx([0.05, 0.05])
+        assert clock.now == pytest.approx(1.55)
+        for _, _, start, timeout in clock.read_calls:
+            assert timeout > 0
+            assert timeout == pytest.approx(
+                min(
+                    oom.SYSTEMCTL_TIMEOUT_SEC,
+                    oom.SCOPE_RESULT_SETTLE_SEC - start,
+                )
+            )
+
+    def test_zero_exit_reads_scope_once_without_delay(self, monkeypatch):
+        generation = "4" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(oom, "launch_scope", lambda argv: 0)
+        read_result = MagicMock(return_value="success")
+        monkeypatch.setattr(oom, "read_scope_result", read_result)
+        settle_result = MagicMock()
+        monkeypatch.setattr(oom, "settle_scope_result", settle_result)
+        monotonic = MagicMock()
+        monkeypatch.setattr(oom.time, "monotonic", monotonic)
+        sleep = MagicMock()
+        monkeypatch.setattr(oom.time, "sleep", sleep)
+        report = MagicMock(return_value={"durable": True})
+        monkeypatch.setattr("hopper.process.report_lode_run_result", report)
+        release = MagicMock()
+        monkeypatch.setattr(oom, "release_scope", release)
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 0
+        read_result.assert_called_once_with("systemctl", unit)
+        settle_result.assert_not_called()
+        monotonic.assert_not_called()
+        sleep.assert_not_called()
+        report.assert_called_once_with(
+            Path("server.sock"),
+            "test-id",
+            generation,
+            unit,
+            "success",
+            0,
+        )
+        release.assert_not_called()
 
     def test_non_linux_supervisor_uses_inline_worker_without_probes(self, monkeypatch):
         monkeypatch.setattr(oom, "is_linux", lambda: False)
