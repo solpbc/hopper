@@ -106,7 +106,7 @@ When all four pass, undo only your own fast-forward:
 git reset --hard <pre-merge main SHA>
 ```
 
-If the merge itself failed, this is a no-op, which is expected.
+If the merge itself failed, this is a no-op, which is expected. If the reset does not succeed, stop and gate: rebasing from here would rewrite the feature branch while local main still points at the old tip, which invalidates the check above and cannot be undone by retrying.
 
 **Then decide whether retrying can help.**
 
@@ -128,7 +128,7 @@ git push
 
 Apply this same rule to every later failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
 
-Stop and gate on any of these. They are the only terminal conditions in this stage:
+Stop and gate on any of these:
 
 - A rebase conflict that cannot be resolved unambiguously (see step 2).
 - Validation fails for a reason attributable to the branch. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs; if the failure was already present on the feature branch before rebase, step 3's exception applies — note it and proceed. Gate only when neither applies.
@@ -136,8 +136,9 @@ Stop and gate on any of these. They are the only terminal conditions in this sta
 - A merge or push failed while the remote base was unchanged.
 - The remote base cannot be fetched or read.
 - The four restore checks above do not all pass.
+- Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you cannot attribute to either exception above.
 
-Losing a merge race is not a terminal condition.
+Losing a merge race is not a terminal condition. That list is deliberately open-ended at the end: gating is the only correct way to stop this stage short of a completed merge. Never end this stage by reporting a failure as prose — nothing reads the pane, so a prose report leaves the lode silently idle until it is parked as stuck.
 
 To gate, submit the facts an operator needs in order to decide:
 
