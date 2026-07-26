@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from hopper.client import HopperConnection, connect
-from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir
+from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
 
@@ -722,11 +722,7 @@ class BaseRunner:
 
     def _format_park_status(self, reason: str) -> str:
         """Prescriptive park status -- agents and operators both read this."""
-        return (
-            f"Parked (idle): {reason}. The agent is ALIVE and was NOT terminated. "
-            f"Inspect: hop lode peek {self.lode_id} | "
-            f"Resume: hop lode nudge {self.lode_id} (or hop lode answer {self.lode_id} 1)"
-        )
+        return format_park_status(reason, self.lode_id)
 
     def _format_stuck_error(self, reason: str, record: dict) -> str:
         """Add recovery details and the restart command to a stuck error."""

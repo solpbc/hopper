@@ -3,14 +3,18 @@
 
 """Tests for authoritative supervised lode waiting."""
 
+import copy
 import json
 import threading
 from collections import deque
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 import hopper.wait as wait
+from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status
+from hopper.tmux import Liveness
 
 
 class FakeClock:
@@ -791,6 +795,74 @@ def test_gated_human_output_includes_latest_snapshot_summary(monkeypatch, capsys
     assert "status=Review required" in out
     assert "source=local" in out
     assert "observed_age_s=" in out
+
+
+def test_gated_parked_gone_human_output_reports_restart_and_exits_two(monkeypatch, capsys):
+    reason = "no pane output"
+    branch = "hopper-abc123"
+    gated = snapshot(
+        state="gated",
+        status=format_park_status(reason, "abc123"),
+        tmux_pane="%21",
+        branch=branch,
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="abc123",
+        branch=branch,
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE):
+        rc, _, _ = run_local_wait(monkeypatch, gated)
+
+    assert rc == 2
+    assert capsys.readouterr().out.splitlines() == [
+        "Lode abc123 is gated. Review with: hop gate show abc123",
+        f"  stage=mill state=gated active=True status={expected} source=local observed_age_s=0.000",
+    ]
+
+
+def test_gated_display_copy_does_not_mutate_wait_record(capsys):
+    reason = "no pane output"
+    branch = "hopper-abc123"
+    snapshot_data = snapshot(
+        state="gated",
+        status=format_park_status(reason, "abc123"),
+        tmux_pane="%22",
+        branch=branch,
+    )
+    record = wait._new_record("abc123", snapshot_data, "local", 0.0, 0)
+    before = copy.deepcopy(record)
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="abc123",
+        branch=branch,
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE):
+        wait._emit_outcome(record, "gated", False, 0.0)
+
+    assert f"status={expected}" in capsys.readouterr().out
+    assert record == before
+
+
+def test_gated_parked_json_keeps_stored_status_without_probe(monkeypatch, capsys):
+    stored = format_park_status("no pane output", "abc123")
+    gated = snapshot(
+        state="gated",
+        status=stored,
+        tmux_pane="%23",
+        branch="hopper-abc123",
+    )
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        rc, _, _ = run_local_wait(monkeypatch, gated, json_output=True)
+
+    assert rc == 2
+    assert json.loads(capsys.readouterr().out)["status"] == stored
 
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["human", "jsonl"])

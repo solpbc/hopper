@@ -14,7 +14,7 @@ from pathlib import Path
 
 import hopper.client as client
 import hopper.remote as remote
-from hopper.lodes import STATUS_ERROR, STATUS_SHIPPED
+from hopper.lodes import STATUS_ERROR, STATUS_SHIPPED, lode_status_for_display
 from hopper.tmux import capture_pane
 
 STUCK_GRACE_MS = 120_000
@@ -520,8 +520,11 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
         print(f"  {_snapshot_summary(record, now)}")
         print(f"Lode {lid} entered error state. Restart with: hop lode restart {lid}")
     elif outcome == "gated":
+        display_status = lode_status_for_display({**snapshot, "host": record["host"]})
+        display_snapshot = {**snapshot, "status": display_status}
+        display_record = {**record, "latest_snapshot": display_snapshot}
         print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
-        print(f"  {_snapshot_summary(record, now)}")
+        print(f"  {_snapshot_summary(display_record, now)}")
     elif outcome == "inactive":
         print(f"Lode '{lid}' is not active ({_snapshot_summary(record, now)})")
         print(f"Recover with: hop lode resume {lid} or hop lode restart {lid}")

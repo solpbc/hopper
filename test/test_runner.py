@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
-from hopper.lodes import current_time_ms, get_lode_dir
+from hopper.lodes import current_time_ms, format_park_status, get_lode_dir
 from hopper.runner import (
     BaseRunner,
     _descendant_pids,
@@ -254,6 +254,27 @@ class TestBaseRunnerActivityMonitor:
     def _make_runner(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         return runner
+
+    def test_park_idle_emits_template_status_after_delegation(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+        runner.connection = MagicMock()
+        reason = "no pane output"
+
+        with (
+            patch("hopper.runner._write_recovery_record") as mock_write_recovery,
+            patch.object(runner, "_open_gate") as mock_open_gate,
+        ):
+            runner._park_idle(reason)
+
+        runner.connection.emit.assert_called_once_with(
+            "lode_set_state",
+            lode_id="test-session",
+            state="gated",
+            status=format_park_status(reason, "test-session"),
+        )
+        mock_write_recovery.assert_called_once()
+        mock_open_gate.assert_called_once_with()
 
     def test_base_stuck_kill_writes_no_worktree_recovery(self):
         runner = self._make_runner()

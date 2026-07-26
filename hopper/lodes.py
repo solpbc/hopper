@@ -39,6 +39,7 @@ import uuid
 from pathlib import Path
 
 from hopper import config
+from hopper.tmux import Liveness, pane_liveness
 
 ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
@@ -530,6 +531,63 @@ def find_lode_by_prefix(lodes: list[dict], prefix: str) -> dict | None:
     if len(matches) == 1:
         return matches[0]
     return None
+
+
+# --- Status rendering ---
+
+PARK_STATUS_TEMPLATE = """Parked (idle): {reason}. The agent is ALIVE and was NOT terminated. Inspect: hop lode peek {lode_id} | Resume: hop lode nudge {lode_id} (or hop lode answer {lode_id} 1)"""  # noqa: E501
+
+PARK_PANE_GONE_STATUS = """Parked (idle), but the pane is GONE: {reason}. The agent did NOT survive — nudge and answer cannot reach a dead pane. Recover: hop lode restart {lode_id} (check first that the work did not already land: git cherry origin/main {branch})"""  # noqa: E501
+
+# The branch advice is the final parenthetical in the constant.
+_PARK_PANE_GONE_WITHOUT_BRANCH = PARK_PANE_GONE_STATUS.rsplit(" (", 1)[0]
+
+PARK_LIVENESS_UNVERIFIED_SUFFIX = (
+    """ (pane liveness UNVERIFIED — could not probe tmux; treat ALIVE as unconfirmed)"""
+)
+
+
+def format_park_status(reason: str, lode_id: str) -> str:
+    """Format the durable status written when an idle lode is parked."""
+    return PARK_STATUS_TEMPLATE.format(reason=reason, lode_id=lode_id)
+
+
+def lode_status_for_display(lode: dict) -> str:
+    """Return a lode's human-readable status with current local pane evidence."""
+    status = lode.get("status", "")
+    if not status:
+        return status
+
+    lode_id = lode.get("id", "")
+    reason_prefix, suffix_template = PARK_STATUS_TEMPLATE.split("{reason}", 1)
+    status_suffix = suffix_template.format(lode_id=lode_id)
+    if not status.startswith(reason_prefix) or not status.endswith(status_suffix):
+        return status
+
+    reason = status[len(reason_prefix) : -len(status_suffix)]
+    if format_park_status(reason, lode_id) != status:
+        return status
+
+    if lode.get("host") not in (None, "", "local"):
+        return status
+
+    pane = lode.get("tmux_pane")
+    if not pane:
+        liveness = Liveness.GONE
+    else:
+        try:
+            liveness = pane_liveness(pane)
+        except Exception:
+            liveness = Liveness.UNKNOWN
+
+    if liveness is Liveness.ALIVE:
+        return status
+    elif liveness is Liveness.GONE:
+        branch = lode.get("branch")
+        template = PARK_PANE_GONE_STATUS if branch else _PARK_PANE_GONE_WITHOUT_BRANCH
+        return template.format(reason=reason, lode_id=lode_id, branch=branch)
+    else:
+        return status + PARK_LIVENESS_UNVERIFIED_SUFFIX
 
 
 # --- Status icon constants ---

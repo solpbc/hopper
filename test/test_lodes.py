@@ -21,6 +21,8 @@ from hopper.git import create_worktree
 from hopper.lodes import (
     ID_ALPHABET,
     ID_LEN,
+    PARK_LIVENESS_UNVERIFIED_SUFFIX,
+    PARK_PANE_GONE_STATUS,
     archive_lode,
     compute_runtime_ms,
     create_lode,
@@ -29,11 +31,13 @@ from hopper.lodes import (
     find_lodes_by_prefix,
     format_age,
     format_duration_ms,
+    format_park_status,
     format_uptime,
     get_lode_dir,
     get_worktree_dir,
     load_archived_lodes,
     load_lodes,
+    lode_status_for_display,
     reset_lode_claude_stage,
     save_archived_lodes,
     save_lodes,
@@ -47,6 +51,7 @@ from hopper.lodes import (
     update_lode_state,
     update_lode_title,
 )
+from hopper.tmux import Liveness
 
 
 def test_lode_dict_json_roundtrip():
@@ -1145,3 +1150,185 @@ def test_update_lode_state_stuck_no_timing_change(temp_config):
     runs = lodes_list[0]["runs"]
     assert "stopped_at" not in runs["mill"]
     assert runs["mill"]["started_at"] == now - 5000
+
+
+def test_parked_alive_status_is_byte_for_byte_unchanged(make_lode):
+    reason = "no pane output for 60 min (sustained only by heartbeat/CPU activity)"
+    expected = "Parked (idle): no pane output for 60 min (sustained only by heartbeat/CPU activity). The agent is ALIVE and was NOT terminated. Inspect: hop lode peek testid11 | Resume: hop lode nudge testid11 (or hop lode answer testid11 1)"  # noqa: E501
+    lode = make_lode(
+        state="gated",
+        status=format_park_status(reason, "testid11"),
+        tmux_pane="%1",
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.ALIVE) as mock_liveness:
+        assert lode_status_for_display(lode) == expected
+
+    mock_liveness.assert_called_once_with("%1")
+
+
+def test_parked_gone_with_branch_preserves_reason(make_lode):
+    reason = "quiet: CPU/heartbeat {unchanged} — 61m"
+    branch = "hopper-testid11-park-liveness"
+    lode = make_lode(
+        state="gated",
+        status=format_park_status(reason, "testid11"),
+        branch=branch,
+        tmux_pane="%2",
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="testid11",
+        branch=branch,
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE):
+        assert lode_status_for_display(lode) == expected
+
+
+@pytest.mark.parametrize("branch", [None, ""])
+def test_parked_gone_without_branch_omits_entire_cherry_clause(make_lode, branch):
+    reason = "no pane output"
+    lode = make_lode(
+        state="gated",
+        status=format_park_status(reason, "testid11"),
+        branch=branch,
+        tmux_pane="%3",
+    )
+    expected = PARK_PANE_GONE_STATUS.rsplit(" (", 1)[0].format(
+        reason=reason,
+        lode_id="testid11",
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE):
+        output = lode_status_for_display(lode)
+
+    assert output == expected
+    assert "check first" not in output
+    assert "git cherry" not in output
+    assert "{branch}" not in output
+
+
+def test_parked_without_pane_is_gone_without_probe(make_lode):
+    reason = "no pane output"
+    lode = make_lode(
+        state="gated",
+        status=format_park_status(reason, "testid11"),
+        branch="hopper-testid11",
+        tmux_pane=None,
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="testid11",
+        branch="hopper-testid11",
+    )
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        assert lode_status_for_display(lode) == expected
+
+
+def test_parked_unknown_appends_suffix_without_claiming_gone(make_lode):
+    stored = format_park_status("quiet", "testid11")
+    lode = make_lode(state="gated", status=stored, tmux_pane="%4")
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.UNKNOWN):
+        output = lode_status_for_display(lode)
+
+    assert output == stored + PARK_LIVENESS_UNVERIFIED_SUFFIX
+    assert "pane is GONE" not in output
+
+
+def test_parked_probe_exception_is_unknown(make_lode):
+    stored = format_park_status("quiet", "testid11")
+    lode = make_lode(state="gated", status=stored, tmux_pane="%5")
+
+    with patch("hopper.lodes.pane_liveness", side_effect=RuntimeError("tmux broke")):
+        assert lode_status_for_display(lode) == stored + PARK_LIVENESS_UNVERIFIED_SUFFIX
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"state": "running", "status": "Claude running"},
+        {"stage": "shipped", "state": "ready", "status": "Shipped"},
+        {"state": "error", "status": "Command failed"},
+        {"state": "gated", "status": "Review required"},
+        {"state": "gated", "status": "Awaiting operator answer"},
+    ],
+)
+def test_non_parked_status_is_untouched_without_probe(make_lode, overrides):
+    lode = make_lode(tmux_pane="%6", **overrides)
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        assert lode_status_for_display(lode) == overrides["status"]
+
+
+@pytest.mark.parametrize("variant", ["truncated", "wrong-id"])
+def test_parked_template_near_miss_is_untouched_without_probe(make_lode, variant):
+    stored = format_park_status("quiet", "testid11")
+    if variant == "truncated":
+        stored = stored[:-1]
+    else:
+        stored = stored.replace("testid11", "other-id", 1)
+    lode = make_lode(state="gated", status=stored, tmux_pane="%7")
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        assert lode_status_for_display(lode) == stored
+
+
+def test_remote_parked_lode_is_untouched_without_probe(make_lode):
+    stored = format_park_status("quiet", "testid11")
+    lode = make_lode(
+        state="gated",
+        status=stored,
+        host="builder.example",
+        tmux_pane="%8",
+    )
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        assert lode_status_for_display(lode) == stored
+
+
+def test_missing_status_is_empty_without_probe(make_lode):
+    lode = make_lode(tmux_pane="%missing")
+    del lode["status"]
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        assert lode_status_for_display(lode) == ""
+
+
+@pytest.mark.parametrize("host_fields", [{}, {"host": None}, {"host": ""}, {"host": "local"}])
+def test_local_host_sentinels_are_probed(make_lode, host_fields):
+    reason = "quiet"
+    lode = make_lode(
+        state="gated",
+        status=format_park_status(reason, "testid11"),
+        branch="hopper-testid11",
+        tmux_pane="%9",
+        **host_fields,
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="testid11",
+        branch="hopper-testid11",
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness:
+        assert lode_status_for_display(lode) == expected
+
+    mock_liveness.assert_called_once_with("%9")

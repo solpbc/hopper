@@ -3,6 +3,7 @@
 
 """Tests for the hopper CLI."""
 
+import copy
 import json
 import os
 import socket
@@ -52,9 +53,10 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
-from hopper.lodes import get_lode_dir, save_lodes
+from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status, get_lode_dir, save_lodes
 from hopper.projects import Project, load_projects, save_projects
 from hopper.server import Server
+from hopper.tmux import Liveness
 
 LONG_SCOPE = "this is a stdin scope that is long enough to pass the minimum character validation"
 
@@ -4640,6 +4642,158 @@ def test_format_lode_line_shows_spawn_refusal():
     }
 
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)
+
+
+def test_format_lode_detail_corrects_parked_gone_status(make_lode):
+    reason = "no pane output"
+    branch = "hopper-test-id"
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=format_park_status(reason, "test-id"),
+        branch=branch,
+        active=True,
+        tmux_pane="%41",
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="test-id",
+        branch=branch,
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness:
+        output = format_lode_detail(lode)
+
+    assert output.count(expected) == 2
+    assert f"  status:   {expected}" in output
+    assert mock_liveness.call_count == 2
+
+
+def test_format_lode_line_corrects_parked_gone_status(make_lode):
+    reason = "no pane output"
+    branch = "hopper-test-id"
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=format_park_status(reason, "test-id"),
+        branch=branch,
+        active=True,
+        tmux_pane="%42",
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="test-id",
+        branch=branch,
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness:
+        output = format_lode_line(lode)
+
+    assert output.endswith(expected)
+    mock_liveness.assert_called_once_with("%42")
+
+
+def test_lode_list_all_hosts_probes_stamped_local_parked_lode(capsys, make_lode):
+    reason = "no pane output"
+    branch = "hopper-test-id"
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=format_park_status(reason, "test-id"),
+        branch=branch,
+        active=True,
+        tmux_pane="%43",
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="test-id",
+        branch=branch,
+    )
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[lode]),
+        patch("hopper.remote.remote_registry", return_value={}),
+        patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness,
+    ):
+        assert cmd_lode(["list", "--all-hosts"]) == 0
+
+    output = capsys.readouterr().out
+    assert "local" in output
+    assert expected in output
+    mock_liveness.assert_called_once_with("%43")
+
+
+def test_rendering_parked_gone_does_not_mutate_memory_or_files(temp_config, make_lode):
+    reason = "no pane output"
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=format_park_status(reason, "test-id"),
+        branch="hopper-test-id",
+        active=True,
+        tmux_pane="%44",
+    )
+    save_lodes([lode])
+    recovery_path = get_lode_dir("test-id") / "recovery.json"
+    recovery_path.parent.mkdir(parents=True)
+    recovery_path.write_text(json.dumps({"state": "gated", "reason": reason}) + "\n")
+    active_path = temp_config / "active.jsonl"
+    before_lode = copy.deepcopy(lode)
+    before_active = active_path.read_bytes()
+    before_recovery = recovery_path.read_bytes()
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE):
+        format_lode_detail(lode)
+
+    assert lode == before_lode
+    assert active_path.read_bytes() == before_active
+    assert recovery_path.read_bytes() == before_recovery
+
+
+def test_lode_status_json_keeps_stored_park_status_without_probe(capsys, make_lode):
+    stored = format_park_status("no pane output", "test-id")
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=stored,
+        active=True,
+        tmux_pane="%45",
+    )
+
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.lodes.pane_liveness",
+            side_effect=AssertionError("pane_liveness must not be called"),
+        ),
+    ):
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == stored
+
+
+def test_lode_list_json_keeps_stored_park_status_without_probe(capsys, make_lode):
+    stored = format_park_status("no pane output", "test-id")
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=stored,
+        active=True,
+        tmux_pane="%46",
+    )
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[lode]),
+        patch(
+            "hopper.lodes.pane_liveness",
+            side_effect=AssertionError("pane_liveness must not be called"),
+        ),
+    ):
+        assert cmd_lode(["list", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["lodes"][0]["status"] == stored
 
 
 def test_format_lode_detail_pane_active(make_lode):

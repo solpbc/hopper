@@ -24,6 +24,7 @@ from hopper.lodes import (
     format_age,
     get_lode_dir,
     lode_icon,
+    lode_status_for_display,
 )
 from hopper.tmux import capture_pane, paste_buffer, send_keys
 
@@ -1437,7 +1438,7 @@ def format_lode_line(lode: dict) -> str:
     host = lode.get("host")
     project = lode.get("project", "")
     title = lode.get("title", "")
-    status_text = lode.get("status", "")
+    status_text = lode_status_for_display(lode)
     if host:
         return f"  {host:<14} {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
     return f"  {icon} {stage:<7} {lid}  {project:<16} {title:<28} {status_text}"
@@ -1488,7 +1489,7 @@ def format_lode_detail(lode: dict) -> str:
     lines.append(f"  stage:    {lode.get('stage', '')}")
     lines.append(f"  state:    {lode.get('state', '')}")
 
-    status_text = lode.get("status", "")
+    status_text = lode_status_for_display(lode)
     if status_text:
         lines.append(f"  status:   {status_text}")
     progress_text = lode.get("last_progress_summary", "")
