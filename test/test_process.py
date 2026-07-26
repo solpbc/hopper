@@ -2304,10 +2304,21 @@ class TestOomBoundary:
 
         assert oom.settle_scope_result("systemctl", "hopper-test.scope") is None
         assert clock.read_count == 2
-        assert [call[2] for call in clock.read_calls] == pytest.approx([0.0, 1.05])
-        assert [call[3] for call in clock.read_calls] == pytest.approx([1.0, 0.45])
-        assert clock.sleeps == pytest.approx([0.05, 0.05])
-        assert clock.now == pytest.approx(1.55)
+        assert [call[2] for call in clock.read_calls] == pytest.approx(
+            [0.0, 1.0 + oom.SCOPE_RESULT_POLL_SEC]
+        )
+        assert [call[3] for call in clock.read_calls] == pytest.approx(
+            [
+                1.0,
+                oom.SCOPE_RESULT_SETTLE_SEC - 1.0 - oom.SCOPE_RESULT_POLL_SEC,
+            ]
+        )
+        assert clock.now == pytest.approx(oom.SCOPE_RESULT_SETTLE_SEC)
+        assert clock.sleeps == pytest.approx([oom.SCOPE_RESULT_POLL_SEC])
+        final_start, final_timeout = clock.read_calls[-1][2:]
+        assert final_start + final_timeout == pytest.approx(oom.SCOPE_RESULT_SETTLE_SEC)
+        assert len(clock.sleeps) == clock.read_count - 1
+        assert clock.now <= oom.SCOPE_RESULT_SETTLE_SEC
         for _, _, start, timeout in clock.read_calls:
             assert timeout > 0
             assert timeout == pytest.approx(

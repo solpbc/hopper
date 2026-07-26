@@ -152,6 +152,9 @@ def settle_scope_result(systemctl: str, unit_name: str) -> str | None:
         )
         if result not in (None, "success"):
             return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result
         time.sleep(min(SCOPE_RESULT_POLL_SEC, remaining))
 
 
