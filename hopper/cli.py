@@ -1166,15 +1166,15 @@ def cmd_gate(args: list[str]) -> int:
     if err := validate_hopper_lid():
         return err
 
-    # Validate lode is in refine stage
+    # Validate lode is in a stage that supports review gates
     lode = get_lode(_socket(), lode_id)
     if not lode:
         print(f"Lode {lode_id} not found.")
         return 1
 
     stage = lode.get("stage", "")
-    if stage != "refine":
-        print(f"Lode {lode_id} is not in refine stage.")
+    if stage not in ("refine", "ship"):
+        print(f"Lode {lode_id} is not in refine or ship stage.")
         return 1
 
     # Read review doc from stdin

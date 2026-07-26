@@ -3629,7 +3629,7 @@ def test_gate_no_hopper_lid(capsys):
 
 
 def test_gate_wrong_stage(capsys):
-    """gate returns 1 when lode is not in refine stage."""
+    """gate returns 1 when lode is in the mill stage."""
     lode_data = {"id": "test-session", "stage": "mill"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
         with patch("hopper.client.probe_server", return_value="up"):
@@ -3638,7 +3638,7 @@ def test_gate_wrong_stage(capsys):
                     result = cmd_gate([])
     assert result == 1
     captured = capsys.readouterr()
-    assert "not in refine stage" in captured.out
+    assert "Lode test-session is not in refine or ship stage." in captured.out
 
 
 def test_gate_empty_stdin(capsys):
@@ -3684,6 +3684,38 @@ def test_gate_saves_file_and_sets_state(temp_config, capsys):
     assert gate_path.read_text() == review_text
 
     # Verify state was set to gated
+    mock_set.assert_called_once()
+    _, sid, state, status = mock_set.call_args[0]
+    assert sid == lode_id
+    assert state == "gated"
+    assert status == "Gate"
+
+
+def test_gate_ship_stage_saves_file_and_sets_state(temp_config, capsys):
+    """gate saves gate.md and gates a ship-stage lode."""
+    from io import StringIO
+
+    lode_id = "test-ship-gate-1234"
+    review_text = "# Ship Blocked\n\nPush rejected.\n"
+    lode_data = {"id": lode_id, "stage": "ship"}
+
+    with patch.dict(os.environ, {"HOPPER_LID": lode_id}):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.client.lode_exists", return_value=True):
+                with patch("hopper.client.get_lode", return_value=lode_data):
+                    with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
+                        with patch("sys.stdin", StringIO(review_text)):
+                            result = cmd_gate([])
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Gate set" in captured.out
+
+    lode_dir = temp_config / "lodes" / lode_id
+    gate_path = lode_dir / "gate.md"
+    assert gate_path.exists()
+    assert gate_path.read_text() == review_text
+
     mock_set.assert_called_once()
     _, sid, state, status = mock_set.call_args[0]
     assert sid == lode_id

@@ -69,6 +69,13 @@ If tests fail due to rebase conflicts you resolved, fix the issues and amend the
 
 ### 4. Land on main
 
+The retry rule below needs two recorded facts. Record both before every merge attempt:
+
+- **Validated base SHA** — in the worktree, `git rev-parse origin/main`. This is the base step 3 validated against.
+- **Pre-merge main SHA** — in `$dir`, after confirming it is on main or master and immediately before running the merge, `git rev-parse HEAD`.
+
+If step 2 used the `origin/master` fallback, read `origin/master` instead of `origin/main` everywhere in this section.
+
 Verify the original repo is on main (or master) before merging:
 
 ```
@@ -80,16 +87,76 @@ git push
 
 If the branch is not main or master, switch to main first: `git checkout main` (or `git checkout master`).
 
-If `git push` fails because the remote has advanced, or if `--ff-only` fails:
+If there is no remote configured, skip `git push`.
+
+If `git merge --ff-only` or `git push` fails, do not repeat the command.
+
+**First, restore the original repo.** Do this immediately, before re-fetching or rebasing: the last check below is only valid while `$branch` still holds the commits that were fast-forwarded onto local main, and the rebase rewrites `$branch`. In `$dir`, confirm all four:
+
+- `git status --porcelain` is empty
+- `git rev-parse --abbrev-ref HEAD` is main or master
+- `git merge-base --is-ancestor <pre-merge main SHA> origin/main` succeeds
+- `git rev-list origin/main..HEAD --not $branch` prints nothing
+
+The last one matters most: `$dir` is shared with other lodes on this project, and a sibling lode can fast-forward local main without having pushed yet. Any SHA it prints is a commit that is neither upstream nor yours. If it prints anything, or if any other check fails, stop and gate — do not reset — and list the offending SHAs in the gate document.
+
+When all four pass, undo only your own fast-forward:
+
+```
+git reset --hard <pre-merge main SHA>
+```
+
+If the merge itself failed, this is a no-op, which is expected.
+
+**Then decide whether retrying can help.**
 
 1. Return to the worktree: `cd $worktree`
-2. Re-fetch and rebase: `git fetch origin main && git rebase origin/main`
-3. Re-validate (step 3)
-4. Retry: `cd $dir && git merge --ff-only $branch && git push`
+2. Re-read the remote base: `git fetch origin main && git rev-parse origin/main`
+3. Compare it with the validated base SHA:
+   - **Unchanged** — the base did not move, so the failure was not a merge race and running the same commands against the same base cannot succeed. Stop and gate.
+   - **Advanced** — you lost a merge race. Continue.
+4. Rebase onto the new base and re-validate: `git rebase origin/main`, then run step 3's validation again in full. Re-running an already-passed gate at a fresh base is required work, not an error. The new SHA becomes the validated base SHA.
+5. Retry. Re-record the pre-merge main SHA first, because re-validation takes time and a sibling lode may have moved local main while it ran:
 
-If the second attempt also fails, report the failure — do not retry further.
+```
+cd $dir
+git rev-parse --abbrev-ref HEAD   # must be main or master
+git rev-parse HEAD                # the new pre-merge main SHA
+git merge --ff-only $branch
+git push
+```
 
-If there is no remote configured, skip `git push`.
+Apply this same rule to every later failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
+
+Stop and gate on any of these. They are the only terminal conditions in this stage:
+
+- A rebase conflict that cannot be resolved unambiguously (see step 2).
+- Validation fails for a reason attributable to the branch. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs; if the failure was already present on the feature branch before rebase, step 3's exception applies — note it and proceed. Gate only when neither applies.
+- The original repo is not on main or master and cannot be switched safely.
+- A merge or push failed while the remote base was unchanged.
+- The remote base cannot be fetched or read.
+- The four restore checks above do not all pass.
+
+Losing a merge race is not a terminal condition.
+
+To gate, submit the facts an operator needs in order to decide:
+
+```
+hop gate <<'EOF'
+# Ship blocked
+
+- Stop condition:
+- Command that failed, and its actual error:
+- Validated base SHA:
+- Current remote base SHA (say so explicitly if it could not be read):
+- Any foreign commits found on local main:
+- State of the worktree and of the original repo right now:
+- Most recent validation result:
+- Decision needed from the operator:
+EOF
+```
+
+`hop gate` leaves this lode in the `gated` state, and feedback arrives in this same session. Stop after the gate: run no further git commands, and do not call `hop processed` on this path.
 
 ### 5. Signal completion
 
