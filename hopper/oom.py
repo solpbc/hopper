@@ -55,10 +55,17 @@ def find_scope_tools() -> tuple[str, str] | None:
     if not is_linux():
         return None
     systemd_run = shutil.which("systemd-run")
-    systemctl = shutil.which("systemctl")
+    systemctl = find_systemctl()
     if not systemd_run or not systemctl:
         return None
     return systemd_run, systemctl
+
+
+def find_systemctl() -> str | None:
+    """Return the systemctl path used to inspect retained scope evidence."""
+    if not is_linux():
+        return None
+    return shutil.which("systemctl")
 
 
 def find_hop_executable() -> str | None:

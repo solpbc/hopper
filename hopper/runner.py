@@ -307,13 +307,14 @@ class BaseRunner:
                         actual_unit=self.actual_unit,
                     ),
                 )
-                if self.run_generation:
-                    if not self._registration_complete.wait(REGISTRATION_TIMEOUT_SEC):
-                        logger.error(f"registration timed out lode={self.lode_id}")
-                        return 1
-                    if not self._registration_accepted:
-                        logger.error(f"registration refused lode={self.lode_id}")
-                        return 1
+                if not self._registration_complete.wait(REGISTRATION_TIMEOUT_SEC):
+                    logger.error(f"registration timed out lode={self.lode_id}")
+                    print(f"Failed to register lode {self.lode_id}: server response timed out")
+                    return 1
+                if not self._registration_accepted:
+                    logger.error(f"registration refused lode={self.lode_id}")
+                    print(f"Failed to register lode {self.lode_id}: server refused ownership")
+                    return 1
 
                 # Subclass pre-flight validation and setup
                 err = self._setup()

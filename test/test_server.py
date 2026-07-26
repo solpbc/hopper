@@ -39,6 +39,7 @@ from hopper.server import (
     start_server_with_tui,
 )
 from hopper.tmux import Liveness
+from hopper.wait import classify
 
 
 class TestGetGitHash:
@@ -2456,6 +2457,51 @@ def test_server_pauses_lode_without_archiving(socket_path, temp_config, make_lod
     assert _decode_mock_response(conn)["type"] == "lode_paused"
 
 
+def test_pause_replaces_terminal_oom_outcome(socket_path, temp_config, make_lode):
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        state="error",
+        status=format_terminal_failure_status("oom", "test-id"),
+        failure_kind="oom",
+        active=False,
+        run_generation="1" * 32,
+        oom_scope="hopper-test.scope",
+    )
+    srv.lodes = [lode]
+
+    with patch.object(srv, "broadcast"):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, None)
+
+    assert lode["state"] == "paused"
+    assert lode["status"] == "Paused by user; worktree retained"
+    assert lode["failure_kind"] is None
+    assert classify(lode) == ("inactive", 1)
+
+
+def test_kill_replaces_terminal_oom_outcome(socket_path, temp_config, make_lode):
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        state="error",
+        status=format_terminal_failure_status("oom", "test-id"),
+        failure_kind="oom",
+        active=False,
+        run_generation="2" * 32,
+        oom_scope="hopper-test.scope",
+    )
+    srv.lodes = [lode]
+
+    with patch.object(srv, "broadcast"):
+        srv._handle_mutation({"type": "lode_kill", "lode_id": "test-id"}, None)
+
+    archived = srv.archived_lodes[0]
+    assert archived["state"] == "error"
+    assert archived["status"] == "Killed by user"
+    assert archived["failure_kind"] is None
+    assert classify(archived) == ("error", 1)
+
+
 def test_server_refuses_pause_until_runner_process_group_exits(socket_path, temp_config, make_lode):
     """Pause keeps runner identity intact when quiescence cannot be proven."""
     srv = Server(socket_path)
@@ -2477,6 +2523,44 @@ def test_server_refuses_pause_until_runner_process_group_exits(socket_path, temp
     assert srv.lodes[0]["tmux_pane"] == "%1"
     assert srv.lodes[0]["pid"] == 12345
     mock_kill_pane.assert_not_called()
+
+
+def test_failed_pause_clears_guard_before_later_disconnect(socket_path, temp_config, make_lode):
+    srv = Server(socket_path)
+    generation = "3" * 32
+    lode = make_lode(
+        id="test-id",
+        state="running",
+        active=True,
+        tmux_pane="%1",
+        pid=12345,
+        run_generation=generation,
+        oom_scope="hopper-test.scope",
+    )
+    srv.lodes = [lode]
+    owner = MagicMock()
+    srv.lode_clients["test-id"] = owner
+    srv.client_lodes[owner] = "test-id"
+    srv.client_generations[owner] = generation
+    key = ("test-id", generation)
+    srv.pending_disconnects[key] = {"deadline": 100, "unit_name": "hopper-test.scope"}
+    srv.runner_results[key] = (None, 137)
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server._terminate_runner_process_group", return_value=False),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, conn)
+        assert _decode_mock_response(conn)["type"] == "error"
+        assert lode["oom_scope"] is None
+        assert key not in srv.pending_disconnects
+        assert key not in srv.runner_results
+
+        srv._on_client_disconnect(owner)
+
+    assert lode["failure_kind"] is None
+    assert lode["active"] is False
 
 
 def test_server_quiesces_pidless_live_pane_before_pausing(socket_path, temp_config, make_lode):
@@ -4445,6 +4529,64 @@ class TestOomLifecycle:
         assert save.call_count == 2
         assert lode["failure_kind"] == "oom"
 
+    @pytest.mark.parametrize("unit_result", [None, "success"])
+    def test_connected_ordinary_result_ack_is_not_durable(
+        self, socket_path, make_lode, unit_result
+    ):
+        srv = Server(socket_path)
+        generation = "d" * 32
+        lode = make_lode(
+            id="test-id",
+            run_generation=generation,
+            oom_scope="hopper-test.scope",
+        )
+        srv.lodes = [lode]
+        srv.lode_clients["test-id"] = MagicMock()
+        conn = _mock_client(srv)
+
+        srv._handle_lode_run_result(
+            {
+                "lode_id": "test-id",
+                "run_generation": generation,
+                "unit_name": "hopper-test.scope",
+                "unit_result": unit_result,
+                "worker_returncode": 0,
+            },
+            conn,
+        )
+
+        assert _decode_mock_response(conn) == {
+            "type": "lode_run_result_ack",
+            "ts": ANY,
+            "accepted": True,
+            "durable": False,
+            "disposition": "success",
+        }
+        assert srv.runner_results[("test-id", generation)] == (unit_result, 0)
+
+    def test_unknown_lode_result_ack_is_durable(self, socket_path):
+        srv = Server(socket_path)
+        conn = _mock_client(srv)
+
+        srv._handle_lode_run_result(
+            {
+                "lode_id": "archived-id",
+                "run_generation": "e" * 32,
+                "unit_name": "hopper-archived.scope",
+                "unit_result": "exit-code",
+                "worker_returncode": 1,
+            },
+            conn,
+        )
+
+        assert _decode_mock_response(conn) == {
+            "type": "lode_run_result_ack",
+            "ts": ANY,
+            "accepted": False,
+            "durable": True,
+            "disposition": "not-found",
+        }
+
     @pytest.mark.parametrize("unit_result", [None, "success"], ids=["collected", "loaded"])
     @pytest.mark.parametrize(
         ("stage", "status", "auto_advance", "auto_archive"),
@@ -4591,6 +4733,73 @@ class TestOomLifecycle:
         assert all(message["lode"]["state"] == "error" for message in broadcasts)
         spawn.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "recovery_message",
+        [
+            {"type": "lode_resume", "lode_id": "test-id"},
+            {
+                "type": "lode_reset_claude_stage",
+                "lode_id": "test-id",
+                "claude_stage": "mill",
+                "spawn": True,
+            },
+        ],
+        ids=["resume", "restart"],
+    )
+    def test_oom_first_disconnect_does_not_delay_explicit_recovery(
+        self, socket_path, make_lode, recovery_message
+    ):
+        srv = Server(socket_path)
+        generation = "6" * 32
+        lode = make_lode(
+            id="test-id",
+            project="proj",
+            state="running",
+            active=True,
+            tmux_pane="%1",
+            pid=123,
+            run_generation=generation,
+            oom_scope="hopper-test.scope",
+        )
+        srv.lodes = [lode]
+        owner = MagicMock()
+        srv.lode_clients["test-id"] = owner
+        srv.client_lodes[owner] = "test-id"
+        srv.client_generations[owner] = generation
+
+        with (
+            patch("hopper.server.save_lodes"),
+            patch.object(srv, "broadcast"),
+        ):
+            srv._handle_lode_run_result(
+                {
+                    "lode_id": "test-id",
+                    "run_generation": generation,
+                    "unit_name": "hopper-test.scope",
+                    "unit_result": "oom-kill",
+                    "worker_returncode": 137,
+                },
+                None,
+            )
+            srv._on_client_disconnect(owner)
+
+        assert not srv.pending_disconnects
+
+        with (
+            patch(
+                "hopper.server.find_project",
+                return_value=Project(path="/repo", name="proj"),
+            ),
+            patch("hopper.server.oom.is_linux", return_value=False),
+            patch("hopper.server.spawn_claude", return_value="%2") as spawn,
+            patch("hopper.server.save_lodes"),
+            patch.object(srv, "broadcast"),
+        ):
+            srv._handle_mutation(recovery_message, None)
+
+        spawn.assert_called_once()
+        assert lode["run_generation"] != generation
+
     def test_guarded_disconnect_times_out_unverified_and_allows_same_generation_upgrade(
         self, socket_path, make_lode
     ):
@@ -4687,9 +4896,10 @@ class TestOomLifecycle:
         spawn = MagicMock()
         with (
             patch(
-                "hopper.server.oom.find_scope_tools",
-                return_value=("systemd-run", "systemctl"),
+                "hopper.server.oom.find_systemctl",
+                return_value="systemctl",
             ),
+            patch("hopper.server.oom.find_scope_tools", side_effect=AssertionError),
             patch("hopper.server.oom.read_scope_result", return_value="oom-kill"),
             patch("hopper.server.oom.release_scope", release),
             patch("hopper.server.pane_liveness", side_effect=AssertionError("reconciled pane")),
@@ -4725,8 +4935,8 @@ class TestOomLifecycle:
 
         with (
             patch(
-                "hopper.server.oom.find_scope_tools",
-                return_value=("systemd-run", "systemctl"),
+                "hopper.server.oom.find_systemctl",
+                return_value="systemctl",
             ),
             patch("hopper.server.oom.read_scope_result", return_value=None),
             patch("hopper.server.oom.release_scope") as release,
@@ -4747,6 +4957,35 @@ class TestOomLifecycle:
         srv._drain_due_disconnects()
         assert lode["failure_kind"] == "runner_exit_unverified"
 
+    def test_startup_without_systemctl_fails_guarded_lode_closed(self, socket_path, make_lode):
+        lode = make_lode(
+            id="test-id",
+            state="running",
+            active=True,
+            tmux_pane="%1",
+            pid=123,
+            run_generation="c" * 32,
+            oom_scope="hopper-test.scope",
+        )
+        srv = Server(socket_path)
+        srv.lodes = [lode]
+
+        with (
+            patch("hopper.server.oom.find_systemctl", return_value=None),
+            patch("hopper.server.oom.read_scope_result") as read_result,
+            patch("hopper.server.oom.release_scope") as release,
+            patch("hopper.server.pane_liveness") as pane_liveness,
+        ):
+            srv._consume_failed_oom_units()
+            srv._reconcile_startup_lodes()
+
+        read_result.assert_not_called()
+        release.assert_not_called()
+        pane_liveness.assert_not_called()
+        assert lode["failure_kind"] == "runner_exit_unverified"
+        assert lode["failure_kind"] != "oom"
+        assert classify(lode) == ("error", 1)
+
     def test_startup_terminal_lode_skips_unavailable_hold_but_allows_oom_upgrade(
         self, socket_path, make_lode
     ):
@@ -4763,8 +5002,8 @@ class TestOomLifecycle:
 
         with (
             patch(
-                "hopper.server.oom.find_scope_tools",
-                return_value=("systemd-run", "systemctl"),
+                "hopper.server.oom.find_systemctl",
+                return_value="systemctl",
             ),
             patch(
                 "hopper.server.oom.read_scope_result",

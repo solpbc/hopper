@@ -497,7 +497,7 @@ class TestMillStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine"),
             ),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -687,7 +687,7 @@ class TestMillStage:
                 return_value=_mock_response(stage="mill", project="my-project"),
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -715,7 +715,7 @@ class TestMillStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.is_dirty", return_value=True),
             patch("hopper.process.quarantine_dirty_repo", return_value=None),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1028,7 +1028,7 @@ class TestRefineStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine", state="ready", project="my-project"),
             ),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
@@ -1195,7 +1195,7 @@ class TestRefineStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="mill"),
             ),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1217,7 +1217,7 @@ class TestRefineStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine", project=""),
             ),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1241,7 +1241,7 @@ class TestRefineStage:
                 return_value=_mock_response(stage="refine", project="my-project"),
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1267,7 +1267,7 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=False),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1293,7 +1293,7 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=True),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1322,7 +1322,7 @@ class TestRefineStage:
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(1, None, None)),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1353,7 +1353,7 @@ class TestRefineStage:
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(1, None, message)),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1382,7 +1382,7 @@ class TestRefineStage:
             patch("hopper.process.create_worktree", return_value=True),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(124, None, None)),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1555,7 +1555,7 @@ class TestShipStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="refine", project="my-project"),
             ),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1578,7 +1578,7 @@ class TestShipStage:
                 "hopper.runner.connect",
                 return_value=_mock_response(stage="ship", project=""),
             ),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1608,7 +1608,7 @@ class TestShipStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -1636,7 +1636,7 @@ class TestShipStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.is_dirty", return_value=True),
             patch("hopper.process.quarantine_dirty_repo", return_value=None),
-            patch("hopper.runner.HopperConnection") as MockConn,
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
             assert runner.run() == 0
@@ -2103,6 +2103,47 @@ class TestOomBoundary:
 
         assert run_process_supervisor("test-id", Path("server.sock")) == 137
         release.assert_not_called()
+
+    @pytest.mark.parametrize("unit_result", [None, "success"])
+    def test_ordinary_exit_never_releases_scope(self, monkeypatch, unit_result):
+        generation = "e" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(oom, "launch_scope", lambda argv: 0)
+        monkeypatch.setattr(oom, "read_scope_result", lambda *args: unit_result)
+        monkeypatch.setattr(
+            "hopper.process.report_lode_run_result",
+            lambda *args: {"durable": False, "disposition": "success"},
+        )
+        release = MagicMock()
+        monkeypatch.setattr(oom, "release_scope", release)
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 0
+        release.assert_not_called()
+
+    def test_durable_not_found_report_releases_failed_scope(self, monkeypatch):
+        generation = "f" * 32
+        unit = oom.scope_unit_name("archived-id", generation)
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(oom, "launch_scope", lambda argv: 1)
+        monkeypatch.setattr(oom, "read_scope_result", lambda *args: "exit-code")
+        monkeypatch.setattr(
+            "hopper.process.report_lode_run_result",
+            lambda *args: {"durable": True, "disposition": "not-found"},
+        )
+        release = MagicMock(return_value=True)
+        monkeypatch.setattr(oom, "release_scope", release)
+
+        assert run_process_supervisor("archived-id", Path("server.sock")) == 1
+        release.assert_called_once_with("systemctl", unit)
 
     def test_non_linux_supervisor_uses_inline_worker_without_probes(self, monkeypatch):
         monkeypatch.setattr(oom, "is_linux", lambda: False)

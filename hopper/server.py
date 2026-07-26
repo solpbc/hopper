@@ -377,8 +377,8 @@ class Server:
     Uses a single writer thread to serialize all broadcasts, preventing
     race conditions when multiple client handler threads send concurrently.
 
-    Tracks which clients own which lodes. Sets active=False and clears
-    tmux_pane and pid on disconnect; state/status are client-driven.
+    Tracks which clients own which lodes. Ordinary disconnects clear runner
+    identity immediately; guarded disconnects defer until scope classification.
     """
 
     def __init__(self, socket_path: Path, tmux_location: dict | None = None):
@@ -534,10 +534,16 @@ class Server:
 
     def _consume_failed_oom_units(self) -> None:
         """Consume retained failed scope evidence before startup reconciliation."""
-        tools = oom.find_scope_tools()
-        if not tools:
+        systemctl = oom.find_systemctl()
+        if not systemctl:
+            for lode in self.lodes:
+                if lode.get("oom_scope") and not is_terminal_failure_kind(lode.get("failure_kind")):
+                    self._set_terminal_failure(
+                        lode,
+                        "runner_exit_unverified",
+                        broadcast=False,
+                    )
             return
-        _, systemctl = tools
         for lode in self.lodes:
             unit_name = lode.get("oom_scope")
             run_generation = lode.get("run_generation")
@@ -556,7 +562,6 @@ class Server:
                 self.pending_disconnects[(lode["id"], run_generation)] = {
                     "deadline": time.monotonic() + GUARDED_DISCONNECT_HOLD_SEC,
                     "unit_name": unit_name,
-                    "token": uuid.uuid4().hex,
                 }
                 logger.warning(
                     "Startup scope result unavailable lode=%s generation=%s",
@@ -835,6 +840,9 @@ class Server:
 
         key = (lode_id, run_generation)
         observed_result = self.runner_results.pop(key, None)
+        if is_terminal_failure_kind(lode.get("failure_kind")):
+            self.pending_disconnects.pop(key, None)
+            return
         if observed_result is not None and _is_verified_ordinary_exit(*observed_result):
             self._finalize_lode_disconnect(lode_id, run_generation)
             return
@@ -843,7 +851,6 @@ class Server:
             self.pending_disconnects[key] = {
                 "deadline": time.monotonic() + GUARDED_DISCONNECT_HOLD_SEC,
                 "unit_name": lode["oom_scope"],
-                "token": uuid.uuid4().hex,
             }
             logger.info("Holding guarded disconnect lode=%s generation=%s", lode_id, run_generation)
             return
@@ -1125,7 +1132,7 @@ class Server:
                 )
 
         if not lode:
-            acknowledge(False, False, "not-found")
+            acknowledge(False, True, "not-found")
             return
         if run_generation != lode.get("run_generation"):
             acknowledge(False, True, "stale-generation")
@@ -1146,7 +1153,6 @@ class Server:
                     {
                         "deadline": time.monotonic() + GUARDED_DISCONNECT_HOLD_SEC,
                         "unit_name": unit_name,
-                        "token": uuid.uuid4().hex,
                     },
                 )
             acknowledge(True, False, "result-unavailable")
@@ -1164,14 +1170,16 @@ class Server:
             return
 
         if _is_verified_ordinary_exit(unit_result, worker_returncode):
+            durable = True
             if lode_id in self.lode_clients:
                 self.runner_results[key] = (unit_result, worker_returncode)
+                durable = False
             elif key in self.pending_disconnects:
                 self.pending_disconnects.pop(key, None)
                 self._finalize_lode_disconnect(lode_id, run_generation)
             else:
                 self._set_terminal_failure(lode, "runner_exit_unverified")
-            acknowledge(True, True, "success")
+            acknowledge(True, durable, "success")
             return
 
         self.pending_disconnects.pop(key, None)
@@ -1361,6 +1369,12 @@ class Server:
                 if conn:
                     self._send_response(conn, {"type": "error", "error": error})
                 return
+            lode["oom_scope"] = None
+            generation = lode.get("run_generation")
+            if generation:
+                self.pending_disconnects.pop((lode_id, generation), None)
+                self.runner_results.pop((lode_id, generation), None)
+            save_lodes(self.lodes)
             if runner_pid and not _terminate_runner_process_group(runner_pid):
                 error = (
                     f"lode {lode_id} runner did not exit; pause refused so resume cannot "
@@ -1370,17 +1384,13 @@ class Server:
                 if conn:
                     self._send_response(conn, {"type": "error", "error": error})
                 return
-            lode["oom_scope"] = None
-            generation = lode.get("run_generation")
-            if generation:
-                self.pending_disconnects.pop((lode_id, generation), None)
-                self.runner_results.pop((lode_id, generation), None)
             if pane:
                 from hopper.tmux import kill_pane
 
                 kill_pane(pane)
             lode["state"] = "paused"
             lode["status"] = "Paused by user; worktree retained"
+            lode["failure_kind"] = None
             lode["active"] = False
             lode["tmux_pane"] = None
             lode["pid"] = None
@@ -1471,6 +1481,7 @@ class Server:
                         kill_pane(tmux_pane)
                     lode["state"] = "error"
                     lode["status"] = "Killed by user"
+                    lode["failure_kind"] = None
                     lode["active"] = False
                     lode["tmux_pane"] = None
                     lode["pid"] = None

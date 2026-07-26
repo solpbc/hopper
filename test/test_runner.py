@@ -61,6 +61,38 @@ class TestExtractErrorMessage:
         assert "invalid" in result
 
 
+class TestBaseRunnerRegistration:
+    def test_missing_generation_refusal_exits_before_any_child_launch(self):
+        runner = BaseRunner("test-id", Path("server.sock"))
+        connection = MagicMock()
+
+        def start(callback=None, on_connect=None):
+            on_connect()
+            callback({"type": "lode_register_refused", "lode_id": "test-id"})
+
+        connection.emit.return_value = True
+        connection.start.side_effect = start
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"active": False, "claude": {}}},
+            ),
+            patch("hopper.runner.HopperConnection", return_value=connection),
+            patch.object(runner, "_setup") as setup,
+            patch.object(runner, "_run_claude") as run_model,
+            patch("hopper.process._run_setup_command") as setup_command,
+            patch("hopper.process.bootstrap_codex") as codex_bootstrap,
+            patch("hopper.runner.subprocess.Popen") as claude_popen,
+        ):
+            assert runner.run() == 1
+
+        setup.assert_not_called()
+        run_model.assert_not_called()
+        setup_command.assert_not_called()
+        codex_bootstrap.assert_not_called()
+        claude_popen.assert_not_called()
+
+
 class TestPsCpuHelpers:
     def test_parse_ps_time_formats(self):
         assert _parse_ps_time("12:34.50") == 754.5
