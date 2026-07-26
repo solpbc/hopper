@@ -2172,6 +2172,71 @@ class TestOomBoundary:
         assert capsys.readouterr().out.count(oom.OOM_DEGRADED_WARNING) == 1
         assert caplog.messages.count(oom.OOM_DEGRADED_WARNING) == 1
 
+    def test_read_scope_result_passes_bounded_timeout(self):
+        """The systemctl show probe uses the shared bounded timeout."""
+        unit = oom.scope_unit_name("test-id", "a" * 32)
+        result = subprocess.CompletedProcess([], 0, stdout="oom-kill\n", stderr="")
+
+        with patch("hopper.oom.subprocess.run", return_value=result) as mock_run:
+            assert oom.read_scope_result("systemctl", unit) == "oom-kill"
+
+        mock_run.assert_called_once_with(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=Result",
+                "--value",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=oom.SYSTEMCTL_TIMEOUT_SEC,
+        )
+
+    def test_release_scope_passes_bounded_timeout(self):
+        """The systemctl reset-failed probe uses the shared bounded timeout."""
+        unit = oom.scope_unit_name("test-id", "b" * 32)
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with patch("hopper.oom.subprocess.run", return_value=result) as mock_run:
+            assert oom.release_scope("systemctl", unit) is True
+
+        mock_run.assert_called_once_with(
+            ["systemctl", "--user", "reset-failed", unit],
+            capture_output=True,
+            text=True,
+            timeout=oom.SYSTEMCTL_TIMEOUT_SEC,
+        )
+
+    def test_read_scope_result_timeout_returns_none(self):
+        """A wedged systemctl show probe degrades to an unreadable result."""
+        unit = oom.scope_unit_name("test-id", "c" * 32)
+        error = subprocess.TimeoutExpired("systemctl", oom.SYSTEMCTL_TIMEOUT_SEC)
+
+        with patch("hopper.oom.subprocess.run", side_effect=error):
+            assert oom.read_scope_result("systemctl", unit) is None
+
+    def test_release_scope_timeout_returns_false(self):
+        """A wedged reset-failed probe leaves the failed scope retained."""
+        unit = oom.scope_unit_name("test-id", "d" * 32)
+        error = subprocess.TimeoutExpired("systemctl", oom.SYSTEMCTL_TIMEOUT_SEC)
+
+        with patch("hopper.oom.subprocess.run", side_effect=error):
+            assert oom.release_scope("systemctl", unit) is False
+
+    def test_launch_scope_remains_unbounded(self):
+        """The worker-owning systemd scope remains deliberately unbounded."""
+        unit = oom.scope_unit_name("test-id", "e" * 32)
+        argv = oom.build_scope_argv("systemd-run", "hop", unit, "test-id")
+        result = subprocess.CompletedProcess(argv, 137)
+
+        with patch("hopper.oom.subprocess.run", return_value=result) as mock_run:
+            assert oom.launch_scope(argv) == 137
+
+        mock_run.assert_called_once_with(argv)
+        assert "timeout" not in mock_run.call_args.kwargs
+
 
 class TestArmedRegistration:
     def test_registration_ack_precedes_setup_and_model_launch(self):

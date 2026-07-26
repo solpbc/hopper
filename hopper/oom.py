@@ -20,6 +20,7 @@ OOM_SCORE_DEGRADED_WARNING = (
     "Hopper OOM guard degraded: failed to set and verify oom_score_adj=500; "
     "this lode has no Hopper-managed OOM protection."
 )
+SYSTEMCTL_TIMEOUT_SEC = 1.0
 
 
 class OomCapability(Enum):
@@ -94,7 +95,7 @@ def build_scope_argv(
 
 
 def launch_scope(argv: list[str]) -> int:
-    """Run a synchronous systemd scope while the caller remains outside it."""
+    """Run a synchronous systemd scope, deliberately unbounded for the worker lifetime."""
     return subprocess.run(argv).returncode
 
 
@@ -112,6 +113,7 @@ def read_scope_result(systemctl: str, unit_name: str) -> str | None:
             ],
             capture_output=True,
             text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SEC,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -128,6 +130,7 @@ def release_scope(systemctl: str, unit_name: str) -> bool:
             [systemctl, "--user", "reset-failed", unit_name],
             capture_output=True,
             text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SEC,
         )
     except (OSError, subprocess.SubprocessError):
         return False
