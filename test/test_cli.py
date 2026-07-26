@@ -4724,6 +4724,43 @@ def test_lode_list_all_hosts_probes_stamped_local_parked_lode(capsys, make_lode)
     mock_liveness.assert_called_once_with("%43")
 
 
+def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(capsys, make_lode):
+    stored = format_park_status("quiet", "remote-id")
+    remote_lode = make_lode(
+        id="remote-id",
+        state="gated",
+        status=stored,
+        branch="hopper-remote-id",
+        tmux_pane="%remote",
+        status_display="remote-computed correction",
+        pane_liveness="gone",
+    )
+    remote_result = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout=json.dumps({"lodes": [remote_lode]}),
+        stderr="",
+    )
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[]),
+        patch("hopper.remote.remote_registry", return_value={"proj": "builder.example"}),
+        patch("hopper.remote.run_remote", return_value=remote_result),
+        patch(
+            "hopper.lodes.pane_liveness",
+            side_effect=AssertionError("pane_liveness must not be called"),
+        ),
+    ):
+        assert cmd_lode(["list", "--all-hosts", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)["lodes"][0]
+    assert payload["host"] == "builder.example"
+    assert payload["status"] == stored
+    assert payload["status_display"] == stored
+    assert payload["pane_liveness"] == "not_probed"
+
+
 def test_rendering_parked_gone_does_not_mutate_memory_or_files(temp_config, make_lode):
     reason = "no pane output"
     lode = make_lode(
@@ -4751,49 +4788,127 @@ def test_rendering_parked_gone_does_not_mutate_memory_or_files(temp_config, make
     assert recovery_path.read_bytes() == before_recovery
 
 
-def test_lode_status_json_keeps_stored_park_status_without_probe(capsys, make_lode):
+def test_lode_status_json_does_not_mutate_memory_or_files(temp_config, capsys, make_lode):
+    reason = "no pane output"
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=format_park_status(reason, "test-id"),
+        branch="hopper-test-id",
+        active=True,
+        tmux_pane="%45",
+    )
+    save_lodes([lode])
+    recovery_path = get_lode_dir("test-id") / "recovery.json"
+    recovery_path.parent.mkdir(parents=True)
+    recovery_path.write_text(json.dumps({"state": "gated", "reason": reason}) + "\n")
+    active_path = temp_config / "active.jsonl"
+    before_lode = copy.deepcopy(lode)
+    before_active = active_path.read_bytes()
+    before_recovery = recovery_path.read_bytes()
+
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE),
+    ):
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+
+    capsys.readouterr()
+    assert lode == before_lode
+    assert active_path.read_bytes() == before_active
+    assert recovery_path.read_bytes() == before_recovery
+
+
+@pytest.mark.parametrize("subcommand", ["status", "show"])
+def test_lode_status_json_reports_parked_gone_status(capsys, make_lode, subcommand):
     stored = format_park_status("no pane output", "test-id")
+    branch = "hopper-test-id"
     lode = make_lode(
         id="test-id",
         state="gated",
         status=stored,
+        branch=branch,
         active=True,
-        tmux_pane="%45",
+        tmux_pane="%46",
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason="no pane output",
+        lode_id="test-id",
+        branch=branch,
     )
 
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch(
-            "hopper.lodes.pane_liveness",
-            side_effect=AssertionError("pane_liveness must not be called"),
-        ),
+        patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness,
     ):
-        assert cmd_lode(["status", "test-id", "--json"]) == 0
+        assert cmd_lode([subcommand, "test-id", "--json"]) == 0
 
-    assert json.loads(capsys.readouterr().out)["status"] == stored
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == stored
+    assert payload["status_display"] == expected
+    assert payload["pane_liveness"] == "gone"
+    mock_liveness.assert_called_once_with("%46")
 
 
-def test_lode_list_json_keeps_stored_park_status_without_probe(capsys, make_lode):
+def test_lode_list_json_reports_parked_gone_status(capsys, make_lode):
     stored = format_park_status("no pane output", "test-id")
+    branch = "hopper-test-id"
     lode = make_lode(
         id="test-id",
         state="gated",
         status=stored,
+        branch=branch,
         active=True,
-        tmux_pane="%46",
+        tmux_pane="%47",
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason="no pane output",
+        lode_id="test-id",
+        branch=branch,
     )
 
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.list_lodes", return_value=[lode]),
-        patch(
-            "hopper.lodes.pane_liveness",
-            side_effect=AssertionError("pane_liveness must not be called"),
-        ),
+        patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness,
     ):
         assert cmd_lode(["list", "--json"]) == 0
 
-    assert json.loads(capsys.readouterr().out)["lodes"][0]["status"] == stored
+    payload = json.loads(capsys.readouterr().out)["lodes"][0]
+    assert payload["status"] == stored
+    assert payload["status_display"] == expected
+    assert payload["pane_liveness"] == "gone"
+    mock_liveness.assert_called_once_with("%47")
+
+
+def test_lode_status_json_display_matches_human_status(capsys, make_lode):
+    reason = "no pane output"
+    branch = "hopper-test-id"
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        status=format_park_status(reason, "test-id"),
+        branch=branch,
+        active=True,
+        tmux_pane="%48",
+    )
+
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE),
+    ):
+        assert cmd_lode(["status", "test-id"]) == 0
+        human_output = capsys.readouterr().out
+        human_status = next(
+            line.removeprefix("  status:   ")
+            for line in human_output.splitlines()
+            if line.startswith("  status:   ")
+        )
+
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+        json_status = json.loads(capsys.readouterr().out)["status_display"]
+
+    assert json_status == human_status
 
 
 def test_format_lode_detail_pane_active(make_lode):
@@ -4887,7 +5002,12 @@ def test_lode_status_json_includes_recovery_without_mutating_lode(capsys, make_l
         assert cmd_lode(["status", "test-id", "--json"]) == 0
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {**lode, "recovery": recovery}
+    assert json.loads(captured.out) == {
+        **lode,
+        "recovery": recovery,
+        "status_display": lode["status"],
+        "pane_liveness": "not_probed",
+    }
     assert captured.err == ""
     assert "recovery" not in lode
 
@@ -5010,14 +5130,29 @@ def test_lode_status_json_remote(capsys):
         "state": "running",
         "status": "Working",
         "host": "fedora.local",
+        "tmux_pane": "%remote",
+        "status_display": "remote-computed status",
+        "pane_liveness": "gone",
     }
-    with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
-        with patch("hopper.cli._find_remote_lode", return_value=(remote_lode, "fedora.local")):
-            assert cmd_lode(["status", "remote123", "--json"]) == 0
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.cli._find_remote_lode", return_value=(remote_lode, "fedora.local")),
+        patch(
+            "hopper.lodes.pane_liveness",
+            side_effect=AssertionError("pane_liveness must not be called"),
+        ),
+    ):
+        assert cmd_lode(["status", "remote123", "--json"]) == 0
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == remote_lode
+    assert json.loads(captured.out) == {
+        **remote_lode,
+        "status_display": remote_lode["status"],
+        "pane_liveness": "not_probed",
+    }
     assert captured.err == ""
+    assert remote_lode["status_display"] == "remote-computed status"
+    assert remote_lode["pane_liveness"] == "gone"
 
 
 def test_lode_list_json_envelope(capsys):
@@ -5033,7 +5168,9 @@ def test_lode_list_json_envelope(capsys):
             assert cmd_lode(["list", "--json"]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {"lodes": [lode]}
+    assert payload == {"lodes": [{**lode, "status_display": "", "pane_liveness": "not_probed"}]}
+    assert "status_display" not in lode
+    assert "pane_liveness" not in lode
 
 
 def test_lode_peek_plain_text(capsys):

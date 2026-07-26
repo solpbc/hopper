@@ -242,6 +242,8 @@ def test_json_terminal_records_have_stable_and_additive_fields(
         "active": initial["active"],
         "source": "local",
         "observed_age_s": 0.0,
+        "status_display": initial["status"],
+        "pane_liveness": "not_probed",
     }
 
 
@@ -737,6 +739,8 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
         "source",
         "observed_age_s",
         "host",
+        "status_display",
+        "pane_liveness",
     }
     assert payload["outcome"] == "stuck"
     assert payload["source"] == "fedora.local"
@@ -744,6 +748,8 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
     assert payload["stage"] == "refine"
     assert payload["state"] == "stuck"
     assert payload["status"] == "Confirmed wedge"
+    assert payload["status_display"] == "Confirmed wedge"
+    assert payload["pane_liveness"] == "not_probed"
     assert "fedora.local" in captured.err
     assert "%83" in captured.err
     assert "hop -H fedora.local lode peek abc123" in captured.err
@@ -846,23 +852,63 @@ def test_gated_display_copy_does_not_mutate_wait_record(capsys):
     assert record == before
 
 
-def test_gated_parked_json_keeps_stored_status_without_probe(monkeypatch, capsys):
-    stored = format_park_status("no pane output", "abc123")
+def test_gated_parked_json_reports_gone_status(monkeypatch, capsys):
+    reason = "no pane output"
+    branch = "hopper-abc123"
+    stored = format_park_status(reason, "abc123")
     gated = snapshot(
         state="gated",
         status=stored,
         tmux_pane="%23",
+        branch=branch,
+    )
+    expected = PARK_PANE_GONE_STATUS.format(
+        reason=reason,
+        lode_id="abc123",
+        branch=branch,
+    )
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness:
+        rc, _, _ = run_local_wait(monkeypatch, gated, json_output=True)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == stored
+    assert payload["status_display"] == expected
+    assert payload["pane_liveness"] == "gone"
+    mock_liveness.assert_called_once_with("%23")
+
+
+def test_remote_gated_wait_json_is_not_probed(monkeypatch, capsys):
+    stored = format_park_status("no pane output", "abc123")
+    gated = snapshot(
+        state="gated",
+        status=stored,
+        host="fedora.local",
+        tmux_pane="%remote",
         branch="hopper-abc123",
+        status_display="remote-computed correction",
+        pane_liveness="gone",
     )
 
     with patch(
         "hopper.lodes.pane_liveness",
         side_effect=AssertionError("pane_liveness must not be called"),
     ):
-        rc, _, _ = run_local_wait(monkeypatch, gated, json_output=True)
+        rc, _ = run_remote_wait(
+            monkeypatch,
+            {"abc123": gated},
+            {"abc123": []},
+            json_output=True,
+            publish=False,
+        )
 
     assert rc == 2
-    assert json.loads(capsys.readouterr().out)["status"] == stored
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["host"] == "fedora.local"
+    assert payload["status"] == stored
+    assert payload["status_display"] == stored
+    assert payload["pane_liveness"] == "not_probed"
 
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["human", "jsonl"])
@@ -900,6 +946,8 @@ def test_observer_failure_reports_latest_valid_snapshot(monkeypatch, capsys, jso
             "source": "fedora.local",
             "observed_age_s": 75.0,
             "host": "fedora.local",
+            "status_display": "Later durable status",
+            "pane_liveness": "not_probed",
         }
     else:
         assert "stage=refine state=design active=True" in captured.out
@@ -1192,6 +1240,8 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
         "active",
         "source",
         "observed_age_s",
+        "status_display",
+        "pane_liveness",
     }
     assert "warning:" not in captured.out
     assert "warning:" in captured.err

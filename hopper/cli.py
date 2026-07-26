@@ -25,6 +25,7 @@ from hopper.lodes import (
     get_lode_dir,
     lode_icon,
     lode_status_for_display,
+    lode_with_status_annotations,
 )
 from hopper.tmux import capture_pane, paste_buffer, send_keys
 
@@ -1884,6 +1885,7 @@ def cmd_lode(args: list[str]) -> int:
                         lode["host"] = host
                         lodes.append(lode)
         if getattr(parsed, "json_output", False):
+            lodes = [lode_with_status_annotations(lode) for lode in lodes]
             print(json.dumps({"lodes": lodes}, indent=2))
             return 0
         if not lodes:
@@ -2271,6 +2273,7 @@ def cmd_lode(args: list[str]) -> int:
             if recovery is not None:
                 display_lode["recovery"] = recovery
         if getattr(parsed, "json_output", False):
+            display_lode = lode_with_status_annotations(display_lode)
             print(json.dumps(display_lode, indent=2))
             return 0
         print(format_lode_detail(display_lode))

@@ -14,7 +14,12 @@ from pathlib import Path
 
 import hopper.client as client
 import hopper.remote as remote
-from hopper.lodes import STATUS_ERROR, STATUS_SHIPPED, lode_status_for_display
+from hopper.lodes import (
+    STATUS_ERROR,
+    STATUS_SHIPPED,
+    lode_status_for_display,
+    lode_with_status_annotations,
+)
 from hopper.tmux import capture_pane
 
 STUCK_GRACE_MS = 120_000
@@ -451,6 +456,7 @@ def _observed_age(record: dict, now: float) -> float:
 def _json_event(record: dict, outcome: str, now: float) -> dict:
     """Build one additive, compatibility-preserving JSONL terminal record."""
     snapshot = record["latest_snapshot"]
+    annotated = lode_with_status_annotations({**snapshot, "host": record["host"]})
     event = {
         "id": record["id"],
         "outcome": outcome,
@@ -460,6 +466,8 @@ def _json_event(record: dict, outcome: str, now: float) -> dict:
         "active": snapshot["active"],
         "source": record["source"],
         "observed_age_s": _observed_age(record, now),
+        "status_display": annotated["status_display"],
+        "pane_liveness": annotated["pane_liveness"],
     }
     if record["host"]:
         event["host"] = record["host"]

@@ -546,30 +546,32 @@ PARK_LIVENESS_UNVERIFIED_SUFFIX = (
     """ (pane liveness UNVERIFIED — could not probe tmux; treat ALIVE as unconfirmed)"""
 )
 
+PANE_LIVENESS_NOT_PROBED = "not_probed"
+
 
 def format_park_status(reason: str, lode_id: str) -> str:
     """Format the durable status written when an idle lode is parked."""
     return PARK_STATUS_TEMPLATE.format(reason=reason, lode_id=lode_id)
 
 
-def lode_status_for_display(lode: dict) -> str:
-    """Return a lode's human-readable status with current local pane evidence."""
+def _lode_status_and_liveness(lode: dict) -> tuple[str, Liveness | None]:
+    """Return display status and current local pane evidence, if probed."""
     status = lode.get("status", "")
     if not status:
-        return status
+        return status, None
 
     lode_id = lode.get("id", "")
     reason_prefix, suffix_template = PARK_STATUS_TEMPLATE.split("{reason}", 1)
     status_suffix = suffix_template.format(lode_id=lode_id)
     if not status.startswith(reason_prefix) or not status.endswith(status_suffix):
-        return status
+        return status, None
 
     reason = status[len(reason_prefix) : -len(status_suffix)]
     if format_park_status(reason, lode_id) != status:
-        return status
+        return status, None
 
     if lode.get("host") not in (None, "", "local"):
-        return status
+        return status, None
 
     pane = lode.get("tmux_pane")
     if not pane:
@@ -581,13 +583,30 @@ def lode_status_for_display(lode: dict) -> str:
             liveness = Liveness.UNKNOWN
 
     if liveness is Liveness.ALIVE:
-        return status
+        return status, liveness
     elif liveness is Liveness.GONE:
         branch = lode.get("branch")
         template = PARK_PANE_GONE_STATUS if branch else _PARK_PANE_GONE_WITHOUT_BRANCH
-        return template.format(reason=reason, lode_id=lode_id, branch=branch)
+        return template.format(reason=reason, lode_id=lode_id, branch=branch), liveness
     else:
-        return status + PARK_LIVENESS_UNVERIFIED_SUFFIX
+        return status + PARK_LIVENESS_UNVERIFIED_SUFFIX, liveness
+
+
+def lode_status_for_display(lode: dict) -> str:
+    """Return a lode's human-readable status with current local pane evidence."""
+    status, _liveness = _lode_status_and_liveness(lode)
+    return status
+
+
+def lode_with_status_annotations(lode: dict) -> dict:
+    """Return a copied lode with additive display status and pane liveness."""
+    status, liveness = _lode_status_and_liveness(lode)
+    annotated = dict(lode)
+    annotated["status_display"] = status
+    annotated["pane_liveness"] = (
+        liveness.value if liveness is not None else PANE_LIVENESS_NOT_PROBED
+    )
+    return annotated
 
 
 # --- Status icon constants ---

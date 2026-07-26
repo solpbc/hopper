@@ -21,6 +21,7 @@ from hopper.git import create_worktree
 from hopper.lodes import (
     ID_ALPHABET,
     ID_LEN,
+    PANE_LIVENESS_NOT_PROBED,
     PARK_LIVENESS_UNVERIFIED_SUFFIX,
     PARK_PANE_GONE_STATUS,
     archive_lode,
@@ -38,6 +39,7 @@ from hopper.lodes import (
     load_archived_lodes,
     load_lodes,
     lode_status_for_display,
+    lode_with_status_annotations,
     reset_lode_claude_stage,
     save_archived_lodes,
     save_lodes,
@@ -1332,3 +1334,79 @@ def test_local_host_sentinels_are_probed(make_lode, host_fields):
         assert lode_status_for_display(lode) == expected
 
     mock_liveness.assert_called_once_with("%9")
+
+
+def test_lode_with_status_annotations_reports_alive_parked_lode(make_lode):
+    stored = format_park_status("quiet", "testid11")
+    lode = make_lode(state="gated", status=stored, tmux_pane="%10")
+    before = dict(lode)
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.ALIVE) as mock_liveness:
+        annotated = lode_with_status_annotations(lode)
+
+    assert annotated is not lode
+    assert lode == before
+    assert annotated["status"] == stored
+    assert annotated["status_display"] == stored
+    assert annotated["pane_liveness"] == "alive"
+    mock_liveness.assert_called_once_with("%10")
+
+
+@pytest.mark.parametrize(
+    "probe_result",
+    [Liveness.UNKNOWN, RuntimeError("tmux broke")],
+    ids=["unknown", "exception"],
+)
+def test_lode_with_status_annotations_reports_unknown_parked_lode(make_lode, probe_result):
+    stored = format_park_status("quiet", "testid11")
+    lode = make_lode(state="gated", status=stored, tmux_pane="%11")
+    probe = (
+        patch("hopper.lodes.pane_liveness", side_effect=probe_result)
+        if isinstance(probe_result, Exception)
+        else patch("hopper.lodes.pane_liveness", return_value=probe_result)
+    )
+
+    with probe as mock_liveness:
+        annotated = lode_with_status_annotations(lode)
+
+    assert annotated["status"] == stored
+    assert annotated["status_display"] == stored + PARK_LIVENESS_UNVERIFIED_SUFFIX
+    assert "pane is GONE" not in annotated["status_display"]
+    assert annotated["pane_liveness"] == "unknown"
+    mock_liveness.assert_called_once_with("%11")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"state": "running", "status": "Claude running"},
+        {"stage": "shipped", "state": "ready", "status": "Shipped"},
+        {"state": "error", "status": "Command failed"},
+        {"state": "gated", "status": "Review required"},
+    ],
+)
+def test_lode_with_status_annotations_marks_non_parked_not_probed(make_lode, overrides):
+    lode = make_lode(tmux_pane="%12", **overrides)
+
+    with patch(
+        "hopper.lodes.pane_liveness",
+        side_effect=AssertionError("pane_liveness must not be called"),
+    ):
+        annotated = lode_with_status_annotations(lode)
+
+    assert annotated["status_display"] == overrides["status"]
+    assert annotated["pane_liveness"] == PANE_LIVENESS_NOT_PROBED
+
+
+def test_lode_status_annotations_distinguish_unknown_from_not_probed(make_lode):
+    stored = format_park_status("quiet", "testid11")
+    parked = make_lode(state="gated", status=stored, tmux_pane="%13")
+    running = make_lode(state="running", status="Working", tmux_pane="%14")
+
+    with patch("hopper.lodes.pane_liveness", return_value=Liveness.UNKNOWN):
+        unknown = lode_with_status_annotations(parked)
+        not_probed = lode_with_status_annotations(running)
+
+    assert unknown["pane_liveness"] == "unknown"
+    assert not_probed["pane_liveness"] == PANE_LIVENESS_NOT_PROBED
+    assert unknown["pane_liveness"] != not_probed["pane_liveness"]
