@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from hopper import oom
+from hopper.claude import spawn_claude
 from hopper.git import is_dirty
 from hopper.lodes import get_lode_dir, get_worktree_dir
 from hopper.process import (
@@ -28,6 +30,7 @@ from hopper.process import (
     _run_make_install,
     _run_setup_command,
     run_process,
+    run_process_supervisor,
 )
 
 CLAUDE_SESSIONS = {
@@ -35,6 +38,8 @@ CLAUDE_SESSIONS = {
     "refine": {"session_id": "22222222-2222-2222-2222-222222222222", "started": False},
     "ship": {"session_id": "33333333-3333-3333-3333-333333333333", "started": False},
 }
+
+REAL_ARM_WORKER = oom.arm_worker
 
 
 def _claude_sessions(**stage_overrides):
@@ -64,7 +69,27 @@ def _mock_conn(emitted=None):
         mock.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
     else:
         mock.emit = MagicMock(return_value=True)
+
+    def start(callback=None, on_connect=None):
+        if on_connect:
+            on_connect()
+        if callback:
+            callback({"type": "lode_registered", "lode_id": "test-id"})
+
+    mock.start.side_effect = start
     return mock
+
+
+@pytest.fixture(autouse=True)
+def mock_worker_oom_boundary(monkeypatch):
+    """Never touch the host's procfs/cgroup state from process tests."""
+    monkeypatch.setattr(
+        oom,
+        "arm_worker",
+        lambda **_kwargs: oom.OomCapability.NON_LINUX,
+    )
+    monkeypatch.setattr("hopper.process._sum_descendant_cpu_ms", lambda _pid: None)
+    monkeypatch.setattr("hopper.process._sum_process_tree_io_chars", lambda _pid: None)
 
 
 def _run_git(repo_dir, *args):
@@ -1954,3 +1979,223 @@ class TestProcessingLog:
             and Path(getattr(handler, "baseFilename", "")) == log_path
             for handler in hopper_logger.handlers
         )
+
+
+class TestOomBoundary:
+    def test_pane_command_is_identical_when_guard_environment_is_present(self):
+        with patch("hopper.claude.new_window", return_value="%1") as new_window:
+            spawn_claude("test-id", "/repo")
+            plain_command = new_window.call_args.args[0]
+            spawn_claude(
+                "test-id",
+                "/repo",
+                env={"HOPPER_RUN_GENERATION": "a" * 32, "HOPPER_OOM_SCOPE": "unit.scope"},
+            )
+            guarded_command = new_window.call_args.args[0]
+
+        assert guarded_command == plain_command
+        assert "hop process test-id" in guarded_command
+
+    def test_scope_argv_is_unique_and_has_no_resource_limits(self):
+        first = oom.scope_unit_name("test-id", "a" * 32)
+        second = oom.scope_unit_name("test-id", "b" * 32)
+
+        assert first != second
+        argv = oom.build_scope_argv("/usr/bin/systemd-run", "/usr/bin/hop", first, "test-id")
+        assert argv == [
+            "/usr/bin/systemd-run",
+            "--user",
+            "--scope",
+            f"--unit={first}",
+            "--property=OOMPolicy=kill",
+            "--",
+            "/usr/bin/hop",
+            "process-worker",
+            "test-id",
+        ]
+        joined = " ".join(argv)
+        for forbidden in ("MemoryMax", "MemorySwapMax", "TasksMax", "CPUQuota", "--collect"):
+            assert forbidden not in joined
+
+    def test_memory_group_is_read_once_from_resolved_cgroup(self, monkeypatch):
+        reads = []
+
+        def read_text(path):
+            reads.append(path)
+            if path == Path("/proc/self/cgroup"):
+                return "0::/user.slice/session.scope\n"
+            if path == Path("/proc/self/mountinfo"):
+                return "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            assert path == Path("/sys/fs/cgroup/user.slice/session.scope/memory.oom.group")
+            return "1\n"
+
+        monkeypatch.setattr(oom, "_read_text", read_text)
+
+        assert oom._memory_oom_group_is_armed() is True
+        assert reads.count(Path("/sys/fs/cgroup/user.slice/session.scope/memory.oom.group")) == 1
+
+    def test_oom_score_is_written_and_verified(self, monkeypatch):
+        writes = []
+        monkeypatch.setattr(oom, "_write_text", lambda path, value: writes.append((path, value)))
+        monkeypatch.setattr(oom, "_read_text", lambda path: "500\n")
+
+        assert oom._set_oom_score() is True
+        assert writes == [(Path("/proc/self/oom_score_adj"), "500")]
+
+    def test_capability_requires_group_and_score(self, monkeypatch):
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "_memory_oom_group_is_armed", lambda: True)
+        monkeypatch.setattr(oom, "_set_oom_score", lambda: True)
+        assert REAL_ARM_WORKER(expect_scope=True) is oom.OomCapability.SUPPORTED
+
+        monkeypatch.setattr(oom, "_memory_oom_group_is_armed", lambda: False)
+        assert REAL_ARM_WORKER(expect_scope=True) is oom.OomCapability.DEGRADED_NO_CONTROLLER
+
+        monkeypatch.setattr(oom, "_set_oom_score", lambda: False)
+        assert REAL_ARM_WORKER(expect_scope=True) is oom.OomCapability.DEGRADED_NO_SCORE
+
+    def test_supported_supervisor_reports_before_releasing(self, monkeypatch):
+        generation = "a" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        events = []
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(
+            oom, "launch_scope", lambda argv: events.append(("launch", argv)) or 137
+        )
+        monkeypatch.setattr(
+            oom,
+            "read_scope_result",
+            lambda systemctl, unit_name: (
+                events.append(("read", systemctl, unit_name)) or "oom-kill"
+            ),
+        )
+        monkeypatch.setattr(
+            "hopper.process.report_lode_run_result",
+            lambda *args: events.append(("report", args)) or {"durable": True},
+        )
+        monkeypatch.setattr(
+            oom,
+            "release_scope",
+            lambda systemctl, unit_name: events.append(("release", systemctl, unit_name)) or True,
+        )
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 0
+        assert [event[0] for event in events] == ["launch", "read", "report", "release"]
+        assert events[0][1] == oom.build_scope_argv("systemd-run", "hop", unit, "test-id")
+
+    def test_failed_ack_retains_failed_unit_evidence(self, monkeypatch):
+        generation = "b" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(oom, "launch_scope", lambda argv: 137)
+        monkeypatch.setattr(oom, "read_scope_result", lambda *args: "oom-kill")
+        monkeypatch.setattr("hopper.process.report_lode_run_result", lambda *args: None)
+        release = MagicMock()
+        monkeypatch.setattr(oom, "release_scope", release)
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 137
+        release.assert_not_called()
+
+    def test_non_linux_supervisor_uses_inline_worker_without_probes(self, monkeypatch):
+        monkeypatch.setattr(oom, "is_linux", lambda: False)
+        monkeypatch.setattr(oom, "find_scope_tools", MagicMock(side_effect=AssertionError))
+        monkeypatch.setattr(oom, "find_hop_executable", MagicMock(side_effect=AssertionError))
+        inline = MagicMock(return_value=7)
+        monkeypatch.setattr("hopper.process.run_process", inline)
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 7
+        inline.assert_called_once_with("test-id", Path("server.sock"), expect_scope=False)
+
+    def test_degraded_warning_is_printed_and_logged_once(self, monkeypatch, capsys, caplog):
+        monkeypatch.setattr(
+            oom,
+            "arm_worker",
+            lambda **kwargs: oom.OomCapability.DEGRADED_NO_CONTROLLER,
+        )
+        monkeypatch.setattr(
+            "hopper.client.connect", lambda *args, **kwargs: {"lode": {"stage": "mill"}}
+        )
+        monkeypatch.setattr(ProcessRunner, "run", lambda self: 0)
+
+        with caplog.at_level(logging.WARNING, logger="hopper.process"):
+            assert run_process("test-id", Path("server.sock")) == 0
+
+        assert capsys.readouterr().out.count(oom.OOM_DEGRADED_WARNING) == 1
+        assert caplog.messages.count(oom.OOM_DEGRADED_WARNING) == 1
+
+
+class TestArmedRegistration:
+    def test_registration_ack_precedes_setup_and_model_launch(self):
+        events = []
+        generation = "c" * 32
+        runner = ProcessRunner(
+            "test-id",
+            Path("server.sock"),
+            "mill",
+            run_generation=generation,
+            oom_capability=oom.OomCapability.SUPPORTED,
+            actual_unit="hopper.scope",
+        )
+        connection = MagicMock()
+
+        def emit(msg_type, **fields):
+            events.append((msg_type, fields))
+            return True
+
+        def start(callback=None, on_connect=None):
+            on_connect()
+            callback({"type": "lode_registered", "lode_id": "test-id"})
+
+        connection.emit.side_effect = emit
+        connection.start.side_effect = start
+        with (
+            patch("hopper.runner.connect", return_value=_mock_response()),
+            patch("hopper.runner.HopperConnection", return_value=connection),
+            patch.object(runner, "_setup", side_effect=lambda: events.append(("setup", {}))),
+            patch.object(
+                runner,
+                "_run_claude",
+                side_effect=lambda: events.append(("model", {})) or (0, None),
+            ),
+        ):
+            assert runner.run() == 0
+
+        assert [event[0] for event in events[:3]] == ["lode_register", "setup", "model"]
+        assert events[0][1]["armed_mode"] == "supported"
+        assert events[0][1]["actual_unit"] == "hopper.scope"
+
+    def test_registration_refusal_launches_no_setup_or_model(self):
+        generation = "d" * 32
+        runner = ProcessRunner(
+            "test-id",
+            Path("server.sock"),
+            "mill",
+            run_generation=generation,
+            oom_capability=oom.OomCapability.DEGRADED_NO_SCORE,
+        )
+        connection = MagicMock()
+
+        def start(callback=None, on_connect=None):
+            on_connect()
+            callback({"type": "lode_register_refused", "lode_id": "test-id"})
+
+        connection.emit.return_value = True
+        connection.start.side_effect = start
+        with (
+            patch("hopper.runner.connect", return_value=_mock_response()),
+            patch("hopper.runner.HopperConnection", return_value=connection),
+            patch.object(runner, "_setup") as setup,
+            patch.object(runner, "_run_claude") as run_model,
+        ):
+            assert runner.run() == 1
+
+        setup.assert_not_called()
+        run_model.assert_not_called()

@@ -12,8 +12,16 @@ import threading
 import time
 from pathlib import Path
 
-from hopper import config, prompt
-from hopper.client import set_codex_thread_id, set_lode_branch, set_lode_state, set_lode_status
+from hopper import config, oom, prompt
+from hopper.client import (
+    OOM_SCOPE_ENV,
+    RUN_GENERATION_ENV,
+    report_lode_run_result,
+    set_codex_thread_id,
+    set_lode_branch,
+    set_lode_state,
+    set_lode_status,
+)
 from hopper.codex import bootstrap_codex
 from hopper.git import (
     commit_all,
@@ -317,8 +325,23 @@ STAGES = {
 class ProcessRunner(BaseRunner):
     """Unified runner for all lode stages."""
 
-    def __init__(self, lode_id: str, socket_path: Path, stage: str):
-        super().__init__(lode_id, socket_path)
+    def __init__(
+        self,
+        lode_id: str,
+        socket_path: Path,
+        stage: str,
+        *,
+        run_generation: str | None = None,
+        oom_capability: oom.OomCapability = oom.OomCapability.NON_LINUX,
+        actual_unit: str | None = None,
+    ):
+        super().__init__(
+            lode_id,
+            socket_path,
+            run_generation=run_generation,
+            armed_mode=oom_capability.value,
+            actual_unit=actual_unit,
+        )
         if stage not in STAGES:
             raise ValueError(f"Unknown stage: {stage}")
         cfg = STAGES[stage]
@@ -674,7 +697,7 @@ class ProcessRunner(BaseRunner):
         return None
 
 
-def run_process(lode_id: str, socket_path: Path) -> int:
+def run_process(lode_id: str, socket_path: Path, *, expect_scope: bool = False) -> int:
     """Entry point for process command. Reads stage from server."""
     from hopper.client import connect
 
@@ -692,6 +715,12 @@ def run_process(lode_id: str, socket_path: Path) -> int:
     hopper_logger.addHandler(handler)
 
     try:
+        capability = oom.arm_worker(expect_scope=expect_scope)
+        warning = oom.warning_for(capability)
+        if warning:
+            print(warning)
+            logger.warning(warning)
+
         response = connect(socket_path, lode_id=lode_id)
         if not response:
             logger.error(f"connect failed lode={lode_id}")
@@ -712,7 +741,17 @@ def run_process(lode_id: str, socket_path: Path) -> int:
             emitted = set_lode_state(socket_path, lode_id, "error", f"Unknown stage: {stage}")
             return 0 if emitted else 1
 
-        runner = ProcessRunner(lode_id, socket_path, stage)
+        run_generation = os.environ.get(RUN_GENERATION_ENV)
+        candidate_unit = os.environ.get(OOM_SCOPE_ENV)
+        actual_unit = candidate_unit if capability is oom.OomCapability.SUPPORTED else None
+        runner = ProcessRunner(
+            lode_id,
+            socket_path,
+            stage,
+            run_generation=run_generation,
+            oom_capability=capability,
+            actual_unit=actual_unit,
+        )
         try:
             return runner.run()
         except Exception as exc:
@@ -727,3 +766,40 @@ def run_process(lode_id: str, socket_path: Path) -> int:
     finally:
         hopper_logger.removeHandler(handler)
         handler.close()
+
+
+def run_process_supervisor(lode_id: str, socket_path: Path) -> int:
+    """Run a guarded Linux worker while this process remains outside its scope."""
+    if not oom.is_linux():
+        return run_process(lode_id, socket_path, expect_scope=False)
+
+    run_generation = os.environ.get(RUN_GENERATION_ENV)
+    unit_name = os.environ.get(OOM_SCOPE_ENV)
+    tools = oom.find_scope_tools()
+    hop_executable = oom.find_hop_executable()
+    if not run_generation or not unit_name or not tools or not hop_executable:
+        return run_process(lode_id, socket_path, expect_scope=False)
+
+    systemd_run, systemctl = tools
+    argv = oom.build_scope_argv(systemd_run, hop_executable, unit_name, lode_id)
+    try:
+        worker_returncode = oom.launch_scope(argv)
+    except OSError:
+        logger.warning("failed to launch guarded systemd scope", exc_info=True)
+        return run_process(lode_id, socket_path, expect_scope=False)
+
+    unit_result = oom.read_scope_result(systemctl, unit_name)
+    acknowledgement = report_lode_run_result(
+        socket_path,
+        lode_id,
+        run_generation,
+        unit_name,
+        unit_result,
+        worker_returncode,
+    )
+    durable = bool(acknowledgement and acknowledgement.get("durable"))
+    if durable and unit_result not in (None, "success"):
+        oom.release_scope(systemctl, unit_name)
+    if durable and unit_result == "oom-kill":
+        return 0
+    return worker_returncode

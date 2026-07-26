@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 
 import hopper.wait as wait
-from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status
+from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status, format_terminal_failure_status
 from hopper.tmux import Liveness
 
 
@@ -239,6 +239,7 @@ def test_json_terminal_records_have_stable_and_additive_fields(
         "stage": initial["stage"],
         "state": initial["state"],
         "status": initial["status"],
+        "failure_kind": initial.get("failure_kind"),
         "active": initial["active"],
         "source": "local",
         "observed_age_s": 0.0,
@@ -735,6 +736,7 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
         "stage",
         "state",
         "status",
+        "failure_kind",
         "active",
         "source",
         "observed_age_s",
@@ -942,6 +944,7 @@ def test_observer_failure_reports_latest_valid_snapshot(monkeypatch, capsys, jso
             "stage": "refine",
             "state": "design",
             "status": "Later durable status",
+            "failure_kind": None,
             "active": True,
             "source": "fedora.local",
             "observed_age_s": 75.0,
@@ -1237,6 +1240,7 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
         "stage",
         "state",
         "status",
+        "failure_kind",
         "active",
         "source",
         "observed_age_s",
@@ -1245,3 +1249,26 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
     }
     assert "warning:" not in captured.out
     assert "warning:" in captured.err
+
+
+@pytest.mark.parametrize("failure_kind", ["oom", "runner_exit_unverified"])
+def test_terminal_runner_failure_json_and_human_output(monkeypatch, capsys, failure_kind):
+    status = format_terminal_failure_status(failure_kind, "abc123")
+    initial = snapshot(
+        state="error",
+        active=False,
+        status=status,
+        failure_kind=failure_kind,
+    )
+
+    rc, _, _ = run_local_wait(monkeypatch, initial, json_output=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["failure_kind"] == failure_kind
+    assert payload["status"] == status
+
+    rc, _, _ = run_local_wait(monkeypatch, initial)
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert status in output
+    assert "Restart with:" not in output

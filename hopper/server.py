@@ -15,11 +15,12 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
-from hopper import config
+from hopper import config, oom
 from hopper.backlog import (
     BacklogItem,
     add_backlog_item,
@@ -33,13 +34,20 @@ from hopper.backlog import (
     find_by_prefix as find_backlog_by_prefix,
 )
 from hopper.claude import spawn_claude
+from hopper.client import (
+    OOM_SCOPE_ENV,
+    RUN_GENERATION_ENV,
+    RUNNER_MUTATION_TYPES,
+)
 from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
     archive_lode,
     create_lode,
     current_time_ms,
     find_lodes_by_prefix,
+    format_terminal_failure_status,
     get_worktree_dir,
+    is_terminal_failure_kind,
     load_archived_lodes,
     load_lodes,
     reset_lode_claude_stage,
@@ -77,6 +85,7 @@ PAUSE_TERM_GRACE_SEC = 0.75
 PAUSE_KILL_GRACE_SEC = 0.5
 PAUSE_PROCESS_POLL_SEC = 0.02
 PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
+GUARDED_DISCONNECT_HOLD_SEC = 2.0
 _FEEDBACK_POLL_INTERVAL = 0.25
 _FEEDBACK_IDLE_POLL_COUNT = 12
 _FEEDBACK_SETTLE_POLL_COUNT = 4
@@ -84,6 +93,12 @@ _FEEDBACK_ACCEPTANCE_POLL_COUNT = 12
 _FEEDBACK_IDLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_IDLE_POLL_COUNT
 _FEEDBACK_SETTLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_SETTLE_POLL_COUNT
 _FEEDBACK_ACCEPTANCE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_ACCEPTANCE_POLL_COUNT
+
+
+def _is_verified_ordinary_exit(unit_result: str | None, worker_returncode: int | None) -> bool:
+    """Return whether the supervisor verified an ordinary successful exit."""
+    return unit_result in (None, "success") and worker_returncode == 0
+
 
 _FEEDBACK_FAILURES = {
     "pane_unavailable": (
@@ -388,6 +403,9 @@ class Server:
         # Lode ownership tracking: lode_id -> socket, socket -> lode_id
         self.lode_clients: dict[str, socket.socket] = {}
         self.client_lodes: dict[socket.socket, str] = {}
+        self.client_generations: dict[socket.socket, str] = {}
+        self.pending_disconnects: dict[tuple[str, str], dict] = {}
+        self.runner_results: dict[tuple[str, str], tuple[str | None, int]] = {}
         self._log_handler: logging.FileHandler | None = None
         self._lock_file = None
         self._socket_bound = False
@@ -397,6 +415,23 @@ class Server:
     def _find_lode(self, lode_id: str) -> dict | None:
         """Find a lode by ID."""
         return next((lode for lode in self.lodes if lode["id"] == lode_id), None)
+
+    def _runner_generation_matches(self, lode: dict | None, message: dict) -> bool:
+        """Admit a runner mutation only for the lode's current run generation."""
+        if not lode:
+            return False
+        expected = lode.get("run_generation")
+        observed = message.get("run_generation")
+        matched = bool(expected and observed and observed == expected)
+        if not matched:
+            logger.info(
+                "Dropping stale runner mutation type=%s lode=%s generation=%s current=%s",
+                message.get("type"),
+                lode.get("id"),
+                observed,
+                expected,
+            )
+        return matched
 
     def _acquire_server_lock(self) -> None:
         """Acquire and retain the singleton lock colocated with the server socket."""
@@ -451,6 +486,16 @@ class Server:
         """Reconcile recorded runner identity against tmux without guessing."""
         changed = False
         for lode in self.lodes:
+            generation = lode.get("run_generation")
+            if generation and (lode["id"], generation) in self.pending_disconnects:
+                continue
+            if is_terminal_failure_kind(lode.get("failure_kind")):
+                if lode.get("active") or lode.get("tmux_pane") or lode.get("pid"):
+                    lode["active"] = False
+                    lode["tmux_pane"] = None
+                    lode["pid"] = None
+                    changed = True
+                continue
             pane = lode.get("tmux_pane")
             if pane:
                 liveness = pane_liveness(pane)
@@ -487,6 +532,42 @@ class Server:
         if changed:
             save_lodes(self.lodes)
 
+    def _consume_failed_oom_units(self) -> None:
+        """Consume retained failed scope evidence before startup reconciliation."""
+        tools = oom.find_scope_tools()
+        if not tools:
+            return
+        _, systemctl = tools
+        for lode in self.lodes:
+            unit_name = lode.get("oom_scope")
+            run_generation = lode.get("run_generation")
+            if not unit_name or not run_generation:
+                continue
+            unit_result = oom.read_scope_result(systemctl, unit_name)
+            if unit_result == "oom-kill":
+                self._set_terminal_failure(lode, "oom", broadcast=False)
+            elif is_terminal_failure_kind(lode.get("failure_kind")):
+                if unit_result not in (None, "success"):
+                    oom.release_scope(systemctl, unit_name)
+                continue
+            elif unit_result not in (None, "success"):
+                self._set_terminal_failure(lode, "runner_exit_unverified", broadcast=False)
+            elif unit_result is None:
+                self.pending_disconnects[(lode["id"], run_generation)] = {
+                    "deadline": time.monotonic() + GUARDED_DISCONNECT_HOLD_SEC,
+                    "unit_name": unit_name,
+                    "token": uuid.uuid4().hex,
+                }
+                logger.warning(
+                    "Startup scope result unavailable lode=%s generation=%s",
+                    lode["id"],
+                    run_generation,
+                )
+                continue
+            else:
+                continue
+            oom.release_scope(systemctl, unit_name)
+
     def _gated_spawn(
         self,
         lode: dict,
@@ -495,8 +576,18 @@ class Server:
         foreground: bool = False,
         spawn_updates: dict | None = None,
         pre_spawn: Callable[[], None] | None = None,
+        allow_terminal_recovery: bool = False,
     ) -> tuple[SpawnOutcome, str | None]:
         """Spawn a runner only when its recorded pane is absent or gone."""
+        generation = lode.get("run_generation")
+        if generation and (lode["id"], generation) in self.pending_disconnects:
+            logger.warning("lode %s: spawn suppressed while scope result is pending", lode["id"])
+            return SpawnOutcome.FAILED, None
+        terminal_recovery = is_terminal_failure_kind(lode.get("failure_kind"))
+        if terminal_recovery and not allow_terminal_recovery:
+            logger.warning("lode %s: automatic spawn suppressed by terminal failure", lode["id"])
+            return SpawnOutcome.FAILED, None
+
         pane = lode.get("tmux_pane")
         if pane:
             liveness = pane_liveness(pane)
@@ -533,13 +624,32 @@ class Server:
         lode["pid"] = None
         _clear_spawn_refusal(lode)
         if spawn_updates:
-            lode.update(spawn_updates)
+            updates = dict(spawn_updates)
+            if terminal_recovery:
+                for field in ("state", "status", "failure_kind"):
+                    updates.pop(field, None)
+            lode.update(updates)
+        run_generation = uuid.uuid4().hex
+        lode["run_generation"] = run_generation
+        lode["oom_scope"] = (
+            oom.scope_unit_name(lode["id"], run_generation) if oom.is_linux() else None
+        )
+        touch(lode)
+        save_lodes(self.lodes)
         if pre_spawn:
             pre_spawn()
 
         launch_error = None
         try:
-            pane_id = spawn_claude(lode["id"], project_path, foreground=foreground)
+            pane_env = {RUN_GENERATION_ENV: run_generation}
+            if lode.get("oom_scope"):
+                pane_env[OOM_SCOPE_ENV] = lode["oom_scope"]
+            pane_id = spawn_claude(
+                lode["id"],
+                project_path,
+                foreground=foreground,
+                env=pane_env,
+            )
         except OSError as error:
             logger.error("lode %s: failed to create tmux runner pane: %s", lode["id"], error)
             launch_error = error
@@ -552,10 +662,11 @@ class Server:
             lode["active"] = False
             lode["tmux_pane"] = None
             lode["pid"] = None
-            lode["status"] = (
-                "spawn failed: tmux could not create a runner pane — "
-                "verify tmux is running, then retry"
-            )
+            if not terminal_recovery:
+                lode["status"] = (
+                    "spawn failed: tmux could not create a runner pane — "
+                    "verify tmux is running, then retry"
+                )
             touch(lode)
             save_lodes(self.lodes)
             self.broadcast({"type": "lode_updated", "lode": lode})
@@ -588,10 +699,20 @@ class Server:
         self.backlog = load_backlog()
         self.projects = get_active_projects()
 
+        self._consume_failed_oom_units()
         self._reconcile_startup_lodes()
 
         # Runs only while lock-held; UNKNOWN panes do not block shipped auto-archive.
-        shipped = [lode for lode in self.lodes if lode.get("stage") == "shipped"]
+        shipped = [
+            lode
+            for lode in self.lodes
+            if lode.get("stage") == "shipped"
+            and not is_terminal_failure_kind(lode.get("failure_kind"))
+            and (
+                not lode.get("run_generation")
+                or (lode["id"], lode["run_generation"]) not in self.pending_disconnects
+            )
+        ]
         for lode in shipped:
             archived = archive_lode(self.lodes, lode["id"])
             if archived:
@@ -697,23 +818,50 @@ class Server:
         Runs on the event loop thread — no lock needed for state mutations.
         """
         lode_id = self.client_lodes.pop(conn, None)
-        if lode_id:
+        run_generation = self.client_generations.pop(conn, None)
+        owned = bool(lode_id and self.lode_clients.get(lode_id) is conn)
+        if owned:
             self.lode_clients.pop(lode_id, None)
 
-        if not lode_id:
+        if not lode_id or not owned:
             return
 
         lode = self._find_lode(lode_id)
         if not lode:
             return
 
-        # Skip if another runner already claimed this lode
+        if run_generation != lode.get("run_generation"):
+            return
+
+        key = (lode_id, run_generation)
+        observed_result = self.runner_results.pop(key, None)
+        if observed_result is not None and _is_verified_ordinary_exit(*observed_result):
+            self._finalize_lode_disconnect(lode_id, run_generation)
+            return
+
+        if lode.get("oom_scope"):
+            self.pending_disconnects[key] = {
+                "deadline": time.monotonic() + GUARDED_DISCONNECT_HOLD_SEC,
+                "unit_name": lode["oom_scope"],
+                "token": uuid.uuid4().hex,
+            }
+            logger.info("Holding guarded disconnect lode=%s generation=%s", lode_id, run_generation)
+            return
+
+        self._finalize_lode_disconnect(lode_id, run_generation)
+
+    def _finalize_lode_disconnect(self, lode_id: str, run_generation: str | None) -> None:
+        """Apply ordinary disconnect state after guarded-result resolution."""
+        lode = self._find_lode(lode_id)
+        if not lode or lode.get("run_generation") != run_generation:
+            return
         if lode_id in self.lode_clients:
             return
 
         lode["active"] = False
         lode["tmux_pane"] = None
         lode["pid"] = None
+        lode["oom_scope"] = None
         touch(lode)
         save_lodes(self.lodes)
 
@@ -725,6 +873,7 @@ class Server:
             lode.get("state") == "ready"
             and stage in STAGES
             and lode.get("status") != STAGES[stage]["done_status"]
+            and not is_terminal_failure_kind(lode.get("failure_kind"))
         ):
             project = find_project(lode.get("project", ""))
             project_path = project.path if project else None
@@ -735,13 +884,73 @@ class Server:
                 logger.warning(f"Auto-advance skipped for {lode_id}: project not found")
 
         # Auto-archive shipped lodes
-        if stage == "shipped":
+        if stage == "shipped" and not is_terminal_failure_kind(lode.get("failure_kind")):
             archived = archive_lode(self.lodes, lode_id)
             if archived:
                 self.archived_lodes.append(archived)
                 logger.info(f"Lode {lode_id} auto-archived")
                 self.broadcast({"type": "lode_archived", "lode": archived})
                 self._cleanup_worktree(archived)
+
+    def _set_terminal_failure(
+        self,
+        lode: dict,
+        failure_kind: str,
+        *,
+        broadcast: bool = True,
+    ) -> bool:
+        """Persist one canonical terminal runner failure."""
+        if lode.get("failure_kind") == "oom" and failure_kind != "oom":
+            return False
+        status = format_terminal_failure_status(failure_kind, lode["id"])
+        changed = (
+            lode.get("failure_kind") != failure_kind
+            or lode.get("status") != status
+            or lode.get("state") != "error"
+            or lode.get("active", False)
+            or lode.get("tmux_pane") is not None
+            or lode.get("pid") is not None
+        )
+        lode["state"] = "error"
+        lode["status"] = status
+        lode["failure_kind"] = failure_kind
+        lode["active"] = False
+        lode["tmux_pane"] = None
+        lode["pid"] = None
+        if changed:
+            touch(lode)
+        save_lodes(self.lodes)
+        if changed and broadcast:
+            self.broadcast({"type": "lode_updated", "lode": lode})
+        return changed
+
+    def _drain_due_disconnects(self) -> None:
+        """Resolve guarded disconnects whose non-blocking hold expired."""
+        now = time.monotonic()
+        due = [
+            key for key, pending in self.pending_disconnects.items() if pending["deadline"] <= now
+        ]
+        for key in due:
+            pending = self.pending_disconnects.pop(key, None)
+            if pending is None:
+                continue
+            lode_id, run_generation = key
+            lode = self._find_lode(lode_id)
+            if (
+                not lode
+                or lode.get("run_generation") != run_generation
+                or lode.get("oom_scope") != pending["unit_name"]
+                or lode_id in self.lode_clients
+            ):
+                continue
+            observed_result = self.runner_results.pop(key, None)
+            if observed_result is not None and _is_verified_ordinary_exit(*observed_result):
+                self._finalize_lode_disconnect(lode_id, run_generation)
+                continue
+            if lode.get("state") == "error" and not lode.get("failure_kind"):
+                self._finalize_lode_disconnect(lode_id, run_generation)
+            else:
+                self._set_terminal_failure(lode, "runner_exit_unverified")
 
     def _cleanup_worktree(self, lode: dict) -> None:
         """Remove git worktree and branch for an archived lode."""
@@ -772,17 +981,43 @@ class Server:
         conn: socket.socket,
         tmux_pane: str | None = None,
         pid: int | None = None,
-    ) -> None:
+        run_generation: str | None = None,
+        armed_mode: str | None = None,
+        actual_unit: str | None = None,
+    ) -> bool:
         """Register a client as owning a lode.
 
         Sets active=True on the lode and disconnects any stale owner.
         Runs on the event loop thread — no lock needed for state mutations.
         """
+        lode = self._find_lode(lode_id)
+        if not lode or run_generation != lode.get("run_generation"):
+            return False
+        terminal_recovery = is_terminal_failure_kind(lode.get("failure_kind"))
+        if terminal_recovery and (not tmux_pane or tmux_pane != lode.get("tmux_pane")):
+            return False
+        if armed_mode == oom.OomCapability.SUPPORTED.value:
+            if not actual_unit or actual_unit != lode.get("oom_scope"):
+                return False
+        elif armed_mode in {
+            oom.OomCapability.DEGRADED_NO_CONTROLLER.value,
+            oom.OomCapability.DEGRADED_NO_SCORE.value,
+            oom.OomCapability.NON_LINUX.value,
+        }:
+            if actual_unit is not None:
+                return False
+            lode["oom_scope"] = None
+        else:
+            return False
+
+        self.pending_disconnects.pop((lode_id, run_generation), None)
+
         # Check for existing owner
         existing_conn = self.lode_clients.get(lode_id)
         if existing_conn and existing_conn != conn:
             # Disconnect stale client
             old_lode_id = self.client_lodes.pop(existing_conn, None)
+            self.client_generations.pop(existing_conn, None)
             if old_lode_id:
                 self.lode_clients.pop(old_lode_id, None)
             try:
@@ -794,21 +1029,25 @@ class Server:
         # Register new owner
         self.lode_clients[lode_id] = conn
         self.client_lodes[conn] = lode_id
+        self.client_generations[conn] = run_generation
 
         # Set active on the lode
-        lode = self._find_lode(lode_id)
-        if lode:
-            lode["active"] = True
-            if tmux_pane:
-                lode["tmux_pane"] = tmux_pane
-            if pid:
-                lode["pid"] = pid
-            _clear_spawn_refusal(lode)
-            touch(lode)
-            save_lodes(self.lodes)
-            self.broadcast({"type": "lode_updated", "lode": lode})
+        lode["active"] = True
+        if tmux_pane:
+            lode["tmux_pane"] = tmux_pane
+        if pid:
+            lode["pid"] = pid
+        _clear_spawn_refusal(lode)
+        if terminal_recovery:
+            lode["failure_kind"] = None
+            lode["state"] = "running"
+            lode["status"] = f"Starting {lode.get('stage', '')}"
+        touch(lode)
+        save_lodes(self.lodes)
+        self.broadcast({"type": "lode_updated", "lode": lode})
 
         logger.info(f"Registered client for lode {lode_id}, active=True")
+        return True
 
     def _handle_read_only(self, message: dict, conn: socket.socket) -> None:
         """Handle read-only messages inline (from any client thread)."""
@@ -864,10 +1103,109 @@ class Server:
         self._gated_spawn(lode, project_path, foreground=False)
         return lode
 
+    def _handle_lode_run_result(self, message: dict, conn: socket.socket | None) -> None:
+        """Classify one outside-supervisor observation and acknowledge durability."""
+        lode_id = message.get("lode_id")
+        run_generation = message.get("run_generation")
+        unit_name = message.get("unit_name")
+        unit_result = message.get("unit_result")
+        worker_returncode = message.get("worker_returncode")
+        lode = self._find_lode(lode_id) if lode_id else None
+
+        def acknowledge(accepted: bool, durable: bool, disposition: str) -> None:
+            if conn:
+                self._send_response(
+                    conn,
+                    {
+                        "type": "lode_run_result_ack",
+                        "accepted": accepted,
+                        "durable": durable,
+                        "disposition": disposition,
+                    },
+                )
+
+        if not lode:
+            acknowledge(False, False, "not-found")
+            return
+        if run_generation != lode.get("run_generation"):
+            acknowledge(False, True, "stale-generation")
+            return
+        if lode.get("oom_scope") is None:
+            acknowledge(False, True, "unguarded")
+            return
+        if unit_name != lode.get("oom_scope"):
+            acknowledge(False, False, "unit-mismatch")
+            return
+
+        key = (lode_id, run_generation)
+        if unit_result is None and worker_returncode != 0:
+            self.runner_results[key] = (unit_result, worker_returncode)
+            if lode_id not in self.lode_clients:
+                self.pending_disconnects.setdefault(
+                    key,
+                    {
+                        "deadline": time.monotonic() + GUARDED_DISCONNECT_HOLD_SEC,
+                        "unit_name": unit_name,
+                        "token": uuid.uuid4().hex,
+                    },
+                )
+            acknowledge(True, False, "result-unavailable")
+            return
+        if unit_result == "oom-kill":
+            self.pending_disconnects.pop(key, None)
+            self.runner_results.pop(key, None)
+            self._set_terminal_failure(lode, "oom")
+            acknowledge(True, True, "oom")
+            return
+
+        if is_terminal_failure_kind(lode.get("failure_kind")):
+            save_lodes(self.lodes)
+            acknowledge(True, True, "already-terminal")
+            return
+
+        if _is_verified_ordinary_exit(unit_result, worker_returncode):
+            if lode_id in self.lode_clients:
+                self.runner_results[key] = (unit_result, worker_returncode)
+            elif key in self.pending_disconnects:
+                self.pending_disconnects.pop(key, None)
+                self._finalize_lode_disconnect(lode_id, run_generation)
+            else:
+                self._set_terminal_failure(lode, "runner_exit_unverified")
+            acknowledge(True, True, "success")
+            return
+
+        self.pending_disconnects.pop(key, None)
+        self.runner_results.pop(key, None)
+        if lode.get("state") == "error" and not lode.get("failure_kind"):
+            self._finalize_lode_disconnect(lode_id, run_generation)
+            disposition = "runner-error"
+        else:
+            self._set_terminal_failure(lode, "runner_exit_unverified")
+            disposition = "unverified"
+        acknowledge(True, True, disposition)
+
     def _handle_mutation(self, message: dict, conn: socket.socket | None) -> None:
         """Handle a serialized state message. Runs on the event loop thread."""
         self._request_context.exchange_id = message.get("exchange_id")
         msg_type = message.get("type")
+
+        if msg_type in RUNNER_MUTATION_TYPES:
+            lode_id = message.get("lode_id")
+            lode = self._find_lode(lode_id) if lode_id else None
+            if not self._runner_generation_matches(lode, message):
+                if msg_type == "lode_register" and conn and lode_id:
+                    self._send_response(
+                        conn,
+                        {"type": "lode_register_refused", "lode_id": lode_id},
+                    )
+                return
+            if msg_type != "lode_register" and is_terminal_failure_kind(lode.get("failure_kind")):
+                logger.info(
+                    "Dropping runner mutation for terminal lode type=%s lode=%s",
+                    msg_type,
+                    lode_id,
+                )
+                return
 
         if msg_type == "_client_disconnect":
             self._on_client_disconnect(conn)
@@ -910,7 +1248,25 @@ class Server:
                 if lode:
                     tmux_pane = message.get("tmux_pane")
                     pid = message.get("pid")
-                    self._register_lode_client(lode_id, conn, tmux_pane, pid)
+                    accepted = self._register_lode_client(
+                        lode_id,
+                        conn,
+                        tmux_pane,
+                        pid,
+                        message.get("run_generation"),
+                        message.get("armed_mode"),
+                        message.get("actual_unit"),
+                    )
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "lode_registered" if accepted else "lode_register_refused",
+                            "lode_id": lode_id,
+                        },
+                    )
+
+        elif msg_type == "lode_run_result":
+            self._handle_lode_run_result(message, conn)
 
         elif msg_type == "lode_create":
             project = message.get("project", "")
@@ -1014,6 +1370,11 @@ class Server:
                 if conn:
                     self._send_response(conn, {"type": "error", "error": error})
                 return
+            lode["oom_scope"] = None
+            generation = lode.get("run_generation")
+            if generation:
+                self.pending_disconnects.pop((lode_id, generation), None)
+                self.runner_results.pop((lode_id, generation), None)
             if pane:
                 from hopper.tmux import kill_pane
 
@@ -1062,6 +1423,7 @@ class Server:
                 project.path,
                 foreground=False,
                 spawn_updates={"state": "running", "status": f"Resuming {stage}"},
+                allow_terminal_recovery=True,
             )
             if outcome is not SpawnOutcome.SPAWNED:
                 if conn:
@@ -1091,6 +1453,11 @@ class Server:
             if lode_id:
                 lode = self._find_lode(lode_id)
                 if lode:
+                    lode["oom_scope"] = None
+                    generation = lode.get("run_generation")
+                    if generation:
+                        self.pending_disconnects.pop((lode_id, generation), None)
+                        self.runner_results.pop((lode_id, generation), None)
                     pid = lode.get("pid")
                     if pid:
                         try:
@@ -1253,6 +1620,7 @@ class Server:
                         lode,
                         project_path,
                         pre_spawn=reset_before_spawn,
+                        allow_terminal_recovery=True,
                     )
                     if outcome is SpawnOutcome.SPAWNED:
                         logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
@@ -1453,6 +1821,7 @@ class Server:
         ensuring no concurrent access to serialized lode/backlog state or save_lodes.
         """
         while not self.stop_event.is_set():
+            self._drain_due_disconnects()
             try:
                 message, conn = self.event_queue.get(timeout=0.1)
             except queue.Empty:
@@ -1462,6 +1831,8 @@ class Server:
                 self._handle_mutation(message, conn)
             except Exception:
                 logger.exception(f"Event loop error: {message.get('type')}")
+            finally:
+                self._drain_due_disconnects()
 
     def _enqueue_event(self, message: dict, conn: socket.socket | None = None) -> None:
         """Enqueue a mutation event for the event loop thread."""

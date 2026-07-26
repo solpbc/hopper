@@ -23,6 +23,7 @@ from hopper.lodes import (
     find_lode_by_prefix,
     format_age,
     get_lode_dir,
+    is_terminal_failure_kind,
     lode_icon,
     lode_status_for_display,
     lode_with_status_annotations,
@@ -473,7 +474,7 @@ def cmd_up(args: list[str]) -> int:
 @command("process", "Run Claude for a lode's current stage", group="internal")
 def cmd_process(args: list[str]) -> int:
     """Run Claude for a lode, dispatching to the correct stage runner."""
-    from hopper.process import run_process
+    from hopper.process import run_process_supervisor
 
     parser = make_parser("process", "Run Claude for a lode's current stage (internal command).")
     parser.add_argument("lode_id", help="Lode ID to run")
@@ -489,7 +490,28 @@ def cmd_process(args: list[str]) -> int:
     if err := require_server():
         return err
 
-    return run_process(parsed.lode_id, _socket())
+    return run_process_supervisor(parsed.lode_id, _socket())
+
+
+@command("process-worker", "Run one lode worker", group="internal")
+def cmd_process_worker(args: list[str]) -> int:
+    """Run the inner lode worker inside its prepared execution boundary."""
+    from hopper.process import run_process
+
+    parser = make_parser("process-worker", "Run one lode worker (internal command).")
+    parser.add_argument("lode_id", help="Lode ID to run")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as error:
+        print(f"error: {error}")
+        parser.print_usage()
+        return 1
+
+    if err := require_server():
+        return err
+    return run_process(parsed.lode_id, _socket(), expect_scope=True)
 
 
 @command("status", "Show or update lode status", group="lode")
@@ -1455,7 +1477,7 @@ def _format_lode_error(lode: dict) -> str:
     status = lode.get("status", "")
     if status:
         lines.append(f"  status: {status}")
-    if not lode.get("recovery"):
+    if not lode.get("recovery") and not is_terminal_failure_kind(lode.get("failure_kind")):
         lines.append("")
         lines.append(f"to retry: hop lode restart {lode_id}")
     return "\n".join(lines)

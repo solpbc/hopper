@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from hopper.client import HopperConnection, connect
+from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
 from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
@@ -34,6 +34,7 @@ _QUESTION_CHROME_RE = re.compile(
 DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
 STUCK_FAILURE_WAIT_SEC = 60
+REGISTRATION_TIMEOUT_SEC = 5.0
 
 
 def pane_needs_answer(snapshot: str) -> bool:
@@ -205,10 +206,23 @@ class BaseRunner:
     _next_stage: str = ""
     _always_dismiss: bool = False
 
-    def __init__(self, lode_id: str, socket_path: Path):
+    def __init__(
+        self,
+        lode_id: str,
+        socket_path: Path,
+        *,
+        run_generation: str | None = None,
+        armed_mode: str = "non-linux",
+        actual_unit: str | None = None,
+    ):
         self.lode_id = lode_id
         self.socket_path = socket_path
+        self.run_generation = run_generation
+        self.armed_mode = armed_mode
+        self.actual_unit = actual_unit
         self.connection: HopperConnection | None = None
+        self._registration_complete = threading.Event()
+        self._registration_accepted = False
         self.is_first_run = False
         self.claude_session_id: str = ""
         self.project_name: str = ""
@@ -278,7 +292,10 @@ class BaseRunner:
                 logger.info(f"lode loaded lode={self.lode_id} first_run={self.is_first_run}")
 
                 # Start persistent connection and register ownership
-                self.connection = HopperConnection(self.socket_path)
+                self.connection = HopperConnection(
+                    self.socket_path,
+                    run_generation=self.run_generation,
+                )
                 self.connection.start(
                     callback=self._on_server_message,
                     on_connect=lambda: self.connection.emit(
@@ -286,8 +303,17 @@ class BaseRunner:
                         lode_id=self.lode_id,
                         tmux_pane=get_current_pane_id(),
                         pid=os.getpid(),
+                        armed_mode=self.armed_mode,
+                        actual_unit=self.actual_unit,
                     ),
                 )
+                if self.run_generation:
+                    if not self._registration_complete.wait(REGISTRATION_TIMEOUT_SEC):
+                        logger.error(f"registration timed out lode={self.lode_id}")
+                        return 1
+                    if not self._registration_accepted:
+                        logger.error(f"registration refused lode={self.lode_id}")
+                        return 1
 
                 # Subclass pre-flight validation and setup
                 err = self._setup()
@@ -362,6 +388,8 @@ class BaseRunner:
         """Build environment for subprocess. Subclasses can override to add venv."""
         env = os.environ.copy()
         env["HOPPER_LID"] = self.lode_id
+        if self.run_generation:
+            env[RUN_GENERATION_ENV] = self.run_generation
         # Hopper lodes are scoped by their prompt and repo context; do not let
         # Claude Code read/write project auto-memory during managed stages.
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
@@ -468,6 +496,16 @@ class BaseRunner:
 
     def _on_server_message(self, message: dict) -> None:
         """Handle incoming server broadcast messages."""
+        if message.get("type") == "lode_registered":
+            if message.get("lode_id") == self.lode_id:
+                self._registration_accepted = True
+                self._registration_complete.set()
+            return
+        if message.get("type") == "lode_register_refused":
+            if message.get("lode_id") == self.lode_id:
+                self._registration_accepted = False
+                self._registration_complete.set()
+            return
         if message.get("type") != "lode_updated":
             return
         lode = message.get("lode", {})

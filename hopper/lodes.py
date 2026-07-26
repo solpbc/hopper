@@ -17,6 +17,9 @@ Lodes are plain dicts with these fields:
 - active: bool - whether a runner client is connected (default False)
 - tmux_pane: str | None - tmux pane ID (default None)
 - pid: int | None - process ID of active runner (default None)
+- run_generation: str | None - generation owning runner mutations (default None)
+- oom_scope: str | None - guarded systemd scope unit name (default None)
+- failure_kind: str | None - durable terminal runner failure discriminator (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
@@ -367,6 +370,9 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "active": False,
         "tmux_pane": None,
         "pid": None,
+        "run_generation": None,
+        "oom_scope": None,
+        "failure_kind": None,
         "codex_thread_id": None,
         "last_progress_at": None,
         "last_progress_summary": "",
@@ -539,6 +545,12 @@ PARK_STATUS_TEMPLATE = """Parked (idle): {reason}. The agent is ALIVE and was NO
 
 PARK_PANE_GONE_STATUS = """Parked (idle), but the pane is GONE: {reason}. The agent did NOT survive — nudge and answer cannot reach a dead pane. Recover: hop lode restart {lode_id} (check first that the work did not already land: git cherry origin/main {branch})"""  # noqa: E501
 
+OOM_KILLED_STATUS = """OOM-KILLED: the operating system killed this Hopper lode's process group after an out-of-memory event. Automatic restart is suppressed. Inspect the worktree and branch, then recover explicitly: hop lode resume {lode_id} (preserve the stage session) or hop lode restart {lode_id} (fresh stage session)."""  # noqa: E501
+
+RUNNER_EXIT_UNVERIFIED_STATUS = """Runner exit UNVERIFIED: Hopper lost the guarded lode runner before it could classify the scope result. Automatic restart is suppressed. Inspect the worktree and branch, then recover explicitly: hop lode resume {lode_id} (preserve the stage session) or hop lode restart {lode_id} (fresh stage session)."""  # noqa: E501
+
+TERMINAL_FAILURE_KINDS = frozenset({"oom", "runner_exit_unverified"})
+
 # The branch advice is the final parenthetical in the constant.
 _PARK_PANE_GONE_WITHOUT_BRANCH = PARK_PANE_GONE_STATUS.rsplit(" (", 1)[0]
 
@@ -552,6 +564,22 @@ PANE_LIVENESS_NOT_PROBED = "not_probed"
 def format_park_status(reason: str, lode_id: str) -> str:
     """Format the durable status written when an idle lode is parked."""
     return PARK_STATUS_TEMPLATE.format(reason=reason, lode_id=lode_id)
+
+
+def is_terminal_failure_kind(failure_kind: str | None) -> bool:
+    """Return whether failure_kind latches automatic runner launch."""
+    return failure_kind in TERMINAL_FAILURE_KINDS
+
+
+def format_terminal_failure_status(failure_kind: str, lode_id: str) -> str:
+    """Format the canonical durable status for a terminal runner failure."""
+    if failure_kind == "oom":
+        template = OOM_KILLED_STATUS
+    elif failure_kind == "runner_exit_unverified":
+        template = RUNNER_EXIT_UNVERIFIED_STATUS
+    else:
+        raise ValueError(f"unknown terminal failure kind: {failure_kind}")
+    return template.format(lode_id=lode_id)
 
 
 def _lode_status_and_liveness(lode: dict) -> tuple[str, Liveness | None]:

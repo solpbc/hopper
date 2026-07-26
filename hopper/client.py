@@ -5,6 +5,7 @@
 
 import json
 import logging
+import os
 import queue
 import socket
 import threading
@@ -16,6 +17,22 @@ from typing import Any, Callable, Literal
 from hopper.lodes import current_time_ms
 
 logger = logging.getLogger(__name__)
+
+RUN_GENERATION_ENV = "HOPPER_RUN_GENERATION"
+OOM_SCOPE_ENV = "HOPPER_OOM_SCOPE"
+RUNNER_MUTATION_TYPES = frozenset(
+    {
+        "lode_register",
+        "lode_set_state",
+        "lode_set_stage",
+        "lode_set_progress",
+        "lode_set_status",
+        "lode_set_title",
+        "lode_set_branch",
+        "lode_set_codex_thread",
+        "lode_set_claude_started",
+    }
+)
 
 
 class InvalidServerResponse(ValueError):
@@ -30,13 +47,14 @@ class HopperConnection:
     dropped (with debug logging) when disconnected.
     """
 
-    def __init__(self, socket_path: Path):
+    def __init__(self, socket_path: Path, run_generation: str | None = None):
         """Initialize connection (does not connect immediately).
 
         Args:
             socket_path: Path to Unix socket
         """
         self.socket_path = socket_path
+        self.run_generation = run_generation
         self.send_queue: queue.Queue = queue.Queue(maxsize=1000)
         self.callback: Callable[[dict[str, Any]], Any] | None = None
         self.on_connect: Callable[[], Any] | None = None
@@ -180,6 +198,8 @@ class HopperConnection:
             return False
 
         message = {"type": msg_type, "ts": current_time_ms(), **fields}
+        if msg_type in RUNNER_MUTATION_TYPES and self.run_generation:
+            message["run_generation"] = self.run_generation
         try:
             self.send_queue.put_nowait(message)
             return True
@@ -561,11 +581,43 @@ def resume_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict |
 
 def _fire_and_forget(socket_path: Path, msg: dict, timeout: float = 2.0) -> bool:
     """Send a message to the server without waiting for a response."""
+    if msg.get("type") in RUNNER_MUTATION_TYPES:
+        run_generation = os.environ.get(RUN_GENERATION_ENV)
+        if run_generation:
+            msg = {**msg, "run_generation": run_generation}
     try:
         send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
         return True
     except Exception:
         return False
+
+
+def report_lode_run_result(
+    socket_path: Path,
+    lode_id: str,
+    run_generation: str,
+    unit_name: str,
+    unit_result: str | None,
+    worker_returncode: int,
+    timeout: float = 2.0,
+) -> dict | None:
+    """Report one guarded worker result and wait for durable acknowledgement."""
+    response = send_message(
+        socket_path,
+        {
+            "type": "lode_run_result",
+            "lode_id": lode_id,
+            "run_generation": run_generation,
+            "unit_name": unit_name,
+            "unit_result": unit_result,
+            "worker_returncode": worker_returncode,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if response and response.get("type") == "lode_run_result_ack":
+        return response
+    return None
 
 
 def set_lode_state(

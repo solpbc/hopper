@@ -53,7 +53,14 @@ from hopper.cli import (
     require_server,
     validate_hopper_lid,
 )
-from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status, get_lode_dir, save_lodes
+from hopper.client import RUN_GENERATION_ENV
+from hopper.lodes import (
+    PARK_PANE_GONE_STATUS,
+    format_park_status,
+    format_terminal_failure_status,
+    get_lode_dir,
+    save_lodes,
+)
 from hopper.projects import Project, load_projects, save_projects
 from hopper.server import Server
 from hopper.tmux import Liveness
@@ -4644,6 +4651,34 @@ def test_format_lode_line_shows_spawn_refusal():
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)
 
 
+@pytest.mark.parametrize("failure_kind", ["oom", "runner_exit_unverified"])
+def test_terminal_failure_renders_without_generic_retry(make_lode, failure_kind):
+    status = format_terminal_failure_status(failure_kind, "test-id")
+    lode = make_lode(
+        id="test-id",
+        state="error",
+        status=status,
+        failure_kind=failure_kind,
+    )
+
+    assert format_lode_line(lode).endswith(status)
+    detail = format_lode_detail(lode)
+    assert status in detail
+    assert "to retry:" not in detail
+
+
+def test_terminal_failure_json_is_unchanged(capsys, make_lode):
+    status = format_terminal_failure_status("oom", "test-id")
+    lode = make_lode(id="test-id", state="error", status=status, failure_kind="oom")
+
+    with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failure_kind"] == "oom"
+    assert payload["status"] == status
+
+
 def test_format_lode_detail_corrects_parked_gone_status(make_lode):
     reason = "no pane output"
     branch = "hopper-test-id"
@@ -5324,10 +5359,17 @@ def test_check_heartbeats_over_real_socket_and_stops_after_child(
 ):
     """A pane-silent child reports progress only while it is running."""
     server, socket_path = check_server
-    lode = make_lode(id="check-id", state="running", active=True)
+    generation = "a" * 32
+    lode = make_lode(
+        id="check-id",
+        state="running",
+        active=True,
+        run_generation=generation,
+    )
     server.lodes = [lode]
     save_lodes(server.lodes)
     monkeypatch.setenv("HOPPER_LID", "check-id")
+    monkeypatch.setenv(RUN_GENERATION_ENV, generation)
     monkeypatch.setattr("hopper.cli._socket", lambda: socket_path)
     monkeypatch.setattr("hopper.code.HEARTBEAT_INTERVAL_SEC", 0.05)
     command = [sys.executable, "-c", "import time; time.sleep(0.25); print('done')"]

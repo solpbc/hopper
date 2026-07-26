@@ -9,11 +9,12 @@ import socket
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hopper.client import (
+    RUN_GENERATION_ENV,
     HopperConnection,
     InvalidServerResponse,
     _exchange_message,
@@ -33,6 +34,14 @@ from hopper.client import (
     set_lode_title,
 )
 from hopper.server import Server
+
+TEST_RUN_GENERATION = "a" * 32
+
+
+@pytest.fixture(autouse=True)
+def runner_generation_env(monkeypatch):
+    """Fence in-lode client mutations without relying on the developer environment."""
+    monkeypatch.setenv(RUN_GENERATION_ENV, TEST_RUN_GENERATION)
 
 
 @pytest.fixture
@@ -137,7 +146,13 @@ def test_connect_with_tmux_location(server_with_tmux, socket_path):
 def test_connect_with_lode_id_found(server, socket_path):
     """Connect returns session data when session exists."""
 
-    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    session = {
+        "id": "test-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "state": "new",
+        "run_generation": TEST_RUN_GENERATION,
+    }
     server.lodes = [session]
 
     result = connect(socket_path, lode_id="test-id")
@@ -722,11 +737,34 @@ def test_set_lode_state_no_server(socket_path):
     assert result is True  # The try succeeds, send_message handles the error
 
 
+def test_fire_and_forget_attaches_runner_generation(socket_path):
+    with patch("hopper.client.send_message") as send:
+        assert set_lode_state(socket_path, "test-id", "running", "Working") is True
+
+    message = send.call_args.args[1]
+    assert message["run_generation"] == TEST_RUN_GENERATION
+
+
+def test_persistent_connection_attaches_runner_generation(socket_path):
+    conn = HopperConnection(socket_path, run_generation=TEST_RUN_GENERATION)
+    conn.thread = MagicMock()
+    conn.thread.is_alive.return_value = True
+
+    assert conn.emit("lode_set_state", lode_id="test-id", state="running") is True
+    assert conn.send_queue.get_nowait()["run_generation"] == TEST_RUN_GENERATION
+
+
 def test_set_lode_state_sends_message(server, socket_path):
     """set_lode_state sends the correct message type."""
 
     # Create a session first
-    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    session = {
+        "id": "test-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "state": "new",
+        "run_generation": TEST_RUN_GENERATION,
+    }
     server.lodes = [session]
 
     result = set_lode_state(socket_path, "test-id", "running", "Claude running")
@@ -742,7 +780,13 @@ def test_set_lode_state_sends_message(server, socket_path):
 
 def test_set_lode_progress_sends_message(server, socket_path):
     """set_lode_progress updates heartbeat fields through the server."""
-    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "running"}
+    session = {
+        "id": "test-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "state": "running",
+        "run_generation": TEST_RUN_GENERATION,
+    }
     server.lodes = [session]
 
     result = set_lode_progress(socket_path, "test-id", "codex thinking")
@@ -762,6 +806,7 @@ def test_set_lode_progress_rejected_for_error_lode(server, socket_path):
         "created_at": 1000,
         "updated_at": 1000,
         "state": "error",
+        "run_generation": TEST_RUN_GENERATION,
         "last_progress_at": 123,
         "last_progress_summary": "existing",
     }
@@ -770,6 +815,7 @@ def test_set_lode_progress_rejected_for_error_lode(server, socket_path):
         "stage": "mill",
         "created_at": 1000,
         "state": "running",
+        "run_generation": TEST_RUN_GENERATION,
     }
     server.lodes = [rejected_session, accepted_session]
 
@@ -809,7 +855,13 @@ def test_set_lode_title_sends_message(server, socket_path):
     """set_lode_title sends the correct message type."""
 
     # Create a session first
-    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    session = {
+        "id": "test-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "state": "new",
+        "run_generation": TEST_RUN_GENERATION,
+    }
     server.lodes = [session]
 
     result = set_lode_title(socket_path, "test-id", "Auth Flow")
@@ -832,7 +884,13 @@ def test_set_lode_branch_no_server(socket_path):
 
 def test_set_lode_branch_sends_message(server, socket_path):
     """set_lode_branch sends the correct message type."""
-    session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+    session = {
+        "id": "test-id",
+        "stage": "mill",
+        "created_at": 1000,
+        "state": "new",
+        "run_generation": TEST_RUN_GENERATION,
+    }
     server.lodes = [session]
 
     result = set_lode_branch(socket_path, "test-id", "hopper-test-id-auth-flow")
@@ -903,10 +961,16 @@ class TestHopperConnection:
         """Emit can send session state updates."""
 
         # Create a session
-        session = {"id": "test-id", "stage": "mill", "created_at": 1000, "state": "new"}
+        session = {
+            "id": "test-id",
+            "stage": "mill",
+            "created_at": 1000,
+            "state": "new",
+            "run_generation": TEST_RUN_GENERATION,
+        }
         server.lodes = [session]
 
-        conn = HopperConnection(socket_path)
+        conn = HopperConnection(socket_path, run_generation=TEST_RUN_GENERATION)
         conn.start()
 
         # Give time to connect

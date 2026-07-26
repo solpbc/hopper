@@ -17,6 +17,7 @@ import hopper.remote as remote
 from hopper.lodes import (
     STATUS_ERROR,
     STATUS_SHIPPED,
+    is_terminal_failure_kind,
     lode_status_for_display,
     lode_with_status_annotations,
 )
@@ -463,6 +464,7 @@ def _json_event(record: dict, outcome: str, now: float) -> dict:
         "stage": snapshot["stage"],
         "state": snapshot["state"],
         "status": snapshot["status"],
+        "failure_kind": snapshot.get("failure_kind"),
         "active": snapshot["active"],
         "source": record["source"],
         "observed_age_s": _observed_age(record, now),
@@ -526,7 +528,8 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
     elif outcome == "error":
         print(f"{STATUS_ERROR} {lid} error: {snapshot['status']}")
         print(f"  {_snapshot_summary(record, now)}")
-        print(f"Lode {lid} entered error state. Restart with: hop lode restart {lid}")
+        if not is_terminal_failure_kind(snapshot.get("failure_kind")):
+            print(f"Lode {lid} entered error state. Restart with: hop lode restart {lid}")
     elif outcome == "gated":
         display_status = lode_status_for_display({**snapshot, "host": record["host"]})
         display_snapshot = {**snapshot, "status": display_status}

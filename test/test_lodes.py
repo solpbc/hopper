@@ -21,9 +21,11 @@ from hopper.git import create_worktree
 from hopper.lodes import (
     ID_ALPHABET,
     ID_LEN,
+    OOM_KILLED_STATUS,
     PANE_LIVENESS_NOT_PROBED,
     PARK_LIVENESS_UNVERIFIED_SUFFIX,
     PARK_PANE_GONE_STATUS,
+    RUNNER_EXIT_UNVERIFIED_STATUS,
     archive_lode,
     compute_runtime_ms,
     create_lode,
@@ -33,9 +35,11 @@ from hopper.lodes import (
     format_age,
     format_duration_ms,
     format_park_status,
+    format_terminal_failure_status,
     format_uptime,
     get_lode_dir,
     get_worktree_dir,
+    is_terminal_failure_kind,
     load_archived_lodes,
     load_lodes,
     lode_status_for_display,
@@ -152,6 +156,9 @@ def test_create_lode(temp_config):
     assert lode["branch"] == ""
     assert lode["last_progress_at"] is None
     assert lode["last_progress_summary"] == ""
+    assert lode["run_generation"] is None
+    assert lode["oom_scope"] is None
+    assert lode["failure_kind"] is None
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
@@ -174,6 +181,18 @@ def test_create_lode(temp_config):
     assert len(loaded) == 1
     assert loaded[0]["id"] == lode["id"]
     assert loaded[0]["project"] == "test-project"
+
+
+def test_terminal_failure_statuses_have_one_formatter():
+    assert format_terminal_failure_status("oom", "abc12345") == OOM_KILLED_STATUS.replace(
+        "{lode_id}", "abc12345"
+    )
+    assert format_terminal_failure_status(
+        "runner_exit_unverified", "abc12345"
+    ) == RUNNER_EXIT_UNVERIFIED_STATUS.replace("{lode_id}", "abc12345")
+    assert is_terminal_failure_kind("oom") is True
+    assert is_terminal_failure_kind("runner_exit_unverified") is True
+    assert is_terminal_failure_kind("ordinary_error") is False
 
 
 def test_create_lode_with_scope(temp_config):
