@@ -367,6 +367,8 @@ class BaseRunner:
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         env["CLAUDE_CODE_DISABLE_MEMORY_PERIODIC_RESYNC"] = "1"
         env["CLAUDE_CODE_DISABLE_MEMORY_BULK_INFLATE"] = "1"
+        # A lode pane is machine-read, so grayed-out prompt suggestions are scrape noise.
+        env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
         return env
 
     def _run_claude(self) -> tuple[int, str | None]:

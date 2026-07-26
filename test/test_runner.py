@@ -402,8 +402,8 @@ class TestBaseRunnerActivityMonitor:
         assert result == (1, "stuck reason")
         assert "timed out waiting for stuck recovery lode=test-session" in caplog.messages
 
-    def test_subprocess_env_disables_claude_auto_memory(self):
-        """Managed Hopper stages disable Claude Code auto-memory."""
+    def test_subprocess_env_configures_managed_claude(self):
+        """Managed Hopper stages configure Claude Code for machine-read panes."""
         runner = self._make_runner()
 
         env = runner._get_subprocess_env()
@@ -412,6 +412,7 @@ class TestBaseRunnerActivityMonitor:
         assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
         assert env["CLAUDE_CODE_DISABLE_MEMORY_PERIODIC_RESYNC"] == "1"
         assert env["CLAUDE_CODE_DISABLE_MEMORY_BULK_INFLATE"] == "1"
+        assert env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] == "false"
 
     def test_check_activity_detects_stuck(self):
         """Monitor detects stuck state when pane content doesn't change."""
