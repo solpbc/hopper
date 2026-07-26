@@ -137,7 +137,8 @@ hop lode status <lode-id> --json
 hop lode show <lode-id>   # alias for status
 ```
 
-JSON lode objects include `status_display`, the human-facing derived status, and
+`hop lode list/status --json` lode objects and `hop wait --json` JSONL terminal
+records include `status_display`, the human-facing derived status, and
 `pane_liveness`, which is `alive`, `gone`, `unknown`, or `not_probed`. The existing
 `status` field remains the stored string; consumers opt into the derived view through
 `status_display`.
