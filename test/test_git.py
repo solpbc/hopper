@@ -235,10 +235,7 @@ class TestCreateWorktree:
             capture_output=True,
             text=True,
         )
-        assert not any(
-            args[0][:2] == ["git", "fetch"]
-            for args, _kwargs in mock_run.call_args_list
-        )
+        assert not any(args[0][:2] == ["git", "fetch"] for args, _kwargs in mock_run.call_args_list)
 
     def test_git_remote_failure_is_hard_failure(self, tmp_path):
         worktree_path = tmp_path / "worktree"
@@ -304,9 +301,7 @@ class TestCreateWorktreeIntegration:
         registered, local_sha, upstream_sha = stale_clone_factory("main")
         worktree_path = tmp_path / "main-worktree"
 
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-stale-main"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-stale-main")
 
         assert (created, error) == (True, None)
         assert _run_git(worktree_path, "rev-parse", "HEAD").stdout.strip() == upstream_sha
@@ -319,9 +314,7 @@ class TestCreateWorktreeIntegration:
         status_before = _run_git(registered, "status", "--porcelain").stdout
         worktree_path = tmp_path / "unchanged-worktree"
 
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-unchanged"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-unchanged")
 
         assert (created, error) == (True, None)
         assert _run_git(registered, "branch", "--show-current").stdout == branch_before
@@ -332,9 +325,7 @@ class TestCreateWorktreeIntegration:
         registered, local_sha, upstream_sha = stale_clone_factory("master")
         worktree_path = tmp_path / "master-worktree"
 
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-stale-master"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-stale-master")
 
         assert (created, error) == (True, None)
         assert _run_git(worktree_path, "rev-parse", "HEAD").stdout.strip() == upstream_sha
@@ -345,16 +336,12 @@ class TestCreateWorktreeIntegration:
         expected_sha = _run_git(registered, "rev-parse", "HEAD").stdout.strip()
         worktree_path = tmp_path / "topic-worktree"
 
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-no-origin"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-no-origin")
 
         assert (created, error) == (True, None)
         assert _run_git(worktree_path, "rev-parse", "HEAD").stdout.strip() == expected_sha
 
-    def test_fetch_failure_leaves_no_worktree_or_branch(
-        self, tmp_path, stale_clone_factory
-    ):
+    def test_fetch_failure_leaves_no_worktree_or_branch(self, tmp_path, stale_clone_factory):
         registered, _local_sha, _upstream_sha = stale_clone_factory("main")
         missing_remote = tmp_path / "missing.git"
         _run_git(registered, "remote", "set-url", "origin", str(missing_remote))
@@ -369,9 +356,7 @@ class TestCreateWorktreeIntegration:
         assert not worktree_path.exists()
         assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
 
-    def test_resolution_failure_leaves_no_worktree_or_branch(
-        self, tmp_path, stale_clone_factory
-    ):
+    def test_resolution_failure_leaves_no_worktree_or_branch(self, tmp_path, stale_clone_factory):
         registered, _local_sha, _upstream_sha = stale_clone_factory("develop")
         worktree_path = tmp_path / "resolve-failure-worktree"
         branch_name = "hopper-resolve-failure"
@@ -391,9 +376,7 @@ class TestCreateWorktreeIntegration:
     ):
         registered, local_sha, _upstream_sha = stale_clone_factory("main")
         worktree_path = tmp_path / "diff-worktree"
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-diff-base"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-diff-base")
 
         assert (created, error) == (True, None)
         assert _run_git(registered, "rev-parse", "main").stdout.strip() == local_sha
@@ -405,9 +388,7 @@ class TestCreateWorktreeIntegration:
     ):
         registered, _local_sha, _upstream_sha = stale_clone_factory("main")
         worktree_path = tmp_path / "feature-diff-worktree"
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-feature-diff"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-feature-diff")
         assert (created, error) == (True, None)
         (worktree_path / "feature.txt").write_text("feature\n")
         _run_git(worktree_path, "add", ".")
@@ -421,9 +402,7 @@ class TestCreateWorktreeIntegration:
     def test_diff_helpers_fall_back_to_local_default_without_remote_refs(self, tmp_path):
         registered = _init_git_repo(tmp_path)
         worktree_path = tmp_path / "local-diff-worktree"
-        created, error = create_worktree(
-            str(registered), worktree_path, "hopper-local-diff"
-        )
+        created, error = create_worktree(str(registered), worktree_path, "hopper-local-diff")
         assert (created, error) == (True, None)
 
         assert get_diff_stat(str(worktree_path)) == ""

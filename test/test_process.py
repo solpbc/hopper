@@ -1322,10 +1322,7 @@ class TestRefineStage:
             "lode_set_state",
             lode_id="test-id",
             state="error",
-            status=(
-                "Failed to create git worktree: "
-                "git fetch origin failed: fatal: unavailable"
-            ),
+            status=("Failed to create git worktree: git fetch origin failed: fatal: unavailable"),
         )
         MockConn.return_value.stop.assert_called_once()
 
@@ -1357,15 +1354,11 @@ class TestRefineStage:
             "Failed to create git worktree: git fetch origin failed:"
         )
         assert not get_worktree_dir("test-id").exists()
-        assert (
-            _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
-        )
+        assert _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
 
     def test_resolution_failure_sets_specific_error_without_git_side_effects(self, tmp_path):
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
-        session_dir, project_dir, mock_project = self._setup_git_refine(
-            tmp_path, branch="develop"
-        )
+        session_dir, project_dir, mock_project = self._setup_git_refine(tmp_path, branch="develop")
 
         with (
             patch(
@@ -1390,9 +1383,7 @@ class TestRefineStage:
             ),
         )
         assert not get_worktree_dir("test-id").exists()
-        assert (
-            _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
-        )
+        assert _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
 
     def test_fails_if_input_missing_on_first_run(self, tmp_path):
         """Missing mill input emits error and exits 0."""

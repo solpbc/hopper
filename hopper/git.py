@@ -70,9 +70,7 @@ def create_worktree(
             logger.error(error)
             return False, error
 
-        remote_names = {
-            name.strip() for name in remote_result.stdout.splitlines() if name.strip()
-        }
+        remote_names = {name.strip() for name in remote_result.stdout.splitlines() if name.strip()}
         if UPSTREAM_REMOTE in remote_names:
             try:
                 fetch_result = subprocess.run(
@@ -84,8 +82,7 @@ def create_worktree(
                 )
             except subprocess.TimeoutExpired:
                 error = (
-                    f"git fetch {UPSTREAM_REMOTE} timed out after "
-                    f"{GIT_FETCH_TIMEOUT_SEC} seconds"
+                    f"git fetch {UPSTREAM_REMOTE} timed out after {GIT_FETCH_TIMEOUT_SEC} seconds"
                 )
                 logger.error(error)
                 return False, error
