@@ -566,7 +566,9 @@ def test_create_worktree_at_resolved_whitespace_free_path(tmp_path, monkeypatch)
             text=True,
         )
 
-    run_git("init")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    run_git("init", "-b", "main")
     run_git("config", "user.email", "test@example.com")
     run_git("config", "user.name", "Test User")
     (repo_path / "README.md").write_text("init\n")
@@ -578,7 +580,9 @@ def test_create_worktree_at_resolved_whitespace_free_path(tmp_path, monkeypatch)
     worktree_path = get_worktree_dir(lode_id)
     worktree_path.parent.mkdir(parents=True)
 
-    assert create_worktree(str(repo_path), worktree_path, f"hopper-{lode_id}")
+    created, error = create_worktree(str(repo_path), worktree_path, f"hopper-{lode_id}")
+    assert created is True
+    assert error is None
     assert worktree_path.is_dir()
     assert " " not in str(worktree_path)
 

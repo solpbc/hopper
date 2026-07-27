@@ -11,9 +11,43 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+UPSTREAM_REMOTE = "origin"
+DEFAULT_BRANCH_NAMES = ("main", "master")
+GIT_FETCH_TIMEOUT_SEC = 120
 
-def create_worktree(repo_dir: str, worktree_path: Path, branch_name: str) -> bool:
-    """Create a git worktree with a new branch.
+
+def _resolve_default_branch(
+    repo_dir: str, *, allow_local: bool
+) -> tuple[str | None, tuple[str, ...]]:
+    """Resolve the first default-branch ref and report every candidate probed.
+
+    Remote refs are preferred. Local refs are included only when ``allow_local``
+    is true. This function never fetches.
+    """
+    remote_candidates = tuple(
+        f"{UPSTREAM_REMOTE}/{branch_name}" for branch_name in DEFAULT_BRANCH_NAMES
+    )
+    candidates = remote_candidates + (DEFAULT_BRANCH_NAMES if allow_local else ())
+    for candidate in candidates:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", candidate],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return candidate, candidates
+    return None, candidates
+
+
+def create_worktree(
+    repo_dir: str, worktree_path: Path, branch_name: str
+) -> tuple[bool, str | None]:
+    """Create an untracked branch worktree from the current upstream base.
+
+    When the upstream remote is configured, fetch it and require one of its
+    default-branch refs. Without that remote, preserve the current checkout
+    behavior by starting from ``HEAD``. The registered checkout is not moved.
 
     Args:
         repo_dir: Path to the main git repository.
@@ -21,21 +55,87 @@ def create_worktree(repo_dir: str, worktree_path: Path, branch_name: str) -> boo
         branch_name: Name for the new branch.
 
     Returns:
-        True on success, False on failure.
+        (True, None) on success, or (False, error detail) on failure.
     """
     try:
-        result = subprocess.run(
-            ["git", "worktree", "add", str(worktree_path), "-b", branch_name],
+        remote_result = subprocess.run(
+            ["git", "remote"],
             cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if remote_result.returncode != 0:
+            detail = remote_result.stderr.strip() or f"exit code {remote_result.returncode}"
+            error = f"git remote failed: {detail}"
+            logger.error(error)
+            return False, error
+
+        remote_names = {
+            name.strip() for name in remote_result.stdout.splitlines() if name.strip()
+        }
+        if UPSTREAM_REMOTE in remote_names:
+            try:
+                fetch_result = subprocess.run(
+                    ["git", "fetch", UPSTREAM_REMOTE],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_FETCH_TIMEOUT_SEC,
+                )
+            except subprocess.TimeoutExpired:
+                error = (
+                    f"git fetch {UPSTREAM_REMOTE} timed out after "
+                    f"{GIT_FETCH_TIMEOUT_SEC} seconds"
+                )
+                logger.error(error)
+                return False, error
+            if fetch_result.returncode != 0:
+                detail = fetch_result.stderr.strip() or f"exit code {fetch_result.returncode}"
+                error = f"git fetch {UPSTREAM_REMOTE} failed: {detail}"
+                logger.error(error)
+                return False, error
+
+            base_ref, candidates = _resolve_default_branch(repo_dir, allow_local=False)
+            if base_ref is None:
+                attempted = ", ".join(candidates)
+                error = (
+                    f"upstream default branch resolution failed after git fetch "
+                    f"{UPSTREAM_REMOTE}: no candidate exists ({attempted})"
+                )
+                logger.error(error)
+                return False, error
+        else:
+            base_ref = "HEAD"
+
+        result = subprocess.run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                branch_name,
+                str(worktree_path),
+                base_ref,
+            ],
+            cwd=repo_dir,
+            capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            logger.error(f"git worktree add failed (exit {result.returncode})")
-            return False
-        return True
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            error = f"git worktree add failed: {detail}"
+            logger.error(error)
+            return False, error
+        return True, None
     except FileNotFoundError:
-        logger.error("git command not found")
-        return False
+        error = "git command not found"
+        logger.error(error)
+        return False, error
+    except subprocess.SubprocessError as err:
+        error = f"git worktree creation failed: {err}"
+        logger.error(error)
+        return False, error
 
 
 def is_dirty(repo_dir: str) -> bool:
@@ -270,7 +370,7 @@ def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
 
 
 def get_diff_stat(worktree_path: str) -> str:
-    """Get diff stat output comparing worktree branch to main/master.
+    """Get diff stat output against the upstream-preferred default branch.
 
     Args:
         worktree_path: Path to the git worktree.
@@ -278,24 +378,25 @@ def get_diff_stat(worktree_path: str) -> str:
     Returns:
         The diff --stat output as a string, or empty string on error.
     """
-    # Try main first, fall back to master
-    for base in ("main", "master"):
-        try:
-            result = subprocess.run(
-                ["git", "diff", "--stat", f"{base}...HEAD"],
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (FileNotFoundError, subprocess.SubprocessError):
-            pass
+    try:
+        base_ref, _candidates = _resolve_default_branch(worktree_path, allow_local=True)
+        if base_ref is None:
+            return ""
+        result = subprocess.run(
+            ["git", "diff", "--stat", f"{base_ref}...HEAD"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
     return ""
 
 
 def get_diff_numstat(worktree_path: str) -> str:
-    """Get diff numstat output comparing worktree to main/master.
+    """Get diff numstat output against the upstream-preferred default branch.
 
     Args:
         worktree_path: Path to the git worktree.
@@ -303,18 +404,20 @@ def get_diff_numstat(worktree_path: str) -> str:
     Returns:
         The diff --numstat output as a string, or empty string on error.
     """
-    for base in ("main", "master"):
-        try:
-            result = subprocess.run(
-                ["git", "diff", "--numstat", base],
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (FileNotFoundError, subprocess.SubprocessError):
-            pass
+    try:
+        base_ref, _candidates = _resolve_default_branch(worktree_path, allow_local=True)
+        if base_ref is None:
+            return ""
+        result = subprocess.run(
+            ["git", "diff", "--numstat", base_ref],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
     return ""
 
 

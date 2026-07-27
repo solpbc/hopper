@@ -3,6 +3,7 @@
 
 """Tests for the git utilities module."""
 
+import os
 import shutil
 import subprocess
 from unittest.mock import MagicMock, call, patch
@@ -10,6 +11,8 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from hopper.git import (
+    GIT_FETCH_TIMEOUT_SEC,
+    _resolve_default_branch,
     commit_all,
     create_worktree,
     current_branch,
@@ -24,23 +27,34 @@ from hopper.git import (
 )
 
 
-def _run_git(repo_dir, *args):
+@pytest.fixture(autouse=True)
+def isolate_git_config(monkeypatch):
+    """Keep real-git tests independent of user and system configuration."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+
+
+def _run_git(repo_dir, *args, check=True):
     return subprocess.run(
         ["git", *args],
         cwd=repo_dir,
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
     )
 
 
-def _init_git_repo(tmp_path):
+def _init_git_repo(tmp_path, *, name="repo", branch="main", bare=False):
     if shutil.which("git") is None:
         pytest.skip("git not on PATH")
 
-    repo_dir = tmp_path / "repo"
+    repo_dir = tmp_path / name
+    if bare:
+        _run_git(tmp_path, "init", "--bare", "-b", branch, str(repo_dir))
+        return repo_dir
+
     repo_dir.mkdir()
-    _run_git(repo_dir, "init")
+    _run_git(repo_dir, "init", "-b", branch)
     _run_git(repo_dir, "config", "user.email", "test@example.com")
     _run_git(repo_dir, "config", "user.name", "Test User")
     (repo_dir / "README.md").write_text("init\n")
@@ -49,34 +63,106 @@ def _init_git_repo(tmp_path):
     return repo_dir
 
 
+@pytest.fixture
+def stale_clone_factory(tmp_path):
+    """Create a local clone whose upstream branch has advanced by one commit."""
+
+    def create(branch):
+        remote = _init_git_repo(
+            tmp_path,
+            name=f"{branch}-remote.git",
+            branch=branch,
+            bare=True,
+        )
+        publisher = tmp_path / f"{branch}-publisher"
+        _run_git(tmp_path, "clone", str(remote), str(publisher))
+        _run_git(publisher, "config", "user.email", "test@example.com")
+        _run_git(publisher, "config", "user.name", "Test User")
+        (publisher / "README.md").write_text("initial\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "initial")
+        _run_git(publisher, "push", "-u", "origin", branch)
+
+        registered = tmp_path / f"{branch}-registered"
+        _run_git(tmp_path, "clone", str(remote), str(registered))
+        _run_git(registered, "config", "user.email", "test@example.com")
+        _run_git(registered, "config", "user.name", "Test User")
+        local_sha = _run_git(registered, "rev-parse", "HEAD").stdout.strip()
+
+        (publisher / "upstream.txt").write_text("upstream\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "advance upstream")
+        _run_git(publisher, "push", "origin", branch)
+        upstream_sha = _run_git(publisher, "rev-parse", "HEAD").stdout.strip()
+
+        return registered, local_sha, upstream_sha
+
+    return create
+
+
 class TestCreateWorktree:
     def test_success(self, tmp_path):
-        """Creates worktree with correct git command."""
+        """Fetches origin and creates an untracked worktree from its first default ref."""
         worktree_path = tmp_path / "worktree"
-        mock_result = MagicMock()
-        mock_result.returncode = 0
+        remote_result = MagicMock(returncode=0, stdout="origin\n")
+        fetch_result = MagicMock(returncode=0)
+        resolve_result = MagicMock(returncode=0, stdout="abc123\n")
+        add_result = MagicMock(returncode=0)
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
+        with patch(
+            "subprocess.run",
+            side_effect=[remote_result, fetch_result, resolve_result, add_result],
+        ) as mock_run:
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
-        assert result is True
-        mock_run.assert_called_once_with(
-            ["git", "worktree", "add", str(worktree_path), "-b", "hopper-abc12345"],
-            cwd="/repo",
-            text=True,
-        )
+        assert result == (True, None)
+        assert mock_run.call_args_list == [
+            call(
+                ["git", "remote"],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                ["git", "fetch", "origin"],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+                timeout=GIT_FETCH_TIMEOUT_SEC,
+            ),
+            call(
+                ["git", "rev-parse", "--verify", "origin/main"],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    "hopper-abc12345",
+                    str(worktree_path),
+                    "origin/main",
+                ],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+        ]
 
     def test_failure_returns_false(self, tmp_path):
-        """Returns False when git command fails."""
+        """Returns the captured detail when git worktree add fails."""
         worktree_path = tmp_path / "worktree"
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = "fatal: already exists"
+        remote_result = MagicMock(returncode=0, stdout="")
+        add_result = MagicMock(returncode=1, stderr="fatal: already exists")
 
-        with patch("subprocess.run", return_value=mock_result):
+        with patch("subprocess.run", side_effect=[remote_result, add_result]):
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
-        assert result is False
+        assert result == (False, "git worktree add failed: fatal: already exists")
 
     def test_git_not_found(self, tmp_path):
         """Returns False when git is not installed."""
@@ -85,7 +171,328 @@ class TestCreateWorktree:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
-        assert result is False
+        assert result == (False, "git command not found")
+
+    def test_uses_origin_master_when_main_is_missing(self, tmp_path):
+        worktree_path = tmp_path / "worktree"
+        results = [
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0),
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+            MagicMock(returncode=0),
+        ]
+
+        with patch("subprocess.run", side_effect=results) as mock_run:
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (True, None)
+        assert mock_run.call_args_list[-2:] == [
+            call(
+                ["git", "rev-parse", "--verify", "origin/master"],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    "hopper-abc12345",
+                    str(worktree_path),
+                    "origin/master",
+                ],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+        ]
+
+    def test_without_origin_uses_head_without_fetch(self, tmp_path):
+        worktree_path = tmp_path / "worktree"
+        remote_result = MagicMock(returncode=0, stdout="upstream\n")
+        add_result = MagicMock(returncode=0)
+
+        with patch("subprocess.run", side_effect=[remote_result, add_result]) as mock_run:
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (True, None)
+        assert mock_run.call_args_list[-1] == call(
+            [
+                "git",
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                "hopper-abc12345",
+                str(worktree_path),
+                "HEAD",
+            ],
+            cwd="/repo",
+            capture_output=True,
+            text=True,
+        )
+        assert not any(
+            args[0][:2] == ["git", "fetch"]
+            for args, _kwargs in mock_run.call_args_list
+        )
+
+    def test_git_remote_failure_is_hard_failure(self, tmp_path):
+        worktree_path = tmp_path / "worktree"
+        remote_result = MagicMock(returncode=128, stderr="fatal: not a git repository")
+
+        with patch("subprocess.run", return_value=remote_result) as mock_run:
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (False, "git remote failed: fatal: not a git repository")
+        assert mock_run.call_count == 1
+
+    def test_fetch_failure_returns_detail_before_resolution_or_add(self, tmp_path):
+        worktree_path = tmp_path / "worktree"
+        results = [
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=128, stderr="fatal: unavailable"),
+        ]
+
+        with patch("subprocess.run", side_effect=results) as mock_run:
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (False, "git fetch origin failed: fatal: unavailable")
+        assert mock_run.call_count == 2
+
+    def test_fetch_timeout_returns_detail_before_resolution_or_add(self, tmp_path):
+        worktree_path = tmp_path / "worktree"
+        remote_result = MagicMock(returncode=0, stdout="origin\n")
+
+        with patch(
+            "subprocess.run",
+            side_effect=[
+                remote_result,
+                subprocess.TimeoutExpired(["git", "fetch", "origin"], GIT_FETCH_TIMEOUT_SEC),
+            ],
+        ) as mock_run:
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (False, "git fetch origin timed out after 120 seconds")
+        assert mock_run.call_count == 2
+
+    def test_resolution_failure_returns_detail_before_add(self, tmp_path):
+        worktree_path = tmp_path / "worktree"
+        results = [
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0),
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=128, stdout=""),
+        ]
+
+        with patch("subprocess.run", side_effect=results) as mock_run:
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (
+            False,
+            "upstream default branch resolution failed after git fetch origin: "
+            "no candidate exists (origin/main, origin/master)",
+        )
+        assert mock_run.call_count == 4
+
+
+class TestCreateWorktreeIntegration:
+    def test_fetches_stale_origin_main(self, tmp_path, stale_clone_factory):
+        registered, local_sha, upstream_sha = stale_clone_factory("main")
+        worktree_path = tmp_path / "main-worktree"
+
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-stale-main"
+        )
+
+        assert (created, error) == (True, None)
+        assert _run_git(worktree_path, "rev-parse", "HEAD").stdout.strip() == upstream_sha
+        assert _run_git(registered, "rev-parse", "HEAD").stdout.strip() == local_sha
+
+    def test_leaves_registered_checkout_unchanged(self, tmp_path, stale_clone_factory):
+        registered, _local_sha, _upstream_sha = stale_clone_factory("main")
+        branch_before = _run_git(registered, "branch", "--show-current").stdout
+        head_before = _run_git(registered, "rev-parse", "HEAD").stdout
+        status_before = _run_git(registered, "status", "--porcelain").stdout
+        worktree_path = tmp_path / "unchanged-worktree"
+
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-unchanged"
+        )
+
+        assert (created, error) == (True, None)
+        assert _run_git(registered, "branch", "--show-current").stdout == branch_before
+        assert _run_git(registered, "rev-parse", "HEAD").stdout == head_before
+        assert _run_git(registered, "status", "--porcelain").stdout == status_before
+
+    def test_fetches_origin_master(self, tmp_path, stale_clone_factory):
+        registered, local_sha, upstream_sha = stale_clone_factory("master")
+        worktree_path = tmp_path / "master-worktree"
+
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-stale-master"
+        )
+
+        assert (created, error) == (True, None)
+        assert _run_git(worktree_path, "rev-parse", "HEAD").stdout.strip() == upstream_sha
+        assert _run_git(registered, "rev-parse", "HEAD").stdout.strip() == local_sha
+
+    def test_without_origin_uses_current_head(self, tmp_path):
+        registered = _init_git_repo(tmp_path, branch="topic")
+        expected_sha = _run_git(registered, "rev-parse", "HEAD").stdout.strip()
+        worktree_path = tmp_path / "topic-worktree"
+
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-no-origin"
+        )
+
+        assert (created, error) == (True, None)
+        assert _run_git(worktree_path, "rev-parse", "HEAD").stdout.strip() == expected_sha
+
+    def test_fetch_failure_leaves_no_worktree_or_branch(
+        self, tmp_path, stale_clone_factory
+    ):
+        registered, _local_sha, _upstream_sha = stale_clone_factory("main")
+        missing_remote = tmp_path / "missing.git"
+        _run_git(registered, "remote", "set-url", "origin", str(missing_remote))
+        worktree_path = tmp_path / "fetch-failure-worktree"
+        branch_name = "hopper-fetch-failure"
+
+        created, error = create_worktree(str(registered), worktree_path, branch_name)
+
+        assert created is False
+        assert error is not None
+        assert error.startswith("git fetch origin failed:")
+        assert not worktree_path.exists()
+        assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+
+    def test_resolution_failure_leaves_no_worktree_or_branch(
+        self, tmp_path, stale_clone_factory
+    ):
+        registered, _local_sha, _upstream_sha = stale_clone_factory("develop")
+        worktree_path = tmp_path / "resolve-failure-worktree"
+        branch_name = "hopper-resolve-failure"
+
+        created, error = create_worktree(str(registered), worktree_path, branch_name)
+
+        assert created is False
+        assert error == (
+            "upstream default branch resolution failed after git fetch origin: "
+            "no candidate exists (origin/main, origin/master)"
+        )
+        assert not worktree_path.exists()
+        assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+
+    def test_diff_helpers_use_origin_main_when_local_main_is_behind(
+        self, tmp_path, stale_clone_factory
+    ):
+        registered, local_sha, _upstream_sha = stale_clone_factory("main")
+        worktree_path = tmp_path / "diff-worktree"
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-diff-base"
+        )
+
+        assert (created, error) == (True, None)
+        assert _run_git(registered, "rev-parse", "main").stdout.strip() == local_sha
+        assert get_diff_stat(str(worktree_path)) == ""
+        assert get_diff_numstat(str(worktree_path)) == ""
+
+    def test_diff_helpers_report_only_feature_changes_from_origin_main(
+        self, tmp_path, stale_clone_factory
+    ):
+        registered, _local_sha, _upstream_sha = stale_clone_factory("main")
+        worktree_path = tmp_path / "feature-diff-worktree"
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-feature-diff"
+        )
+        assert (created, error) == (True, None)
+        (worktree_path / "feature.txt").write_text("feature\n")
+        _run_git(worktree_path, "add", ".")
+        _run_git(worktree_path, "commit", "-m", "feature")
+
+        assert "feature.txt" in get_diff_stat(str(worktree_path))
+        numstat = get_diff_numstat(str(worktree_path))
+        assert "feature.txt" in numstat
+        assert "upstream.txt" not in numstat
+
+    def test_diff_helpers_fall_back_to_local_default_without_remote_refs(self, tmp_path):
+        registered = _init_git_repo(tmp_path)
+        worktree_path = tmp_path / "local-diff-worktree"
+        created, error = create_worktree(
+            str(registered), worktree_path, "hopper-local-diff"
+        )
+        assert (created, error) == (True, None)
+
+        assert get_diff_stat(str(worktree_path)) == ""
+        assert get_diff_numstat(str(worktree_path)) == ""
+
+
+class TestResolveDefaultBranch:
+    def test_prefers_origin_main(self):
+        result = MagicMock(returncode=0, stdout="abc123\n")
+
+        with patch("subprocess.run", return_value=result) as mock_run:
+            resolved, candidates = _resolve_default_branch("/repo", allow_local=True)
+
+        assert resolved == "origin/main"
+        assert candidates == ("origin/main", "origin/master", "main", "master")
+        mock_run.assert_called_once()
+
+    def test_falls_back_to_origin_master(self):
+        results = [
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+        ]
+
+        with patch("subprocess.run", side_effect=results) as mock_run:
+            resolved, candidates = _resolve_default_branch("/repo", allow_local=False)
+
+        assert resolved == "origin/master"
+        assert candidates == ("origin/main", "origin/master")
+        assert [item.args[0][-1] for item in mock_run.call_args_list] == [
+            "origin/main",
+            "origin/master",
+        ]
+
+    def test_falls_back_to_local_main_when_allowed(self):
+        results = [
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+        ]
+
+        with patch("subprocess.run", side_effect=results):
+            resolved, candidates = _resolve_default_branch("/repo", allow_local=True)
+
+        assert resolved == "main"
+        assert candidates == ("origin/main", "origin/master", "main", "master")
+
+    def test_falls_back_to_local_master(self):
+        results = [
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=128, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+        ]
+
+        with patch("subprocess.run", side_effect=results):
+            resolved, candidates = _resolve_default_branch("/repo", allow_local=True)
+
+        assert resolved == "master"
+        assert candidates == ("origin/main", "origin/master", "main", "master")
+
+    def test_remote_only_does_not_probe_local_refs(self):
+        result = MagicMock(returncode=128, stdout="")
+
+        with patch("subprocess.run", return_value=result) as mock_run:
+            resolved, candidates = _resolve_default_branch("/repo", allow_local=False)
+
+        assert resolved is None
+        assert candidates == ("origin/main", "origin/master")
+        assert mock_run.call_count == 2
 
 
 class TestIsDirty:
@@ -174,57 +581,73 @@ class TestCurrentBranch:
 
 class TestGetDiffStat:
     def test_returns_stat_output_for_main(self):
-        """Returns diff --stat output when comparing to main."""
+        """Returns diff --stat output for the resolved upstream base."""
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = (
             " file.py | 10 ++++------\n 1 file changed, 4 insertions(+), 6 deletions(-)\n"
         )
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/main", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=mock_result) as mock_run,
+        ):
             result = get_diff_stat("/worktree")
 
         assert "file.py" in result
         assert "++++------" in result
         mock_run.assert_called_with(
-            ["git", "diff", "--stat", "main...HEAD"],
+            ["git", "diff", "--stat", "origin/main...HEAD"],
             cwd="/worktree",
             capture_output=True,
             text=True,
         )
 
     def test_falls_back_to_master(self):
-        """Falls back to master when main doesn't exist."""
-        main_result = MagicMock()
-        main_result.returncode = 128  # main doesn't exist
-
+        """Uses the fallback returned by default-branch resolution."""
         master_result = MagicMock()
         master_result.returncode = 0
         master_result.stdout = " file.py | 5 +++++\n"
 
-        def mock_run(cmd, **kwargs):
-            if "main...HEAD" in cmd:
-                return main_result
-            return master_result
-
-        with patch("subprocess.run", side_effect=mock_run):
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/master", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=master_result) as mock_run,
+        ):
             result = get_diff_stat("/worktree")
 
         assert "file.py" in result
+        mock_run.assert_called_once_with(
+            ["git", "diff", "--stat", "origin/master...HEAD"],
+            cwd="/worktree",
+            capture_output=True,
+            text=True,
+        )
 
     def test_returns_empty_on_error(self):
-        """Returns empty string when both main and master fail."""
+        """Returns empty string when the diff command fails."""
         mock_result = MagicMock()
         mock_result.returncode = 128
 
-        with patch("subprocess.run", return_value=mock_result):
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/main", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=mock_result),
+        ):
             result = get_diff_stat("/worktree")
 
         assert result == ""
 
     def test_returns_empty_when_git_not_found(self):
         """Returns empty string when git is not found."""
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        with patch("hopper.git._resolve_default_branch", side_effect=FileNotFoundError):
             result = get_diff_stat("/worktree")
 
         assert result == ""
@@ -235,65 +658,107 @@ class TestGetDiffStat:
         mock_result.returncode = 0
         mock_result.stdout = ""
 
-        with patch("subprocess.run", return_value=mock_result):
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/main", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=mock_result),
+        ):
             result = get_diff_stat("/worktree")
 
         assert result == ""
 
+    def test_returns_empty_when_no_default_branch_resolves(self):
+        with (
+            patch("hopper.git._resolve_default_branch", return_value=(None, ())),
+            patch("subprocess.run") as mock_run,
+        ):
+            result = get_diff_stat("/worktree")
+
+        assert result == ""
+        mock_run.assert_not_called()
+
 
 class TestGetDiffNumstat:
     def test_returns_numstat_output_for_main(self):
-        """Returns diff --numstat output when comparing to main."""
+        """Returns diff --numstat output for the resolved upstream base."""
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "10\t6\tfile.py\n"
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/main", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=mock_result) as mock_run,
+        ):
             result = get_diff_numstat("/worktree")
 
         assert "file.py" in result
         mock_run.assert_called_with(
-            ["git", "diff", "--numstat", "main"],
+            ["git", "diff", "--numstat", "origin/main"],
             cwd="/worktree",
             capture_output=True,
             text=True,
         )
 
     def test_falls_back_to_master(self):
-        """Falls back to master when main doesn't exist."""
-        main_result = MagicMock()
-        main_result.returncode = 128
-
+        """Uses the fallback returned by default-branch resolution."""
         master_result = MagicMock()
         master_result.returncode = 0
         master_result.stdout = "5\t0\tfile.py\n"
 
-        def mock_run(cmd, **kwargs):
-            if "main" in cmd:
-                return main_result
-            return master_result
-
-        with patch("subprocess.run", side_effect=mock_run):
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/master", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=master_result) as mock_run,
+        ):
             result = get_diff_numstat("/worktree")
 
         assert "file.py" in result
+        mock_run.assert_called_once_with(
+            ["git", "diff", "--numstat", "origin/master"],
+            cwd="/worktree",
+            capture_output=True,
+            text=True,
+        )
 
     def test_returns_empty_on_error(self):
-        """Returns empty string when both main and master fail."""
+        """Returns empty string when the diff command fails."""
         mock_result = MagicMock()
         mock_result.returncode = 128
 
-        with patch("subprocess.run", return_value=mock_result):
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/main", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=mock_result),
+        ):
             result = get_diff_numstat("/worktree")
 
         assert result == ""
 
     def test_returns_empty_when_git_not_found(self):
         """Returns empty string when git is not installed."""
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        with patch("hopper.git._resolve_default_branch", side_effect=FileNotFoundError):
             result = get_diff_numstat("/worktree")
 
         assert result == ""
+
+    def test_returns_empty_when_no_default_branch_resolves(self):
+        with (
+            patch("hopper.git._resolve_default_branch", return_value=(None, ())),
+            patch("subprocess.run") as mock_run,
+        ):
+            result = get_diff_numstat("/worktree")
+
+        assert result == ""
+        mock_run.assert_not_called()
 
 
 class TestRemoveWorktree:
@@ -697,7 +1162,7 @@ class TestRemoveWorktreeIntegration:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         subprocess.run(
-            ["git", "init"],
+            ["git", "init", "-b", "main"],
             cwd=repo_dir,
             check=True,
             capture_output=True,

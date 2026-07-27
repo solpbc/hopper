@@ -432,8 +432,13 @@ class ProcessRunner(BaseRunner):
                 slug = slugify(self.lode_title)
                 branch_name = f"hopper-{self.lode_id}-{slug}" if slug else f"hopper-{self.lode_id}"
             self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
-            if not create_worktree(self.project_dir, self.worktree_path, branch_name):
-                self._setup_error = "Failed to create git worktree."
+            worktree_created, create_detail = create_worktree(
+                self.project_dir, self.worktree_path, branch_name
+            )
+            if not worktree_created:
+                self._setup_error = (
+                    f"Failed to create git worktree: {create_detail or 'unknown error'}"
+                )
                 print(self._setup_error)
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1

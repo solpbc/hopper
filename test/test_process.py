@@ -83,6 +83,8 @@ def _mock_conn(emitted=None):
 @pytest.fixture(autouse=True)
 def mock_worker_oom_boundary(monkeypatch):
     """Never touch the host's procfs/cgroup state from process tests."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
     monkeypatch.setattr(
         oom,
         "arm_worker",
@@ -92,23 +94,27 @@ def mock_worker_oom_boundary(monkeypatch):
     monkeypatch.setattr("hopper.process._sum_process_tree_io_chars", lambda _pid: None)
 
 
-def _run_git(repo_dir, *args):
+def _run_git(repo_dir, *args, check=True):
     return subprocess.run(
         ["git", *args],
         cwd=repo_dir,
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
     )
 
 
-def _init_git_repo(tmp_path):
+def _init_git_repo(tmp_path, *, name="repo", branch="main", bare=False):
     if shutil.which("git") is None:
         pytest.skip("git not on PATH")
 
-    repo_dir = tmp_path / "repo"
+    repo_dir = tmp_path / name
+    if bare:
+        _run_git(tmp_path, "init", "--bare", "-b", branch, str(repo_dir))
+        return repo_dir
+
     repo_dir.mkdir()
-    _run_git(repo_dir, "init")
+    _run_git(repo_dir, "init", "-b", branch)
     _run_git(repo_dir, "config", "user.email", "test@example.com")
     _run_git(repo_dir, "config", "user.name", "Test User")
     (repo_dir / "README.md").write_text("init\n")
@@ -912,6 +918,37 @@ class TestRefineStage:
         mock_project = MagicMock(path=str(project_dir))
         return session_dir, project_dir, mock_project
 
+    def _setup_git_refine(self, tmp_path, *, branch, broken_origin=False):
+        """Set up refine with a local bare origin and a real registered checkout."""
+        remote = _init_git_repo(
+            tmp_path,
+            name="origin.git",
+            branch=branch,
+            bare=True,
+        )
+        publisher = tmp_path / "publisher"
+        _run_git(tmp_path, "clone", str(remote), str(publisher))
+        _run_git(publisher, "config", "user.email", "test@example.com")
+        _run_git(publisher, "config", "user.name", "Test User")
+        (publisher / "README.md").write_text("initial\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "initial")
+        _run_git(publisher, "push", "-u", "origin", branch)
+
+        project_dir = tmp_path / "my-project"
+        _run_git(tmp_path, "clone", str(remote), str(project_dir))
+        if broken_origin:
+            _run_git(
+                project_dir,
+                "remote",
+                "set-url",
+                "origin",
+                str(tmp_path / "missing.git"),
+            )
+        session_dir = tmp_path / "lodes" / "test-id"
+        session_dir.mkdir(parents=True)
+        return session_dir, project_dir, MagicMock(path=str(project_dir))
+
     def test_first_run_bootstraps_codex_then_runs_claude(self, tmp_path):
         """First run bootstraps Codex then runs Claude with refine prompt."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
@@ -928,7 +965,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch(
                 "hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)
@@ -964,7 +1001,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process._has_makefile", return_value=True),
             patch("hopper.process._make_install_target", return_value="install"),
             patch("hopper.process._run_make_install", return_value=(True, None)),
@@ -998,7 +1035,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process._has_makefile", return_value=True),
             patch("hopper.process._make_install_target", return_value="hopper-install"),
             patch("hopper.process._run_make_install", return_value=(True, None)) as mock_install,
@@ -1031,7 +1068,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process._has_makefile", return_value=True),
             patch(
                 "hopper.process._run_make_install",
@@ -1069,7 +1106,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process._has_makefile", return_value=False),
             patch("hopper.process._run_make_install") as mock_make_install,
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
@@ -1266,7 +1303,10 @@ class TestRefineStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=False),
+            patch(
+                "hopper.process.create_worktree",
+                return_value=(False, "git fetch origin failed: fatal: unavailable"),
+            ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -1276,9 +1316,77 @@ class TestRefineStage:
             "lode_set_state",
             lode_id="test-id",
             state="error",
-            status="Failed to create git worktree.",
+            status=(
+                "Failed to create git worktree: "
+                "git fetch origin failed: fatal: unavailable"
+            ),
         )
         MockConn.return_value.stop.assert_called_once()
+
+    def test_fetch_failure_sets_specific_error_without_git_side_effects(self, tmp_path):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_git_refine(
+            tmp_path, branch="main", broken_origin=True
+        )
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", project="my-project"),
+            ),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
+        ):
+            assert runner.run() == 0
+
+        error_updates = [
+            item.kwargs
+            for item in MockConn.return_value.emit.call_args_list
+            if item.args == ("lode_set_state",) and item.kwargs.get("state") == "error"
+        ]
+        assert len(error_updates) == 1
+        assert error_updates[0]["status"].startswith(
+            "Failed to create git worktree: git fetch origin failed:"
+        )
+        assert not get_worktree_dir("test-id").exists()
+        assert (
+            _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
+        )
+
+    def test_resolution_failure_sets_specific_error_without_git_side_effects(self, tmp_path):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        session_dir, project_dir, mock_project = self._setup_git_refine(
+            tmp_path, branch="develop"
+        )
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="refine", project="my-project"),
+            ),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.get_lode_dir", return_value=session_dir),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
+            patch("hopper.runner.get_current_pane_id", return_value="%0"),
+        ):
+            assert runner.run() == 0
+
+        MockConn.return_value.emit.assert_any_call(
+            "lode_set_state",
+            lode_id="test-id",
+            state="error",
+            status=(
+                "Failed to create git worktree: upstream default branch resolution "
+                "failed after git fetch origin: no candidate exists "
+                "(origin/main, origin/master)"
+            ),
+        )
+        assert not get_worktree_dir("test-id").exists()
+        assert (
+            _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
+        )
 
     def test_fails_if_input_missing_on_first_run(self, tmp_path):
         """Missing mill input emits error and exits 0."""
@@ -1292,7 +1400,7 @@ class TestRefineStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -1319,7 +1427,7 @@ class TestRefineStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(1, None, None)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
@@ -1350,7 +1458,7 @@ class TestRefineStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(1, None, message)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
@@ -1379,7 +1487,7 @@ class TestRefineStage:
             ),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(124, None, None)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
@@ -1409,7 +1517,7 @@ class TestRefineStage:
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=True),
+            patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
             patch("hopper.process.bootstrap_codex", return_value=(0, "thread-123", None)),
             patch("hopper.process.set_codex_thread_id", return_value=True),
