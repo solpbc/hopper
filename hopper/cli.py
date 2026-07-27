@@ -9,7 +9,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -28,7 +27,7 @@ from hopper.lodes import (
     lode_status_for_display,
     lode_with_status_annotations,
 )
-from hopper.tmux import capture_pane, paste_buffer, send_keys
+from hopper.tmux import capture_pane
 
 logger = logging.getLogger(__name__)
 
@@ -1689,43 +1688,6 @@ def _tail_text(text: str, lines: int = 10) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
-def _submission_tail(text: str) -> str:
-    """Return a small tail used to check whether pasted input remains pending."""
-    compact = " ".join(text.strip().split())
-    return compact[-80:] if compact else ""
-
-
-def _pane_has_pending_text(pane_text: str | None, submitted_text: str) -> bool:
-    """Heuristic for whether submitted text still appears on the input line."""
-    if not pane_text:
-        return False
-    tail = _submission_tail(submitted_text)
-    if not tail:
-        return False
-    compact_tail = " ".join(_tail_text(pane_text, 5).split())
-    return tail in compact_tail
-
-
-def _submit_to_pane(target: str, text: str, *, paste: bool = True) -> tuple[bool, str]:
-    """Submit text to a tmux pane and return (submitted, post-submit tail)."""
-    before = capture_pane(target, plain=True)
-    if before is None:
-        return False, f"pane {target} no longer exists"
-    delivered = paste_buffer(target, text) if paste else send_keys(target, text)
-    if not delivered:
-        return False, f"failed to deliver text to {target}"
-    send_keys(target, "Enter")
-    time.sleep(2)
-    after = capture_pane(target, plain=True)
-    if not _pane_has_pending_text(after, text):
-        return True, _tail_text(after or "", 10)
-    send_keys(target, "Enter")
-    time.sleep(0.2)
-    retry_after = capture_pane(target, plain=True)
-    submitted = not _pane_has_pending_text(retry_after, text)
-    return submitted, _tail_text(retry_after or after or "", 10)
-
-
 def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
@@ -2260,15 +2222,15 @@ def cmd_lode(args: list[str]) -> int:
                 remote_args.append(parsed.choice)
             return _run_remote_cli(lode["host"], remote_args, reason=f"lode {lode['id']}")
 
-        pane = lode.get("tmux_pane")
-        pane_text = capture_pane(pane, plain=True) if pane else None
-        if pane_text is None:
-            print(
-                f"pane {pane or '<unknown>'} no longer exists "
-                f"(lode active={lode.get('active')}, state={lode.get('state')})"
-            )
-            return 1
         if subcommand == "peek":
+            pane = lode.get("tmux_pane")
+            pane_text = capture_pane(pane, plain=True) if pane else None
+            if pane_text is None:
+                print(
+                    f"pane {pane or '<unknown>'} no longer exists "
+                    f"(lode active={lode.get('active')}, state={lode.get('state')})"
+                )
+                return 1
             lines = max(1, parsed.lines)
             print("\n".join(pane_text.splitlines()[-lines:]))
             return 0
@@ -2276,13 +2238,30 @@ def cmd_lode(args: list[str]) -> int:
             print("choice must be a digit 1..9")
             return 1
         text = parsed.text if subcommand == "nudge" else parsed.choice
-        submitted, tail = _submit_to_pane(pane, text, paste=subcommand == "nudge")
-        print("submitted" if submitted else "not submitted")
-        if tail:
-            print("--- pane tail ---")
-            print(tail)
-            print("--- end pane tail ---")
-        return 0 if submitted else 1
+        response = client.send_pane_input(
+            socket_path,
+            lode["id"],
+            text,
+            paste=subcommand == "nudge",
+        )
+        if response and response.get("type") == "pane_input_sent":
+            print("submitted")
+            return 0
+
+        if response is None:
+            error = (
+                "The pane-input request returned no response. The delivery outcome is unknown. "
+                f"Inspect with `hop lode peek {lode['id']}` before deciding whether to retry; "
+                "do not resend blindly."
+            )
+        else:
+            error = response.get("error", "Pane input failed without a recovery message.")
+        print(error, file=sys.stderr)
+        if response and response.get("outcome") == "unverified" and response.get("tail"):
+            print("--- pane tail ---", file=sys.stderr)
+            print(response["tail"], file=sys.stderr)
+            print("--- end pane tail ---", file=sys.stderr)
+        return 1
 
     if subcommand in ("status", "show"):
         lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)

@@ -519,6 +519,28 @@ def send_gate_feedback(
     )
 
 
+def send_pane_input(
+    socket_path: Path,
+    lode_id: str,
+    text: str,
+    *,
+    paste: bool,
+    timeout: float = 15.0,
+) -> dict | None:
+    """Send operator input to a lode pane. Returns the server response dict."""
+    return send_message(
+        socket_path,
+        {
+            "type": "lode_send_pane_input",
+            "lode_id": lode_id,
+            "text": text,
+            "paste": paste,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
 def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
     """Look up a lode and read its gate.md. Returns None if the lode doesn't exist."""
     from hopper.lodes import get_lode_dir

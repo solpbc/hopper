@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -1541,6 +1541,9 @@ def test_lode_log_happy(temp_config, capsys):
             [
                 "2026-01-01 12:00:00.123 hopper.server INFO Lode test1234 created project=myproj",
                 "2026-01-01 12:00:01.123 hopper.server INFO lode=test1234 state=running",
+                "2026-01-01 12:00:01.456 hopper.server WARNING Pane delivery failed "
+                "lode=test1234 pane=%1 reason=pane_state_unknown "
+                'outcome=pane_state_unknown title="_ Working"',
                 "2026-01-01 12:00:02.123 hopper.server INFO Lode other999 ignored",
             ]
         )
@@ -1553,6 +1556,7 @@ def test_lode_log_happy(temp_config, capsys):
     out = capsys.readouterr().out
     assert "Lode test1234 created" in out
     assert "lode=test1234 state=running" in out
+    assert "reason=pane_state_unknown" in out
     assert "other999" not in out
 
 
@@ -5218,47 +5222,116 @@ def test_lode_peek_plain_text(capsys):
     assert capsys.readouterr().out == "two\nthree\n"
 
 
-def test_lode_nudge_uses_buffer_paste(capsys):
+def test_lode_nudge_routes_through_server(capsys):
     lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            with patch("hopper.cli.capture_pane", side_effect=["prompt", "prompt", "done"]):
-                with patch("hopper.cli.paste_buffer", return_value=True) as mock_paste:
-                    with patch("hopper.cli.send_keys", return_value=True) as mock_send:
-                        with patch("hopper.cli.time.sleep"):
-                            assert cmd_lode(["nudge", "abc123", "--text", "continue"]) == 0
+    response = {"type": "pane_input_sent", "lode_id": "abc123", "tmux_pane": "%1"}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.send_pane_input", return_value=response) as mock_send,
+        patch("hopper.cli.capture_pane") as mock_capture,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--text", "continue"]) == 0
 
-    mock_paste.assert_called_once_with("%1", "continue")
-    assert mock_send.call_args_list[0].args == ("%1", "Enter")
-    assert "submitted" in capsys.readouterr().out
+    mock_send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    mock_capture.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == "submitted\n"
+    assert captured.err == ""
 
 
-def test_lode_answer_restricts_choice(capsys):
+def test_lode_answer_rejects_invalid_choice_before_delivery(capsys):
     lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            with patch("hopper.cli.capture_pane", return_value="prompt"):
-                assert cmd_lode(["answer", "abc123", "10"]) == 1
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.send_pane_input") as mock_send,
+    ):
+        assert cmd_lode(["answer", "abc123", "10"]) == 1
 
+    mock_send.assert_not_called()
     assert "choice must be a digit" in capsys.readouterr().out
 
 
-def test_lode_answer_uses_send_keys_without_buffer_paste(capsys):
+def test_lode_answer_routes_through_server_without_paste(capsys):
     lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            with patch("hopper.cli.capture_pane", side_effect=["prompt", "prompt", "done"]):
-                with patch("hopper.cli.paste_buffer") as mock_paste:
-                    with patch("hopper.cli.send_keys", return_value=True) as mock_send:
-                        with patch("hopper.cli.time.sleep"):
-                            assert cmd_lode(["answer", "abc123", "1"]) == 0
+    response = {"type": "pane_input_sent", "lode_id": "abc123", "tmux_pane": "%1"}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.send_pane_input", return_value=response) as mock_send,
+        patch("hopper.cli.capture_pane") as mock_capture,
+    ):
+        assert cmd_lode(["answer", "abc123", "1"]) == 0
 
-    mock_paste.assert_not_called()
-    assert [call.args for call in mock_send.call_args_list] == [
-        ("%1", "1"),
-        ("%1", "Enter"),
-    ]
-    assert "submitted" in capsys.readouterr().out
+    mock_send.assert_called_once_with(ANY, "abc123", "1", paste=False)
+    mock_capture.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == "submitted\n"
+    assert captured.err == ""
+
+
+def test_lode_pane_input_unverified_prints_framed_tail(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    response = {
+        "type": "error",
+        "outcome": "unverified",
+        "error": "Delivery outcome unknown; inspect pane.",
+        "tail": "first pane line\nlast pane line",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.send_pane_input", return_value=response),
+    ):
+        assert cmd_lode(["nudge", "abc123"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "Delivery outcome unknown; inspect pane.\n"
+        "--- pane tail ---\n"
+        "first pane line\n"
+        "last pane line\n"
+        "--- end pane tail ---\n"
+    )
+
+
+def test_lode_pane_input_non_unverified_hides_tail(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    response = {
+        "type": "error",
+        "outcome": "pane_state_unknown",
+        "error": "Input was not sent; inspect pane.",
+        "tail": "pane content",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.send_pane_input", return_value=response),
+    ):
+        assert cmd_lode(["answer", "abc123", "1"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Input was not sent; inspect pane.\n"
+    assert "submitted" not in captured.err
+
+
+def test_lode_pane_input_missing_response_is_unknown(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.send_pane_input", return_value=None),
+    ):
+        assert cmd_lode(["nudge", "abc123"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "delivery outcome is unknown" in captured.err
+    assert "hop lode peek abc123" in captured.err
+    assert "submitted" not in captured.err
 
 
 def test_lode_restart_allows_force_when_active_pane_dead(capsys):

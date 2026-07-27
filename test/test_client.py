@@ -15,6 +15,7 @@ import pytest
 
 from hopper.client import (
     RUN_GENERATION_ENV,
+    RUNNER_MUTATION_TYPES,
     HopperConnection,
     InvalidServerResponse,
     _exchange_message,
@@ -28,6 +29,7 @@ from hopper.client import (
     read_lode_snapshot,
     send_gate_feedback,
     send_message,
+    send_pane_input,
     set_lode_branch,
     set_lode_progress,
     set_lode_state,
@@ -676,6 +678,34 @@ def test_send_gate_feedback_sends_message(socket_path):
         timeout=15.0,
         wait_for_response=True,
     )
+
+
+def test_send_pane_input_sends_exact_message_with_15_second_timeout(socket_path):
+    response = {"type": "pane_input_sent", "lode_id": "test-id", "tmux_pane": "%1"}
+    with patch("hopper.client.send_message", return_value=response) as mock_send_message:
+        result = send_pane_input(
+            socket_path,
+            "test-id",
+            "continue",
+            paste=True,
+        )
+
+    assert result == response
+    mock_send_message.assert_called_once_with(
+        socket_path,
+        {
+            "type": "lode_send_pane_input",
+            "lode_id": "test-id",
+            "text": "continue",
+            "paste": True,
+        },
+        timeout=15.0,
+        wait_for_response=True,
+    )
+
+
+def test_send_pane_input_is_not_a_runner_mutation():
+    assert "lode_send_pane_input" not in RUNNER_MUTATION_TYPES
 
 
 def test_get_gate_returns_lode_and_doc(socket_path, temp_config):

@@ -275,9 +275,20 @@ Code's one-time workspace-trust prompt ("Do you trust the files in this
 folder?"). The pane shows only the prompt and produces zero output, so
 Hopper's liveness model times it out (~351s) and errors the lode; restarting
 reproduces the same wedge. `hop lode peek <lode-id>` confirms it's the trust
-dialog. Recovery: `hop lode answer <lode-id> 1` (accepts the prompt); the
-lode then proceeds normally, and later lodes on the same project don't hit
-it again.
+dialog. This prompt appears before Claude Code sets a pane title, so Hopper
+cannot recognise the pane state and `hop lode answer` refuses to send — by
+design. Recovery is manual, and only after `peek` has shown you the trust
+prompt itself: attach to the lode's tmux window and press `1`, or read
+`tmux_pane` from `hop lode status <lode-id> --json` and run
+`tmux send-keys -t '<pane-id>' 1`. The lode then proceeds normally, and later
+lodes on the same project don't hit it again.
+
+This is the only case where raw `tmux send-keys` is the documented recovery.
+An unrecognised pane state does **not** mean Claude hasn't started: a live,
+fully-titled Claude Code session can also carry a title Hopper does not know,
+and it may be mid-turn. Never send keys to an unrecognised pane on the
+assumption that nothing is running — confirm with `hop lode peek <lode-id>`
+what is actually on screen first.
 
 **Long output-silent test runs are protected by `hop check` heartbeats.** While
 its child runs, `hop check` emits a socket progress heartbeat every 30 seconds,
@@ -323,6 +334,14 @@ use the recovery primitives:
 
     hop lode nudge <lode-id>
     hop lode answer <lode-id> 1
+
+Both send only when Hopper sees a recognised idle Claude prompt, and report
+success only after observing acceptance. If either reports an unrecognised
+pane state, Hopper did not send anything and it is safe to retry — but do not
+retry in a loop. Inspect with `hop lode peek <lode-id>`: an unrecognised pane
+may be a live session mid-turn, not a stalled one. The workspace-trust prompt
+is the one documented case that needs the manual tmux recovery described
+above.
 
 If the pane shows something you're not comfortable resolving (destructive action,
 ambiguous approval, sensitive operation), leave it for the founder to resolve.
