@@ -474,7 +474,19 @@ def _attempt_pane_delivery(pane_id: str | None, text: str, *, paste: bool) -> di
 
 def _deliver_pane_input(lode_id: str, pane_id: str | None, text: str, *, paste: bool) -> dict:
     """Deliver pane input and emit exactly one outcome record."""
-    result = _attempt_pane_delivery(pane_id, text, paste=paste)
+    try:
+        result = _attempt_pane_delivery(pane_id, text, paste=paste)
+    except Exception:
+        logger.warning(
+            "Pane delivery failed lode=%s pane=%s reason=%s outcome=%s title=%s",
+            lode_id,
+            pane_id or "<unknown>",
+            "delivery_exception",
+            "unverified",
+            _render_observed_title(None),
+        )
+        # delivery_exception is logging-only; no taxonomy response exists because this re-raises.
+        raise
     reason = result["reason"]
     accepted = reason in _ACCEPTED_DELIVERY_REASONS
     outcome = "accepted" if accepted else _DELIVERY_FAILURE_OUTCOMES[reason]

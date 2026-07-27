@@ -4404,6 +4404,29 @@ def test_pane_delivery_logs_exactly_once_for_every_reason(reason, outcome, level
     assert delivered_text not in message
 
 
+def test_pane_delivery_exception_logs_once_without_body_and_propagates(caplog):
+    delivered_text = "DISTINCTIVE_EXCEPTION_BODY_MUST_NOT_BE_LOGGED"
+
+    with (
+        patch("hopper.server.capture_pane", side_effect=OSError("tmux failed")),
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        pytest.raises(OSError, match="tmux failed"),
+    ):
+        hopper_server._deliver_pane_input("test-id", "%1", delivered_text, paste=True)
+
+    records = [record for record in caplog.records if record.name == "hopper.server"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert "lode=test-id" in message
+    assert "pane=%1" in message
+    assert "reason=delivery_exception" in message
+    assert "outcome=unverified" in message
+    assert "title=<no title reported>" in message
+    assert delivered_text not in message
+
+
 def test_render_observed_title_distinguishes_none_and_preserves_verbatim():
     assert hopper_server._render_observed_title(None) == "<no title reported>"
     assert (
