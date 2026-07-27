@@ -17,8 +17,9 @@ test:
 	uv run pytest
 
 ci:
-	ruff format .
-	ruff check --fix .
+	uv run ruff format .
+	uv run ruff check --fix .
+	$(MAKE) test
 
 timing:
 	python3 scripts/timing.py

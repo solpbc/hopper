@@ -39,7 +39,7 @@ CLI (hop up)
 ```bash
 make install    # Install package in editable mode with dev dependencies
 make test       # Run all tests with pytest
-make ci         # Auto-format and lint with ruff
+make ci         # Auto-format, lint, and run all tests
 pytest test/test_file.py::test_name  # Run a single test
 ```
 

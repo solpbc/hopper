@@ -102,7 +102,7 @@ User input flows through the TUI to mutate lode state, which the server broadcas
 ```bash
 make install    # Install in editable mode with dev dependencies
 make test       # Run all tests with pytest
-make ci         # Auto-format and lint with ruff
+make ci         # Auto-format, lint, and run all tests
 make clean      # Remove build artifacts and caches
 ```
 Single test: `pytest test/test_file.py::test_name`
