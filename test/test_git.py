@@ -34,11 +34,11 @@ def isolate_git_config(monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
 
 
-def _run_git(repo_dir, *args, check=True):
+def _run_git(repo_dir, *args):
     return subprocess.run(
         ["git", *args],
         cwd=repo_dir,
-        check=check,
+        check=True,
         capture_output=True,
         text=True,
     )

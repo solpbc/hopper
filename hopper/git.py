@@ -132,10 +132,6 @@ def create_worktree(
         error = "git command not found"
         logger.error(error)
         return False, error
-    except subprocess.SubprocessError as err:
-        error = f"git worktree creation failed: {err}"
-        logger.error(error)
-        return False, error
 
 
 def is_dirty(repo_dir: str) -> bool:

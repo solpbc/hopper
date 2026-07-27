@@ -7,6 +7,7 @@ import copy
 import io
 import json
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -81,10 +82,15 @@ def _mock_conn(emitted=None):
 
 
 @pytest.fixture(autouse=True)
+def isolate_git_config(monkeypatch):
+    """Keep real-git tests independent of user and system configuration."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+
+
+@pytest.fixture(autouse=True)
 def mock_worker_oom_boundary(monkeypatch):
     """Never touch the host's procfs/cgroup state from process tests."""
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
     monkeypatch.setattr(
         oom,
         "arm_worker",
@@ -94,11 +100,11 @@ def mock_worker_oom_boundary(monkeypatch):
     monkeypatch.setattr("hopper.process._sum_process_tree_io_chars", lambda _pid: None)
 
 
-def _run_git(repo_dir, *args, check=True):
+def _run_git(repo_dir, *args):
     return subprocess.run(
         ["git", *args],
         cwd=repo_dir,
-        check=check,
+        check=True,
         capture_output=True,
         text=True,
     )
