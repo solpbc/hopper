@@ -18,6 +18,7 @@ from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
 from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
 from hopper.projects import find_project
 from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
+from hopper.workspace_trust import WorkspaceTrustError, trust_claude_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +408,15 @@ class BaseRunner:
         env = self._get_subprocess_env()
 
         logger.debug(f"Running: {' '.join(cmd[:3])}...")
+
+        try:
+            trust_root = trust_claude_workspace(cwd, env)
+            if trust_root is not None:
+                logger.debug(f"Claude workspace pre-trusted lode={self.lode_id} path={trust_root}")
+        except WorkspaceTrustError as exc:
+            message = f"Failed to pre-trust Claude workspace: {exc}"
+            logger.error(f"workspace trust failed lode={self.lode_id}: {exc}")
+            return 1, message
 
         try:
             proc = subprocess.Popen(

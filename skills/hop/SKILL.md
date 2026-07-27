@@ -269,21 +269,14 @@ When `hop lode status` shows a lode in `stuck` state, inspect it through hop:
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
 
-**New project, first lode: workspace-trust dialog.** The very first lode run
-against a freshly `hop project add`-ed directory can wedge silently on Claude
-Code's one-time workspace-trust prompt ("Do you trust the files in this
-folder?"). The pane shows only the prompt and produces zero output, so
-Hopper's liveness model times it out (~351s) and errors the lode; restarting
-reproduces the same wedge. `hop lode peek <lode-id>` confirms it's the trust
-dialog. This prompt appears before Claude Code sets a pane title, so Hopper
-cannot recognise the pane state and `hop lode answer` refuses to send — by
-design. Recovery is manual, and only after `peek` has shown you the trust
-prompt itself: attach to the lode's tmux window and press `1`, or read
-`tmux_pane` from `hop lode status <lode-id> --json` and run
-`tmux send-keys -t '<pane-id>' 1`. The lode then proceeds normally, and later
-lodes on the same project don't hit it again.
+**Workspace trust is Hopper-managed.** Immediately before opening Claude,
+Hopper records trust in the Claude profile inherited by that lode. Registered
+project roots are trusted exactly; lode worktrees inherit one trust grant on
+Hopper's own worktree root. A workspace-trust dialog in a Hopper pane is
+therefore an error, not a routine first-lode cost. Inspect with
+`hop lode peek <lode-id>` and report the lode, stage, path, and effective
+`CLAUDE_CONFIG_DIR`; do not reflexively answer it or add a manual trust entry.
 
-This is the only case where raw `tmux send-keys` is the documented recovery.
 An unrecognised pane state does **not** mean Claude hasn't started: a live,
 fully-titled Claude Code session can also carry a title Hopper does not know,
 and it may be mid-turn. Never send keys to an unrecognised pane on the
@@ -339,9 +332,7 @@ Both send only when Hopper sees a recognised idle Claude prompt, and report
 success only after observing acceptance. If either reports an unrecognised
 pane state, Hopper did not send anything and it is safe to retry — but do not
 retry in a loop. Inspect with `hop lode peek <lode-id>`: an unrecognised pane
-may be a live session mid-turn, not a stalled one. The workspace-trust prompt
-is the one documented case that needs the manual tmux recovery described
-above.
+may be a live session mid-turn, not a stalled one.
 
 If the pane shows something you're not comfortable resolving (destructive action,
 ambiguous approval, sensitive operation), leave it for the founder to resolve.

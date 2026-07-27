@@ -17,6 +17,7 @@ def isolate_config(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(config, "hopper_dir", lambda: tmp_path)
     monkeypatch.setattr(config, "worktree_root", lambda: tmp_path / "worktrees")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     return tmp_path
 
 

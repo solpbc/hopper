@@ -18,6 +18,7 @@ from hopper.runner import (
     _sum_descendant_cpu_ms,
     extract_error_message,
 )
+from hopper.workspace_trust import WorkspaceTrustError
 
 
 class TestExtractErrorMessage:
@@ -454,6 +455,52 @@ class TestBaseRunnerActivityMonitor:
 
         assert result == (1, "stuck reason")
         assert "timed out waiting for stuck recovery lode=test-session" in caplog.messages
+
+    def test_run_claude_pretrusts_workspace_before_launch(self):
+        runner = self._make_runner()
+        proc = MagicMock(returncode=0, stderr=None)
+        events = []
+
+        def trust_workspace(cwd, env):
+            events.append(("trust", cwd, env["HOPPER_LID"]))
+            return Path("/repo")
+
+        def launch(*args, **kwargs):
+            events.append(("launch", kwargs["cwd"]))
+            return proc
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], "/repo")),
+            patch("hopper.runner.trust_claude_workspace", side_effect=trust_workspace),
+            patch("hopper.runner.subprocess.Popen", side_effect=launch),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+        ):
+            assert runner._run_claude() == (0, None)
+
+        assert events == [
+            ("trust", "/repo", "test-session"),
+            ("launch", "/repo"),
+        ]
+
+    def test_run_claude_refuses_launch_when_pretrust_fails(self):
+        runner = self._make_runner()
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], "/repo")),
+            patch(
+                "hopper.runner.trust_claude_workspace",
+                side_effect=WorkspaceTrustError("config is locked"),
+            ),
+            patch("hopper.runner.subprocess.Popen") as launch,
+        ):
+            result = runner._run_claude()
+
+        assert result == (
+            1,
+            "Failed to pre-trust Claude workspace: config is locked",
+        )
+        launch.assert_not_called()
 
     def test_subprocess_env_configures_managed_claude(self):
         """Managed Hopper stages configure Claude Code for machine-read panes."""
