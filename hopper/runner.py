@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
 from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
 from hopper.projects import find_project
@@ -36,6 +37,7 @@ DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
 STUCK_FAILURE_WAIT_SEC = 60
 REGISTRATION_TIMEOUT_SEC = 5.0
+PS_SCAN_TIMEOUT_SEC = 5.0
 
 
 def pane_needs_answer(snapshot: str) -> bool:
@@ -104,6 +106,7 @@ def _descendant_pids(root_pid: int) -> list[int]:
             ["ps", "-Ao", "pid=,ppid="],
             capture_output=True,
             text=True,
+            timeout=PS_SCAN_TIMEOUT_SEC,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning(
@@ -130,8 +133,8 @@ def _descendant_pids(root_pid: int) -> list[int]:
     return _walk_descendant_pids(root_pid, children)
 
 
-def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
-    """Return cumulative CPU time for descendants of root_pid, excluding root_pid."""
+def _process_tree_cpu_ms(root_pid: int | None, *, include_root: bool) -> int | None:
+    """Return cumulative CPU time for a process tree."""
     if root_pid is None:
         return None
 
@@ -140,6 +143,7 @@ def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
             ["ps", "-Ao", "pid=,ppid=,time="],
             capture_output=True,
             text=True,
+            timeout=PS_SCAN_TIMEOUT_SEC,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
         return None
@@ -163,8 +167,21 @@ def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
         children.setdefault(ppid, []).append(pid)
         times[pid] = parsed
 
-    total = sum(times.get(pid, 0.0) for pid in _walk_descendant_pids(root_pid, children))
+    pids = _walk_descendant_pids(root_pid, children)
+    if include_root:
+        pids.append(root_pid)
+    total = sum(times.get(pid, 0.0) for pid in pids)
     return int(total * 1000)
+
+
+def _sum_descendant_cpu_ms(root_pid: int | None) -> int | None:
+    """Return cumulative CPU time for descendants of root_pid, excluding root_pid."""
+    return _process_tree_cpu_ms(root_pid, include_root=False)
+
+
+def _sum_process_tree_cpu_ms(root_pid: int | None) -> int | None:
+    """Return cumulative CPU time for root_pid and all descendants."""
+    return _process_tree_cpu_ms(root_pid, include_root=True)
 
 
 def extract_error_message(stderr_bytes: bytes) -> str | None:
@@ -257,6 +274,7 @@ class BaseRunner:
 
         try:
             try:
+                reap_swiftpm_testing_helpers()
                 logger.info(f"run start lode={self.lode_id}")
                 # Query server for lode state and project info
                 response = connect(self.socket_path, lode_id=self.lode_id)
@@ -364,6 +382,11 @@ class BaseRunner:
 
         finally:
             self._stop_monitor()
+            try:
+                self._terminate_claude_process()
+            except Exception:
+                logger.exception(f"child cleanup failed lode={self.lode_id}")
+            reap_swiftpm_testing_helpers()
             signal.signal(signal.SIGINT, original_sigint)
             signal.signal(signal.SIGTERM, original_sigterm)
             if self.connection:
@@ -459,7 +482,8 @@ class BaseRunner:
         except KeyboardInterrupt:
             return 130, None
         finally:
-            self._claude_proc = None
+            if self._claude_proc is not None and self._claude_proc.poll() is not None:
+                self._claude_proc = None
 
     def _handle_signal(self, signum: int, frame) -> None:
         """Handle shutdown signals gracefully."""
@@ -837,7 +861,7 @@ class BaseRunner:
             self._stuck_failure_complete.set()
 
     def _terminate_claude_process(self) -> None:
-        """Terminate the active Claude process after a stuck timeout."""
+        """Terminate the active Claude process and the descendants it launched."""
         proc = self._claude_proc
         if proc is None or proc.poll() is not None:
             return

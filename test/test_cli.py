@@ -19,6 +19,7 @@ import pytest
 import hopper.code as hopper_code
 from hopper import __version__, config
 from hopper.cli import (
+    _CheckProgress,
     _socket,
     cmd_backlog,
     cmd_check,
@@ -5406,11 +5407,41 @@ def test_check_passes_through_success(capsys):
     assert "exited 0" in captured.err
 
 
+def test_check_redirects_output_to_a_file_not_an_inheritable_pipe(monkeypatch, capsys):
+    observed = {}
+
+    def launch(command, **kwargs):
+        observed.update(kwargs)
+        kwargs["stdout"].write("parent done\n")
+        proc = MagicMock(pid=42, returncode=0)
+        return proc
+
+    monkeypatch.setattr("hopper.cli.subprocess.Popen", launch)
+
+    assert cmd_check(["--", "command"]) == 0
+    assert observed["stdout"] != subprocess.PIPE
+    assert observed["stderr"] == subprocess.STDOUT
+    assert capsys.readouterr().out == "parent done\n"
+
+
 def test_check_preserves_nonzero_exit_code_value(capsys):
     """The specific non-zero code is passed through, not collapsed to 1."""
     result = cmd_check(["--", *_noisy_failing_cmd(3, 7)])
     assert result == 7
     assert "exited 7" in capsys.readouterr().err
+
+
+def test_check_progress_surfaces_sustained_process_tree_cpu_silence(monkeypatch):
+    progress = _CheckProgress("make ci", started_at=1_000)
+    progress.bind(42)
+    readings = iter([100, 100, 101])
+    monkeypatch.setattr("hopper.cli._sum_process_tree_cpu_ms", lambda pid: next(readings))
+
+    assert progress.summary(31_000) == "make ci — running 30s"
+    assert progress.summary(91_000) == (
+        "make ci — running 1m30s; no process-tree CPU progress for 1m00s"
+    )
+    assert progress.summary(121_000) == "make ci — running 2m00s"
 
 
 def test_check_requires_a_command(capsys):

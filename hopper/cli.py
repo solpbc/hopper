@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -16,6 +17,7 @@ import setproctitle
 
 import hopper.code as hopper_code
 from hopper import __version__, config
+from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
 from hopper.lodes import (
     current_time_ms,
@@ -27,6 +29,7 @@ from hopper.lodes import (
     lode_status_for_display,
     lode_with_status_annotations,
 )
+from hopper.runner import _sum_process_tree_cpu_ms
 from hopper.tmux import capture_pane
 
 logger = logging.getLogger(__name__)
@@ -2489,6 +2492,40 @@ def cmd_ping(args: list[str]) -> int:
 
 # Default number of trailing output lines `hop check` prints.
 CHECK_TAIL_LINES = 50
+CHECK_CPU_QUIET_THRESHOLD_MS = 60_000
+
+
+class _CheckProgress:
+    """Report elapsed time and sustained process-tree CPU silence."""
+
+    def __init__(self, command_text: str, started_at: int) -> None:
+        self.command_text = hopper_code.truncate_progress_command(command_text)
+        self.started_at = started_at
+        self.pid: int | None = None
+        self.last_cpu_ms: int | None = None
+        self.last_cpu_change_at = started_at
+
+    def bind(self, pid: int) -> None:
+        """Bind the tracker to the command process after launch."""
+        self.pid = pid
+
+    def summary(self, now_ms: int) -> str:
+        """Return a factual progress summary for the current process tree."""
+        cpu_quiet_ms = 0
+        if self.pid is not None:
+            cpu_ms = _sum_process_tree_cpu_ms(self.pid)
+            if cpu_ms is not None:
+                if self.last_cpu_ms is None or cpu_ms > self.last_cpu_ms:
+                    self.last_cpu_change_at = now_ms
+                self.last_cpu_ms = cpu_ms
+                cpu_quiet_ms = now_ms - self.last_cpu_change_at
+
+        elapsed = hopper_code.format_progress_duration(now_ms - self.started_at)
+        summary = f"{self.command_text} — running {elapsed}"
+        if cpu_quiet_ms >= CHECK_CPU_QUIET_THRESHOLD_MS:
+            quiet = hopper_code.format_progress_duration(cpu_quiet_ms)
+            return f"{summary}; no process-tree CPU progress for {quiet}"
+        return summary
 
 
 @command("check", "Run a validation command, truncating output but keeping its exit status")
@@ -2540,47 +2577,61 @@ def cmd_check(args: list[str]) -> int:
         print("error: --lines must be non-negative")
         return 1
 
+    reap_swiftpm_testing_helpers()
+
     heartbeat = None
+    progress = None
     lode_id = get_hopper_lid()
     if lode_id:
         try:
             started_at = current_time_ms()
             command_text = " ".join(command)
+            progress = _CheckProgress(command_text, started_at)
             heartbeat = hopper_code.ProgressHeartbeat(
                 lambda summary: set_lode_progress(_socket(), lode_id, summary),
-                lambda now_ms: (
-                    f"{hopper_code.truncate_progress_command(command_text)} — running "
-                    f"{hopper_code.format_progress_duration(now_ms - started_at)}"
-                ),
+                progress.summary,
                 interval=hopper_code.HEARTBEAT_INTERVAL_SEC,
             )
         except Exception:
             logger.debug("failed to create check heartbeat", exc_info=True)
 
-    try:
-        if heartbeat:
-            try:
-                heartbeat.start()
-            except Exception:
-                logger.debug("failed to start check heartbeat", exc_info=True)
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as output_file:
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
-                stdout=subprocess.PIPE,
+                stdout=output_file,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
         except FileNotFoundError:
+            if heartbeat:
+                try:
+                    heartbeat.stop()
+                except Exception:
+                    logger.debug("failed to stop check heartbeat", exc_info=True)
             print(f"hop check: command not found: {command[0]}", file=sys.stderr)
             return 127
-    finally:
-        if heartbeat:
-            try:
-                heartbeat.stop()
-            except Exception:
-                logger.debug("failed to stop check heartbeat", exc_info=True)
 
-    output = proc.stdout or ""
+        if progress:
+            progress.bind(proc.pid)
+
+        try:
+            if heartbeat:
+                try:
+                    heartbeat.start()
+                except Exception:
+                    logger.debug("failed to start check heartbeat", exc_info=True)
+            proc.wait()
+        finally:
+            if heartbeat:
+                try:
+                    heartbeat.stop()
+                except Exception:
+                    logger.debug("failed to stop check heartbeat", exc_info=True)
+
+        output_file.seek(0)
+        output = output_file.read()
+
     total = len(output.splitlines())
     tail = _tail_text(output, parsed.lines) if parsed.lines else ""
     if tail:

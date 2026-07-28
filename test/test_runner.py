@@ -16,6 +16,7 @@ from hopper.runner import (
     _descendant_pids,
     _parse_ps_time,
     _sum_descendant_cpu_ms,
+    _sum_process_tree_cpu_ms,
     extract_error_message,
 )
 from hopper.workspace_trust import WorkspaceTrustError
@@ -60,6 +61,20 @@ class TestExtractErrorMessage:
         result = extract_error_message(stderr)
         assert "Error:" in result
         assert "invalid" in result
+
+
+def test_run_teardown_terminates_children_and_sweeps_platform_orphans():
+    runner = BaseRunner("test-id", Path("server.sock"))
+
+    with (
+        patch("hopper.runner.connect", return_value=None),
+        patch.object(runner, "_terminate_claude_process") as terminate,
+        patch("hopper.runner.reap_swiftpm_testing_helpers") as sweep,
+    ):
+        assert runner.run() == 1
+
+    terminate.assert_called_once_with()
+    assert sweep.call_count == 2
 
 
 class TestBaseRunnerRegistration:
@@ -118,11 +133,25 @@ class TestPsCpuHelpers:
         with patch("hopper.runner.subprocess.run", return_value=result) as mock_run:
             assert _sum_descendant_cpu_ms(10) == 183500
 
-        mock_run.assert_called_once_with(
-            ["ps", "-Ao", "pid=,ppid=,time="],
-            capture_output=True,
-            text=True,
+            mock_run.assert_called_once_with(
+                ["ps", "-Ao", "pid=,ppid=,time="],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+
+    def test_sum_process_tree_cpu_ms_includes_root(self):
+        result = MagicMock(returncode=0)
+        result.stdout = "\n".join(
+            [
+                "10 1 00:00:02",
+                "11 10 00:00:03",
+                "12 11 00:00:04",
+            ]
         )
+
+        with patch("hopper.runner.subprocess.run", return_value=result):
+            assert _sum_process_tree_cpu_ms(10) == 9000
 
     def test_sum_descendant_cpu_ms_cycle_does_not_loop_or_count_root(self):
         result = MagicMock()
@@ -172,6 +201,7 @@ class TestPsCpuHelpers:
             ["ps", "-Ao", "pid=,ppid="],
             capture_output=True,
             text=True,
+            timeout=5.0,
         )
 
     def test_descendant_pids_cycle_does_not_loop_or_include_root(self):
@@ -482,6 +512,22 @@ class TestBaseRunnerActivityMonitor:
             ("trust", "/repo", "test-session"),
             ("launch", "/repo"),
         ]
+
+    def test_run_claude_keeps_live_process_reference_after_interrupt(self):
+        runner = self._make_runner()
+        proc = MagicMock(stderr=None)
+        proc.wait.side_effect = KeyboardInterrupt
+        proc.poll.return_value = None
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], "/repo")),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+        ):
+            assert runner._run_claude() == (130, None)
+
+        assert runner._claude_proc is proc
 
     def test_run_claude_refuses_launch_when_pretrust_fails(self):
         runner = self._make_runner()
