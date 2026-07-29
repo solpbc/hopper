@@ -1272,3 +1272,195 @@ def test_terminal_runner_failure_json_and_human_output(monkeypatch, capsys, fail
     assert rc == 1
     assert status in output
     assert "Restart with:" not in output
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_code", "expected_outcome"),
+    [
+        ({"stage": "shipped", "active": False}, 0, "shipped"),
+        ({"state": "error", "status": "Failed"}, 1, "error"),
+        ({"state": "gated", "status": "Review required"}, 2, "gated"),
+        ({"state": "paused", "active": False}, 1, "inactive"),
+    ],
+)
+def test_wait_summary_for_initial_terminal_outcome(
+    monkeypatch,
+    capsys,
+    changes,
+    expected_code,
+    expected_outcome,
+):
+    rc, _, _ = run_local_wait(monkeypatch, snapshot(**changes))
+
+    captured = capsys.readouterr()
+    assert rc == expected_code
+    assert captured.err == f"hop wait: abc123 {expected_outcome} — exited {expected_code}\n"
+
+
+def test_wait_summary_for_not_found(monkeypatch, capsys):
+    initial = snapshot(host="fedora.local")
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        {"abc123": initial},
+        {"abc123": [(None, "absent"), (None, "absent")]},
+        publish=False,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err == "hop wait: abc123 not_found — exited 1\n"
+
+
+def test_wait_summary_for_stuck(monkeypatch, capsys):
+    stuck = snapshot(state="stuck", status="No output")
+    rc, _, _ = run_local_wait(
+        monkeypatch,
+        stuck,
+        [("found", stuck), ("found", stuck)],
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.err == "hop wait: abc123 stuck — exited 3\n"
+
+
+def test_wait_summary_for_timeout(monkeypatch, capsys):
+    rc, _, _ = run_local_wait(monkeypatch, snapshot(), timeout_s=5)
+
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert captured.err == "hop wait: abc123 timeout — exited 4\n"
+
+
+def test_wait_summary_for_observer_unavailable(monkeypatch, capsys):
+    rc, _, _ = run_local_wait(
+        monkeypatch,
+        snapshot(),
+        observer_timeout_s=5,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert captured.err == "hop wait: abc123 observer_unavailable — exited 4\n"
+
+
+def test_wait_summary_for_resolution_failure(monkeypatch, capsys):
+    monkeypatch.setattr(wait, "_resolve_targets", lambda *args, **kwargs: None)
+
+    rc, _, _ = run_local_wait(monkeypatch, snapshot())
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err == "hop wait: could not resolve target — exited 1\n"
+
+
+def test_wait_summary_for_loop_interrupt(monkeypatch, capsys):
+    def interrupt(clock, timeout, connection):
+        raise KeyboardInterrupt
+
+    rc, _, _ = run_local_wait(monkeypatch, snapshot(), wait_action=interrupt)
+
+    captured = capsys.readouterr()
+    assert rc == 130
+    assert captured.err == "hop wait: interrupted — exited 130\n"
+
+
+def test_wait_summary_for_pre_supervisor_interrupt(monkeypatch, capsys):
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wait, "_resolve_targets", interrupt)
+
+    rc, _, _ = run_local_wait(monkeypatch, snapshot())
+
+    captured = capsys.readouterr()
+    assert rc == 130
+    assert captured.err == "hop wait: interrupted — exited 130\n"
+
+
+def test_wait_summary_accumulates_resolved_and_reports_abandoned_sibling(monkeypatch, capsys):
+    initials = {
+        "ship123": snapshot(
+            lid="ship123",
+            host="one.local",
+            stage="shipped",
+            active=False,
+        ),
+        "error123": snapshot(lid="error123", host="two.local"),
+        "pending123": snapshot(lid="pending123", host="three.local"),
+    }
+    failed = snapshot(
+        lid="error123",
+        host="two.local",
+        state="error",
+        status="Failed",
+    )
+    pending = snapshot(lid="pending123", host="three.local", status="Still working")
+    rc, _ = run_remote_wait(
+        monkeypatch,
+        initials,
+        {
+            "ship123": [],
+            "error123": [(failed, "found")],
+            "pending123": [(pending, "found")],
+        },
+        publish=False,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err.splitlines() == [
+        "  ship123: shipped",
+        "  error123: error",
+        "  pending123: not resolved — wait returned first",
+        "hop wait: 2 of 3 lodes resolved — exited 1",
+    ]
+
+
+def test_wait_summary_keeps_json_stdout_parseable(monkeypatch, capsys):
+    rc, _, _ = run_local_wait(
+        monkeypatch,
+        snapshot(stage="shipped", active=False),
+        json_output=True,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out)["outcome"] == "shipped"
+    assert captured.err == "hop wait: abc123 shipped — exited 0\n"
+
+
+def test_wait_summary_uses_synthetic_collector_outcome(monkeypatch, capsys):
+    def collect_synthetic(state, now):
+        record = next(iter(state["records"].values()))
+        return [{"record": record, "outcome": "synthetic_outcome", "code": 0}]
+
+    monkeypatch.setattr(wait, "_collect_boundary_outcomes", collect_synthetic)
+
+    rc, _, _ = run_local_wait(monkeypatch, snapshot())
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.err == "hop wait: abc123 synthetic_outcome — exited 0\n"
+
+
+def test_wait_summary_format_failure_preserves_exit_code(monkeypatch, capsys):
+    initial = snapshot(stage="shipped", active=False)
+    expected_rc, _, _ = run_local_wait(monkeypatch, initial)
+    capsys.readouterr()
+    real_finish_boundary = wait._finish_boundary
+
+    def finish_with_malformed_resolved_item(state, outcomes, now):
+        prior_count = len(state["resolved"])
+        result = real_finish_boundary(state, outcomes, now)
+        for item in state["resolved"][prior_count:]:
+            del item["outcome"]
+        return result
+
+    monkeypatch.setattr(wait, "_finish_boundary", finish_with_malformed_resolved_item)
+
+    rc, _, _ = run_local_wait(monkeypatch, initial)
+
+    captured = capsys.readouterr()
+    assert rc == expected_rc == 0
+    assert captured.err == ""

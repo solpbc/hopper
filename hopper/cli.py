@@ -1817,6 +1817,10 @@ def cmd_lode(args: list[str]) -> int:
             create_p.print_help()
         else:
             parser.print_help()
+        if args and args[0] == "wait":
+            from hopper.wait import WAIT_SUMMARY_NO_TARGET
+
+            print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
         return 1
     except SystemExit:
         return 0
@@ -2076,9 +2080,11 @@ def cmd_lode(args: list[str]) -> int:
         return result[0]
 
     if subcommand == "wait":
+        from hopper.wait import WAIT_SUMMARY_NO_TARGET, wait_for_lodes
+
         if (rc := require_not_inside_lode()) is not None:
+            print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
             return rc
-        from hopper.wait import wait_for_lodes
 
         return wait_for_lodes(
             socket_path,

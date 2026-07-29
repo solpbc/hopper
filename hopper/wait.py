@@ -25,6 +25,12 @@ from hopper.tmux import capture_pane
 
 STUCK_GRACE_MS = 120_000
 MIN_POLL_S = 10.0
+WAIT_SUMMARY_ONE = "hop wait: {lode_id} {outcome} — exited {code}"
+WAIT_SUMMARY_ITEM = "  {lode_id}: {outcome}"
+WAIT_SUMMARY_UNRESOLVED = "  {lode_id}: not resolved — wait returned first"
+WAIT_SUMMARY_MANY = "hop wait: {resolved} of {requested} lodes resolved — exited {code}"
+WAIT_SUMMARY_INTERRUPT = "hop wait: interrupted — exited 130"
+WAIT_SUMMARY_NO_TARGET = "hop wait: could not resolve target — exited 1"
 
 _monotonic = time.monotonic
 
@@ -569,8 +575,50 @@ def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | Non
             _emit_outcome(record, outcome, state["json_output"], now)
         with state["condition"]:
             state["pending"].discard(record["id"])
+        state["resolved"].append(item)
         result = max(result, item["code"])
     return result if result else None
+
+
+def _emit_wait_summary(records: dict[str, dict], resolved: list[dict], code: int) -> None:
+    """Emit the final wait result without risking the established exit code."""
+    try:
+        requested = len(records)
+        if requested == 1:
+            record = next(iter(records.values()))
+            item = resolved[0]
+            lines = [
+                WAIT_SUMMARY_ONE.format(
+                    lode_id=record["id"],
+                    outcome=item["outcome"],
+                    code=code,
+                )
+            ]
+        else:
+            resolved_by_id = {item["record"]["id"]: item for item in resolved}
+            lines = []
+            for record in sorted(records.values(), key=lambda item: item["order"]):
+                item = resolved_by_id.get(record["id"])
+                if item is None:
+                    lines.append(WAIT_SUMMARY_UNRESOLVED.format(lode_id=record["id"]))
+                else:
+                    lines.append(
+                        WAIT_SUMMARY_ITEM.format(
+                            lode_id=record["id"],
+                            outcome=item["outcome"],
+                        )
+                    )
+            lines.append(
+                WAIT_SUMMARY_MANY.format(
+                    resolved=len(resolved),
+                    requested=requested,
+                    code=code,
+                )
+            )
+        print("\n".join(lines), file=sys.stderr)
+    except Exception:
+        # The established wait exit code must win over an optional summary rendering failure.
+        logger.debug("Could not render wait summary", exc_info=True)
 
 
 def _condition_wait(condition: threading.Condition, timeout_s: float) -> None:
@@ -591,37 +639,45 @@ def wait_for_lodes(
     probe_remote: Callable,
 ) -> int:
     """Wait for lodes using one main-thread authoritative supervisor."""
-    poll_s = max(MIN_POLL_S, float(poll_s or 30))
-    records = _resolve_targets(socket_path, lode_ids, json_output, lookup_local, find_remote)
-    if records is None:
-        return 1
-    _publish_remote_mappings(records)
+    try:
+        poll_s = max(MIN_POLL_S, float(poll_s or 30))
+        records = _resolve_targets(socket_path, lode_ids, json_output, lookup_local, find_remote)
+        if records is None:
+            print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
+            return 1
+        _publish_remote_mappings(records)
 
-    start_ts = min(record["last_valid_ts"] for record in records.values())
-    condition = threading.Condition()
-    state = {
-        "condition": condition,
-        "records": records,
-        "pending": set(records),
-        "observations": deque(),
-        "overall_deadline": start_ts + timeout_s if timeout_s > 0 else None,
-        "poll_s": poll_s,
-        "observer_timeout_s": max(0.0, observer_timeout_s),
-        "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
-        "stop_event": threading.Event(),
-        "workers": {},
-        "connection": None,
-        "shutdown": False,
-        "json_output": json_output,
-    }
+        start_ts = min(record["last_valid_ts"] for record in records.values())
+        condition = threading.Condition()
+        state = {
+            "condition": condition,
+            "records": records,
+            "pending": set(records),
+            "resolved": [],
+            "observations": deque(),
+            "overall_deadline": start_ts + timeout_s if timeout_s > 0 else None,
+            "poll_s": poll_s,
+            "observer_timeout_s": max(0.0, observer_timeout_s),
+            "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
+            "stop_event": threading.Event(),
+            "workers": {},
+            "connection": None,
+            "shutdown": False,
+            "json_output": json_output,
+        }
 
-    initial_now = _monotonic()
-    for record in records.values():
-        record["next_reconcile_ts"] = initial_now + poll_s
-    initial_outcomes = _collect_boundary_outcomes(state, initial_now)
-    initial_result = _finish_boundary(state, initial_outcomes, initial_now)
-    if initial_result is not None or not state["pending"]:
-        return initial_result or 0
+        initial_now = _monotonic()
+        for record in records.values():
+            record["next_reconcile_ts"] = initial_now + poll_s
+        initial_outcomes = _collect_boundary_outcomes(state, initial_now)
+        initial_result = _finish_boundary(state, initial_outcomes, initial_now)
+        if initial_result is not None or not state["pending"]:
+            code = initial_result or 0
+            _emit_wait_summary(records, state["resolved"], code)
+            return code
+    except KeyboardInterrupt:
+        print(WAIT_SUMMARY_INTERRUPT, file=sys.stderr)
+        return 130
 
     try:
         local_pending = any(not records[lid]["remote"] for lid in state["pending"])
@@ -657,13 +713,16 @@ def wait_for_lodes(
                 print(warning, file=sys.stderr)
             result = _finish_boundary(state, outcomes, now)
             if result is not None:
+                _emit_wait_summary(records, state["resolved"], result)
                 return result
             if not state["pending"]:
+                _emit_wait_summary(records, state["resolved"], 0)
                 return 0
             with condition:
                 deadline = _next_deadline(state)
                 _condition_wait(condition, max(0.0, deadline - _monotonic()))
     except KeyboardInterrupt:
+        print(WAIT_SUMMARY_INTERRUPT, file=sys.stderr)
         return 130
     finally:
         with condition:

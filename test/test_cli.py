@@ -2745,6 +2745,40 @@ def test_lode_wait_rejects_inside_lode(monkeypatch, capsys):
     assert "hop backlog add" in out
 
 
+def test_wait_summary_for_inside_lode_refusal(monkeypatch, capsys):
+    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
+
+    result, _ = _run_scripted_cli_wait(monkeypatch, {}, {}, ["some-id"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err == "hop wait: could not resolve target — exited 1\n"
+
+
+def test_wait_summary_for_lode_wait_argument_error(monkeypatch, capsys):
+    result, _ = _run_scripted_cli_wait(monkeypatch, {}, {}, [])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err == "hop wait: could not resolve target — exited 1\n"
+
+
+def test_wait_summary_for_wait_alias_argument_error(capsys):
+    result = cmd_wait([])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err == "hop wait: could not resolve target — exited 1\n"
+
+
+def test_wait_summary_not_emitted_for_other_lode_argument_error(capsys):
+    result = cmd_lode(["restart"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err == ""
+
+
 # Tests for config command
 
 
