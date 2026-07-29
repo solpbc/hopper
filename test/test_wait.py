@@ -1297,6 +1297,37 @@ def test_wait_summary_for_initial_terminal_outcome(
     assert captured.err == f"hop wait: abc123 {expected_outcome} — exited {expected_code}\n"
 
 
+def test_wait_summary_for_all_resolved_loop_exit(monkeypatch, capsys):
+    shipped = snapshot(stage="shipped", active=False)
+
+    rc, _, _ = run_local_wait(
+        monkeypatch,
+        snapshot(),
+        [("found", shipped)],
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.err == "hop wait: abc123 shipped — exited 0\n"
+
+
+def test_wait_summary_uses_canonical_dedup_for_requested_count(monkeypatch, capsys):
+    canonical = snapshot(stage="shipped", active=False)
+    monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: dict(canonical))
+
+    rc = wait.wait_for_lodes(
+        Path("server.sock"),
+        ["abc", "abc123"],
+        lookup_local=lambda *args, **kwargs: pytest.fail("unexpected local lookup"),
+        find_remote=lambda *args, **kwargs: pytest.fail("unexpected remote lookup"),
+        probe_remote=lambda *args, **kwargs: pytest.fail("unexpected remote probe"),
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.err == "hop wait: abc123 shipped — exited 0\n"
+
+
 def test_wait_summary_for_not_found(monkeypatch, capsys):
     initial = snapshot(host="fedora.local")
     rc, _ = run_remote_wait(

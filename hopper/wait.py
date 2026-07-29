@@ -597,7 +597,7 @@ def _emit_wait_summary(records: dict[str, dict], resolved: list[dict], code: int
         else:
             resolved_by_id = {item["record"]["id"]: item for item in resolved}
             lines = []
-            for record in sorted(records.values(), key=lambda item: item["order"]):
+            for record in sorted(records.values(), key=lambda record: record["order"]):
                 item = resolved_by_id.get(record["id"])
                 if item is None:
                     lines.append(WAIT_SUMMARY_UNRESOLVED.format(lode_id=record["id"]))
