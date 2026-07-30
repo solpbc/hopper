@@ -44,7 +44,12 @@ def _orphan_process_pids(executable_name: str) -> list[int]:
             pid = int(parts[0])
             ppid = int(parts[1])
             argv = shlex.split(parts[2])
-        except (ValueError, shlex.Error):
+        except ValueError:
+            # int() and shlex.split() both raise ValueError. shlex has no Error
+            # attribute, so naming one here made this handler itself raise
+            # AttributeError on the first ps line with an unbalanced quote —
+            # which any lode's own argv supplies, since the prompt is embedded
+            # in it and English prose contains apostrophes.
             continue
         if ppid != 1 or not argv:
             continue

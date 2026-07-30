@@ -25,6 +25,21 @@ def test_orphan_scan_requires_ppid_one_and_exact_argv0_basename():
         assert _orphan_process_pids("swiftpm-testing-helper") == [101]
 
 
+def test_orphan_scan_skips_unbalanced_quotes_and_keeps_scanning():
+    # A lode's own argv embeds its prompt, so any apostrophe in that prose makes
+    # shlex.split raise. The scan must skip that row and still find later matches.
+    result = MagicMock(returncode=0)
+    result.stdout = "\n".join(
+        [
+            "101 1 claude --session-id abc # You are senior. Don't write code yourself.",
+            "102 1 /tmp/build/swiftpm-testing-helper --flag",
+        ]
+    )
+
+    with patch("hopper.cleanup.subprocess.run", return_value=result):
+        assert _orphan_process_pids("swiftpm-testing-helper") == [102]
+
+
 def test_orphan_scan_failure_is_fail_safe(caplog):
     with patch("hopper.cleanup.subprocess.run", side_effect=TimeoutError("slow ps")):
         assert _orphan_process_pids("swiftpm-testing-helper") == []
