@@ -208,6 +208,7 @@ def run_remote_wait(
         ({"state": "stuck"}, ("stuck", 3)),
         ({"stage": "shipped", "active": False}, ("shipped", 0)),
         ({"active": False}, ("inactive", 1)),
+        ({"state": "ready", "active": False}, None),
         ({"state": "design"}, None),
         ({"state": "completed", "stage": "refine"}, None),
     ],
@@ -397,6 +398,30 @@ def test_later_inactive_snapshot_exits_with_recovery_guidance(monkeypatch, capsy
     out = capsys.readouterr().out
     assert "state=paused active=False status=Stopped" in out
     assert "hop lode resume abc123 or hop lode restart abc123" in out
+
+
+def test_initial_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
+    handoff = snapshot(stage="ship", state="ready", status="Refine complete", active=False)
+    shipped = snapshot(stage="shipped", state="ready", status="Ship complete", active=False)
+
+    rc, _, _ = run_local_wait(monkeypatch, handoff, [("found", shipped)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not active" not in out
+    assert "✓ abc123 shipped" in out
+
+
+def test_later_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
+    handoff = snapshot(stage="ship", state="ready", status="Refine complete", active=False)
+    shipped = snapshot(stage="shipped", state="ready", status="Ship complete", active=False)
+
+    rc, _, _ = run_local_wait(monkeypatch, snapshot(), [("found", handoff), ("found", shipped)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not active" not in out
+    assert "✓ abc123 shipped" in out
 
 
 def test_two_consecutive_not_found_win_observer_boundary(monkeypatch, capsys):

@@ -58,7 +58,10 @@ def classify(snapshot: dict) -> tuple[str, int] | None:
         return "stuck", 3
     if snapshot["stage"] == "shipped":
         return "shipped", 0
-    if not snapshot["active"]:
+    # A clean stage exit briefly disconnects after publishing state=ready and
+    # the next stage. The server auto-advances that durable handoff; it is not
+    # an inactive failure. Other inactive states still require recovery.
+    if not snapshot["active"] and snapshot["state"] != "ready":
         return "inactive", 1
     return None
 
