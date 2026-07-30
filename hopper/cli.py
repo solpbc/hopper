@@ -539,7 +539,7 @@ def cmd_process_worker(args: list[str]) -> int:
 
 @command("status", "Show or update lode status", group="lode")
 def cmd_status(args: list[str]) -> int:
-    """Show or update the current lode's status text and title."""
+    """Show a local or remote lode, or update the current lode's status and title."""
     from hopper.client import get_lode, set_lode_status, set_lode_title
 
     parser = make_parser(
@@ -1598,8 +1598,8 @@ def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) ->
         recovery = _load_lode_recovery(result["canonical_id"])
         if recovery is not None:
             display_lode["recovery"] = recovery
-    display_lode = lode_with_status_annotations(display_lode)
     if json_output:
+        display_lode = lode_with_status_annotations(display_lode)
         print(json.dumps(display_lode, indent=2))
     else:
         print(format_lode_detail(display_lode))
@@ -1659,14 +1659,29 @@ def _cached_lode_host(key: str, hosts: list[str]) -> str | None:
     return host if isinstance(host, str) and host in hosts else None
 
 
-def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dict | None, str]:
+class _RemoteProbeSummary(str):
+    """Human-readable first-match probe evidence with a structured availability flag."""
+
+    unavailable: bool
+
+    def __new__(cls, value: str, *, unavailable: bool):
+        summary = super().__new__(cls, value)
+        summary.unavailable = unavailable
+        return summary
+
+
+def _find_remote_lode(
+    prefix: str,
+    *,
+    remember_result: bool = True,
+) -> tuple[dict | None, _RemoteProbeSummary]:
     """Use cached-first, first-match lookup for pane and lifecycle commands.
 
     Authoritative all-source callers must use _resolve_lode_all_sources.
     """
     hosts = _remote_hosts()
     if not hosts:
-        return None, ""
+        return None, _RemoteProbeSummary("", unavailable=False)
     checked: list[str] = []
     unreadable: set[str] = set()
 
@@ -1680,14 +1695,17 @@ def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dic
         if lode:
             if remember_result:
                 _remember_lode_route(lode["id"], host, lode.get("project", ""))
-            return lode, ", ".join(checked)
+            return lode, _RemoteProbeSummary(
+                ", ".join(checked),
+                unavailable=bool(unreadable),
+            )
 
     remaining_hosts = [host for host in hosts if host not in checked]
     if not remaining_hosts:
         summary = ", ".join(checked)
         if unreadable:
             summary += f" [unreadable: {', '.join(sorted(unreadable))}]"
-        return None, summary
+        return None, _RemoteProbeSummary(summary, unavailable=bool(unreadable))
 
     lock = threading.Lock()
     found: list[dict] = []
@@ -1719,11 +1737,14 @@ def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dic
         lode = found[0]
         if remember_result:
             _remember_lode_route(lode["id"], lode["host"], lode.get("project", ""))
-        return lode, ", ".join(sorted(set(checked)))
+        return lode, _RemoteProbeSummary(
+            ", ".join(sorted(set(checked))),
+            unavailable=bool(unreadable),
+        )
     summary = ", ".join(sorted(set(checked)))
     if unreadable:
         summary += f" [unreadable: {', '.join(sorted(unreadable))}]"
-    return None, summary
+    return None, _RemoteProbeSummary(summary, unavailable=bool(unreadable))
 
 
 def _resolution_result(
@@ -1896,22 +1917,21 @@ def _lookup_lode_with_remote(socket_path, prefix: str) -> dict:
 
     Authoritative all-source callers must use _resolve_lode_all_sources.
     """
-    lode, error = _lookup_lode(socket_path, prefix)
-    remote_eligible = error and (
-        error.startswith("Lode '") or error.startswith("Lode status unavailable")
-    )
-    if lode or (error and not remote_eligible):
-        if lode:
-            return _resolution_result(
-                "found",
-                lode=lode,
-                canonical_id=lode["id"],
-            )
+    import hopper.client as client
+
+    local_outcome, local_payload = client.read_lode_snapshot(socket_path, prefix)
+    if local_outcome == "found":
+        return _resolution_result(
+            "found",
+            lode=local_payload,
+            canonical_id=local_payload["id"],
+        )
+    if local_outcome == "ambiguous":
         return _resolution_result(
             "ambiguous",
-            error=error,
+            error=f"Ambiguous prefix '{prefix}', matches: {', '.join(local_payload)}",
         )
-    local_unavailable = error if error and error.startswith("Lode status unavailable") else None
+
     remote_lode, checked = _find_remote_lode(prefix)
     if remote_lode:
         return _resolution_result(
@@ -1920,15 +1940,16 @@ def _lookup_lode_with_remote(socket_path, prefix: str) -> dict:
             host=remote_lode.get("host"),
             canonical_id=remote_lode["id"],
         )
-    if local_unavailable:
-        if "[unreadable:" in checked:
-            message = f"{local_unavailable}. Remote probes: {checked}."
+    if local_outcome == "unavailable":
+        local_error = f"Lode status unavailable for '{prefix}': {local_payload}"
+        if checked.unavailable:
+            message = f"{local_error}. Remote probes: {checked}."
         elif checked:
-            message = f"{local_unavailable}. Checked remote hosts: {checked}."
+            message = f"{local_error}. Checked remote hosts: {checked}."
         else:
-            message = f"{local_unavailable}. No remote hosts configured."
+            message = f"{local_error}. No remote hosts configured."
         return _resolution_result("unavailable", error=message)
-    if "[unreadable:" in checked:
+    if checked.unavailable:
         return _resolution_result(
             "unavailable",
             error=f"Lode status unavailable for '{prefix}'. Remote probes: {checked}.",
@@ -2029,33 +2050,40 @@ def _run_local_lode_watch(socket_path: Path, initial_lode: dict) -> int:
             events.append(dict(lode))
             condition.notify_all()
 
+    def request_reconcile() -> None:
+        nonlocal reconcile_requested
+        with condition:
+            reconcile_requested = True
+            condition.notify()
+
     connection = client.HopperConnection(socket_path)
     last_successful_read = _watch_monotonic()
     next_reconcile = last_successful_read
     last_probe_summary = _probe_summary_entry("local", "found", lode_id)
     try:
-        connection.start(callback=on_message)
-        # Reconcile immediately after subscribing to close the initial-read race.
-        reconcile_requested = True
+        connection.start(callback=on_message, on_connect=request_reconcile)
+        # Reconcile immediately after start as well as after each confirmed connection.
+        request_reconcile()
         while True:
             with condition:
                 pending_events = list(events)
                 events.clear()
+                should_reconcile = reconcile_requested
+                reconcile_requested = False
             if pending_events:
                 for event_lode in pending_events:
                     emit(event_lode)
-                reconcile_requested = True
+                should_reconcile = True
 
             now = _watch_monotonic()
-            if reconcile_requested or now >= next_reconcile:
+            if should_reconcile or now >= next_reconcile:
                 outcome, snapshot, last_probe_summary = _read_watch_snapshot(
                     socket_path,
                     lode_id,
                 )
-                reconcile_requested = False
                 next_reconcile = now + WATCH_RECONCILE_SECONDS
                 if outcome == "found":
-                    last_successful_read = now
+                    last_successful_read = _watch_monotonic()
                     emit(snapshot)
                     terminal_code = _watch_terminal_code(snapshot)
                     if terminal_code is not None:

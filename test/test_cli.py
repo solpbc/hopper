@@ -1737,7 +1737,9 @@ def _watch_resolution(lode, host="local"):
 def _watch_connection(messages=()):
     connection = MagicMock()
 
-    def start(callback):
+    def start(callback=None, on_connect=None):
+        connection.callback = callback
+        connection.on_connect = on_connect
         for message in messages:
             callback(message)
 
@@ -1770,6 +1772,45 @@ def test_lode_watch_post_subscribe_reconcile_observes_shipped(capsys):
         "● abc123 refine  Working...",
         "✓ abc123 shipped  Done",
     ]
+
+
+def test_lode_watch_on_connect_reconciles_before_interval(monkeypatch, capsys):
+    initial = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    after_immediate = {**initial, "status": "Still working"}
+    shipped = {**initial, "stage": "shipped", "status": "Done", "active": False}
+    connection = _watch_connection()
+    clock = [0.0]
+
+    monkeypatch.setattr("hopper.cli._watch_monotonic", lambda: clock[0])
+
+    def condition_wait(condition, timeout_s):
+        assert timeout_s == 30.0
+        assert connection.on_connect is not None
+        connection.on_connect()
+
+    monkeypatch.setattr("hopper.cli._watch_condition_wait", condition_wait)
+    with (
+        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(initial)),
+        patch(
+            "hopper.cli._read_watch_snapshot",
+            side_effect=[
+                ("found", after_immediate, "local=found abc123"),
+                ("found", shipped, "local=found abc123"),
+            ],
+        ) as read_snapshot,
+        patch("hopper.client.HopperConnection", return_value=connection),
+    ):
+        assert cmd_lode(["watch", "abc123"]) == 0
+
+    assert read_snapshot.call_count == 2
+    assert clock[0] == 0.0
+    assert capsys.readouterr().out.splitlines()[-1] == "✓ abc123 shipped  Done"
 
 
 def test_lode_watch_rejects_inside_lode(monkeypatch, capsys):
@@ -4441,19 +4482,30 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
 
 
 @pytest.mark.parametrize(
-    ("local_result", "remote_result", "expected_lode", "expected_error"),
+    (
+        "local_result",
+        "remote_result",
+        "expected_lode",
+        "expected_outcome",
+        "expected_exit_code",
+        "expected_error",
+    ),
     [
-        (("absent", None), ("found", "fedora.local"), "remote123", None),
+        (("absent", None), ("found", "fedora.local"), "remote123", "found", 0, None),
         (
             ("absent", None),
             ("absent", "fedora.local"),
             None,
+            "absent",
+            1,
             "Lode 'abc' not found. Checked remote hosts: fedora.local.",
         ),
         (
             ("absent", None),
             ("unreadable", "fedora.local [unreadable: fedora.local]"),
             None,
+            "unavailable",
+            2,
             "Lode status unavailable for 'abc'. Remote probes: "
             "fedora.local [unreadable: fedora.local].",
         ),
@@ -4461,42 +4513,56 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
             ("absent", None),
             ("no-hosts", ""),
             None,
+            "absent",
+            1,
             "Lode 'abc' not found. No remote hosts configured.",
         ),
         (
             ("ambiguous", ["abc111", "abc999"]),
             ("found", "fedora.local"),
             None,
+            "ambiguous",
+            1,
             "Ambiguous prefix 'abc', matches: abc111, abc999",
         ),
         (
             ("ambiguous", ["abc111", "abc999"]),
             ("absent", "fedora.local"),
             None,
+            "ambiguous",
+            1,
             "Ambiguous prefix 'abc', matches: abc111, abc999",
         ),
         (
             ("ambiguous", ["abc111", "abc999"]),
             ("unreadable", "fedora.local [unreadable: fedora.local]"),
             None,
+            "ambiguous",
+            1,
             "Ambiguous prefix 'abc', matches: abc111, abc999",
         ),
         (
             ("ambiguous", ["abc111", "abc999"]),
             ("no-hosts", ""),
             None,
+            "ambiguous",
+            1,
             "Ambiguous prefix 'abc', matches: abc111, abc999",
         ),
         (
             ("unavailable", "server not running at sock"),
             ("found", "fedora.local"),
             "remote123",
+            "found",
+            0,
             None,
         ),
         (
             ("unavailable", "server not running at sock"),
             ("absent", "fedora.local"),
             None,
+            "unavailable",
+            2,
             "Lode status unavailable for 'abc': server not running at sock. "
             "Checked remote hosts: fedora.local.",
         ),
@@ -4504,6 +4570,8 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
             ("unavailable", "server not running at sock"),
             ("unreadable", "fedora.local [unreadable: fedora.local]"),
             None,
+            "unavailable",
+            2,
             "Lode status unavailable for 'abc': server not running at sock. Remote probes: "
             "fedora.local [unreadable: fedora.local].",
         ),
@@ -4511,32 +4579,42 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
             ("unavailable", "server not running at sock"),
             ("no-hosts", ""),
             None,
+            "unavailable",
+            2,
             "Lode status unavailable for 'abc': server not running at sock. "
             "No remote hosts configured.",
         ),
     ],
 )
 def test_lookup_lode_with_remote_outcome_matrix(
-    local_result, remote_result, expected_lode, expected_error
+    local_result,
+    remote_result,
+    expected_lode,
+    expected_outcome,
+    expected_exit_code,
+    expected_error,
 ):
-    from hopper.cli import _lookup_lode_with_remote
+    from hopper.cli import _lookup_lode_with_remote, _RemoteProbeSummary
 
     remote_lode = {"id": "remote123", "host": "fedora.local"}
     remote_value = remote_lode if remote_result[0] == "found" else None
+    remote_summary = _RemoteProbeSummary(
+        remote_result[1],
+        unavailable=remote_result[0] == "unreadable",
+    )
     with (
         patch("hopper.client.read_lode_snapshot", return_value=local_result),
         patch(
             "hopper.cli._find_remote_lode",
-            return_value=(remote_value, remote_result[1]),
+            return_value=(remote_value, remote_summary),
         ) as find_remote,
     ):
         result = _lookup_lode_with_remote(Path("sock"), "abc")
 
     assert (result["lode"]["id"] if result["lode"] else None) == expected_lode
+    assert result["outcome"] == expected_outcome
     assert result["error"] == expected_error
-    assert result["exit_code"] == (
-        0 if expected_lode else 2 if expected_error.startswith("Lode status unavailable") else 1
-    )
+    assert result["exit_code"] == expected_exit_code
     if local_result[0] == "ambiguous":
         find_remote.assert_not_called()
     else:
@@ -5779,6 +5857,40 @@ def test_lode_watch_observer_loss_exits_after_300_seconds(monkeypatch, capsys):
     assert "not found" not in out
 
 
+def test_lode_watch_observer_timeout_starts_after_successful_read(monkeypatch):
+    initial = {
+        "id": "abc123",
+        "stage": "refine",
+        "state": "running",
+        "status": "Working",
+        "active": True,
+    }
+    clock = [0.0]
+    reads = [0]
+
+    monkeypatch.setattr("hopper.cli._watch_monotonic", lambda: clock[0])
+
+    def read_snapshot(socket_path, lode_id):
+        reads[0] += 1
+        if reads[0] == 1:
+            clock[0] += 5.0
+            return "found", initial, "local=found abc123"
+        return "unavailable", None, "local=unavailable (server down)"
+
+    def condition_wait(condition, timeout_s):
+        clock[0] += timeout_s
+
+    monkeypatch.setattr("hopper.cli._watch_condition_wait", condition_wait)
+    with (
+        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(initial)),
+        patch("hopper.cli._read_watch_snapshot", side_effect=read_snapshot),
+        patch("hopper.client.HopperConnection", return_value=_watch_connection()),
+    ):
+        assert cmd_lode(["watch", "abc123"]) == 2
+
+    assert clock[0] == 305.0
+
+
 def test_routed_watch_forwards_stdout_before_remote_exit(monkeypatch, capsys):
     from hopper.remote import run_remote_streaming
 
@@ -5935,6 +6047,179 @@ def test_lode_path_absent_candidate_is_never_printed(temp_config, capsys):
     assert captured.err == "No worktree exists for lode 'abc12345'.\n"
     assert str(candidate) not in captured.err
     assert "exists:true" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error", "exit_code"),
+    [
+        ("absent", "Lode 'abc' not found. Probes: local=absent.", 1),
+        (
+            "ambiguous",
+            "Ambiguous lode prefix 'abc'. Matches: local:abc111, local:abc222. "
+            "Probes: local=ambiguous (abc111, abc222).",
+            1,
+        ),
+        (
+            "unavailable",
+            "Lode status unavailable for 'abc'. Probes: local=unavailable (server down).",
+            2,
+        ),
+    ],
+)
+def test_lode_path_json_resolution_errors_have_no_stdout(outcome, error, exit_code, capsys):
+    resolution = {
+        "outcome": outcome,
+        "lode": None,
+        "host": None,
+        "canonical_id": None,
+        "error": error,
+        "probe_summary": "",
+        "exit_code": exit_code,
+    }
+    with (
+        patch("hopper.cli._resolve_lode_all_sources", return_value=resolution),
+        patch("hopper.remote.run_remote") as run_remote,
+    ):
+        assert cmd_lode(["path", "abc", "--json"]) == exit_code
+
+    run_remote.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{error}\n"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("ssh unavailable"),
+        subprocess.TimeoutExpired(["ssh"], timeout=8),
+    ],
+    ids=["os-error", "timeout"],
+)
+def test_lode_path_remote_spawn_failure_has_no_stdout(failure, capsys):
+    lode = {"id": "abc12345", "host": "resident.example"}
+    with (
+        patch(
+            "hopper.cli._resolve_lode_all_sources",
+            return_value=_watch_resolution(lode, "resident.example"),
+        ),
+        patch("hopper.remote.run_remote", side_effect=failure),
+    ):
+        assert cmd_lode(["path", "abc", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"Lode path unavailable for 'abc12345' on resident.example: {failure}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "exit_code", "expected_error"),
+    [
+        (
+            1,
+            "",
+            "No worktree exists for lode 'abc12345'.",
+            1,
+            "No worktree exists for lode 'abc12345' on resident.example.\n",
+        ),
+        (
+            1,
+            "Lode 'abc12345' not found.",
+            "",
+            1,
+            "Lode 'abc12345' not found on resident.example.\n",
+        ),
+        (
+            7,
+            "",
+            "remote failure",
+            2,
+            "Lode path unavailable for 'abc12345' on resident.example: remote command exited 7\n",
+        ),
+    ],
+    ids=["no-worktree", "not-found", "generic"],
+)
+def test_lode_path_remote_nonzero_has_no_stdout(
+    returncode,
+    stdout,
+    stderr,
+    exit_code,
+    expected_error,
+    capsys,
+):
+    lode = {"id": "abc12345", "host": "resident.example"}
+    result = subprocess.CompletedProcess(
+        [],
+        returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    with (
+        patch(
+            "hopper.cli._resolve_lode_all_sources",
+            return_value=_watch_resolution(lode, "resident.example"),
+        ),
+        patch("hopper.remote.run_remote", return_value=result),
+    ):
+        assert cmd_lode(["path", "abc", "--json"]) == exit_code
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected_error
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "{",
+        json.dumps(
+            {
+                "id": "abc12345",
+                "host": "local",
+                "path": "/remote/worktrees/abc12345",
+                "exists": True,
+                "extra": "unexpected",
+            }
+        ),
+        json.dumps(
+            {
+                "id": "different",
+                "host": "local",
+                "path": "/remote/worktrees/abc12345",
+                "exists": True,
+            }
+        ),
+        json.dumps(
+            {
+                "id": "abc12345",
+                "host": "local",
+                "path": "/remote/worktrees/abc12345",
+                "exists": False,
+            }
+        ),
+    ],
+    ids=["malformed", "extra-key", "mismatched-id", "not-existing"],
+)
+def test_lode_path_rejects_invalid_remote_json_without_path_output(stdout, capsys):
+    lode = {"id": "abc12345", "host": "resident.example"}
+    result = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+    with (
+        patch(
+            "hopper.cli._resolve_lode_all_sources",
+            return_value=_watch_resolution(lode, "resident.example"),
+        ),
+        patch("hopper.remote.run_remote", return_value=result),
+    ):
+        assert cmd_lode(["path", "abc", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "Lode path unavailable for 'abc12345' on resident.example: invalid remote response\n"
+    )
+    assert "/remote/worktrees/abc12345" not in captured.err
 
 
 @pytest.mark.parametrize(
