@@ -107,12 +107,15 @@ Watch live status events for a lode **(outside lode only)**:
 hop lode watch <lode-id>
 ```
 
-Practical create + wait workflow:
+Watch, pause, and resume resolve the lode across configured hosts and route to
+its resident host.
+
+Practical create + blocking-wait workflow:
 
 ```bash
 cat scope.md | hop implement myproject
-# note the lode ID from output, then poll to completion:
-hop lode status <lode-id>   # repeat on an interval until: stage: shipped
+# note the lode ID from output, then block until it finishes:
+hop wait <lode-id>
 ```
 
 ## Lode management
@@ -135,6 +138,10 @@ Show detailed status for a lode:
 hop lode status <lode-id>
 hop lode status <lode-id> --json
 hop lode show <lode-id>   # alias for status
+hop status <lode-id>
+hop status <lode-id> --json
+hop lode path <lode-id>
+hop lode path <lode-id> --json
 ```
 
 `hop lode list/status --json` lode objects and `hop wait --json` JSONL terminal
@@ -256,9 +263,16 @@ hop ping                            # check server connectivity
 hop screenshot                      # render TUI window as ANSI text
 hop lode peek <lode-id>             # plain-text tail of the lode pane
 hop lode nudge <lode-id>            # submit "continue" via buffer paste
+hop lode nudge <lode-id> "focus the failing test"
 hop lode nudge <lode-id> --text "..."
+hop lode nudge <lode-id> -- -leading-dash-text
 hop lode answer <lode-id> 1         # answer numbered prompts
 ```
+
+When JavaScript exec runs a command, inspect `r.exit_code` directly. When forwarding the
+shell result to the model, emit both fields with
+`text(JSON.stringify({exit_code: r.exit_code, output: r.output}))`;
+never emit only `r.output` when success matters.
 
 ### Stuck lodes
 

@@ -63,11 +63,12 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
 
-Useful lode subcommands include `hop lode peek`, `hop lode nudge`, and
-`hop lode answer` for pane inspection and routine prompt recovery. `hop lode
-pause ID` stops the pane while retaining the active lode, worktree, branch, and
-stage session; `hop lode resume ID` continues it. `hop lode kill` archives the
-lode but retains its worktree and branch for recovery.
+Useful lode subcommands include `hop lode peek`, `hop lode nudge`, `hop lode
+answer`, and `hop lode path` for pane inspection, prompt recovery, and locating
+the exact worktree. `hop lode pause ID` stops the pane while retaining the
+active lode, worktree, branch, and stage session; `hop lode resume ID` continues
+it. Watch, pause, and resume route to the lode's resident host. `hop lode kill`
+archives the lode but retains its worktree and branch for recovery.
 
 Use `hop remote` plus the global `-H/--host` flag for remote hopper hosts.
 Quote remote-home paths (`hop -H host project add '~/src/repo'`): an unquoted
