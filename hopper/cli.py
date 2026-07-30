@@ -1620,25 +1620,70 @@ def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
     return None, f"Lode status unavailable for '{prefix}': {payload}"
 
 
-def _remote_lode_status(host: str, lode_id: str, timeout: float = 5.0) -> tuple[dict | None, str]:
+class _RemoteLodeProbeState(str):
+    """Remote probe outcome with ambiguity IDs when the host supplied them."""
+
+    matches: tuple[str, ...]
+
+    def __new__(cls, value: str, *, matches: tuple[str, ...] = ()):
+        state = super().__new__(cls, value)
+        state.matches = matches
+        return state
+
+
+def _remote_ambiguity_matches(output: str) -> tuple[str, ...]:
+    """Extract IDs from current and legacy remote ambiguity diagnostics."""
+    patterns = (
+        r"Ambiguous lode prefix .+?\. Matches: (.+?)(?:\. Probes:|\n|$)",
+        r"Ambiguous prefix .+?, matches: (.+?)(?:\n|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, output, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        ids: list[str] = []
+        for item in match.group(1).split(","):
+            lode_id = item.strip().rsplit(":", 1)[-1].strip().rstrip(".")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", lode_id):
+                return ()
+            ids.append(lode_id)
+        if len(ids) >= 2 and len(set(ids)) == len(ids):
+            return tuple(ids)
+    return ()
+
+
+def _remote_lode_status(
+    host: str,
+    lode_id: str,
+    timeout: float = 5.0,
+) -> tuple[dict | None, _RemoteLodeProbeState]:
     """Return (lode, probe state), distinguishing absence from unreadability."""
     from hopper.remote import run_remote
 
     try:
         result = run_remote(host, ["lode", "status", lode_id, "--json"], timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
-        return None, "unreadable"
+        return None, _RemoteLodeProbeState("unreadable")
     if result.returncode != 0:
-        output = f"{result.stdout}\n{result.stderr}".lower()
-        return None, "absent" if result.returncode == 1 and "not found" in output else "unreadable"
+        output = f"{result.stdout}\n{result.stderr}"
+        ambiguity_matches = _remote_ambiguity_matches(output)
+        if result.returncode == 1 and ambiguity_matches:
+            return None, _RemoteLodeProbeState(
+                "ambiguous",
+                matches=ambiguity_matches,
+            )
+        state = (
+            "absent" if result.returncode == 1 and "not found" in output.lower() else "unreadable"
+        )
+        return None, _RemoteLodeProbeState(state)
     try:
         lode = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return None, "unreadable"
+        return None, _RemoteLodeProbeState("unreadable")
     if not isinstance(lode, dict) or not lode.get("id"):
-        return None, "unreadable"
+        return None, _RemoteLodeProbeState("unreadable")
     lode["host"] = host
-    return lode, "found"
+    return lode, _RemoteLodeProbeState("found")
 
 
 def _remote_hosts() -> list[str]:
@@ -1690,7 +1735,7 @@ def _find_remote_lode(
         host = cached_host
         checked.append(host)
         lode, probe_state = _remote_lode_status(host, prefix)
-        if probe_state == "unreadable":
+        if probe_state in ("ambiguous", "unreadable"):
             unreadable.add(host)
         if lode:
             if remember_result:
@@ -1714,7 +1759,7 @@ def _find_remote_lode(
         lode, probe_state = _remote_lode_status(host, prefix)
         with lock:
             checked.append(host)
-            if probe_state == "unreadable":
+            if probe_state in ("ambiguous", "unreadable"):
                 unreadable.add(host)
             if lode and not found:
                 found.append(lode)
@@ -1772,7 +1817,7 @@ def _probe_summary_entry(source: str, outcome: str, detail: object = None) -> st
     """Format one deterministic, single-line probe summary entry."""
     suffix = ""
     if detail:
-        if isinstance(detail, list):
+        if isinstance(detail, (list, tuple)):
             text = ", ".join(str(item) for item in detail)
         else:
             text = " ".join(str(detail).split())
@@ -1852,18 +1897,24 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
             return _found_resolution(matches[0][1], matches[0][0], probes)
         return _failed_resolution("absent", prefix, probes)
 
-    # Same-host remote ambiguity deliberately degrades to unreadable across versions.
     cached_host = _cached_lode_host(prefix, hosts)
     remaining_hosts = list(hosts)
     if cached_host:
         remaining_hosts.remove(cached_host)
         lode, state = _remote_lode_status(cached_host, prefix)
-        probes.append(_probe_summary_entry(cached_host, state))
+        ambiguity_matches = getattr(state, "matches", ())
+        probes.append(_probe_summary_entry(cached_host, state, ambiguity_matches))
         if lode and lode["id"] == prefix:
             _remember_lode_route(lode["id"], cached_host, lode.get("project", ""))
             return _found_resolution(lode, cached_host, probes)
         if lode:
             matches.append((cached_host, lode))
+        elif state == "ambiguous":
+            found_ids = [
+                *[(host, match["id"]) for host, match in matches],
+                *[(cached_host, lode_id) for lode_id in ambiguity_matches],
+            ]
+            return _failed_resolution("ambiguous", prefix, probes, found_ids)
         elif state == "unreadable":
             unavailable = True
 
@@ -1886,11 +1937,14 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
     exact_matches: list[tuple[str, dict]] = []
     for host, thread in zip(remaining_hosts, threads):
         lode, state = remote_results.get(host, (None, "unreadable"))
-        probes.append(_probe_summary_entry(host, state))
+        ambiguity_matches = getattr(state, "matches", ())
+        probes.append(_probe_summary_entry(host, state, ambiguity_matches))
         if lode and lode["id"] == prefix:
             exact_matches.append((host, lode))
         elif lode:
             matches.append((host, lode))
+        elif state == "ambiguous":
+            matches.extend((host, {"id": lode_id}) for lode_id in ambiguity_matches)
         elif state == "unreadable" or thread.is_alive():
             unavailable = True
 

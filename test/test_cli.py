@@ -4688,6 +4688,45 @@ def test_remote_lode_probe_classifies_malformed_output_as_unreadable(stdout):
     assert state == "unreadable"
 
 
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        (
+            "Ambiguous lode prefix 'abc'. Matches: "
+            "local:abc11111, local:abc22222. Probes: local=ambiguous.\n"
+        ),
+        "Ambiguous prefix 'abc', matches: abc11111, abc22222\n",
+    ],
+)
+def test_remote_lode_probe_preserves_ambiguity_ids(diagnostic):
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess([], 1, stdout=diagnostic, stderr="")
+    with patch("hopper.remote.run_remote", return_value=result):
+        lode, state = _remote_lode_status("fedora.local", "abc")
+
+    assert lode is None
+    assert state == "ambiguous"
+    assert state.matches == ("abc11111", "abc22222")
+
+
+def test_remote_lode_probe_rejects_malformed_ambiguity_as_unreadable():
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess(
+        [],
+        1,
+        stdout="Ambiguous lode prefix 'abc'. Matches: one match only.\n",
+        stderr="",
+    )
+    with patch("hopper.remote.run_remote", return_value=result):
+        lode, state = _remote_lode_status("fedora.local", "abc")
+
+    assert lode is None
+    assert state == "unreadable"
+    assert state.matches == ()
+
+
 def test_find_remote_lode_can_skip_cache_publish():
     from hopper.cli import _find_remote_lode
 
@@ -5613,6 +5652,43 @@ def test_resolver_two_host_prefix_is_ambiguous_without_mutation(verb, mutation, 
     mutate.assert_not_called()
     run_remote.assert_not_called()
     assert "one.example:abc11111, two.example:abc22222" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("verb", "mutation"),
+    [("pause", "pause_lode"), ("resume", "resume_lode")],
+)
+@pytest.mark.parametrize("cached_host", [None, "one.example"], ids=["uncached", "cached"])
+def test_resolver_one_remote_host_ambiguity_refuses_without_mutation(
+    verb,
+    mutation,
+    cached_host,
+    capsys,
+):
+    result = subprocess.CompletedProcess(
+        [],
+        1,
+        stdout=(
+            "Ambiguous lode prefix 'abc'. Matches: "
+            "local:abc11111, local:abc22222. Probes: local=ambiguous.\n"
+        ),
+        stderr="",
+    )
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.cli._remote_hosts", return_value=["one.example"]),
+        patch("hopper.cli._cached_lode_host", return_value=cached_host),
+        patch("hopper.remote.run_remote", return_value=result),
+        patch(f"hopper.client.{mutation}") as mutate,
+        patch("hopper.cli._run_remote_cli") as run_remote,
+    ):
+        assert cmd_lode([verb, "abc"]) == 1
+
+    mutate.assert_not_called()
+    run_remote.assert_not_called()
+    out = capsys.readouterr().out
+    assert "one.example:abc11111, one.example:abc22222" in out
+    assert "one.example=ambiguous (abc11111, abc22222)" in out
 
 
 @pytest.mark.parametrize(
