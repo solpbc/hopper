@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,11 +28,48 @@ def run_remote(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hop on a remote host over ssh and return the completed process."""
+    command = _remote_command(host, hop_args)
+    kwargs: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout,
+    }
+    if stdin_text is not None:
+        kwargs["input"] = stdin_text
+    return subprocess.run(command, **kwargs)
+
+
+def run_remote_streaming(host: str, hop_args: list[str]) -> int:
+    """Run remote hop while forwarding stdout and inheriting stderr live."""
+    process = subprocess.Popen(
+        _remote_command(host, hop_args, unbuffered=True),
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        if process.stdout is not None:
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        return process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+        process.wait()
+        return 130
+
+
+def _remote_command(host: str, hop_args: list[str], *, unbuffered: bool = False) -> list[str]:
+    """Build the ssh argv for one remote hop invocation."""
     quoted_args = " ".join(_quote_remote_arg(arg) for arg in hop_args)
     remote_command = 'export HOP_NO_ROUTE=1; exec "$HOME/.local/bin/hop"'
+    if unbuffered:
+        remote_command = (
+            'export HOP_NO_ROUTE=1; export PYTHONUNBUFFERED=1; exec "$HOME/.local/bin/hop"'
+        )
     if quoted_args:
         remote_command = f"{remote_command} {quoted_args}"
-    command = [
+    return [
         "ssh",
         "-o",
         "BatchMode=yes",
@@ -41,14 +79,6 @@ def run_remote(
         "--",
         remote_command,
     ]
-    kwargs: dict[str, object] = {
-        "capture_output": True,
-        "text": True,
-        "timeout": timeout,
-    }
-    if stdin_text is not None:
-        kwargs["input"] = stdin_text
-    return subprocess.run(command, **kwargs)
 
 
 def _quote_remote_arg(arg: str) -> str:

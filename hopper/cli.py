@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from hopper.lodes import (
     find_lode_by_prefix,
     format_age,
     get_lode_dir,
+    get_worktree_dir,
     is_terminal_failure_kind,
     lode_icon,
     lode_status_for_display,
@@ -42,6 +44,15 @@ _GATE_FEEDBACK_DESCRIPTION = (
     "  hop gate feedback <lode_id> < file.md\n"
     "  hop gate feedback <lode_id> - < file.md"
 )
+HELP_SKILL_REMINDER = "Note for AI agent sessions: load the `hop` skill before using this CLI."
+WATCH_RECONCILE_SECONDS = 30.0
+WATCH_OBSERVER_TIMEOUT_SECONDS = 300.0
+_watch_monotonic = time.monotonic
+
+
+def _watch_condition_wait(condition: threading.Condition, timeout_s: float) -> None:
+    """Wait for a watch event; monkeypatched by deterministic tests."""
+    condition.wait(timeout=timeout_s)
 
 
 def _socket() -> Path:
@@ -81,6 +92,14 @@ class HopperArgumentParser(argparse.ArgumentParser):
 
     def error(self, message: str) -> None:
         raise ArgumentError(message)
+
+    def _print_message(self, message, file=None) -> None:
+        if not message:
+            return
+        text = message.rstrip("\n")
+        if HELP_SKILL_REMINDER not in text.splitlines():
+            text = f"{text}\n\n{HELP_SKILL_REMINDER}"
+        super()._print_message(f"{text}\n", file)
 
 
 def make_parser(cmd: str, description: str) -> argparse.ArgumentParser:
@@ -124,6 +143,8 @@ def print_help() -> None:
     print("  -H, --host   Run the command on a remote hopper host (use 'local' to force local)")
     print("  -h, --help   Show this help message")
     print("  --version    Show version number")
+    print()
+    print(HELP_SKILL_REMINDER)
 
 
 def _print_unresponsive_server(socket_path: Path, timeout: float) -> None:
@@ -529,6 +550,7 @@ def cmd_status(args: list[str]) -> int:
     )
     parser.add_argument("text", nargs="*", help="New status text (optional)")
     parser.add_argument("-t", "--title", default=None, help="Set a short title for this lode")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -539,20 +561,14 @@ def cmd_status(args: list[str]) -> int:
         return 1
 
     lode_id = get_hopper_lid()
-    if not lode_id and parsed.title is None and len(parsed.text) == 1:
-        lookup_id = parsed.text[0]
-        lode, error = _lookup_lode(_socket(), lookup_id)
-        if error:
-            print(error)
+    if lode_id and parsed.json_output:
+        if parsed.text or parsed.title is not None:
+            print("error: --json cannot be combined with status text or --title")
+            parser.print_usage()
             return 1
-        print(format_lode_detail(lode))
-        return 0
-
-    if err := require_server():
-        return err
+        return _show_lode_status(_socket(), lode_id, json_output=True)
 
     if not lode_id:
-        # Outside a lode — look up a specific lode by ID/prefix
         if parsed.title is not None:
             print("Cannot set title from outside a lode.")
             return 1
@@ -562,6 +578,14 @@ def cmd_status(args: list[str]) -> int:
         if len(parsed.text) > 1:
             print("Too many arguments. Usage: hop status <lode-id>")
             return 1
+        return _show_lode_status(
+            _socket(),
+            parsed.text[0],
+            json_output=parsed.json_output,
+        )
+
+    if err := require_server():
+        return err
 
     if err := validate_hopper_lid():
         return err
@@ -1562,6 +1586,26 @@ def format_lode_detail(lode: dict) -> str:
     return "\n".join(lines)
 
 
+def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) -> int:
+    """Resolve and render one local or remote lode through the shared status path."""
+    result = _resolve_lode_all_sources(socket_path, lode_ref)
+    if result["outcome"] != "found":
+        print(result["error"])
+        return result["exit_code"]
+
+    display_lode = dict(result["lode"])
+    if result["host"] == "local":
+        recovery = _load_lode_recovery(result["canonical_id"])
+        if recovery is not None:
+            display_lode["recovery"] = recovery
+    display_lode = lode_with_status_annotations(display_lode)
+    if json_output:
+        print(json.dumps(display_lode, indent=2))
+    else:
+        print(format_lode_detail(display_lode))
+    return 0
+
+
 def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
     """Look up a lode by ID prefix across active and archived lodes."""
     import hopper.client as client
@@ -1597,18 +1641,38 @@ def _remote_lode_status(host: str, lode_id: str, timeout: float = 5.0) -> tuple[
     return lode, "found"
 
 
-def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dict | None, str]:
-    """Find a lode on configured remote hosts using cache, then fan-out."""
-    from hopper.remote import load_lode_cache, remote_registry
+def _remote_hosts() -> list[str]:
+    """Return configured discovery hosts unless remote routing is disabled."""
+    if _remote_disabled():
+        return []
+    from hopper.remote import remote_registry
 
-    registry = remote_registry()
-    hosts = sorted(set(registry.values()))
+    return sorted(set(remote_registry().values()))
+
+
+def _cached_lode_host(key: str, hosts: list[str]) -> str | None:
+    """Return a cached route only while its host remains configured."""
+    from hopper.remote import load_lode_cache
+
+    entry = load_lode_cache().get(key)
+    host = entry.get("host") if isinstance(entry, dict) else None
+    return host if isinstance(host, str) and host in hosts else None
+
+
+def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dict | None, str]:
+    """Use cached-first, first-match lookup for pane and lifecycle commands.
+
+    Authoritative all-source callers must use _resolve_lode_all_sources.
+    """
+    hosts = _remote_hosts()
+    if not hosts:
+        return None, ""
     checked: list[str] = []
     unreadable: set[str] = set()
 
-    cache_entry = load_lode_cache().get(prefix)
-    if cache_entry and isinstance(cache_entry.get("host"), str):
-        host = cache_entry["host"]
+    cached_host = _cached_lode_host(prefix, hosts)
+    if cached_host:
+        host = cached_host
         checked.append(host)
         lode, probe_state = _remote_lode_status(host, prefix)
         if probe_state == "unreadable":
@@ -1662,28 +1726,365 @@ def _find_remote_lode(prefix: str, *, remember_result: bool = True) -> tuple[dic
     return None, summary
 
 
-def _lookup_lode_with_remote(socket_path, prefix: str) -> tuple[dict | None, str | None]:
-    """Look up a lode locally, then on configured remote hosts."""
+def _resolution_result(
+    outcome: str,
+    *,
+    lode: dict | None = None,
+    host: str | None = None,
+    canonical_id: str | None = None,
+    error: str | None = None,
+    probe_summary: str = "",
+) -> dict:
+    """Build one stable lode-resolution result."""
+    return {
+        "outcome": outcome,
+        "lode": lode,
+        "host": host,
+        "canonical_id": canonical_id,
+        "error": error,
+        "probe_summary": probe_summary,
+        "exit_code": 0 if outcome == "found" else 2 if outcome == "unavailable" else 1,
+    }
+
+
+def _probe_summary_entry(source: str, outcome: str, detail: object = None) -> str:
+    """Format one deterministic, single-line probe summary entry."""
+    suffix = ""
+    if detail:
+        if isinstance(detail, list):
+            text = ", ".join(str(item) for item in detail)
+        else:
+            text = " ".join(str(detail).split())
+        suffix = f" ({text})"
+    return f"{source}={outcome}{suffix}"
+
+
+def _found_resolution(lode: dict, host: str, probes: list[str]) -> dict:
+    """Return a copied, host-stamped successful resolution."""
+    resolved = dict(lode)
+    resolved["host"] = host
+    return _resolution_result(
+        "found",
+        lode=resolved,
+        host=host,
+        canonical_id=resolved["id"],
+        probe_summary="; ".join(probes),
+    )
+
+
+def _failed_resolution(
+    outcome: str,
+    prefix: str,
+    probes: list[str],
+    matches: list[tuple[str, str]] | None = None,
+) -> dict:
+    """Return a failed resolution with one truthful, actionable message."""
+    summary = "; ".join(probes)
+    if outcome == "ambiguous":
+        match_text = ", ".join(f"{host}:{lode_id}" for host, lode_id in matches or [])
+        error = f"Ambiguous lode prefix '{prefix}'. Matches: {match_text}. Probes: {summary}."
+    elif outcome == "unavailable":
+        error = f"Lode status unavailable for '{prefix}'. Probes: {summary}."
+    else:
+        error = f"Lode '{prefix}' not found. Probes: {summary}."
+    return _resolution_result(
+        outcome,
+        error=error,
+        probe_summary=summary,
+    )
+
+
+def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
+    """Resolve a lode authoritatively across local and configured remote sources."""
+    import hopper.client as client
+
+    local_outcome, local_payload = client.read_lode_snapshot(socket_path, prefix)
+    probes = [
+        _probe_summary_entry(
+            "local",
+            local_outcome,
+            local_payload
+            if local_outcome
+            in {
+                "ambiguous",
+                "unavailable",
+            }
+            else None,
+        )
+    ]
+    matches: list[tuple[str, dict]] = []
+    unavailable = local_outcome == "unavailable"
+
+    if local_outcome == "found":
+        if local_payload["id"] == prefix:
+            return _found_resolution(local_payload, "local", probes)
+        matches.append(("local", local_payload))
+    elif local_outcome == "ambiguous":
+        local_matches = [("local", lode_id) for lode_id in local_payload]
+        return _failed_resolution("ambiguous", prefix, probes, local_matches)
+
+    hosts = _remote_hosts()
+    if not hosts:
+        if unavailable:
+            return _failed_resolution("unavailable", prefix, probes)
+        if matches:
+            return _found_resolution(matches[0][1], matches[0][0], probes)
+        return _failed_resolution("absent", prefix, probes)
+
+    # Same-host remote ambiguity deliberately degrades to unreadable across versions.
+    cached_host = _cached_lode_host(prefix, hosts)
+    remaining_hosts = list(hosts)
+    if cached_host:
+        remaining_hosts.remove(cached_host)
+        lode, state = _remote_lode_status(cached_host, prefix)
+        probes.append(_probe_summary_entry(cached_host, state))
+        if lode and lode["id"] == prefix:
+            _remember_lode_route(lode["id"], cached_host, lode.get("project", ""))
+            return _found_resolution(lode, cached_host, probes)
+        if lode:
+            matches.append((cached_host, lode))
+        elif state == "unreadable":
+            unavailable = True
+
+    lock = threading.Lock()
+    remote_results: dict[str, tuple[dict | None, str]] = {}
+
+    def probe(host: str) -> None:
+        result = _remote_lode_status(host, prefix)
+        with lock:
+            remote_results[host] = result
+
+    threads = [
+        threading.Thread(target=probe, args=(host,), daemon=True) for host in remaining_hosts
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.5)
+
+    exact_matches: list[tuple[str, dict]] = []
+    for host, thread in zip(remaining_hosts, threads):
+        lode, state = remote_results.get(host, (None, "unreadable"))
+        probes.append(_probe_summary_entry(host, state))
+        if lode and lode["id"] == prefix:
+            exact_matches.append((host, lode))
+        elif lode:
+            matches.append((host, lode))
+        elif state == "unreadable" or thread.is_alive():
+            unavailable = True
+
+    if exact_matches:
+        host, lode = exact_matches[0]
+        _remember_lode_route(lode["id"], host, lode.get("project", ""))
+        return _found_resolution(lode, host, probes)
+
+    if len(matches) >= 2:
+        found_ids = [(host, lode["id"]) for host, lode in matches]
+        return _failed_resolution("ambiguous", prefix, probes, found_ids)
+    if unavailable:
+        return _failed_resolution("unavailable", prefix, probes)
+    if matches:
+        host, lode = matches[0]
+        if host != "local":
+            _remember_lode_route(lode["id"], host, lode.get("project", ""))
+        return _found_resolution(lode, host, probes)
+    return _failed_resolution("absent", prefix, probes)
+
+
+def _lookup_lode_with_remote(socket_path, prefix: str) -> dict:
+    """Use local-then-first-remote lookup for pane commands.
+
+    Authoritative all-source callers must use _resolve_lode_all_sources.
+    """
     lode, error = _lookup_lode(socket_path, prefix)
     remote_eligible = error and (
         error.startswith("Lode '") or error.startswith("Lode status unavailable")
     )
     if lode or (error and not remote_eligible):
-        return lode, error
+        if lode:
+            return _resolution_result(
+                "found",
+                lode=lode,
+                canonical_id=lode["id"],
+            )
+        return _resolution_result(
+            "ambiguous",
+            error=error,
+        )
     local_unavailable = error if error and error.startswith("Lode status unavailable") else None
     remote_lode, checked = _find_remote_lode(prefix)
     if remote_lode:
-        return remote_lode, None
+        return _resolution_result(
+            "found",
+            lode=remote_lode,
+            host=remote_lode.get("host"),
+            canonical_id=remote_lode["id"],
+        )
     if local_unavailable:
         if "[unreadable:" in checked:
-            return None, f"{local_unavailable}. Remote probes: {checked}."
-        if checked:
-            return None, f"{local_unavailable}. Checked remote hosts: {checked}."
-        return None, f"{local_unavailable}. No remote hosts configured."
+            message = f"{local_unavailable}. Remote probes: {checked}."
+        elif checked:
+            message = f"{local_unavailable}. Checked remote hosts: {checked}."
+        else:
+            message = f"{local_unavailable}. No remote hosts configured."
+        return _resolution_result("unavailable", error=message)
     if "[unreadable:" in checked:
-        return None, f"Lode status unavailable for '{prefix}'. Remote probes: {checked}."
+        return _resolution_result(
+            "unavailable",
+            error=f"Lode status unavailable for '{prefix}'. Remote probes: {checked}.",
+        )
     suffix = f" Checked remote hosts: {checked}." if checked else " No remote hosts configured."
-    return None, f"Lode '{prefix}' not found.{suffix}"
+    return _resolution_result(
+        "absent",
+        error=f"Lode '{prefix}' not found.{suffix}",
+    )
+
+
+def _format_watch_line(lode: dict) -> str:
+    """Format one watch transition."""
+    icon = lode_icon(lode)
+    return f"{icon} {lode.get('id', '')} {lode.get('stage', '')}  {lode.get('status', '')}"
+
+
+def _read_watch_snapshot(socket_path: Path, lode_id: str) -> tuple[str, dict | None, str]:
+    """Read one exact durable watch snapshot with probe evidence."""
+    import hopper.client as client
+
+    outcome, payload = client.read_lode_snapshot(socket_path, lode_id)
+    if outcome == "found" and isinstance(payload, dict) and payload.get("id") == lode_id:
+        return "found", dict(payload), _probe_summary_entry("local", "found", lode_id)
+    if outcome == "absent":
+        return "absent", None, _probe_summary_entry("local", "absent")
+    if outcome == "unavailable":
+        return "unavailable", None, _probe_summary_entry("local", "unavailable", payload)
+    return (
+        "unavailable",
+        None,
+        _probe_summary_entry("local", "unavailable", f"invalid exact snapshot: {outcome}"),
+    )
+
+
+def _watch_terminal_code(lode: dict) -> int | None:
+    """Print terminal guidance and return its watch exit code."""
+    lode_id = lode["id"]
+    if lode.get("stage") == "shipped":
+        return 0
+    if lode.get("state") == "error":
+        print(_format_lode_error(lode))
+        return 1
+    if isinstance(lode.get("archived_at"), int):
+        print(f"Lode '{lode_id}' is archived and cannot change.")
+        print(f"Inspect with: hop lode status {lode_id}")
+        return 1
+    if not lode.get("active"):
+        print(f"Lode '{lode_id}' is not active.")
+        print(f"Resume with: hop lode resume {lode_id}")
+        return 1
+    return None
+
+
+def _run_local_lode_watch(socket_path: Path, initial_lode: dict) -> int:
+    """Watch one locally resident lode using events plus durable reconciliation."""
+    import hopper.client as client
+
+    lode_id = initial_lode["id"]
+    condition = threading.Condition()
+    events: list[dict] = []
+    reconcile_requested = False
+    prior_state = initial_lode.get("state")
+    last_line_key = None
+
+    def emit(lode: dict) -> None:
+        nonlocal last_line_key, prior_state
+        line_key = (
+            lode.get("stage"),
+            lode.get("state"),
+            lode.get("status"),
+            lode.get("active"),
+            lode.get("archived_at"),
+        )
+        if line_key != last_line_key:
+            print(_format_watch_line(lode), flush=True)
+            last_line_key = line_key
+        state = lode.get("state")
+        if state != prior_state:
+            if state == "gated":
+                print(f"Lode {lode_id} is gated. Review with: hop gate show {lode_id}", flush=True)
+            elif prior_state == "gated":
+                print(f"Lode {lode_id} gate resumed.", flush=True)
+            prior_state = state
+
+    emit(initial_lode)
+    terminal_code = _watch_terminal_code(initial_lode)
+    if terminal_code is not None:
+        return terminal_code
+
+    def on_message(message: dict) -> None:
+        if message.get("type") not in ("lode_updated", "lode_archived"):
+            return
+        lode = message.get("lode")
+        if not isinstance(lode, dict) or lode.get("id") != lode_id:
+            return
+        with condition:
+            events.append(dict(lode))
+            condition.notify_all()
+
+    connection = client.HopperConnection(socket_path)
+    last_successful_read = _watch_monotonic()
+    next_reconcile = last_successful_read
+    last_probe_summary = _probe_summary_entry("local", "found", lode_id)
+    try:
+        connection.start(callback=on_message)
+        # Reconcile immediately after subscribing to close the initial-read race.
+        reconcile_requested = True
+        while True:
+            with condition:
+                pending_events = list(events)
+                events.clear()
+            if pending_events:
+                for event_lode in pending_events:
+                    emit(event_lode)
+                reconcile_requested = True
+
+            now = _watch_monotonic()
+            if reconcile_requested or now >= next_reconcile:
+                outcome, snapshot, last_probe_summary = _read_watch_snapshot(
+                    socket_path,
+                    lode_id,
+                )
+                reconcile_requested = False
+                next_reconcile = now + WATCH_RECONCILE_SECONDS
+                if outcome == "found":
+                    last_successful_read = now
+                    emit(snapshot)
+                    terminal_code = _watch_terminal_code(snapshot)
+                    if terminal_code is not None:
+                        return terminal_code
+                elif outcome == "absent":
+                    print(f"Lode '{lode_id}' not found. Probes: {last_probe_summary}.")
+                    print(f"Retry with: hop lode status {lode_id}")
+                    return 1
+
+            now = _watch_monotonic()
+            if now - last_successful_read >= WATCH_OBSERVER_TIMEOUT_SECONDS:
+                print(f"Lode status unavailable for '{lode_id}'. Probes: {last_probe_summary}.")
+                print(f"Retry with: hop lode status {lode_id}")
+                return 2
+
+            deadline = min(
+                next_reconcile,
+                last_successful_read + WATCH_OBSERVER_TIMEOUT_SECONDS,
+            )
+            with condition:
+                if not events:
+                    _watch_condition_wait(
+                        condition,
+                        max(0.0, deadline - _watch_monotonic()),
+                    )
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        connection.stop()
 
 
 def _tail_text(text: str, lines: int = 10) -> str:
@@ -1732,13 +2133,6 @@ def cmd_lode(args: list[str]) -> int:
     from hopper.projects import disabled_project_message, find_project
 
     STAGE_ORDER = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
-
-    def format_watch_line(lode: dict) -> str:
-        icon = lode_icon(lode)
-        lode_id = lode.get("id", "")
-        stage = lode.get("stage", "")
-        status = lode.get("status", "")
-        return f"{icon} {lode_id} {stage}  {status}"
 
     parser = make_parser("lode", "Manage lodes")
     subs = parser.add_subparsers(dest="subcommand")
@@ -1792,6 +2186,9 @@ def cmd_lode(args: list[str]) -> int:
     show_p = subs.add_parser("show", help="Show a lode's status", exit_on_error=False)
     show_p.add_argument("lode_id", help="Lode ID to show")
     show_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    path_p = subs.add_parser("path", help="Show a lode's worktree path", exit_on_error=False)
+    path_p.add_argument("lode_id", help="Lode ID to show")
+    path_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     log_p = subs.add_parser("log", help="Show activity log for a lode", exit_on_error=False)
     log_p.add_argument("lode_id", help="Lode ID (or prefix)")
     log_p.add_argument("-n", "--tail", type=int, default=0, help="Show last N entries")
@@ -1804,7 +2201,8 @@ def cmd_lode(args: list[str]) -> int:
     peek_p.add_argument("-n", "--lines", type=int, default=40, help="Number of lines to show")
     nudge_p = subs.add_parser("nudge", help="Send text to a lode pane", exit_on_error=False)
     nudge_p.add_argument("lode_id", help="Lode ID to nudge")
-    nudge_p.add_argument("--text", default="continue", help="Text to submit")
+    nudge_p.add_argument("text", nargs="?", default=None, help="Text to submit (default: continue)")
+    nudge_p.add_argument("--text", dest="text_option", default=None, help="Text to submit")
     answer_p = subs.add_parser("answer", help="Answer a numbered lode prompt", exit_on_error=False)
     answer_p.add_argument("lode_id", help="Lode ID to answer")
     answer_p.add_argument("choice", help="Numbered choice, 1-9")
@@ -1826,6 +2224,18 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     subcommand = parsed.subcommand or "list"
+    if subcommand == "nudge" and parsed.text is not None and parsed.text_option is not None:
+        print("error: positional text and --text cannot be used together")
+        nudge_p.print_usage()
+        return 1
+    if subcommand == "nudge":
+        parsed.nudge_text = (
+            parsed.text_option
+            if parsed.text_option is not None
+            else parsed.text
+            if parsed.text is not None
+            else "continue"
+        )
     socket_path = _socket()
 
     if subcommand in ("list", "ls"):
@@ -1944,18 +2354,19 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand in ("pause", "resume"):
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        err = require_server()
-        if err:
-            remote_lode, _checked = _find_remote_lode(parsed.lode_id)
-            if remote_lode:
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    ["lode", subcommand, parsed.lode_id],
-                    reason=f"lode {remote_lode['id']}",
-                )
-            return err
+        resolved = _resolve_lode_all_sources(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        if resolved["host"] != "local":
+            return _run_remote_cli(
+                resolved["host"],
+                ["lode", subcommand, lode_id],
+                reason=f"lode {lode_id}",
+            )
         operation = client.pause_lode if subcommand == "pause" else client.resume_lode
-        response = operation(socket_path, parsed.lode_id)
+        response = operation(socket_path, lode_id)
         expected = "lode_paused" if subcommand == "pause" else "lode_resumed"
         if not response or response.get("type") != expected:
             error = (
@@ -1969,6 +2380,95 @@ def cmd_lode(args: list[str]) -> int:
             print(f"Paused lode {response['lode']['id']}; worktree and stage session retained")
         else:
             print(f"Resuming lode {response['lode']['id']} (pane {response.get('tmux_pane', '')})")
+        return 0
+
+    if subcommand == "path":
+        resolved = _resolve_lode_all_sources(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(
+                resolved["error"],
+                file=sys.stderr if parsed.json_output else sys.stdout,
+            )
+            return resolved["exit_code"]
+
+        lode_id = resolved["canonical_id"]
+        host = resolved["host"]
+        if host == "local":
+            worktree = get_worktree_dir(lode_id)
+            try:
+                path = worktree.resolve(strict=True) if worktree.is_dir() else None
+            except OSError:
+                path = None
+            if path is None or not path.is_dir():
+                print(
+                    f"No worktree exists for lode '{lode_id}'.",
+                    file=sys.stderr if parsed.json_output else sys.stdout,
+                )
+                return 1
+            payload = {
+                "id": lode_id,
+                "host": "local",
+                "path": str(path),
+                "exists": True,
+            }
+        else:
+            from hopper.remote import run_remote
+
+            try:
+                remote_result = run_remote(
+                    host,
+                    ["lode", "path", lode_id, "--json"],
+                    timeout=8,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                print(f"Lode path unavailable for '{lode_id}' on {host}: {error}", file=sys.stderr)
+                return 2
+            if remote_result.returncode != 0:
+                output = f"{remote_result.stdout}\n{remote_result.stderr}".lower()
+                if "no worktree exists" in output:
+                    print(
+                        f"No worktree exists for lode '{lode_id}' on {host}.",
+                        file=sys.stderr if parsed.json_output else sys.stdout,
+                    )
+                    return 1
+                if "not found" in output:
+                    print(
+                        f"Lode '{lode_id}' not found on {host}.",
+                        file=sys.stderr if parsed.json_output else sys.stdout,
+                    )
+                    return 1
+                print(
+                    f"Lode path unavailable for '{lode_id}' on {host}: "
+                    f"remote command exited {remote_result.returncode}",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                payload = json.loads(remote_result.stdout)
+            except json.JSONDecodeError:
+                payload = None
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"id", "host", "path", "exists"}
+                or payload.get("id") != lode_id
+                or not isinstance(payload.get("path"), str)
+                or not Path(payload["path"]).is_absolute()
+                or payload.get("exists") is not True
+            ):
+                print(
+                    f"Lode path unavailable for '{lode_id}' on {host}: invalid remote response",
+                    file=sys.stderr,
+                )
+                return 2
+            payload = dict(payload)
+            payload["host"] = host
+
+        if parsed.json_output:
+            print(json.dumps(payload, separators=(",", ":")))
+        elif host == "local":
+            print(payload["path"])
+        else:
+            print(f"{host}:{payload['path']}")
         return 0
 
     if subcommand == "restart":
@@ -2017,67 +2517,26 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand == "watch":
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        lode_id = parsed.lode_id
-        if require_server():
-            return 1
-        lode = client.get_lode(socket_path, lode_id)
-        if not lode:
-            print(f"Lode '{lode_id}' not found")
-            return 1
-        if lode.get("state") == "error":
-            print(_format_lode_error(lode))
-            return 1
-        if not lode.get("active"):
-            print(f"Lode '{lode_id}' is not active")
-            return 1
+        resolved = _resolve_lode_all_sources(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        if resolved["host"] == "local":
+            return _run_local_lode_watch(socket_path, resolved["lode"])
 
-        # Print initial state
-        print(format_watch_line(lode))
+        from hopper.remote import run_remote_streaming
 
-        done = threading.Event()
-        result = [0]
-        prior_states: dict[str, str] = {lode_id: lode.get("state")}
-
-        def on_message(message: dict) -> None:
-            msg_type = message.get("type")
-            if msg_type not in ("lode_updated", "lode_archived"):
-                return
-            msg_lode = message.get("lode", {})
-            msg_lode_id = msg_lode.get("id")
-            if msg_lode_id != lode_id:
-                return
-            print(format_watch_line(msg_lode))
-            old_state = prior_states.get(msg_lode_id)
-            new_state = msg_lode.get("state")
-            if old_state != new_state:
-                if new_state == "gated":
-                    print(f"Lode {msg_lode_id} is gated. Review with: hop gate show {msg_lode_id}")
-                elif old_state == "gated":
-                    print(f"Lode {msg_lode_id} gate resumed.")
-                prior_states[msg_lode_id] = new_state
-            if msg_type == "lode_archived":
-                done.set()
-            elif msg_lode.get("state") == "error":
-                result[0] = 1
-                done.set()
-            elif msg_lode.get("stage") == "shipped":
-                done.set()
-
-        conn = client.HopperConnection(socket_path)
         try:
-            conn.start(callback=on_message)
-            done.wait()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            conn.stop()
-        if result[0] == 1:
-            err_lode = client.get_lode(socket_path, lode_id)
-            if err_lode:
-                print(_format_lode_error(err_lode))
-            else:
-                print(f"Lode '{lode_id}' entered error state")
-        return result[0]
+            return run_remote_streaming(
+                resolved["host"],
+                ["lode", "watch", resolved["canonical_id"]],
+            )
+        except OSError as error:
+            print(
+                f"remote command failed on {resolved['host']}: {error}",
+                file=sys.stderr,
+            )
+            return 2
 
     if subcommand == "wait":
         from hopper.wait import WAIT_SUMMARY_NO_TARGET, wait_for_lodes
@@ -2204,11 +2663,11 @@ def cmd_lode(args: list[str]) -> int:
         if err:
             remote_lode, _checked = _find_remote_lode(parsed.lode_id)
             if remote_lode:
-                remote_args = ["lode", subcommand, parsed.lode_id]
+                remote_args = ["lode", subcommand, remote_lode["id"]]
                 if subcommand == "peek":
                     remote_args.extend(["-n", str(parsed.lines)])
                 elif subcommand == "nudge":
-                    remote_args.extend(["--text", parsed.text])
+                    remote_args.extend(["--", parsed.nudge_text])
                 else:
                     remote_args.append(parsed.choice)
                 return _run_remote_cli(
@@ -2217,19 +2676,20 @@ def cmd_lode(args: list[str]) -> int:
                     reason=f"lode {remote_lode['id']}",
                 )
             return err
-        lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)
-        if error:
-            print(error)
-            return 2 if error.startswith("Lode status unavailable") else 1
-        if lode.get("host"):
-            remote_args = ["lode", subcommand, parsed.lode_id]
+        resolved = _lookup_lode_with_remote(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode = resolved["lode"]
+        if resolved["host"]:
+            remote_args = ["lode", subcommand, resolved["canonical_id"]]
             if subcommand == "peek":
                 remote_args.extend(["-n", str(parsed.lines)])
             elif subcommand == "nudge":
-                remote_args.extend(["--text", parsed.text])
+                remote_args.extend(["--", parsed.nudge_text])
             else:
                 remote_args.append(parsed.choice)
-            return _run_remote_cli(lode["host"], remote_args, reason=f"lode {lode['id']}")
+            return _run_remote_cli(resolved["host"], remote_args, reason=f"lode {lode['id']}")
 
         if subcommand == "peek":
             pane = lode.get("tmux_pane")
@@ -2246,7 +2706,7 @@ def cmd_lode(args: list[str]) -> int:
         if subcommand == "answer" and parsed.choice not in {str(i) for i in range(1, 10)}:
             print("choice must be a digit 1..9")
             return 1
-        text = parsed.text if subcommand == "nudge" else parsed.choice
+        text = parsed.nudge_text if subcommand == "nudge" else parsed.choice
         response = client.send_pane_input(
             socket_path,
             lode["id"],
@@ -2273,21 +2733,11 @@ def cmd_lode(args: list[str]) -> int:
         return 1
 
     if subcommand in ("status", "show"):
-        lode, error = _lookup_lode_with_remote(socket_path, parsed.lode_id)
-        if error:
-            print(error)
-            return 2 if error.startswith("Lode status unavailable") else 1
-        display_lode = dict(lode)
-        if not lode.get("host"):
-            recovery = _load_lode_recovery(lode["id"])
-            if recovery is not None:
-                display_lode["recovery"] = recovery
-        if getattr(parsed, "json_output", False):
-            display_lode = lode_with_status_annotations(display_lode)
-            print(json.dumps(display_lode, indent=2))
-            return 0
-        print(format_lode_detail(display_lode))
-        return 0
+        return _show_lode_status(
+            socket_path,
+            parsed.lode_id,
+            json_output=getattr(parsed, "json_output", False),
+        )
 
     return 0
 
@@ -2692,6 +3142,14 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if cmd == "watch" or (cmd == "lode" and cmd_args[:1] == ["watch"]):
+            from hopper.remote import run_remote_streaming
+
+            try:
+                return run_remote_streaming(explicit_host, [cmd, *cmd_args])
+            except OSError as error:
+                print(f"remote command failed on {explicit_host}: {error}", file=sys.stderr)
+                return 2
         stdin_text = _stdin_for_remote(cmd, cmd_args)
         return _run_remote_cli(
             explicit_host,
