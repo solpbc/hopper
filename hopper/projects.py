@@ -55,23 +55,27 @@ def validate_git_dir(path: str) -> bool:
 
 
 def validate_makefile_install(path: str) -> bool:
-    """Check if a path has a Makefile with an install target.
+    """Check if a path has a Makefile with a Hopper bootstrap target.
 
     Args:
         path: Path to check.
 
     Returns:
-        True if `make -n install` succeeds, False otherwise.
+        True if `make -n hopper-install` or `make -n install` succeeds,
+        False otherwise.
     """
-    try:
-        result = subprocess.run(
-            ["make", "-n", "install", "-C", path],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, OSError):
-        return False
+    for target in ("hopper-install", "install"):
+        try:
+            result = subprocess.run(
+                ["make", "-n", target, "-C", path],
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, OSError):
+            return False
+        if result.returncode == 0:
+            return True
+    return False
 
 
 def load_projects() -> list[Project]:
@@ -141,7 +145,7 @@ def add_project(path: str) -> Project:
 
     Raises:
         ValueError: If path is not a directory, not a git repository,
-            has no Makefile with install target, or name already exists.
+            has no Makefile with a Hopper bootstrap target, or name already exists.
     """
     # Resolve to absolute path
     abs_path = str(Path(path).resolve())
@@ -152,7 +156,7 @@ def add_project(path: str) -> Project:
     if not validate_git_dir(abs_path):
         raise ValueError(f"Not a git repository: {abs_path}")
     if not validate_makefile_install(abs_path):
-        raise ValueError(f"No Makefile with 'install' target: {abs_path}")
+        raise ValueError(f"No Makefile with 'hopper-install' or 'install' target: {abs_path}")
 
     name = Path(abs_path).name
     projects = load_projects()

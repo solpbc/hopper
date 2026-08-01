@@ -214,20 +214,31 @@ def test_add_project_no_makefile(mock_config, tmp_path):
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
 
-    with pytest.raises(ValueError, match="No Makefile with 'install' target"):
+    with pytest.raises(ValueError, match="No Makefile with 'hopper-install' or 'install' target"):
         add_project(str(repo))
 
 
 def test_add_project_makefile_no_install_target(mock_config, tmp_path):
-    """add_project raises ValueError when Makefile has no install target."""
+    """add_project raises ValueError when Makefile has no bootstrap target."""
     repo = tmp_path / "no-install"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
     (repo / "Makefile").write_text(".PHONY: test\ntest:\n\t@true\n")
     assert validate_makefile_install(str(repo)) is False
 
-    with pytest.raises(ValueError, match="No Makefile with 'install' target"):
+    with pytest.raises(ValueError, match="No Makefile with 'hopper-install' or 'install' target"):
         add_project(str(repo))
+
+
+def test_add_project_hopper_install_only(mock_config, tmp_path):
+    """add_project accepts the lean bootstrap target used by the runner."""
+    repo = tmp_path / "hopper-install-only"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    (repo / "Makefile").write_text(".PHONY: hopper-install\nhopper-install:\n\t@true\n")
+
+    assert validate_makefile_install(str(repo)) is True
+    assert add_project(str(repo)).name == "hopper-install-only"
 
 
 # Tests for remove_project
