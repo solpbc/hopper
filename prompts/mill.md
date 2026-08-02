@@ -74,7 +74,7 @@ D) Define acceptance criteria + validation
   - UI: specify screenshot tool usage and which page/state to capture.
   - Data pipelines: specify spot checks on real data (or best available fixtures) and what to verify.
   - Scripts: require dry-run mode + summary counts by reason, and idempotence expectations.
-  - Tests: specify the smallest focused commands that prove the behavior and where tests should be added/updated (or explicit "no test needed" if the task says so).
+  - Tests: specify the smallest focused commands that prove the behavior, and where tests should be added/updated. A test is warranted when a future change could plausibly reintroduce the defect. Say "no test needed" on your own judgment — not only when the task says so — when nothing realistically would: copy and wording edits, casing or punctuation changes, one-time renames, dead-code removal, doc fixes. Never assert over hand-edited prose, wording, casing, or naming; that test fails the next time someone correctly rewords it. Do not emit one test per acceptance criterion by default.
   - Do not add `make ci` or another full repository gate mechanically. Include a full gate during refine only for changes to CI/test infrastructure, shared fixtures, packaging or dependencies, broad cross-cutting contracts, or when a clean baseline is necessary to diagnose the task. State why it is needed. Ship owns the mandatory final full gate.
 
 E) Produce the scoped prompt
