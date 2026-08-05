@@ -189,6 +189,29 @@ class TestCreateWorktree:
 
         assert result == (False, "git worktree add failed: fatal: already exists")
 
+    def test_cleanup_failure_preserves_original_add_detail(self, tmp_path):
+        """Cleanup errors do not replace the original worktree-add failure."""
+        worktree_path = tmp_path / "worktree"
+        results = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=1),
+            MagicMock(returncode=1, stderr="fatal: original add failure"),
+            MagicMock(returncode=0),
+            MagicMock(returncode=1),
+        ]
+
+        with (
+            patch("subprocess.run", side_effect=results),
+            patch(
+                "hopper.git.remove_worktree",
+                side_effect=RuntimeError("cleanup failed"),
+            ) as mock_remove,
+        ):
+            result = create_worktree("/repo", worktree_path, "hopper-abc12345")
+
+        assert result == (False, "git worktree add failed: fatal: original add failure")
+        mock_remove.assert_called_once_with("/repo", str(worktree_path))
+
     def test_git_not_found(self, tmp_path):
         """Returns False when git is not installed."""
         worktree_path = tmp_path / "worktree"
@@ -457,6 +480,34 @@ class TestCreateWorktreeIntegration:
         else:
             assert (worktree_path / "sentinel.txt").read_text() == "keep\n"
             assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+
+    def test_inconclusive_branch_probe_preserves_preexisting_branch(self, tmp_path):
+        registered = _init_git_repo(tmp_path)
+        worktree_path = tmp_path / "preserved-worktree"
+        branch_name = "hopper-preserved"
+        _run_git(registered, "branch", branch_name)
+        real_run = subprocess.run
+
+        def inconclusive_probe(command, **kwargs):
+            if command == [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch_name}",
+            ]:
+                return subprocess.CompletedProcess(command, 128, stderr="fatal: cannot inspect")
+            if command[:3] == ["git", "worktree", "add"]:
+                return subprocess.CompletedProcess(command, 1, stderr="fatal: add rejected")
+            return real_run(command, **kwargs)
+
+        with patch("hopper.git.subprocess.run", side_effect=inconclusive_probe):
+            created, error = create_worktree(str(registered), worktree_path, branch_name)
+
+        assert created is False
+        assert error == "git worktree add failed: fatal: add rejected"
+        assert not worktree_path.exists()
+        assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == branch_name
 
     def test_diff_helpers_use_origin_main_when_local_main_is_behind(
         self, tmp_path, stale_clone_factory

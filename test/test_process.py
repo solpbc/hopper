@@ -516,6 +516,32 @@ class TestStuckWorktreeSnapshot:
 
 
 class TestMillStage:
+    def test_branch_persistence_only_accepts_expected_same_lode_broadcast(self):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+
+        runner._on_server_message({"type": "lode_updated", "lode": {"id": "test-id", "branch": ""}})
+        assert not runner._branch_persisted.is_set()
+
+        runner._expected_lode_branch = "hopper-test-id"
+        runner._on_server_message(
+            {"type": "lode_updated", "lode": {"id": "test-id", "branch": "other"}}
+        )
+        runner._on_server_message(
+            {
+                "type": "lode_updated",
+                "lode": {"id": "other-id", "branch": "hopper-test-id"},
+            }
+        )
+        assert not runner._branch_persisted.is_set()
+
+        runner._on_server_message(
+            {
+                "type": "lode_updated",
+                "lode": {"id": "test-id", "branch": "hopper-test-id"},
+            }
+        )
+        assert runner._branch_persisted.is_set()
+
     def test_emits_running_state(self):
         """Mill runner emits running state when Claude starts."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
@@ -715,6 +741,7 @@ class TestMillStage:
                     stage="mill",
                     state="new",
                     project="my-project",
+                    title="A non-empty title",
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -745,18 +772,30 @@ class TestMillStage:
         _run_git(publisher, "commit", "-m", "advance after mill")
         _run_git(publisher, "push", "origin", "main")
         mill_sha = _run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        lode_dir = get_lode_dir("test-id")
+        lode_dir.mkdir(parents=True, exist_ok=True)
+        (lode_dir / "mill_out.md").write_text("Build from the mill snapshot")
 
         refine = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
         refine.project_dir = str(project_dir)
         refine.project_name = "my-project"
         refine.lode_branch = runner.lode_branch
-        refine.is_first_run = False
-        with patch("hopper.process.create_worktree") as mock_create:
+        refine.is_first_run = True
+        with (
+            patch("hopper.process.create_worktree") as mock_create,
+            patch.object(refine, "_bootstrap_codex", return_value=None) as mock_bootstrap,
+        ):
             assert refine._setup_refine() is None
 
         mock_create.assert_not_called()
+        mock_bootstrap.assert_called_once_with()
         assert refine.worktree_path == worktree
         assert refine._cwd == str(worktree)
+        assert refine._context == {
+            "input": "Build from the mill snapshot",
+            "project": "my-project",
+            "dir": str(project_dir),
+        }
         assert _run_git(worktree, "rev-parse", "HEAD").stdout.strip() == mill_sha
         assert not (worktree / "later.txt").exists()
 
@@ -896,7 +935,9 @@ class TestMillStage:
 
         assert runner.lode_branch == ""
         assert runner._setup_error == (
-            f"Existing worktree has no current branch (detached HEAD): {worktree}"
+            f"Existing worktree has no current branch (detached HEAD): {worktree}. "
+            "Put the worktree back on a branch, then restart with: "
+            "hop lode restart test-id"
         )
         mock_persist.assert_not_called()
 
@@ -930,7 +971,11 @@ class TestMillStage:
         assert any(
             msg_type == "lode_set_state"
             and payload["state"] == "error"
-            and payload["status"] == "Failed to persist lode branch: hopper-test-id"
+            and payload["status"]
+            == (
+                "Failed to persist lode branch: hopper-test-id. Retry with: "
+                "hop lode restart test-id"
+            )
             for msg_type, payload in emitted
         )
         mock_claude.assert_not_called()
@@ -969,7 +1014,8 @@ class TestMillStage:
         assert any(
             msg_type == "lode_set_state"
             and payload["state"] == "error"
-            and payload["status"] == f"Failed to create git worktree: {detail}"
+            and payload["status"]
+            == (f"Failed to create git worktree: {detail}. Retry with: hop lode restart test-id")
             for msg_type, payload in emitted
         )
         mock_claude.assert_not_called()
@@ -1674,7 +1720,10 @@ class TestRefineStage:
             "lode_set_state",
             lode_id="test-id",
             state="error",
-            status=("Failed to create git worktree: git fetch origin failed: fatal: unavailable"),
+            status=(
+                "Failed to create git worktree: git fetch origin failed: fatal: unavailable. "
+                "Retry with: hop lode restart test-id"
+            ),
         )
         MockConn.return_value.stop.assert_called_once()
 
@@ -1731,7 +1780,7 @@ class TestRefineStage:
             status=(
                 "Failed to create git worktree: upstream default branch resolution "
                 "failed after git fetch origin: no candidate exists "
-                "(origin/main, origin/master)"
+                "(origin/main, origin/master). Retry with: hop lode restart test-id"
             ),
         )
         assert not get_worktree_dir("test-id").exists()

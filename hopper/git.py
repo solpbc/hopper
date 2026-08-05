@@ -16,8 +16,8 @@ DEFAULT_BRANCH_NAMES = ("main", "master")
 GIT_FETCH_TIMEOUT_SEC = 120
 
 
-def _branch_exists(repo_dir: str, branch_name: str) -> bool:
-    """Return whether a local branch exists."""
+def _branch_exists(repo_dir: str, branch_name: str) -> bool | None:
+    """Return branch existence, or None when it cannot be proven."""
     try:
         result = subprocess.run(
             [
@@ -31,10 +31,17 @@ def _branch_exists(repo_dir: str, branch_name: str) -> bool:
             capture_output=True,
             text=True,
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        logger.warning(
+            f"failed to check branch {branch_name}: git rev-parse exited {result.returncode}"
+        )
+        return None
     except OSError as exc:
         logger.warning(f"failed to check branch {branch_name}: {exc}")
-        return False
+        return None
 
 
 def _force_delete_branch(repo_dir: str, branch_name: str) -> bool:
@@ -143,7 +150,7 @@ def create_worktree(
         else:
             base_ref = "HEAD"
 
-        branch_existed = _branch_exists(repo_dir, branch_name)
+        branch_absence_proven = _branch_exists(repo_dir, branch_name) is False
         path_existed = worktree_path.exists()
         result = subprocess.run(
             [
@@ -183,7 +190,7 @@ def create_worktree(
                 except OSError as exc:
                     logger.warning(f"git worktree prune failed: {exc}")
 
-            if not branch_existed and _branch_exists(repo_dir, branch_name):
+            if branch_absence_proven and _branch_exists(repo_dir, branch_name) is True:
                 _force_delete_branch(repo_dir, branch_name)
             return False, error
         return True, None

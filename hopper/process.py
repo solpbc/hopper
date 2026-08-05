@@ -392,13 +392,17 @@ class ProcessRunner(BaseRunner):
                 if branch is None:
                     self._setup_error = (
                         "Existing worktree has no current branch (detached HEAD): "
-                        f"{self.worktree_path}"
+                        f"{self.worktree_path}. Put the worktree back on a branch, then "
+                        f"restart with: hop lode restart {self.lode_id}"
                     )
                     print(self._setup_error)
                     logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                     return False
                 if not self._persist_lode_branch(branch):
-                    self._setup_error = f"Failed to persist lode branch: {branch}"
+                    self._setup_error = (
+                        f"Failed to persist lode branch: {branch}. Retry with: "
+                        f"hop lode restart {self.lode_id}"
+                    )
                     print(self._setup_error)
                     logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                     return False
@@ -421,12 +425,18 @@ class ProcessRunner(BaseRunner):
             self.project_dir, self.worktree_path, branch
         )
         if not worktree_created:
-            self._setup_error = f"Failed to create git worktree: {create_detail or 'unknown error'}"
+            self._setup_error = (
+                f"Failed to create git worktree: {create_detail or 'unknown error'}. "
+                f"Retry with: hop lode restart {self.lode_id}"
+            )
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return False
         if not branch_recorded and not self._persist_lode_branch(branch):
-            self._setup_error = f"Failed to persist lode branch: {branch}"
+            self._setup_error = (
+                f"Failed to persist lode branch: {branch}. Retry with: "
+                f"hop lode restart {self.lode_id}"
+            )
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return False

@@ -243,7 +243,6 @@ class BaseRunner:
         self._registration_complete = threading.Event()
         self._registration_accepted = False
         self._expected_lode_branch: str | None = None
-        self._observed_lode_branch: str | None = None
         self._branch_persisted = threading.Event()
         self.is_first_run = False
         self.claude_session_id: str = ""
@@ -499,7 +498,6 @@ class BaseRunner:
     def _persist_lode_branch(self, branch: str) -> bool:
         """Persist branch metadata and wait for its post-save broadcast."""
         self._branch_persisted.clear()
-        self._observed_lode_branch = None
         self._expected_lode_branch = branch
         try:
             if not self.connection:
@@ -569,8 +567,11 @@ class BaseRunner:
         if lode.get("id") != self.lode_id:
             return
         if "branch" in lode:
-            self._observed_lode_branch = lode["branch"]
-            if self._observed_lode_branch == self._expected_lode_branch:
+            observed_branch = lode["branch"]
+            if (
+                self._expected_lode_branch is not None
+                and observed_branch == self._expected_lode_branch
+            ):
                 self._branch_persisted.set()
         if lode.get("state") == "completed":
             self._done.set()
