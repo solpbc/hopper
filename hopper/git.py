@@ -16,6 +16,45 @@ DEFAULT_BRANCH_NAMES = ("main", "master")
 GIT_FETCH_TIMEOUT_SEC = 120
 
 
+def _branch_exists(repo_dir: str, branch_name: str) -> bool:
+    """Return whether a local branch exists."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch_name}",
+            ],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except OSError as exc:
+        logger.warning(f"failed to check branch {branch_name}: {exc}")
+        return False
+
+
+def _force_delete_branch(repo_dir: str, branch_name: str) -> bool:
+    """Force-delete a branch created by a failed worktree-add attempt."""
+    try:
+        result = subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.warning(f"git branch -D failed: {result.stderr.strip()}")
+            return False
+        return True
+    except OSError as exc:
+        logger.warning(f"git branch -D failed: {exc}")
+        return False
+
+
 def _resolve_default_branch(
     repo_dir: str, *, allow_local: bool
 ) -> tuple[str | None, tuple[str, ...]]:
@@ -104,6 +143,8 @@ def create_worktree(
         else:
             base_ref = "HEAD"
 
+        branch_existed = _branch_exists(repo_dir, branch_name)
+        path_existed = worktree_path.exists()
         result = subprocess.run(
             [
                 "git",
@@ -123,6 +164,27 @@ def create_worktree(
             detail = result.stderr.strip() or f"exit code {result.returncode}"
             error = f"git worktree add failed: {detail}"
             logger.error(error)
+
+            if not path_existed:
+                try:
+                    if not remove_worktree(repo_dir, str(worktree_path)):
+                        logger.warning(f"failed to remove partial worktree {worktree_path}")
+                except Exception as exc:
+                    logger.warning(f"failed to remove partial worktree {worktree_path}: {exc}")
+                try:
+                    prune_result = subprocess.run(
+                        ["git", "worktree", "prune"],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if prune_result.returncode != 0:
+                        logger.warning(f"git worktree prune failed: {prune_result.stderr.strip()}")
+                except OSError as exc:
+                    logger.warning(f"git worktree prune failed: {exc}")
+
+            if not branch_existed and _branch_exists(repo_dir, branch_name):
+                _force_delete_branch(repo_dir, branch_name)
             return False, error
         return True, None
     except FileNotFoundError:

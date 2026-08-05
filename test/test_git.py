@@ -107,11 +107,12 @@ class TestCreateWorktree:
         remote_result = MagicMock(returncode=0, stdout="origin\n")
         fetch_result = MagicMock(returncode=0)
         resolve_result = MagicMock(returncode=0, stdout="abc123\n")
+        branch_result = MagicMock(returncode=1)
         add_result = MagicMock(returncode=0)
 
         with patch(
             "subprocess.run",
-            side_effect=[remote_result, fetch_result, resolve_result, add_result],
+            side_effect=[remote_result, fetch_result, resolve_result, branch_result, add_result],
         ) as mock_run:
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
@@ -139,6 +140,18 @@ class TestCreateWorktree:
             call(
                 [
                     "git",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/hopper-abc12345",
+                ],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                [
+                    "git",
                     "worktree",
                     "add",
                     "--no-track",
@@ -157,9 +170,21 @@ class TestCreateWorktree:
         """Returns the captured detail when git worktree add fails."""
         worktree_path = tmp_path / "worktree"
         remote_result = MagicMock(returncode=0, stdout="")
+        branch_result = MagicMock(returncode=1)
         add_result = MagicMock(returncode=1, stderr="fatal: already exists")
+        prune_result = MagicMock(returncode=0)
+        branch_after_result = MagicMock(returncode=1)
 
-        with patch("subprocess.run", side_effect=[remote_result, add_result]):
+        with patch(
+            "subprocess.run",
+            side_effect=[
+                remote_result,
+                branch_result,
+                add_result,
+                prune_result,
+                branch_after_result,
+            ],
+        ):
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
         assert result == (False, "git worktree add failed: fatal: already exists")
@@ -180,6 +205,7 @@ class TestCreateWorktree:
             MagicMock(returncode=0),
             MagicMock(returncode=128, stdout=""),
             MagicMock(returncode=0, stdout="abc123\n"),
+            MagicMock(returncode=1),
             MagicMock(returncode=0),
         ]
 
@@ -187,9 +213,21 @@ class TestCreateWorktree:
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
         assert result == (True, None)
-        assert mock_run.call_args_list[-2:] == [
+        assert mock_run.call_args_list[-3:] == [
             call(
                 ["git", "rev-parse", "--verify", "origin/master"],
+                cwd="/repo",
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                [
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/hopper-abc12345",
+                ],
                 cwd="/repo",
                 capture_output=True,
                 text=True,
@@ -214,9 +252,12 @@ class TestCreateWorktree:
     def test_without_origin_uses_head_without_fetch(self, tmp_path):
         worktree_path = tmp_path / "worktree"
         remote_result = MagicMock(returncode=0, stdout="upstream\n")
+        branch_result = MagicMock(returncode=1)
         add_result = MagicMock(returncode=0)
 
-        with patch("subprocess.run", side_effect=[remote_result, add_result]) as mock_run:
+        with patch(
+            "subprocess.run", side_effect=[remote_result, branch_result, add_result]
+        ) as mock_run:
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
         assert result == (True, None)
@@ -370,6 +411,52 @@ class TestCreateWorktreeIntegration:
         )
         assert not worktree_path.exists()
         assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+
+    def test_partial_add_failure_removes_created_worktree_branch_and_registration(
+        self, tmp_path, stale_clone_factory
+    ):
+        registered, local_sha, upstream_sha = stale_clone_factory("main")
+        hook = registered / ".git" / "hooks" / "post-checkout"
+        hook.write_text("#!/bin/sh\nexit 3\n")
+        hook.chmod(0o755)
+        worktree_path = tmp_path / "partial-worktree"
+        branch_name = "hopper-partial"
+
+        created, error = create_worktree(str(registered), worktree_path, branch_name)
+
+        assert created is False
+        assert error is not None
+        assert error.startswith("git worktree add failed:")
+        assert not worktree_path.exists()
+        assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+        worktree_list = _run_git(registered, "worktree", "list", "--porcelain").stdout
+        assert str(worktree_path) not in worktree_list
+        assert _run_git(registered, "rev-parse", "HEAD").stdout.strip() == local_sha
+        assert _run_git(registered, "rev-parse", "origin/main").stdout.strip() == upstream_sha
+        assert _run_git(registered, "status", "--porcelain").stdout.strip() == ""
+        assert not (registered / "upstream.txt").exists()
+
+    @pytest.mark.parametrize("artifact", ["branch", "path"])
+    def test_add_failure_preserves_preexisting_artifact(self, tmp_path, artifact):
+        registered = _init_git_repo(tmp_path)
+        worktree_path = tmp_path / "preserved-worktree"
+        branch_name = "hopper-preserved"
+        if artifact == "branch":
+            _run_git(registered, "branch", branch_name)
+        else:
+            worktree_path.mkdir()
+            (worktree_path / "sentinel.txt").write_text("keep\n")
+
+        created, error = create_worktree(str(registered), worktree_path, branch_name)
+
+        assert created is False
+        assert error is not None
+        if artifact == "branch":
+            assert _run_git(registered, "branch", "--list", branch_name).stdout.strip()
+            assert not worktree_path.exists()
+        else:
+            assert (worktree_path / "sentinel.txt").read_text() == "keep\n"
+            assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
 
     def test_diff_helpers_use_origin_main_when_local_main_is_behind(
         self, tmp_path, stale_clone_factory

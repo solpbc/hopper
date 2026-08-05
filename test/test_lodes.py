@@ -48,7 +48,6 @@ from hopper.lodes import (
     save_archived_lodes,
     save_lodes,
     set_lode_claude_started,
-    slugify,
     touch,
     unarchive_lode,
     update_lode_branch,
@@ -685,48 +684,6 @@ def test_format_uptime_days():
     assert format_uptime(now - (3 * 24 + 4) * 60 * 60_000) == "3d 4h"
     # Minutes not shown when days > 0
     assert format_uptime(now - (1 * 24 * 60 + 30) * 60_000) == "1d"
-
-
-def test_slugify_empty():
-    """slugify returns empty string for empty input."""
-    assert slugify("") == ""
-
-
-def test_slugify_all_special_chars():
-    """slugify strips all special characters."""
-    assert slugify("!!!@@@###") == ""
-
-
-def test_slugify_basic():
-    """slugify lowercases and hyphenates words."""
-    assert slugify("Branch Naming") == "branch-naming"
-
-
-def test_slugify_symbols():
-    """slugify removes symbols and keeps separators normalized."""
-    assert slugify("hello world! @#$ test") == "hello-world-test"
-
-
-def test_slugify_truncates_to_40_chars():
-    """slugify truncates to max length and avoids trailing hyphen."""
-    result = slugify("a" * 60)
-    assert len(result) == 40
-    assert not result.endswith("-")
-
-
-def test_slugify_strips_wrapping_hyphens():
-    """slugify strips leading and trailing separators."""
-    assert slugify("---hello---") == "hello"
-
-
-def test_slugify_non_ascii():
-    """slugify strips non-ascii characters."""
-    assert slugify("名前テスト") == ""
-
-
-def test_slugify_strips_lock_suffix():
-    """slugify removes a trailing .lock suffix."""
-    assert slugify("test.lock") == "test"
 
 
 def test_touch():

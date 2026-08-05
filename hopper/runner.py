@@ -37,6 +37,7 @@ DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
 STUCK_FAILURE_WAIT_SEC = 60
 REGISTRATION_TIMEOUT_SEC = 5.0
+BRANCH_PERSIST_TIMEOUT_SEC = 5.0
 PS_SCAN_TIMEOUT_SEC = 5.0
 
 
@@ -241,6 +242,9 @@ class BaseRunner:
         self.connection: HopperConnection | None = None
         self._registration_complete = threading.Event()
         self._registration_accepted = False
+        self._expected_lode_branch: str | None = None
+        self._observed_lode_branch: str | None = None
+        self._branch_persisted = threading.Event()
         self.is_first_run = False
         self.claude_session_id: str = ""
         self.project_name: str = ""
@@ -492,6 +496,24 @@ class BaseRunner:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
 
+    def _persist_lode_branch(self, branch: str) -> bool:
+        """Persist branch metadata and wait for its post-save broadcast."""
+        self._branch_persisted.clear()
+        self._observed_lode_branch = None
+        self._expected_lode_branch = branch
+        try:
+            if not self.connection:
+                return False
+            if not self.connection.emit(
+                "lode_set_branch",
+                lode_id=self.lode_id,
+                branch=branch,
+            ):
+                return False
+            return self._branch_persisted.wait(BRANCH_PERSIST_TIMEOUT_SEC)
+        finally:
+            self._expected_lode_branch = None
+
     def _emit_state(
         self,
         state: str,
@@ -546,6 +568,10 @@ class BaseRunner:
         lode = message.get("lode", {})
         if lode.get("id") != self.lode_id:
             return
+        if "branch" in lode:
+            self._observed_lode_branch = lode["branch"]
+            if self._observed_lode_branch == self._expected_lode_branch:
+                self._branch_persisted.set()
         if lode.get("state") == "completed":
             self._done.set()
             logger.debug(f"{self._done_label} signal received")

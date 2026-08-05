@@ -18,7 +18,6 @@ from hopper.client import (
     RUN_GENERATION_ENV,
     report_lode_run_result,
     set_codex_thread_id,
-    set_lode_branch,
     set_lode_state,
     set_lode_status,
 )
@@ -26,12 +25,13 @@ from hopper.codex import bootstrap_codex
 from hopper.git import (
     commit_all,
     create_worktree,
+    current_branch,
     get_diff_numstat,
     head_sha,
     is_dirty,
     quarantine_dirty_repo,
 )
-from hopper.lodes import get_lode_dir, get_worktree_dir, slugify
+from hopper.lodes import get_lode_dir, get_worktree_dir
 from hopper.runner import BaseRunner, _descendant_pids, _sum_descendant_cpu_ms
 
 logger = logging.getLogger(__name__)
@@ -359,13 +359,11 @@ class ProcessRunner(BaseRunner):
         self.use_env: bool = False
         self.scope: str = ""
         self.stage: str = ""
-        self.lode_title: str = ""
         self.lode_branch: str = ""
 
     def _load_lode_data(self, lode_data: dict) -> None:
         self.stage = lode_data.get("stage", "")
         self.scope = lode_data.get("scope", "")
-        self.lode_title = lode_data.get("title", "")
         self.lode_branch = lode_data.get("branch", "")
 
     def _setup(self) -> int | None:
@@ -385,8 +383,61 @@ class ProcessRunner(BaseRunner):
         }[self._claude_stage]
         return setup_method()
 
+    def _establish_lode_worktree(self) -> bool:
+        """Create or reuse this lode's worktree and establish its branch identity."""
+        self.worktree_path = get_worktree_dir(self.lode_id)
+        if self.worktree_path.is_dir():
+            if not self.lode_branch:
+                branch = current_branch(str(self.worktree_path))
+                if branch is None:
+                    self._setup_error = (
+                        "Existing worktree has no current branch (detached HEAD): "
+                        f"{self.worktree_path}"
+                    )
+                    print(self._setup_error)
+                    logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+                    return False
+                if not self._persist_lode_branch(branch):
+                    self._setup_error = f"Failed to persist lode branch: {branch}"
+                    print(self._setup_error)
+                    logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+                    return False
+                self.lode_branch = branch
+            logger.debug(f"worktree reused lode={self.lode_id} path={self.worktree_path}")
+            return True
+
+        branch_recorded = bool(self.lode_branch)
+        branch = self.lode_branch or f"hopper-{self.lode_id}"
+        set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
+        try:
+            self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._setup_error = f"Failed to create worktree directory: {exc}"
+            print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+            return False
+
+        worktree_created, create_detail = create_worktree(
+            self.project_dir, self.worktree_path, branch
+        )
+        if not worktree_created:
+            self._setup_error = f"Failed to create git worktree: {create_detail or 'unknown error'}"
+            print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+            return False
+        if not branch_recorded and not self._persist_lode_branch(branch):
+            self._setup_error = f"Failed to persist lode branch: {branch}"
+            print(self._setup_error)
+            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+            return False
+        self.lode_branch = branch
+        logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
+        return True
+
     def _setup_mill(self) -> int | None:
-        if self.project_dir:
+        if not self.project_dir:
+            self._cwd = None
+        else:
             if not Path(self.project_dir).is_dir():
                 self._setup_error = f"Project directory not found: {self.project_dir}"
                 print(self._setup_error)
@@ -397,7 +448,20 @@ class ProcessRunner(BaseRunner):
                 if rc is not None:
                     return rc
 
-        self._cwd = self.project_dir if self.project_dir else None
+            if not self.is_first_run and not get_worktree_dir(self.lode_id).is_dir():
+                self._setup_error = (
+                    "Cannot resume mill: the original mill snapshot cannot be reconstructed "
+                    "because its worktree is missing. Restart with: "
+                    f"hop lode restart {self.lode_id}"
+                )
+                print(self._setup_error)
+                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+                return 1
+
+            if not self._establish_lode_worktree():
+                return 1
+            self._cwd = str(self.worktree_path)
+
         if self.is_first_run:
             if self.project_name:
                 self._context["project"] = self.project_name
@@ -422,30 +486,8 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
 
-        # Ensure worktree exists
-        self.worktree_path = get_worktree_dir(self.lode_id)
-        if not self.worktree_path.is_dir():
-            set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
-            if self.lode_branch:
-                branch_name = self.lode_branch
-            else:
-                slug = slugify(self.lode_title)
-                branch_name = f"hopper-{self.lode_id}-{slug}" if slug else f"hopper-{self.lode_id}"
-            self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
-            worktree_created, create_detail = create_worktree(
-                self.project_dir, self.worktree_path, branch_name
-            )
-            if not worktree_created:
-                self._setup_error = (
-                    f"Failed to create git worktree: {create_detail or 'unknown error'}"
-                )
-                print(self._setup_error)
-                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
-                return 1
-            if not self.lode_branch:
-                set_lode_branch(self.socket_path, self.lode_id, branch_name)
-            self.lode_branch = branch_name
-            logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
+        if not self._establish_lode_worktree():
+            return 1
 
         # Set up the environment via the project's selected Make target.
         if _has_makefile(self.worktree_path):

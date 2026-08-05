@@ -35,7 +35,6 @@ Lodes are plain dicts with these fields:
 
 import json
 import os
-import re
 import secrets
 import time
 import uuid
@@ -157,22 +156,6 @@ def compute_runtime_ms(lode: dict, now: int | None = None) -> int:
         else:
             total += now - started
     return max(0, total)
-
-
-def slugify(title: str) -> str:
-    """Convert a title to a git-branch-safe slug.
-
-    Lowercase, alphanumeric + hyphens only, no leading/trailing/consecutive
-    hyphens, truncated to 40 chars, no '.lock' suffix.
-    """
-    s = title.lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = s.strip("-")
-    s = re.sub(r"-{2,}", "-", s)
-    s = s[:40].rstrip("-")
-    if s.endswith("-lock"):
-        s = s[:-5]
-    return s
 
 
 def touch(lode: dict) -> None:

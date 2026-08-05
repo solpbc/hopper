@@ -19,8 +19,16 @@ import pytest
 
 from hopper import oom
 from hopper.claude import spawn_claude
-from hopper.git import is_dirty
-from hopper.lodes import get_lode_dir, get_worktree_dir
+from hopper.git import (
+    create_worktree as git_create_worktree,
+)
+from hopper.git import (
+    is_dirty,
+)
+from hopper.git import (
+    quarantine_dirty_repo as git_quarantine_dirty_repo,
+)
+from hopper.lodes import get_lode_dir, get_worktree_dir, load_lodes, save_lodes
 from hopper.process import (
     QUARANTINE_STATUS,
     STAGES,
@@ -33,6 +41,7 @@ from hopper.process import (
     run_process,
     run_process_supervisor,
 )
+from hopper.server import Server
 
 CLAUDE_SESSIONS = {
     "mill": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
@@ -66,12 +75,28 @@ def _mock_response(stage="mill", state="new", active=False, project="", claude=N
 
 def _mock_conn(emitted=None):
     mock = MagicMock()
-    if emitted is not None:
-        mock.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
-    else:
-        mock.emit = MagicMock(return_value=True)
+    callback_ref = None
+
+    def emit(msg_type, **kw):
+        if emitted is not None:
+            emitted.append((msg_type, kw))
+        if msg_type == "lode_set_branch" and callback_ref:
+            callback_ref(
+                {
+                    "type": "lode_updated",
+                    "lode": {
+                        "id": kw["lode_id"],
+                        "branch": kw["branch"],
+                    },
+                }
+            )
+        return True
+
+    mock.emit.side_effect = emit
 
     def start(callback=None, on_connect=None):
+        nonlocal callback_ref
+        callback_ref = callback
         if on_connect:
             on_connect()
         if callback:
@@ -127,6 +152,32 @@ def _init_git_repo(tmp_path, *, name="repo", branch="main", bare=False):
     _run_git(repo_dir, "add", ".")
     _run_git(repo_dir, "commit", "-m", "init")
     return repo_dir
+
+
+def _stale_clone(tmp_path, branch="main"):
+    """Create a registered clone one commit behind its origin."""
+    remote = _init_git_repo(tmp_path, name=f"{branch}-origin.git", branch=branch, bare=True)
+    publisher = tmp_path / f"{branch}-publisher"
+    _run_git(tmp_path, "clone", str(remote), str(publisher))
+    _run_git(publisher, "config", "user.email", "test@example.com")
+    _run_git(publisher, "config", "user.name", "Test User")
+    (publisher / "README.md").write_text("initial\n")
+    _run_git(publisher, "add", ".")
+    _run_git(publisher, "commit", "-m", "initial")
+    _run_git(publisher, "push", "-u", "origin", branch)
+
+    registered = tmp_path / f"{branch}-registered"
+    _run_git(tmp_path, "clone", str(remote), str(registered))
+    _run_git(registered, "config", "user.email", "test@example.com")
+    _run_git(registered, "config", "user.name", "Test User")
+    local_sha = _run_git(registered, "rev-parse", "HEAD").stdout.strip()
+
+    (publisher / "upstream.txt").write_text("upstream\n")
+    _run_git(publisher, "add", ".")
+    _run_git(publisher, "commit", "-m", "advance upstream")
+    _run_git(publisher, "push", "origin", branch)
+    upstream_sha = _run_git(publisher, "rev-parse", "HEAD").stdout.strip()
+    return registered, publisher, local_sha, upstream_sha
 
 
 def test_ship_next_stage_is_shipped():
@@ -638,13 +689,110 @@ class TestMillStage:
             "claude_stage": "mill",
         }
 
-    def test_sets_cwd_to_project_dir(self, tmp_path):
-        """Runner sets cwd to project directory."""
+    def test_mill_and_refine_share_fetched_snapshot_without_moving_registered_checkout(
+        self, tmp_path
+    ):
+        """Mill and refine use one fetched snapshot while leaving the checkout unchanged."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
-
-        project_dir = tmp_path / "my-project"
-        project_dir.mkdir()
+        project_dir, publisher, local_sha, upstream_sha = _stale_clone(tmp_path)
+        original_branch = _run_git(project_dir, "branch", "--show-current").stdout.strip()
+        (project_dir / "README.md").write_text("dirty registered checkout\n")
         mock_project = MagicMock(path=str(project_dir))
+        events = []
+
+        def quarantine(repo_dir, lode_id):
+            events.append("quarantine")
+            return git_quarantine_dirty_repo(repo_dir, lode_id)
+
+        def create(repo_dir, worktree_path, branch_name):
+            events.append("create")
+            return git_create_worktree(repo_dir, worktree_path, branch_name)
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(
+                    stage="mill",
+                    state="new",
+                    project="my-project",
+                ),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.quarantine_dirty_repo", side_effect=quarantine),
+            patch("hopper.process.create_worktree", side_effect=create),
+            patch("hopper.process.prompt.load", return_value="mill prompt"),
+            patch.object(runner, "_run_claude", return_value=(0, None)) as mock_claude,
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            runner.run()
+
+        worktree = get_worktree_dir("test-id")
+        assert events == ["quarantine", "create"]
+        assert runner.worktree_path == worktree
+        assert runner.lode_branch == "hopper-test-id"
+        assert runner._cwd == str(worktree)
+        mock_claude.assert_called_once_with()
+        assert (worktree / "upstream.txt").read_text() == "upstream\n"
+        assert _run_git(worktree, "rev-parse", "HEAD").stdout.strip() == upstream_sha
+        assert not (project_dir / "upstream.txt").exists()
+        assert _run_git(project_dir, "branch", "--show-current").stdout.strip() == original_branch
+        assert _run_git(project_dir, "rev-parse", "HEAD").stdout.strip() == local_sha
+        assert _run_git(project_dir, "status", "--porcelain").stdout.strip() == ""
+
+        (publisher / "later.txt").write_text("later\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "advance after mill")
+        _run_git(publisher, "push", "origin", "main")
+        mill_sha = _run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+        refine = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        refine.project_dir = str(project_dir)
+        refine.project_name = "my-project"
+        refine.lode_branch = runner.lode_branch
+        refine.is_first_run = False
+        with patch("hopper.process.create_worktree") as mock_create:
+            assert refine._setup_refine() is None
+
+        mock_create.assert_not_called()
+        assert refine.worktree_path == worktree
+        assert refine._cwd == str(worktree)
+        assert _run_git(worktree, "rev-parse", "HEAD").stdout.strip() == mill_sha
+        assert not (worktree / "later.txt").exists()
+
+    def test_resumed_mill_reuses_recorded_legacy_worktree_without_creation(self, tmp_path):
+        """A resumed mill reuses its recorded legacy branch and existing snapshot."""
+        repo_dir = _init_git_repo(tmp_path)
+        worktree = get_worktree_dir("test-id")
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        branch = "hopper-test-id-legacy-title"
+        _run_git(repo_dir, "worktree", "add", "-b", branch, str(worktree))
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_dir = str(repo_dir)
+        runner.is_first_run = False
+        runner.lode_branch = branch
+
+        with (
+            patch("hopper.process.current_branch") as mock_current_branch,
+            patch("hopper.process.create_worktree") as mock_create,
+            patch.object(runner, "_persist_lode_branch") as mock_persist,
+        ):
+            assert runner._setup_mill() is None
+
+        assert runner.worktree_path == worktree
+        assert runner.lode_branch == branch
+        assert runner._cwd == str(worktree)
+        mock_current_branch.assert_not_called()
+        mock_create.assert_not_called()
+        mock_persist.assert_not_called()
+
+    @pytest.mark.parametrize("branch", ["", "hopper-test-id-legacy-title"])
+    def test_resumed_mill_without_worktree_fails_before_launch(self, tmp_path, branch):
+        """A legacy mill cannot replace its missing original snapshot."""
+        repo_dir = _init_git_repo(tmp_path)
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        mock_project = MagicMock(path=str(repo_dir))
+        emitted = []
 
         with (
             patch(
@@ -653,19 +801,199 @@ class TestMillStage:
                     stage="mill",
                     state="running",
                     project="my-project",
+                    branch=branch,
                     claude=_claude_sessions(mill={"started": True}),
                 ),
             ),
-            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
             patch("hopper.runner.find_project", return_value=mock_project),
-            patch(
-                "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
-            ) as mock_popen,
+            patch("hopper.process.create_worktree") as mock_create,
+            patch.object(runner, "_run_claude") as mock_claude,
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
-            runner.run()
+            assert runner.run() == 0
 
-        assert mock_popen.call_args[1]["cwd"] == str(project_dir)
+        error = (
+            "Cannot resume mill: the original mill snapshot cannot be reconstructed "
+            "because its worktree is missing. Restart with: hop lode restart test-id"
+        )
+        assert ("lode_set_state", {"lode_id": "test-id", "state": "error", "status": error}) in (
+            emitted
+        )
+        mock_create.assert_not_called()
+        mock_claude.assert_not_called()
+
+    def test_existing_worktree_blank_branch_persists_before_mill(self, tmp_path, make_lode):
+        """Blank metadata is durable before mill accepts an existing worktree."""
+        repo_dir = _init_git_repo(tmp_path)
+        worktree = get_worktree_dir("test-id")
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        branch = "hopper-test-id"
+        _run_git(repo_dir, "worktree", "add", "-b", branch, str(worktree))
+        generation = "a" * 32
+        save_lodes(
+            [
+                make_lode(
+                    id="test-id",
+                    project="my-project",
+                    branch="",
+                    run_generation=generation,
+                )
+            ]
+        )
+        server = Server(tmp_path / "hopper.sock")
+        server.lodes = load_lodes()
+        runner = ProcessRunner(
+            "test-id",
+            Path("/tmp/test.sock"),
+            "mill",
+            run_generation=generation,
+        )
+        runner.project_dir = str(repo_dir)
+        runner.is_first_run = False
+        connection = MagicMock()
+
+        def emit(msg_type, **payload):
+            server._handle_mutation(
+                {
+                    "type": msg_type,
+                    "run_generation": generation,
+                    **payload,
+                },
+                None,
+            )
+            return True
+
+        connection.emit.side_effect = emit
+        runner.connection = connection
+
+        with (
+            patch.object(server, "broadcast", side_effect=runner._on_server_message),
+            patch("hopper.process.create_worktree") as mock_create,
+        ):
+            assert runner._setup_mill() is None
+
+        persisted = load_lodes()
+        assert persisted[0]["branch"] == branch
+        assert json.loads((tmp_path / "active.jsonl").read_text())["branch"] == branch
+        assert runner.worktree_path == worktree
+        assert runner.lode_branch == branch
+        assert runner._cwd == str(worktree)
+        mock_create.assert_not_called()
+
+    def test_existing_detached_worktree_with_blank_branch_fails(self, tmp_path):
+        """Detached worktrees cannot supply missing branch metadata."""
+        repo_dir = _init_git_repo(tmp_path)
+        worktree = get_worktree_dir("test-id")
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(repo_dir, "worktree", "add", "--detach", str(worktree))
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_dir = str(repo_dir)
+        runner.is_first_run = False
+
+        with patch.object(runner, "_persist_lode_branch") as mock_persist:
+            assert runner._setup_mill() == 1
+
+        assert runner.lode_branch == ""
+        assert runner._setup_error == (
+            f"Existing worktree has no current branch (detached HEAD): {worktree}"
+        )
+        mock_persist.assert_not_called()
+
+    def test_unacknowledged_branch_persistence_fails_before_launch(self, tmp_path):
+        """Mill does not launch until its branch update is observed after persistence."""
+        repo_dir = _init_git_repo(tmp_path)
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        mock_project = MagicMock(path=str(repo_dir))
+        emitted = []
+        connection = _mock_conn(emitted)
+
+        def emit_without_branch_broadcast(msg_type, **payload):
+            emitted.append((msg_type, payload))
+            return True
+
+        connection.emit.side_effect = emit_without_branch_broadcast
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="mill", state="new", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=connection),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.runner.BRANCH_PERSIST_TIMEOUT_SEC", 0),
+            patch.object(runner, "_run_claude") as mock_claude,
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            assert runner.run() == 0
+
+        assert runner.lode_branch == ""
+        assert any(
+            msg_type == "lode_set_state"
+            and payload["state"] == "error"
+            and payload["status"] == "Failed to persist lode branch: hopper-test-id"
+            for msg_type, payload in emitted
+        )
+        mock_claude.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "git fetch origin failed: network unavailable",
+            (
+                "upstream default branch resolution failed after git fetch origin: "
+                "no candidate exists (origin/main, origin/master)"
+            ),
+            "git worktree add failed: post-checkout hook declined",
+        ],
+    )
+    def test_worktree_creation_failure_detail_prevents_launch(self, tmp_path, detail):
+        """Every worktree creation failure reaches the setup error unchanged."""
+        repo_dir = _init_git_repo(tmp_path)
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        mock_project = MagicMock(path=str(repo_dir))
+        emitted = []
+
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value=_mock_response(stage="mill", state="new", project="my-project"),
+            ),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
+            patch("hopper.runner.find_project", return_value=mock_project),
+            patch("hopper.process.create_worktree", return_value=(False, detail)),
+            patch.object(runner, "_run_claude") as mock_claude,
+            patch("hopper.runner.get_current_pane_id", return_value=None),
+        ):
+            assert runner.run() == 0
+
+        assert any(
+            msg_type == "lode_set_state"
+            and payload["state"] == "error"
+            and payload["status"] == f"Failed to create git worktree: {detail}"
+            for msg_type, payload in emitted
+        )
+        mock_claude.assert_not_called()
+
+    @pytest.mark.parametrize("repository_kind", ["master-origin", "local-head"])
+    def test_first_mill_supports_existing_base_variants(self, tmp_path, repository_kind):
+        """First mill keeps create_worktree's master and no-origin base behavior."""
+        if repository_kind == "master-origin":
+            repo_dir, _publisher, _local_sha, expected_sha = _stale_clone(tmp_path, branch="master")
+        else:
+            repo_dir = _init_git_repo(tmp_path, branch="topic")
+            expected_sha = _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_dir = str(repo_dir)
+        runner.is_first_run = True
+
+        with (
+            patch.object(runner, "_persist_lode_branch", return_value=True),
+            patch("hopper.process.set_lode_status"),
+        ):
+            assert runner._setup_mill() is None
+
+        assert runner.lode_branch == "hopper-test-id"
+        assert _run_git(runner.worktree_path, "rev-parse", "HEAD").stdout.strip() == expected_sha
 
     def test_no_project_uses_none_cwd(self):
         """Runner passes cwd=None when no project set."""
@@ -679,6 +1007,10 @@ class TestMillStage:
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.process.get_worktree_dir") as mock_worktree_dir,
+            patch("hopper.process.current_branch") as mock_current_branch,
+            patch("hopper.process.create_worktree") as mock_create,
+            patch.object(runner, "_persist_lode_branch") as mock_persist,
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
             ) as mock_popen,
@@ -687,6 +1019,10 @@ class TestMillStage:
             runner.run()
 
         assert mock_popen.call_args[1]["cwd"] is None
+        mock_worktree_dir.assert_not_called()
+        mock_current_branch.assert_not_called()
+        mock_create.assert_not_called()
+        mock_persist.assert_not_called()
 
     def test_fails_if_project_dir_missing(self, tmp_path):
         """Missing project dir emits error and exits 0."""
@@ -746,16 +1082,29 @@ class TestMillStage:
     def test_quarantines_dirty_repo(self, tmp_path):
         """Dirty project repo is quarantined before milling."""
         repo_dir = _init_git_repo(tmp_path)
+        worktree = get_worktree_dir("test-id")
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(
+            repo_dir,
+            "worktree",
+            "add",
+            "-b",
+            "hopper-test-id",
+            str(worktree),
+        )
         (repo_dir / "README.md").write_text("changed\n")
         (repo_dir / "new.txt").write_text("new\n")
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         runner.project_dir = str(repo_dir)
         runner.is_first_run = False
+        runner.lode_branch = "hopper-test-id"
 
         with patch("hopper.process.set_lode_status") as mock_status:
             assert runner._setup_mill() is None
 
         assert runner._setup_error is None
+        assert runner.worktree_path == worktree
+        assert runner._cwd == str(worktree)
         assert is_dirty(str(repo_dir)) is False
         branch = _run_git(
             repo_dir,
@@ -1142,6 +1491,7 @@ class TestRefineStage:
                     stage="refine",
                     state="running",
                     project="my-project",
+                    branch="hopper-test-id",
                     claude=_claude_sessions(refine={"started": True}),
                 ),
             ),
@@ -1179,6 +1529,7 @@ class TestRefineStage:
                     stage="refine",
                     state="running",
                     project="my-project",
+                    branch="hopper-test-id",
                     claude=_claude_sessions(refine={"started": True}),
                 ),
             ),
@@ -1212,6 +1563,7 @@ class TestRefineStage:
                     stage="refine",
                     state="running",
                     project="my-project",
+                    branch="hopper-test-id",
                     claude=_claude_sessions(refine={"started": True}),
                 ),
             ),
