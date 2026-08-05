@@ -6,6 +6,7 @@
 import copy
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+import hopper.cli as hopper_cli
 import hopper.code as hopper_code
 from hopper import __version__, config
 from hopper.cli import (
@@ -6468,6 +6470,70 @@ def test_check_help(capsys):
     assert result == 0
     captured = capsys.readouterr()
     assert "usage: hop check" in captured.out
+
+
+def test_check_refuses_nonterminal_stdout_before_dispatch(monkeypatch, capsys):
+    calls = []
+
+    def handler(args):
+        calls.append(args)
+        return 0
+
+    stdout = MagicMock()
+    stdout.isatty.return_value = False
+    monkeypatch.setattr(sys, "argv", ["hop", "check", "--", "should-not-run"])
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setitem(hopper_cli.COMMANDS, "check", (handler, "test handler", "commands"))
+
+    assert main() == 2
+    assert calls == []
+    error = capsys.readouterr().err
+    assert "refusing non-terminal stdout" in error
+    assert "No validation command was started." in error
+
+
+def test_check_dispatches_with_terminal_stdout(monkeypatch):
+    calls = []
+
+    def handler(args):
+        calls.append(args)
+        return 7
+
+    stdout = MagicMock()
+    stdout.isatty.return_value = True
+    monkeypatch.setattr(sys, "argv", ["hop", "check", "--", "command"])
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setitem(hopper_cli.COMMANDS, "check", (handler, "test handler", "commands"))
+
+    assert main() == 7
+    assert calls == [["--", "command"]]
+
+
+def test_check_refusal_stops_producer_in_a_backgrounded_pipe(tmp_path):
+    """A piped background check must not run a producer its caller cannot observe."""
+    marker = tmp_path / "producer-ran"
+    producer = [
+        sys.executable,
+        "-c",
+        "from hopper.cli import main; raise SystemExit(main())",
+        "check",
+        "--",
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+    ]
+    result = subprocess.run(
+        ["bash", "-c", f"{shlex.join(producer)} | cat & wait"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    # Bash reports the final pipe stage even when the backgrounded check refuses.
+    assert result.returncode == 0
+    assert not marker.exists()
+    assert "refusing non-terminal stdout" in result.stderr
+    assert "No validation command was started." in result.stderr
 
 
 def _noisy_failing_cmd(lines: int, code: int) -> list[str]:

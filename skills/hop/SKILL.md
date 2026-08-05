@@ -209,8 +209,9 @@ hop status [-t TITLE] <text...>     # update status text, optionally set title
 
 ## Running validation checks
 
-Run a build/test/lint command, print only the tail of its output, and exit with
-the command's **real** status. Use this instead of piping to a pager — a plain
+Run a build/test/lint command bare in a terminal, print only the tail of its
+output, and exit with the command's **real** status. Use this instead of piping
+to a pager — a plain
 `make ci 2>&1 | tail -30` reports `tail`'s exit code, not make's, so a red build
 silently looks green.
 
@@ -222,7 +223,9 @@ hop check -n 20 -- make ci          # keep only the last 20 lines of output
 
 `hop check` buffers combined stdout+stderr, prints the trailing lines, then
 prints `hop check: `<cmd>` exited N` and returns N. A non-zero exit is a failed
-check. Runs locally in the current directory; does not need the server.
+check. It refuses non-terminal stdout before starting the command, so a pipe
+cannot make an unrun validation look successful — use `-n` to bound output
+instead. Runs locally in the current directory; does not need the server.
 
 ## Internal lode commands (inside a lode only)
 

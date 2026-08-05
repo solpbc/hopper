@@ -3066,21 +3066,22 @@ class _CheckProgress:
         return summary
 
 
-@command("check", "Run a validation command, truncating output but keeping its exit status")
+@command("check", "Run a validation command with bounded output and its real exit status")
 def cmd_check(args: list[str]) -> int:
-    """Run a command, print only its output tail, and exit with its real status.
+    """Run a bare-terminal command, print its output tail, and return its real status.
 
     Replaces the false-green `make ci 2>&1 | tail -30` pattern used to keep a
     long CI log out of an agent's context: a pipe reports the pager's exit code,
     not the command's, so a failing build can be truncated into an apparent
     success. `hop check` captures combined stdout+stderr, prints the last -n
     lines plus an explicit `exited N` summary, and returns the command's own
-    exit code — so a red command can never be reported as green.
+    exit code. The CLI dispatcher refuses non-terminal stdout before this runs,
+    because a downstream pipe would otherwise mask this function's status.
     """
     parser = make_parser(
         "check",
-        "Run a validation command, print only the tail of its output, and exit "
-        "with the command's real status (never the pager's). "
+        "Run a validation command with terminal output, print only its tail, and exit "
+        "with the command's real status. "
         "Usage: hop check [-n LINES] -- <command> [args...]",
     )
     parser.add_argument(
@@ -3184,6 +3185,14 @@ def cmd_check(args: list[str]) -> int:
     return proc.returncode
 
 
+def _check_stdout_is_terminal() -> bool:
+    """Return whether `hop check` can expose its status directly to its caller."""
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def main() -> int:
     """Main entry point with command dispatch."""
     args = sys.argv[1:]
@@ -3214,6 +3223,16 @@ def main() -> int:
 
     # Set process title
     setproctitle.setproctitle(f"hop:{cmd}")
+
+    if cmd == "check" and not any(arg in {"-h", "--help"} for arg in cmd_args):
+        if not _check_stdout_is_terminal():
+            print(
+                "hop check: refusing non-terminal stdout because a downstream pipe can "
+                "mask its exit status; run `hop check -n <lines> -- <command>` bare. "
+                "No validation command was started.",
+                file=sys.stderr,
+            )
+            return 2
 
     if explicit_host and explicit_host != "local" and not _remote_disabled():
         expanded_arg = _locally_expanded_home_arg(cmd, cmd_args)
