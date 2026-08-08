@@ -219,6 +219,7 @@ silently looks green.
 hop check -- make ci                # run make ci; last 50 lines + explicit "exited N"
 hop check -- make test
 hop check -n 20 -- make ci          # keep only the last 20 lines of output
+hop check --allow-capture -- make ci   # from a tool call with captured stdout
 ```
 
 `hop check` buffers combined stdout+stderr, prints the trailing lines, then
@@ -226,6 +227,19 @@ prints `hop check: `<cmd>` exited N` and returns N. A non-zero exit is a failed
 check. It refuses non-terminal stdout before starting the command, so a pipe
 cannot make an unrun validation look successful — use `-n` to bound output
 instead. Runs locally in the current directory; does not need the server.
+
+**If you are an agent calling this from a tool, add `--allow-capture`.** A tool
+call has no TTY, so the bare form refuses and nothing runs. `--allow-capture` is
+your promise that your stdout is *captured* (your harness hands you the exit
+code) rather than *piped* into another command that would replace it. With it,
+you get the command's real status.
+
+⛔ **Do not work around the refusal by detaching the gate.** `nohup … &` or a
+trailing `&` returns the *launcher's* status, not the job's, so the gate result
+becomes unverifiable — which is the exact failure `hop check` exists to prevent.
+⛔ And do not hand-roll a pty with `pty.spawn`: it returns a **wait-status, not
+an exit code** (256 means exit 1, and it is truthy), so reading it directly is
+the same class of error. Use `--allow-capture`.
 
 ## Internal lode commands (inside a lode only)
 

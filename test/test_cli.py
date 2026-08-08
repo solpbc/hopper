@@ -6492,6 +6492,102 @@ def test_check_refuses_nonterminal_stdout_before_dispatch(monkeypatch, capsys):
     assert "No validation command was started." in error
 
 
+def test_check_refusal_names_the_allow_capture_escape(monkeypatch, capsys):
+    """The refusal must name an action a captured-stdout caller can actually take.
+
+    Prescribing "run it bare" to an agent whose tool call has no TTY is an
+    impossible instruction, and it pushed lodes into detaching the gate instead.
+    """
+
+    def handler(args):
+        raise AssertionError("handler must not run")
+
+    stdout = MagicMock()
+    stdout.isatty.return_value = False
+    monkeypatch.setattr(sys, "argv", ["hop", "check", "--", "should-not-run"])
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setitem(hopper_cli.COMMANDS, "check", (handler, "test handler", "commands"))
+
+    assert main() == 2
+    assert "--allow-capture" in capsys.readouterr().err
+
+
+def test_check_allow_capture_dispatches_with_nonterminal_stdout(monkeypatch):
+    """--allow-capture is the opt-in for a caller that propagates the exit code."""
+    calls = []
+
+    def handler(args):
+        calls.append(args)
+        return 7
+
+    stdout = MagicMock()
+    stdout.isatty.return_value = False
+    monkeypatch.setattr(sys, "argv", ["hop", "check", "--allow-capture", "--", "command"])
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setitem(hopper_cli.COMMANDS, "check", (handler, "test handler", "commands"))
+
+    assert main() == 7
+    assert calls == [["--allow-capture", "--", "command"]]
+
+
+def test_check_allow_capture_after_separator_does_not_bypass_the_guard(monkeypatch, capsys):
+    """Everything after `--` belongs to the command, not to hop.
+
+    `hop check -- make ci --allow-capture` must still refuse; otherwise the
+    guard is defeated by any payload that happens to carry the flag.
+    """
+
+    def handler(args):
+        raise AssertionError("handler must not run")
+
+    stdout = MagicMock()
+    stdout.isatty.return_value = False
+    monkeypatch.setattr(sys, "argv", ["hop", "check", "--", "make", "ci", "--allow-capture"])
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setitem(hopper_cli.COMMANDS, "check", (handler, "test handler", "commands"))
+
+    assert main() == 2
+    assert "refusing non-terminal stdout" in capsys.readouterr().err
+
+
+def test_check_help_after_separator_does_not_bypass_the_guard(monkeypatch, capsys):
+    """The same payload-vs-own-flag split applies to --help."""
+
+    def handler(args):
+        raise AssertionError("handler must not run")
+
+    stdout = MagicMock()
+    stdout.isatty.return_value = False
+    monkeypatch.setattr(sys, "argv", ["hop", "check", "--", "make", "--help"])
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setitem(hopper_cli.COMMANDS, "check", (handler, "test handler", "commands"))
+
+    assert main() == 2
+    assert "refusing non-terminal stdout" in capsys.readouterr().err
+
+
+def test_check_allow_capture_returns_the_real_exit_status(tmp_path):
+    """With the opt-in, a failing command's status reaches a captured caller."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from hopper.cli import main; raise SystemExit(main())",
+            "check",
+            "-n",
+            "5",
+            "--allow-capture",
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(7)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 7
+
+
 def test_check_dispatches_with_terminal_stdout(monkeypatch):
     calls = []
 

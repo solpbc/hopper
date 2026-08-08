@@ -58,10 +58,12 @@ included by it. Every ship requires a successful full gate.
 Run the gate bare through `hop check` so a failure cannot be misreported as success:
 
 ```
-hop check -- make ci
+hop check --allow-capture -- make ci
 ```
 
-`hop check` runs the command, prints only the last lines of its output (so a long log does not flood this session), and — critically — exits with the command's **real** status and prints an explicit `exited N` summary. It refuses piped stdout before starting the gate; use `-n` to reduce output. A non-zero exit is a failed check; do not land the branch on it.
+`hop check` runs the command, prints only the last lines of its output (so a long log does not flood this session), and — critically — exits with the command's **real** status and prints an explicit `exited N` summary. It refuses non-terminal stdout before starting the gate; use `-n` to reduce output. A non-zero exit is a failed check; do not land the branch on it.
+
+**Your tool call has no TTY, so `--allow-capture` is required** — without it the gate refuses and nothing runs. The flag is your promise that your stdout is *captured* (your harness reports the exit code back to you) rather than *piped* into another command that would replace it. ⛔ Never work around the refusal by detaching the gate (`nohup`, a trailing `&`): that hands back the launcher's status, not the gate's, leaving you no trustworthy result — the exact failure `hop check` exists to prevent. ⛔ Never hand-roll a pty either; `pty.spawn` returns a wait-status, not an exit code.
 
 Do **not** pipe validation straight through a pager yourself. `make ci 2>&1 | tail -30` reports `tail`'s exit code, not make's, so a red build silently looks green. If you ever must hand-build such a pipeline instead of using `hop check`, prefix it with `set -o pipefail`, or capture to a file and check `$?` explicitly.
 

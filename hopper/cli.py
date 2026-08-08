@@ -3076,13 +3076,14 @@ def cmd_check(args: list[str]) -> int:
     success. `hop check` captures combined stdout+stderr, prints the last -n
     lines plus an explicit `exited N` summary, and returns the command's own
     exit code. The CLI dispatcher refuses non-terminal stdout before this runs,
-    because a downstream pipe would otherwise mask this function's status.
+    because a downstream pipe would otherwise mask this function's status --
+    unless --allow-capture says the caller propagates the exit code itself.
     """
     parser = make_parser(
         "check",
         "Run a validation command with terminal output, print only its tail, and exit "
         "with the command's real status. "
-        "Usage: hop check [-n LINES] -- <command> [args...]",
+        "Usage: hop check [-n LINES] [--allow-capture] -- <command> [args...]",
     )
     parser.add_argument(
         "-n",
@@ -3090,6 +3091,14 @@ def cmd_check(args: list[str]) -> int:
         type=int,
         default=CHECK_TAIL_LINES,
         help=f"Trailing output lines to print (default: {CHECK_TAIL_LINES})",
+    )
+    parser.add_argument(
+        "--allow-capture",
+        action="store_true",
+        help=(
+            "Run even though stdout is captured rather than a terminal. Pass this only "
+            "when you propagate the exit code; it is unsafe with a downstream pipe."
+        ),
     )
     parser.add_argument(
         "command",
@@ -3193,6 +3202,18 @@ def _check_stdout_is_terminal() -> bool:
         return False
 
 
+def _hop_own_args(cmd_args: list[str]) -> list[str]:
+    """Return only hop's own flags, stopping at the `--` that begins the payload.
+
+    `hop check -- make ci --allow-capture` must not be read as passing
+    --allow-capture to hop; everything after the first `--` belongs to the
+    command being run.
+    """
+    if "--" in cmd_args:
+        return cmd_args[: cmd_args.index("--")]
+    return cmd_args
+
+
 def main() -> int:
     """Main entry point with command dispatch."""
     args = sys.argv[1:]
@@ -3224,15 +3245,19 @@ def main() -> int:
     # Set process title
     setproctitle.setproctitle(f"hop:{cmd}")
 
-    if cmd == "check" and not any(arg in {"-h", "--help"} for arg in cmd_args):
-        if not _check_stdout_is_terminal():
-            print(
-                "hop check: refusing non-terminal stdout because a downstream pipe can "
-                "mask its exit status; run `hop check -n <lines> -- <command>` bare. "
-                "No validation command was started.",
-                file=sys.stderr,
-            )
-            return 2
+    if cmd == "check":
+        own_args = _hop_own_args(cmd_args)
+        if not any(arg in {"-h", "--help"} for arg in own_args):
+            if not _check_stdout_is_terminal() and "--allow-capture" not in own_args:
+                print(
+                    "hop check: refusing non-terminal stdout because a downstream pipe can "
+                    "mask its exit status; run `hop check -n <lines> -- <command>` bare. "
+                    "If your stdout is captured (not piped) and you propagate the exit "
+                    "code, re-run with --allow-capture. "
+                    "No validation command was started.",
+                    file=sys.stderr,
+                )
+                return 2
 
     if explicit_host and explicit_host != "local" and not _remote_disabled():
         expanded_arg = _locally_expanded_home_arg(cmd, cmd_args)
