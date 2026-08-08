@@ -359,6 +359,8 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "codex_thread_id": None,
         "last_progress_at": None,
         "last_progress_summary": "",
+        "last_pane_activity_at": None,
+        "pane_title_observation": None,
         "backlog": None,
         "runs": {},
         "claude": _make_claude_sessions(),
@@ -502,6 +504,8 @@ def reset_lode_claude_stage(
             lode["claude"][claude_stage]["started"] = False
             lode["last_progress_at"] = None
             lode["last_progress_summary"] = ""
+            lode["last_pane_activity_at"] = None
+            lode["pane_title_observation"] = None
             if persist:
                 touch(lode)
                 save_lodes(lodes)

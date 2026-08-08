@@ -23,11 +23,9 @@ from hopper.client import (
 )
 from hopper.codex import bootstrap_codex
 from hopper.git import (
-    commit_all,
     create_worktree,
     current_branch,
     get_diff_numstat,
-    head_sha,
     is_dirty,
     quarantine_dirty_repo,
 )
@@ -302,21 +300,18 @@ STAGES = {
         "prompt": "mill",
         "done_status": "Mill complete",
         "next_stage": "refine",
-        "always_dismiss": False,
         "input_from": None,
     },
     "refine": {
         "prompt": "refine",
         "done_status": "Refine complete",
         "next_stage": "ship",
-        "always_dismiss": True,
         "input_from": "mill",
     },
     "ship": {
         "prompt": "ship",
         "done_status": "Ship complete",
         "next_stage": "shipped",
-        "always_dismiss": True,
         "input_from": "refine",
     },
 }
@@ -349,7 +344,6 @@ class ProcessRunner(BaseRunner):
         self._done_label = f"{stage.capitalize()} done"
         self._done_status = cfg["done_status"]
         self._next_stage = cfg["next_stage"]
-        self._always_dismiss = cfg["always_dismiss"]
         self._prompt_name: str = cfg["prompt"]
         self._input_from: str | None = cfg["input_from"]
         # Set by _setup
@@ -674,30 +668,6 @@ class ProcessRunner(BaseRunner):
             cmd = ["claude", skip, "--resume", self.claude_session_id]
 
         return cmd, self._cwd
-
-    def _snapshot_stuck_worktree(self) -> dict:
-        """Commit dirty worktree contents after a stuck timeout."""
-        try:
-            if not self.worktree_path or not self.worktree_path.is_dir():
-                return {"outcome": "no_worktree"}
-            wt = str(self.worktree_path)
-            if not is_dirty(wt):
-                return {"outcome": "clean"}
-            committed, error = commit_all(
-                wt, f"hopper: auto-snapshot after stuck timeout ({self.lode_id})"
-            )
-            if not committed:
-                return {"outcome": "failed", "git_error": error or "unknown git error"}
-            sha = head_sha(wt)
-            if sha is None:
-                return {
-                    "outcome": "failed",
-                    "git_error": "snapshot commit succeeded but HEAD SHA could not be resolved",
-                }
-            return {"outcome": "committed", "sha": sha}
-        except Exception as exc:
-            logger.warning(f"failed to snapshot stuck worktree lode={self.lode_id}", exc_info=True)
-            return {"outcome": "failed", "git_error": str(exc)}
 
     def _bootstrap_codex(self) -> int | None:
         """Bootstrap a Codex session for the refine stage."""

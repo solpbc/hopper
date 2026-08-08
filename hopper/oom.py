@@ -22,9 +22,7 @@ OOM_SCORE_DEGRADED_WARNING = (
     "this lode has no Hopper-managed OOM protection."
 )
 SYSTEMCTL_TIMEOUT_SEC = 1.0
-# Keep this below GUARDED_DISCONNECT_HOLD_SEC = 2.0 in hopper/server.py so the
-# supervisor normally reports the settled result within the live server hold.
-SCOPE_RESULT_SETTLE_SEC = 1.5
+SCOPE_RESULT_SETTLE_SEC = 30.0
 SCOPE_RESULT_POLL_SEC = 0.05
 
 

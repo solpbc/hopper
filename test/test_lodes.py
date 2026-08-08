@@ -155,6 +155,8 @@ def test_create_lode(temp_config):
     assert lode["branch"] == ""
     assert lode["last_progress_at"] is None
     assert lode["last_progress_summary"] == ""
+    assert lode["last_pane_activity_at"] is None
+    assert lode["pane_title_observation"] is None
     assert lode["run_generation"] is None
     assert lode["oom_scope"] is None
     assert lode["failure_kind"] is None
@@ -868,6 +870,8 @@ def test_reset_lode_claude_stage(temp_config):
             "state": "running",
             "last_progress_at": 900,
             "last_progress_summary": "codex running",
+            "last_pane_activity_at": 800,
+            "pane_title_observation": {"title": "⠐ Working", "observed_at": 700},
             "claude": {"mill": {"session_id": "session-1", "started": True}},
         }
     ]
@@ -880,6 +884,8 @@ def test_reset_lode_claude_stage(temp_config):
     assert updated["claude"]["mill"]["session_id"] != "session-1"
     assert updated["last_progress_at"] is None
     assert updated["last_progress_summary"] == ""
+    assert updated["last_pane_activity_at"] is None
+    assert updated["pane_title_observation"] is None
     uuid.UUID(updated["claude"]["mill"]["session_id"])
     assert updated["updated_at"] > 1000
 
@@ -888,6 +894,8 @@ def test_reset_lode_claude_stage(temp_config):
     assert loaded[0]["claude"]["mill"]["session_id"] != "session-1"
     assert loaded[0]["last_progress_at"] is None
     assert loaded[0]["last_progress_summary"] == ""
+    assert loaded[0]["last_pane_activity_at"] is None
+    assert loaded[0]["pane_title_observation"] is None
 
 
 def test_reset_lode_claude_stage_not_found(temp_config):
@@ -1318,7 +1326,13 @@ def test_local_host_sentinels_are_probed(make_lode, host_fields):
 
 def test_lode_with_status_annotations_reports_alive_parked_lode(make_lode):
     stored = format_park_status("quiet", "testid11")
-    lode = make_lode(state="gated", status=stored, tmux_pane="%10")
+    lode = make_lode(
+        state="gated",
+        status=stored,
+        tmux_pane="%10",
+        last_pane_activity_at=42_000,
+        pane_title_observation={"title": "⠐ Working", "observed_at": 40_000},
+    )
     before = dict(lode)
 
     with patch("hopper.lodes.pane_liveness", return_value=Liveness.ALIVE) as mock_liveness:
@@ -1329,6 +1343,11 @@ def test_lode_with_status_annotations_reports_alive_parked_lode(make_lode):
     assert annotated["status"] == stored
     assert annotated["status_display"] == stored
     assert annotated["pane_liveness"] == "alive"
+    assert annotated["last_pane_activity_at"] == 42_000
+    assert annotated["pane_title_observation"] == {
+        "title": "⠐ Working",
+        "observed_at": 40_000,
+    }
     mock_liveness.assert_called_once_with("%10")
 
 

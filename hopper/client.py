@@ -20,12 +20,14 @@ logger = logging.getLogger(__name__)
 
 RUN_GENERATION_ENV = "HOPPER_RUN_GENERATION"
 OOM_SCOPE_ENV = "HOPPER_OOM_SCOPE"
+MUTATION_ACK_TIMEOUT_SEC = 15.0
 RUNNER_MUTATION_TYPES = frozenset(
     {
         "lode_register",
         "lode_set_state",
         "lode_set_stage",
         "lode_set_progress",
+        "lode_set_pane_activity",
         "lode_set_status",
         "lode_set_title",
         "lode_set_branch",
@@ -558,18 +560,31 @@ def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
     return {"lode": lode, "gate": gate_text}
 
 
-def restart_lode(socket_path: Path, lode_id: str, stage: str, timeout: float = 2.0) -> bool:
-    """Restart a lode's current stage session. Fire-and-forget."""
-    return _fire_and_forget(
+def restart_lode(
+    socket_path: Path,
+    lode_id: str,
+    stage: str,
+    *,
+    force: bool = False,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Restart a lode's current stage session and await its disposition."""
+    response = send_message(
         socket_path,
         {
             "type": "lode_reset_claude_stage",
             "lode_id": lode_id,
             "claude_stage": stage,
             "spawn": True,
+            "force": force,
+            "ack_requested": True,
         },
         timeout=timeout,
+        wait_for_response=True,
     )
+    if response and response.get("type") == "mutation_ack":
+        return response
+    return None
 
 
 def kill_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> bool:
@@ -608,7 +623,7 @@ def _fire_and_forget(socket_path: Path, msg: dict, timeout: float = 2.0) -> bool
         if run_generation:
             msg = {**msg, "run_generation": run_generation}
     try:
-        send_message(socket_path, msg, timeout=timeout, wait_for_response=False)
+        _exchange_message(socket_path, msg, timeout=timeout, wait_for_response=False)
         return True
     except Exception:
         return False
@@ -665,6 +680,36 @@ def set_lode_state(
         "ts": current_time_ms(),
     }
     return _fire_and_forget(socket_path, msg, timeout)
+
+
+def set_lode_state_acknowledged(
+    socket_path: Path,
+    lode_id: str,
+    state: str,
+    status: str,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Set lode state and await the server's fenced-mutation disposition."""
+    msg = {
+        "type": "lode_set_state",
+        "lode_id": lode_id,
+        "state": state,
+        "status": status,
+        "ts": current_time_ms(),
+        "ack_requested": True,
+    }
+    run_generation = os.environ.get(RUN_GENERATION_ENV)
+    if run_generation:
+        msg["run_generation"] = run_generation
+    response = send_message(
+        socket_path,
+        msg,
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if response and response.get("type") == "mutation_ack":
+        return response
+    return None
 
 
 def set_lode_status(socket_path: Path, lode_id: str, status: str, timeout: float = 2.0) -> bool:

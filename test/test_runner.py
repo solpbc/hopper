@@ -3,14 +3,15 @@
 
 """Tests for the base runner module."""
 
-import json
 import signal
 import subprocess
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
-from hopper.lodes import current_time_ms, format_park_status, get_lode_dir
+import pytest
+
+from hopper.lodes import current_time_ms, format_park_status
 from hopper.runner import (
     BaseRunner,
     _descendant_pids,
@@ -339,153 +340,6 @@ class TestBaseRunnerActivityMonitor:
         mock_write_recovery.assert_called_once()
         mock_open_gate.assert_called_once_with()
 
-    def test_base_stuck_kill_writes_no_worktree_recovery(self):
-        runner = self._make_runner()
-        runner._claude_stage = "mill"
-
-        with (
-            patch("hopper.runner.current_time_ms", return_value=1234),
-            patch.object(runner, "_terminate_claude_process"),
-        ):
-            runner._fail_stuck("stuck reason")
-
-        record = json.loads((get_lode_dir("test-session") / "recovery.json").read_text())
-        assert record == {
-            "failed_at": 1234,
-            "stage": "mill",
-            "reason": "stuck reason",
-            "branch": None,
-            "worktree_path": None,
-            "snapshot": {"outcome": "no_worktree"},
-        }
-        assert runner._stuck_error == (
-            "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
-            "so no snapshot was created. Restart with: hop lode restart test-session"
-        )
-        assert runner._monitor_stop.is_set()
-        assert runner._stuck_failure_complete.is_set()
-
-    def test_format_stuck_error_outcomes(self):
-        runner = self._make_runner()
-        reason = "stuck reason"
-        record = {
-            "stage": "refine",
-            "branch": "hopper-test",
-            "worktree_path": "/tmp/worktree",
-        }
-
-        assert runner._format_stuck_error(
-            reason, {**record, "snapshot": {"outcome": "committed", "sha": "abc123"}}
-        ) == (
-            "stuck reason Recovery snapshot committed on branch hopper-test at abc123. "
-            "Restart with: hop lode restart test-session"
-        )
-        assert runner._format_stuck_error(reason, {**record, "snapshot": {"outcome": "clean"}}) == (
-            "stuck reason Recovery branch hopper-test; worktree was clean, so no snapshot "
-            "commit was created. Restart with: hop lode restart test-session"
-        )
-        assert runner._format_stuck_error(
-            reason, {**record, "snapshot": {"outcome": "no_worktree"}}
-        ) == (
-            "stuck reason Recovery branch unavailable; no worktree existed for stage refine, "
-            "so no snapshot was created. Restart with: hop lode restart test-session"
-        )
-        assert runner._format_stuck_error(
-            reason,
-            {
-                **record,
-                "snapshot": {"outcome": "failed", "git_error": "index locked"},
-            },
-        ) == (
-            "stuck reason Recovery snapshot failed on branch hopper-test: index locked. "
-            "Inspect /tmp/worktree before restarting with: hop lode restart test-session"
-        )
-
-    def test_recovery_write_failure_is_appended_to_enriched_error(self):
-        runner = self._make_runner()
-        runner._claude_stage = "mill"
-
-        with (
-            patch.object(runner, "_terminate_claude_process"),
-            patch("hopper.runner._write_recovery_record", side_effect=OSError("disk full")),
-        ):
-            runner._fail_stuck("stuck reason")
-
-        assert runner._stuck_error == (
-            "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
-            "so no snapshot was created. Restart with: hop lode restart test-session "
-            "Recovery record could not be written: disk full."
-        )
-        assert runner._monitor_stop.is_set()
-        assert runner._stuck_failure_complete.is_set()
-
-    def test_run_claude_waits_for_enriched_stuck_error(self):
-        runner = self._make_runner()
-        runner._claude_stage = "mill"
-        proc = MagicMock(returncode=1, stderr=None)
-        snapshot_started = threading.Event()
-        release_snapshot = threading.Event()
-        failure_threads = []
-
-        def slow_snapshot():
-            snapshot_started.set()
-            assert release_snapshot.wait(timeout=1)
-            return {"outcome": "no_worktree"}
-
-        def wait_for_process():
-            thread = threading.Thread(target=runner._fail_stuck, args=("stuck reason",))
-            failure_threads.append(thread)
-            thread.start()
-            assert snapshot_started.wait(timeout=1)
-
-        proc.wait.side_effect = wait_for_process
-        result = []
-
-        with (
-            patch.object(runner, "_build_command", return_value=(["claude"], None)),
-            patch("hopper.runner.subprocess.Popen", return_value=proc),
-            patch.object(runner, "_emit_state"),
-            patch.object(runner, "_start_monitor"),
-            patch.object(runner, "_terminate_claude_process"),
-            patch.object(runner, "_snapshot_stuck_worktree", side_effect=slow_snapshot),
-            patch("hopper.runner._write_recovery_record"),
-        ):
-            run_thread = threading.Thread(target=lambda: result.append(runner._run_claude()))
-            run_thread.start()
-            assert snapshot_started.wait(timeout=1)
-            assert run_thread.is_alive()
-            release_snapshot.set()
-            run_thread.join(timeout=1)
-
-        for thread in failure_threads:
-            thread.join(timeout=1)
-
-        assert not run_thread.is_alive()
-        assert result == [
-            (
-                1,
-                "stuck reason Recovery branch unavailable; no worktree existed for stage mill, "
-                "so no snapshot was created. Restart with: hop lode restart test-session",
-            )
-        ]
-
-    def test_run_claude_stuck_recovery_wait_timeout_returns_current_error(self, caplog):
-        runner = self._make_runner()
-        runner._stuck_error = "stuck reason"
-        proc = MagicMock(returncode=1, stderr=None)
-
-        with (
-            patch.object(runner, "_build_command", return_value=(["claude"], None)),
-            patch("hopper.runner.subprocess.Popen", return_value=proc),
-            patch.object(runner, "_emit_state"),
-            patch.object(runner, "_start_monitor"),
-            patch("hopper.runner.STUCK_FAILURE_WAIT_SEC", 0),
-        ):
-            result = runner._run_claude()
-
-        assert result == (1, "stuck reason")
-        assert "timed out waiting for stuck recovery lode=test-session" in caplog.messages
-
     def test_run_claude_pretrusts_workspace_before_launch(self):
         runner = self._make_runner()
         proc = MagicMock(returncode=0, stderr=None)
@@ -723,9 +577,13 @@ class TestBaseRunnerActivityMonitor:
                         "lode": {
                             "last_progress_at": last_progress_at,
                             "last_progress_summary": "codex thinking",
+                            "last_pane_activity_at": current_time_ms(),
                         }
                     },
                 ),
+                patch("hopper.runner.send_keys"),
+                patch("hopper.runner.get_current_pane_id", return_value="%test"),
+                patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             ):
                 runner._check_activity()
 
@@ -806,7 +664,6 @@ class TestBaseRunnerActivityMonitor:
         # It is parked as gated, not errored, and the monitor keeps watching so the
         # gate clears itself the moment the pane moves again.
         assert runner._gated.is_set()
-        assert runner._stuck_error is None
         assert not runner._monitor_stop.is_set()
 
         states = [kw.get("state") for msg_type, kw in emitted if msg_type == "lode_set_state"]
@@ -880,7 +737,6 @@ class TestBaseRunnerActivityMonitor:
             runner._check_activity()
             runner._check_activity()
 
-        assert runner._stuck_error is None
         runner._claude_proc.terminate.assert_not_called()
         assert any(
             e[0] == "lode_set_state"
@@ -915,7 +771,6 @@ class TestBaseRunnerActivityMonitor:
             runner._check_activity()
 
         assert runner._gated.is_set()
-        assert runner._stuck_error is None
         runner._claude_proc.terminate.assert_not_called()
 
     def test_real_silence_absolute_cap_parks_even_with_cpu(self, monkeypatch):
@@ -943,7 +798,6 @@ class TestBaseRunnerActivityMonitor:
             runner._check_activity()
 
         assert runner._gated.is_set()
-        assert runner._stuck_error is None
         runner._claude_proc.terminate.assert_not_called()
 
     def test_pane_silence_cap_parks_with_fresh_heartbeat_without_cpu_probe(self, monkeypatch):
@@ -1113,19 +967,52 @@ class TestBaseRunnerActivityMonitor:
             for e in emitted
         )
 
-    def test_check_activity_stops_on_capture_failure(self):
-        """Monitor stops when pane capture fails."""
+    def test_check_activity_capture_failure_does_not_stop_completion_watcher(self):
+        """A monitor capture failure remains recoverable before completion."""
         runner = self._make_runner()
         runner._pane_id = "%1"
         runner._monitor_stop.clear()
 
         with (
             patch("hopper.runner.capture_pane", return_value=None),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.connect", return_value=None),
         ):
             runner._check_activity()
 
-        assert runner._monitor_stop.is_set()
+        assert not runner._monitor_stop.is_set()
+        assert runner._pane_capture_failures == 1
+
+    def test_pane_activity_emits_only_real_changes_beyond_throttle(self):
+        runner = self._make_runner()
+        runner._last_snapshot = "first"
+        runner.connection = MagicMock()
+        runner.connection.emit.return_value = True
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="unused"),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+        ):
+            runner._record_pane_snapshot("second", 40_000)
+            runner._record_pane_snapshot("second", 80_000)
+            runner._record_pane_snapshot("third", 80_000)
+
+        assert runner.connection.emit.call_args_list == [
+            call(
+                "lode_set_pane_activity",
+                lode_id="test-session",
+                observed_at=40_000,
+            ),
+            call(
+                "lode_set_pane_activity",
+                lode_id="test-session",
+                observed_at=80_000,
+            ),
+        ]
 
     def test_start_monitor_renames_window(self):
         """Monitor renames tmux window to session ID."""
@@ -1169,6 +1056,9 @@ class TestBaseRunnerActivityMonitor:
 
         with (
             patch("hopper.runner.capture_pane", return_value="Hello World"),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.connect", return_value=None),
         ):
             runner._check_activity()
@@ -1274,30 +1164,40 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.connect", return_value=None),
             patch.object(runner, "_emit_state", return_value=True),
             patch.object(runner, "_park_idle") as mock_park,
-            patch.object(runner, "_fail_stuck") as mock_fail,
         ):
             for tick in range(1_000, 5_001, 100):
                 now[0] = tick
                 runner._check_activity()
 
         mock_park.assert_not_called()
-        mock_fail.assert_not_called()
         assert runner._gated.is_set()
         assert runner._stuck_since is None
 
-    def test_check_activity_while_gated_dead_pane_sets_monitor_stop(self):
-        """Gated monitor stops if pane capture fails."""
+    def test_check_activity_capture_disable_recovers(self):
+        """Capture failures neither stop nor permanently blind the monitor."""
         runner = self._make_runner()
         runner._pane_id = "%1"
         runner._monitor_stop.clear()
 
         with (
-            patch.object(runner._gated, "is_set", return_value=True),
-            patch("hopper.runner.capture_pane", return_value=None),
+            patch(
+                "hopper.runner.capture_pane",
+                side_effect=[None, None, None, "recovered"],
+            ),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+            patch("hopper.runner.connect", return_value=None),
+            patch.object(runner, "_park_idle") as park,
         ):
+            for _ in range(3):
+                runner._check_activity()
+            assert runner._activity_capture_disabled
             runner._check_activity()
 
-        assert runner._monitor_stop.is_set()
+        assert not runner._monitor_stop.is_set()
+        assert not runner._activity_capture_disabled
+        park.assert_not_called()
 
 
 class TestBaseRunnerServerMessages:
@@ -1432,8 +1332,18 @@ class TestBaseRunnerServerMessages:
 class TestBaseRunnerDismiss:
     """Tests for BaseRunner auto-dismiss behavior."""
 
+    @pytest.fixture(autouse=True)
+    def isolate_tmux(self):
+        with (
+            patch("hopper.runner.capture_pane", return_value="stable"),
+            patch("hopper.runner.send_keys", return_value=True),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+        ):
+            yield
+
     def test_wait_and_dismiss_sends_ctrl_c(self):
-        """Dismiss thread sends two Ctrl-D after screen stabilizes."""
+        """Dismiss thread sends two Ctrl-C keystrokes after screen stabilizes."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
         runner._done.set()
@@ -1442,7 +1352,7 @@ class TestBaseRunnerDismiss:
 
         def on_send_keys(w, k):
             send_keys_calls.append((w, k))
-            # Simulate process exit after Ctrl-D pair
+            # Simulate process exit after the initial Ctrl-C pair.
             if len(send_keys_calls) == 2:
                 runner._monitor_stop.set()
             return True
@@ -1451,11 +1361,47 @@ class TestBaseRunnerDismiss:
         with (
             patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
             patch("hopper.runner.send_keys", side_effect=on_send_keys),
-            patch("hopper.runner.MONITOR_INTERVAL", 0.01),
         ):
             runner._wait_and_dismiss_claude()
 
         assert send_keys_calls == [("%1", "C-c"), ("%1", "C-c")]
+
+    def test_resumed_stage_sends_no_keys_until_completed_broadcast(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner.is_first_run = False
+        proc = MagicMock(returncode=0, stderr=None)
+        dismissed = threading.Event()
+
+        def send_key(*_args):
+            if send.call_count == 2:
+                runner._monitor_stop.set()
+                dismissed.set()
+            return True
+
+        def wait_for_process():
+            send.assert_not_called()
+            runner._on_server_message(
+                {
+                    "type": "lode_updated",
+                    "lode": {"id": "test-session", "state": "completed"},
+                }
+            )
+            assert dismissed.wait(timeout=1)
+
+        proc.wait.side_effect = wait_for_process
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], None)),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(
+                runner, "_start_monitor", side_effect=lambda: setattr(runner, "_pane_id", "%1")
+            ),
+            patch("hopper.runner.capture_pane", return_value="stable"),
+            patch("hopper.runner.send_keys", side_effect=send_key) as send,
+        ):
+            assert runner._run_claude() == (0, None)
+
+        assert [call.args[1] for call in send.call_args_list] == ["C-c", "C-c"]
 
     def test_wait_and_dismiss_no_longer_exits_on_gate(self):
         """Dismiss loop still waits for completion even when gated."""
@@ -1486,14 +1432,14 @@ class TestBaseRunnerDismiss:
         mock_send_keys.assert_not_called()
 
     def test_wait_and_dismiss_retries_when_process_survives(self):
-        """Dismiss retries Ctrl-D if process doesn't exit after first attempt."""
+        """Dismiss escalates from a Ctrl-C pair to one Ctrl-D."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
         runner._done.set()
 
         send_keys_calls = []
 
-        # First attempt: stable screen, Ctrl-D sent but process survives
+        # First attempt: stable screen, Ctrl-C sent but process survives
         # Screen changes (Claude still outputting), then stabilizes again
         # Second attempt: Ctrl-D sent, process exits
         snapshots = iter(
@@ -1508,24 +1454,58 @@ class TestBaseRunnerDismiss:
 
         def on_send_keys(w, k):
             send_keys_calls.append((w, k))
-            if len(send_keys_calls) == 4:
+            if len(send_keys_calls) == 3:
                 runner._monitor_stop.set()
             return True
 
         with (
             patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
             patch("hopper.runner.send_keys", side_effect=on_send_keys),
-            patch("hopper.runner.MONITOR_INTERVAL", 0.01),
         ):
             runner._wait_and_dismiss_claude()
 
-        # Two Ctrl-D pairs: first attempt failed, second succeeded
         assert send_keys_calls == [
             ("%1", "C-c"),
             ("%1", "C-c"),
-            ("%1", "C-c"),
-            ("%1", "C-c"),
+            ("%1", "C-d"),
         ]
+
+    def test_wait_and_dismiss_acts_after_capture_failure_limit(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._done.set()
+
+        def stop_after_pair(*_args):
+            if send.call_count == 2:
+                runner._monitor_stop.set()
+            return True
+
+        with (
+            patch("hopper.runner.capture_pane", return_value=None) as capture,
+            patch("hopper.runner.send_keys", side_effect=stop_after_pair) as send,
+        ):
+            runner._wait_and_dismiss_claude()
+
+        assert capture.call_count == 3
+        assert [call.args[1] for call in send.call_args_list] == ["C-c", "C-c"]
+
+    def test_wait_and_dismiss_acts_when_stabilization_bound_expires(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._done.set()
+
+        def stop_after_pair(*_args):
+            if send.call_count == 2:
+                runner._monitor_stop.set()
+            return True
+
+        with (
+            patch("hopper.runner.DISMISS_STABILIZATION_TIMEOUT_SEC", 0),
+            patch("hopper.runner.send_keys", side_effect=stop_after_pair) as send,
+        ):
+            runner._wait_and_dismiss_claude()
+
+        assert [call.args[1] for call in send.call_args_list] == ["C-c", "C-c"]
 
     def test_wait_and_dismiss_aborts_when_monitor_stops(self):
         """Dismiss thread aborts if monitor stop is set."""
@@ -1556,3 +1536,53 @@ class TestBaseRunnerDismiss:
             runner._wait_and_dismiss_claude()
 
         assert send_keys_calls == []
+
+
+def test_completion_deadline_latch_preserves_done_and_allows_advance():
+    runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+    runner._pane_id = "%1"
+    runner._done.set()
+    runner._done_at_ms = 1_000
+    runner._next_stage = "refine"
+    runner._registration_complete.set()
+    runner._registration_accepted = True
+
+    with (
+        patch("hopper.runner.capture_pane", return_value="stable"),
+        patch("hopper.runner.send_keys"),
+        patch("hopper.runner.get_current_pane_id", return_value="%test"),
+        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+        patch("hopper.runner.current_time_ms", return_value=301_000),
+        patch.object(runner, "_park_idle") as park,
+    ):
+        runner._check_activity()
+        runner._check_activity()
+
+    assert runner._dismiss_deadline_parked
+    assert runner._done.is_set()
+    park.assert_called_once_with(
+        "completion was signalled, but the agent did not exit within 5 min"
+    )
+
+    lode = {"active": False, "claude": {"": {}}, "project": ""}
+    connection = MagicMock()
+    with (
+        patch("hopper.runner.capture_pane", return_value="stable"),
+        patch("hopper.runner.send_keys"),
+        patch("hopper.runner.get_current_pane_id", return_value="%test"),
+        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+        patch("hopper.runner.signal.signal", return_value=signal.SIG_DFL),
+        patch("hopper.runner.reap_swiftpm_testing_helpers"),
+        patch("hopper.runner.connect", return_value={"lode": lode}),
+        patch("hopper.runner.HopperConnection", return_value=connection),
+        patch.object(runner, "_setup", return_value=None),
+        patch.object(runner, "_run_claude", return_value=(0, None)),
+        patch.object(runner, "_emit_state", return_value=True) as emit_state,
+        patch.object(runner, "_emit_stage") as emit_stage,
+        patch.object(runner, "_stop_monitor"),
+        patch.object(runner, "_terminate_claude_process"),
+    ):
+        assert runner.run() == 0
+
+    emit_state.assert_called_once_with("ready", "Done")
+    emit_stage.assert_called_once_with("refine")

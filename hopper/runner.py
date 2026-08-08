@@ -29,14 +29,17 @@ MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
 STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
 ABSOLUTE_CAP_MS = 60 * 60_000
+DISMISS_STABILIZATION_TIMEOUT_SEC = 30.0
+PANE_CAPTURE_FAILURE_LIMIT = 3
+DISMISS_DEADLINE_MS = 5 * 60_000
+PANE_ACTIVITY_EMIT_INTERVAL_MS = 30_000
 _QUESTION_SELECTOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.MULTILINE)
 _QUESTION_CHROME_RE = re.compile(
     r"(?:↑/↓ to navigate|Esc to cancel|Enter to select|Type something)", re.IGNORECASE
 )
 DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
-STUCK_FAILURE_WAIT_SEC = 60
-REGISTRATION_TIMEOUT_SEC = 5.0
+REGISTRATION_TIMEOUT_SEC = 30.0
 BRANCH_PERSIST_TIMEOUT_SEC = 5.0
 PS_SCAN_TIMEOUT_SEC = 5.0
 
@@ -223,7 +226,6 @@ class BaseRunner:
     _claude_stage: str = ""  # Key into lode["claude"] dict ("mill", "refine", "ship")
     _done_status: str = "Done"
     _next_stage: str = ""
-    _always_dismiss: bool = False
 
     def __init__(
         self,
@@ -256,12 +258,16 @@ class BaseRunner:
         self._last_descendant_cpu_ms: int | None = None
         self._last_cpu_activity_ms: int | None = None
         self._last_pane_activity_ms: int | None = None
+        self._last_pane_activity_emitted_ms: int | None = None
+        self._pane_capture_failures = 0
+        self._activity_capture_disabled = False
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
-        self._stuck_error: str | None = None
-        self._stuck_failure_complete = threading.Event()
         # Completion tracking
         self._done = threading.Event()
+        self._done_at_ms: int | None = None
+        self._dismiss_deadline_parked = False
+        self._dismiss_attempt = 0
         self._gated = threading.Event()
         # Gate resume detector: the pane as it settled *after* the gate opened,
         # and whether we have seen it hold still long enough to trust a change.
@@ -458,9 +464,7 @@ class BaseRunner:
             self._emit_state("running", "Claude running")
             self._start_monitor()
 
-            # Start dismiss thread if configured
-            should_dismiss = self._always_dismiss or self.is_first_run
-            if should_dismiss and self._pane_id:
+            if self._pane_id:
                 threading.Thread(
                     target=self._wait_and_dismiss_claude,
                     name=f"{self._done_label.lower().replace(' ', '-')}-dismiss",
@@ -469,10 +473,6 @@ class BaseRunner:
 
             proc.wait()
 
-            if self._stuck_error:
-                if not self._stuck_failure_complete.wait(timeout=STUCK_FAILURE_WAIT_SEC):
-                    logger.warning(f"timed out waiting for stuck recovery lode={self.lode_id}")
-                return 1, self._stuck_error
             if proc.returncode != 0 and proc.stderr:
                 stderr_bytes = proc.stderr.read()
                 error_msg = extract_error_message(stderr_bytes)
@@ -574,8 +574,10 @@ class BaseRunner:
             ):
                 self._branch_persisted.set()
         if lode.get("state") == "completed":
-            self._done.set()
-            logger.debug(f"{self._done_label} signal received")
+            if not self._done.is_set():
+                self._done_at_ms = current_time_ms()
+                self._done.set()
+            logger.debug(f"{self._done_label} signal received lode={self.lode_id}")
         elif lode.get("state") == "gated":
             self._open_gate()
             logger.debug(f"gate signal received lode={self.lode_id}")
@@ -586,11 +588,7 @@ class BaseRunner:
         self._gate_epoch = lode.get("gate_epoch", 0)
 
     def _wait_and_dismiss_claude(self) -> None:
-        """Wait for completion or gate, screen stability, then send Ctrl-D to exit Claude.
-
-        Retries if Claude doesn't exit after the first Ctrl-D (e.g. if it was
-        sent during output rather than at the interactive prompt).
-        """
+        """Wait for completion, then dismiss Claude with bounded keystroke retries."""
         while not self._done.is_set():
             self._done.wait(timeout=1.0)
             if self._monitor_stop.is_set():
@@ -600,14 +598,34 @@ class BaseRunner:
             return
 
         while not self._monitor_stop.is_set():
-            logger.debug(f"{self._done_label}, waiting for screen to stabilize")
+            if self._dismiss_deadline_parked:
+                return
+            logger.debug(f"{self._done_label}, waiting for screen to stabilize lode={self.lode_id}")
 
             last_snapshot = None
+            capture_failures = 0
+            stabilization_deadline = time.monotonic() + DISMISS_STABILIZATION_TIMEOUT_SEC
             while not self._monitor_stop.is_set():
-                self._monitor_stop.wait(MONITOR_INTERVAL)
+                if self._dismiss_deadline_parked:
+                    return
+                remaining = stabilization_deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        f"screen did not stabilize before dismiss bound lode={self.lode_id}"
+                    )
+                    break
+                self._monitor_stop.wait(min(MONITOR_INTERVAL, remaining))
                 snapshot = capture_pane(self._pane_id)
                 if snapshot is None:
-                    return
+                    capture_failures += 1
+                    logger.debug(
+                        "failed to capture pane while waiting to dismiss "
+                        f"lode={self.lode_id} failures={capture_failures}"
+                    )
+                    if capture_failures >= PANE_CAPTURE_FAILURE_LIMIT:
+                        break
+                    continue
+                capture_failures = 0
                 if snapshot == last_snapshot:
                     break
                 last_snapshot = snapshot
@@ -615,9 +633,18 @@ class BaseRunner:
             if self._monitor_stop.is_set():
                 return
 
-            logger.debug("Screen stable, sending Ctrl-C")
-            send_keys(self._pane_id, "C-c")
-            send_keys(self._pane_id, "C-c")
+            if self._dismiss_deadline_parked:
+                return
+            if last_snapshot is None:
+                logger.warning(f"dismissing without a stable pane capture lode={self.lode_id}")
+            self._dismiss_attempt += 1
+            if self._dismiss_attempt == 1:
+                logger.debug(f"sending Ctrl-C dismiss keystrokes lode={self.lode_id}")
+                send_keys(self._pane_id, "C-c")
+                send_keys(self._pane_id, "C-c")
+            else:
+                logger.debug(f"sending Ctrl-D dismiss keystroke lode={self.lode_id}")
+                send_keys(self._pane_id, "C-d")
 
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""
@@ -665,13 +692,19 @@ class BaseRunner:
             return
 
         if self._done.is_set():
+            now = current_time_ms()
+            if self._done_at_ms is None:
+                self._done_at_ms = now
+            if not self._dismiss_deadline_parked and now - self._done_at_ms >= DISMISS_DEADLINE_MS:
+                self._dismiss_deadline_parked = True
+                reason = "completion was signalled, but the agent did not exit within 5 min"
+                logger.warning(f"dismiss deadline reached lode={self.lode_id}: {reason}")
+                self._park_idle(reason)
             return
 
         if self._gated.is_set():
-            snapshot = capture_pane(self._pane_id)
+            snapshot = self._capture_activity_pane()
             if snapshot is None:
-                logger.debug("Failed to capture pane, stopping monitor")
-                self._monitor_stop.set()
                 return
             self._stuck_since = None
             if not self._gate_armed:
@@ -689,8 +722,7 @@ class BaseRunner:
                 if snapshot == self._gate_snapshot:
                     self._gate_armed = True
                 self._gate_snapshot = snapshot
-                self._last_snapshot = snapshot
-                self._last_pane_activity_ms = current_time_ms()
+                self._record_pane_snapshot(snapshot, current_time_ms())
                 return
             if snapshot != self._gate_snapshot:
                 self._emit_state(
@@ -698,15 +730,12 @@ class BaseRunner:
                     "Gate resumed",
                     gate_epoch=self._gate_epoch,
                 )
-                self._last_snapshot = snapshot
-                self._last_pane_activity_ms = current_time_ms()
+                self._record_pane_snapshot(snapshot, current_time_ms())
                 self._clear_gate()
             return
 
-        snapshot = capture_pane(self._pane_id)
+        snapshot = self._capture_activity_pane()
         if snapshot is None:
-            logger.debug("Failed to capture pane, stopping monitor")
-            self._monitor_stop.set()
             return
 
         if pane_needs_answer(snapshot):
@@ -718,8 +747,7 @@ class BaseRunner:
 
         now = current_time_ms()
         if snapshot != self._last_snapshot:
-            self._last_snapshot = snapshot
-            self._last_pane_activity_ms = now
+            self._record_pane_snapshot(snapshot, now)
 
         response = connect(self.socket_path, lode_id=self.lode_id)
         lode = response.get("lode") if response else None
@@ -781,9 +809,42 @@ class BaseRunner:
                 self._emit_state("running", status)
             self._stuck_since = None
 
-    def _snapshot_stuck_worktree(self) -> dict:
-        """Overridden by runners that own a worktree."""
-        return {"outcome": "no_worktree"}
+    def _capture_activity_pane(self) -> str | None:
+        """Capture the pane while keeping capture failures recoverable."""
+        snapshot = capture_pane(self._pane_id)
+        if snapshot is None:
+            self._pane_capture_failures += 1
+            logger.debug(
+                f"failed to capture pane lode={self.lode_id} failures={self._pane_capture_failures}"
+            )
+            if self._pane_capture_failures >= PANE_CAPTURE_FAILURE_LIMIT:
+                self._activity_capture_disabled = True
+            return None
+
+        if self._activity_capture_disabled:
+            logger.info(f"pane capture recovered lode={self.lode_id}")
+        self._activity_capture_disabled = False
+        self._pane_capture_failures = 0
+        return snapshot
+
+    def _record_pane_snapshot(self, snapshot: str, observed_at: int) -> None:
+        """Record and report a real change between two captured pane snapshots."""
+        previous = self._last_snapshot
+        self._last_snapshot = snapshot
+        self._last_pane_activity_ms = observed_at
+        if previous is None or previous == snapshot or not self.connection:
+            return
+        if (
+            self._last_pane_activity_emitted_ms is not None
+            and observed_at - self._last_pane_activity_emitted_ms < PANE_ACTIVITY_EMIT_INTERVAL_MS
+        ):
+            return
+        if self.connection.emit(
+            "lode_set_pane_activity",
+            lode_id=self.lode_id,
+            observed_at=observed_at,
+        ):
+            self._last_pane_activity_emitted_ms = observed_at
 
     def _park_idle(self, reason: str) -> None:
         """Park an idle stage as gated and wait for a human. NEVER terminate it.
@@ -823,69 +884,6 @@ class BaseRunner:
     def _format_park_status(self, reason: str) -> str:
         """Prescriptive park status -- agents and operators both read this."""
         return format_park_status(reason, self.lode_id)
-
-    def _format_stuck_error(self, reason: str, record: dict) -> str:
-        """Add recovery details and the restart command to a stuck error."""
-        snapshot = record["snapshot"]
-        outcome = snapshot["outcome"]
-        branch = record.get("branch") or "unavailable"
-        stage = record.get("stage", "")
-        if outcome == "committed":
-            return (
-                f"{reason} Recovery snapshot committed on branch {branch} at {snapshot['sha']}. "
-                f"Restart with: hop lode restart {self.lode_id}"
-            )
-        if outcome == "clean":
-            return (
-                f"{reason} Recovery branch {branch}; worktree was clean, so no snapshot commit "
-                f"was created. Restart with: hop lode restart {self.lode_id}"
-            )
-        if outcome == "no_worktree":
-            return (
-                f"{reason} Recovery branch unavailable; no worktree existed for stage {stage}, "
-                f"so no snapshot was created. Restart with: hop lode restart {self.lode_id}"
-            )
-        worktree_path = record.get("worktree_path") or "unavailable"
-        return (
-            f"{reason} Recovery snapshot failed on branch {branch}: {snapshot['git_error']}. "
-            f"Inspect {worktree_path} before restarting with: hop lode restart {self.lode_id}"
-        )
-
-    def _fail_stuck(self, reason: str) -> None:
-        """Terminate a stuck runner and preserve failure state."""
-        failed_at = current_time_ms()
-        self._stuck_error = reason
-        logger.error(f"stuck timeout lode={self.lode_id}: {reason}")
-        try:
-            self._terminate_claude_process()
-            try:
-                snapshot = self._snapshot_stuck_worktree()
-            except Exception as exc:
-                logger.exception(f"unexpected stuck snapshot failure lode={self.lode_id}")
-                snapshot = {"outcome": "failed", "git_error": str(exc)}
-
-            worktree_path = getattr(self, "worktree_path", None)
-            record = {
-                "failed_at": failed_at,
-                "stage": self._claude_stage,
-                "reason": reason,
-                "branch": getattr(self, "lode_branch", None) or None,
-                "worktree_path": str(worktree_path) if worktree_path else None,
-                "snapshot": snapshot,
-            }
-            try:
-                _write_recovery_record(self.lode_id, record)
-            except Exception as exc:
-                logger.error(f"failed to write recovery record lode={self.lode_id}: {exc}")
-                self._stuck_error = (
-                    f"{self._format_stuck_error(reason, record)} "
-                    f"Recovery record could not be written: {exc}."
-                )
-            else:
-                self._stuck_error = self._format_stuck_error(reason, record)
-        finally:
-            self._monitor_stop.set()
-            self._stuck_failure_complete.set()
 
     def _terminate_claude_process(self) -> None:
         """Terminate the active Claude process and the descendants it launched."""

@@ -242,7 +242,7 @@ def test_process_missing_lode_id(capsys):
 def test_process_delegates_to_runner(capsys):
     """process delegates to run_process after server check."""
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.process.run_process", return_value=0) as mock_run:
+        with patch("hopper.process.run_process_supervisor", return_value=0) as mock_run:
             result = cmd_process(["test-1234-session"])
     assert result == 0
     mock_run.assert_called_once()
@@ -1345,6 +1345,38 @@ def test_implement_delegates_to_lode_create(capsys):
     assert "myproj" in out
 
 
+def test_implement_warns_with_registered_runner_count_and_still_creates(capsys):
+    from io import StringIO
+
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch("hopper.cli.os.getloadavg", return_value=(56.0, 28.0, 14.0)),
+        patch("hopper.cli.os.cpu_count", return_value=16),
+        patch(
+            "hopper.client.list_lodes",
+            return_value=[{"active": True}, {"active": True}, {"active": False}],
+        ),
+        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert cmd_implement(["myproj"]) == 0
+
+    create.assert_called_once()
+    assert capsys.readouterr().err == (
+        "warning: target load 1m=56.00 5m=28.00 15m=14.00 across 16 logical CPUs; "
+        "lodes with a registered runner=2; creating anyway\n"
+    )
+
+
+def test_load_report_failure_is_swallowed():
+    with patch("hopper.cli.os.getloadavg", side_effect=OSError("unavailable")):
+        hopper_cli._warn_target_load(Path("/tmp/test.sock"))
+
+
 def test_implement_rejects_inside_lode(monkeypatch, capsys):
     """hop implement rejects when inside a lode."""
     from io import StringIO
@@ -1430,7 +1462,10 @@ def test_lode_restart_happy(capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
+            with patch(
+                "hopper.client.restart_lode",
+                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+            ) as mock_restart:
                 assert cmd_lode(["restart", "test1234"]) == 0
                 mock_restart.assert_called_once()
     out = capsys.readouterr().out
@@ -1464,7 +1499,29 @@ def test_lode_restart_active(capsys):
         with patch("hopper.client.get_lode", return_value=lode):
             assert cmd_lode(["restart", "test1234"]) == 1
     out = capsys.readouterr().out
-    assert "active" in out.lower()
+    assert "registered runner" in out.lower()
+    assert "--force" in out
+
+
+def test_lode_restart_pending_result_gives_wait_and_status_next_step(capsys):
+    lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.get_lode", return_value=lode),
+        patch(
+            "hopper.client.restart_lode",
+            return_value={
+                "type": "mutation_ack",
+                "accepted": False,
+                "reason": "pending_runner_result",
+            },
+        ),
+    ):
+        assert cmd_lode(["restart", "test1234", "--force"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Wait about 60 seconds" in out
+    assert "hop lode status test1234" in out
 
 
 def test_lode_restart_shipped(capsys):
@@ -1518,7 +1575,10 @@ def test_lode_restart_force_proceeds_when_started(capsys):
     }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
+            with patch(
+                "hopper.client.restart_lode",
+                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+            ) as mock_restart:
                 result = cmd_lode(["restart", "test1234", "--force"])
     assert result == 0
     mock_restart.assert_called_once()
@@ -1536,7 +1596,10 @@ def test_lode_restart_error_proceeds_when_started_without_force(capsys):
     }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
+            with patch(
+                "hopper.client.restart_lode",
+                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+            ) as mock_restart:
                 result = cmd_lode(["restart", "test1234"])
     assert result == 0
     mock_restart.assert_called_once()
@@ -3485,7 +3548,10 @@ def test_processed_saves_file(temp_config, capsys):
         with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
-                    with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
+                    with patch(
+                        "hopper.client.set_lode_state_acknowledged",
+                        return_value={"accepted": True, "reason": "accepted"},
+                    ) as mock_set:
                         with patch("sys.stdin", StringIO(output_text)):
                             result = cmd_processed([])
 
@@ -3532,7 +3598,10 @@ def test_processed_refine_stage(temp_config, capsys):
         with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
-                    with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
+                    with patch(
+                        "hopper.client.set_lode_state_acknowledged",
+                        return_value={"accepted": True, "reason": "accepted"},
+                    ) as mock_set:
                         with patch("sys.stdin", StringIO(output_text)):
                             result = cmd_processed([])
 
@@ -3549,6 +3618,71 @@ def test_processed_refine_stage(temp_config, capsys):
     assert sid == lode_id
     assert state == "completed"
     assert "Refine complete" in status
+
+
+def test_processed_no_ack_is_unknown_but_keeps_written_output(temp_config, capsys):
+    from io import StringIO
+
+    lode_id = "test-session"
+    output = "completed output\n"
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
+        patch("hopper.client.set_lode_state_acknowledged", return_value=None),
+        patch("sys.stdin", StringIO(output)),
+    ):
+        assert cmd_processed([]) == 0
+
+    assert (temp_config / "lodes" / lode_id / "mill_out.md").read_text() == output
+    captured = capsys.readouterr()
+    assert "disposition is UNKNOWN" in captured.err
+    assert f"hop lode status {lode_id}" in captured.err
+
+
+def test_processed_explicit_refusal_is_nonzero_with_written_output(temp_config, capsys):
+    from io import StringIO
+
+    lode_id = "test-session"
+    output = "completed output\n"
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
+        patch(
+            "hopper.client.set_lode_state_acknowledged",
+            return_value={"accepted": False, "reason": "lode_not_found"},
+        ),
+        patch("sys.stdin", StringIO(output)),
+    ):
+        assert cmd_processed([]) == 1
+
+    assert (temp_config / "lodes" / lode_id / "mill_out.md").read_text() == output
+    assert f"Lode {lode_id} not found or archived." in capsys.readouterr().err
+
+
+def test_processed_acknowledges_over_real_server_socket(
+    check_server, make_lode, temp_config, monkeypatch, capsys
+):
+    from io import StringIO
+
+    server, socket_path = check_server
+    generation = "a" * 32
+    lode_id = "test-session"
+    server.lodes = [make_lode(id=lode_id, state="running", run_generation=generation)]
+    monkeypatch.setattr(config, "server_socket_path", lambda: socket_path)
+    monkeypatch.setenv("HOPPER_LID", lode_id)
+    monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+    monkeypatch.setattr(sys, "stdin", StringIO("real boundary output\n"))
+
+    assert cmd_processed([]) == 0
+
+    assert server.lodes[0]["state"] == "completed"
+    assert (temp_config / "lodes" / lode_id / "mill_out.md").exists()
+    captured = capsys.readouterr()
+    assert "UNKNOWN" not in captured.err
 
 
 # Tests for gate command
@@ -4219,7 +4353,10 @@ def test_restart_delegates_to_lode_restart(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.cli.require_not_inside_lode", return_value=None):
             with patch("hopper.client.get_lode", return_value=lode):
-                with patch("hopper.client.restart_lode"):
+                with patch(
+                    "hopper.client.restart_lode",
+                    return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+                ):
                     assert cmd_restart(["abc123"]) == 0
     out = capsys.readouterr().out
     assert "Restarting" in out
@@ -5545,16 +5682,23 @@ def test_lode_pane_input_missing_response_is_unknown(capsys):
     assert "submitted" not in captured.err
 
 
-def test_lode_restart_allows_force_when_active_pane_dead(capsys):
+def test_lode_restart_force_requests_server_side_termination(capsys):
     lode = {"id": "abc123", "stage": "mill", "state": "running", "active": True, "tmux_pane": "%9"}
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.get_lode", return_value=lode):
-            with patch("hopper.cli.capture_pane", return_value=None):
-                with patch("hopper.client.restart_lode", return_value=True) as mock_restart:
-                    assert cmd_lode(["restart", "abc123", "--force"]) == 0
+            with patch(
+                "hopper.client.restart_lode",
+                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+            ) as mock_restart:
+                assert cmd_lode(["restart", "abc123", "--force"]) == 0
 
-    mock_restart.assert_called_once()
-    assert "dead pane" in capsys.readouterr().out
+    mock_restart.assert_called_once_with(
+        Path(config.server_socket_path()),
+        "abc123",
+        "mill",
+        force=True,
+    )
+    assert "Terminating the registered runner" in capsys.readouterr().out
 
 
 def test_resolver_remote_probe_does_not_cascade(monkeypatch):

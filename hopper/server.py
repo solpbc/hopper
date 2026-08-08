@@ -85,7 +85,9 @@ PAUSE_TERM_GRACE_SEC = 0.75
 PAUSE_KILL_GRACE_SEC = 0.5
 PAUSE_PROCESS_POLL_SEC = 0.02
 PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
-GUARDED_DISCONNECT_HOLD_SEC = 2.0
+GUARDED_DISCONNECT_HOLD_SEC = 60.0
+assert oom.SCOPE_RESULT_SETTLE_SEC < GUARDED_DISCONNECT_HOLD_SEC
+FROZEN_PANE_THRESHOLD_MS = 10 * 60_000
 _FEEDBACK_POLL_INTERVAL = 0.25
 _FEEDBACK_IDLE_POLL_COUNT = 12
 _FEEDBACK_SETTLE_POLL_COUNT = 4
@@ -105,6 +107,7 @@ _DELIVERY_FAILURE_OUTCOMES = {
     "pane_unavailable": "pane_unavailable",
     "idle_timeout": "busy",
     "pane_state_unknown": "pane_state_unknown",
+    "pane_frozen": "pane_frozen",
     "paste_failed": "not_sent",
     "paste_failed_unknown": "unverified",
     "paste_not_staged": "unverified",
@@ -119,6 +122,7 @@ _GATE_FEEDBACK_STATUSES = {
     "not_sent": "Feedback not sent; gate remains blocked",
     "unverified": "Feedback outcome unknown; inspect pane",
     "pane_state_unknown": "Feedback blocked: pane state unrecognized",
+    "pane_frozen": "Feedback blocked: pane appears frozen",
 }
 _GATE_FEEDBACK_MESSAGES = {
     "pane_unavailable": (
@@ -136,6 +140,11 @@ _GATE_FEEDBACK_MESSAGES = {
         "Feedback was not sent because Hopper does not recognize the pane state reported "
         "for pane {pane}: {title}. Inspect with `hop lode peek {lode_id}`. It is safe to "
         "retry the same feedback after the pane reaches a recognized idle state."
+    ),
+    "pane_frozen": (
+        "Feedback was not sent because pane {pane} has reported the same processing title "
+        "for at least 10 min. Inspect with `hop lode peek {lode_id}` before deciding "
+        "whether to retry."
     ),
     "paste_failed": (
         "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
@@ -195,6 +204,11 @@ _PANE_INPUT_MESSAGES = {
         "pane {pane}: {title}. Inspect with `hop lode peek {lode_id}`. It is safe to retry "
         "after the pane reaches a recognized idle state."
     ),
+    "pane_frozen": (
+        "Input was not sent because pane {pane} has reported the same processing title for "
+        "at least 10 min. Inspect with `hop lode peek {lode_id}` before deciding whether "
+        "to retry."
+    ),
     "paste_failed": (
         "Input was not sent because Hopper could not deliver it to pane {pane}. Retry the "
         "same input."
@@ -234,7 +248,9 @@ _PANE_INPUT_MESSAGES = {
     ),
 }
 # Any future reason returned before delivery must be added here.
-_PRE_PASTE_REASONS = frozenset({"pane_unavailable", "idle_timeout", "pane_state_unknown"})
+_PRE_PASTE_REASONS = frozenset(
+    {"pane_unavailable", "idle_timeout", "pane_state_unknown", "pane_frozen"}
+)
 
 
 class ServerLockHeld(RuntimeError):
@@ -363,7 +379,25 @@ def _render_observed_title(title: str | None) -> str:
     return f'"{title}"' if title is not None else "<no title reported>"
 
 
-def _attempt_pane_delivery(pane_id: str | None, text: str, *, paste: bool) -> dict:
+def _observe_pane_title(title: str | None, observation: dict | None) -> bool:
+    """Update a cross-attempt title observation and report a frozen pane."""
+    if title is None or observation is None:
+        return False
+    now = current_time_ms()
+    if observation.get("title") != title or not isinstance(observation.get("observed_at"), int):
+        observation.clear()
+        observation.update({"title": title, "observed_at": now})
+        return False
+    return now - observation["observed_at"] >= FROZEN_PANE_THRESHOLD_MS
+
+
+def _attempt_pane_delivery(
+    pane_id: str | None,
+    text: str,
+    *,
+    paste: bool,
+    pane_title_observation: dict | None = None,
+) -> dict:
     """Attempt one pane delivery and return its reason and latest observations."""
     observed_title = None
     if not pane_id:
@@ -386,6 +420,12 @@ def _attempt_pane_delivery(pane_id: str | None, text: str, *, paste: bool) -> di
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
+        if _observe_pane_title(observed_title, pane_title_observation):
+            return {
+                "reason": "pane_frozen",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
         phase = classify_pane_phase(observed_title)
         if phase is PanePhase.PROCESSING:
             saw_processing = True
@@ -472,10 +512,22 @@ def _attempt_pane_delivery(pane_id: str | None, text: str, *, paste: bool) -> di
     }
 
 
-def _deliver_pane_input(lode_id: str, pane_id: str | None, text: str, *, paste: bool) -> dict:
+def _deliver_pane_input(
+    lode_id: str,
+    pane_id: str | None,
+    text: str,
+    *,
+    paste: bool,
+    pane_title_observation: dict | None = None,
+) -> dict:
     """Deliver pane input and emit exactly one outcome record."""
     try:
-        result = _attempt_pane_delivery(pane_id, text, paste=paste)
+        result = _attempt_pane_delivery(
+            pane_id,
+            text,
+            paste=paste,
+            pane_title_observation=pane_title_observation,
+        )
     except Exception:
         logger.warning(
             "Pane delivery failed lode=%s pane=%s reason=%s outcome=%s title=%s",
@@ -509,6 +561,23 @@ def _deliver_pane_input(lode_id: str, pane_id: str | None, text: str, *, paste: 
             outcome,
             rendered_title,
         )
+    return result
+
+
+def _deliver_lode_pane_input(lodes: list[dict], lode: dict, text: str, *, paste: bool) -> dict:
+    """Deliver input and persist only cross-attempt pane-title evidence."""
+    prior_observation = lode.get("pane_title_observation")
+    observation = dict(prior_observation) if isinstance(prior_observation, dict) else {}
+    result = _deliver_pane_input(
+        lode["id"],
+        lode.get("tmux_pane"),
+        text,
+        paste=paste,
+        pane_title_observation=observation,
+    )
+    if observation and observation != prior_observation:
+        lode["pane_title_observation"] = observation
+        save_lodes(lodes)
     return result
 
 
@@ -1352,6 +1421,20 @@ class Server:
         """Handle a serialized state message. Runs on the event loop thread."""
         self._request_context.exchange_id = message.get("exchange_id")
         msg_type = message.get("type")
+        ack_requested = message.get("ack_requested") is True
+
+        def acknowledge_mutation(accepted: bool, reason: str) -> None:
+            if conn and ack_requested:
+                self._send_response(
+                    conn,
+                    {
+                        "type": "mutation_ack",
+                        "mutation_type": msg_type,
+                        "lode_id": message.get("lode_id"),
+                        "accepted": accepted,
+                        "reason": reason,
+                    },
+                )
 
         if msg_type in RUNNER_MUTATION_TYPES:
             lode_id = message.get("lode_id")
@@ -1362,6 +1445,13 @@ class Server:
                         conn,
                         {"type": "lode_register_refused", "lode_id": lode_id},
                     )
+                if not lode:
+                    reason = "lode_not_found"
+                elif not message.get("run_generation"):
+                    reason = "missing_run_generation"
+                else:
+                    reason = "stale_run_generation"
+                acknowledge_mutation(False, reason)
                 return
             if msg_type != "lode_register" and is_terminal_failure_kind(lode.get("failure_kind")):
                 logger.info(
@@ -1369,7 +1459,10 @@ class Server:
                     msg_type,
                     lode_id,
                 )
+                acknowledge_mutation(False, "terminal_failure")
                 return
+            if msg_type not in {"lode_register", "lode_set_state"}:
+                acknowledge_mutation(True, "accepted")
 
         if msg_type == "_client_disconnect":
             self._on_client_disconnect(conn)
@@ -1694,11 +1787,17 @@ class Server:
                         message_epoch,
                         current_epoch,
                     )
+                    acknowledge_mutation(False, "stale_gate_epoch")
                     return
                 lode = update_lode_state(self.lodes, lode_id, state, status)
                 if lode:
                     logger.info(f"Lode {lode_id} state={state} status={status}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
+                    acknowledge_mutation(True, "accepted")
+                else:
+                    acknowledge_mutation(False, "lode_not_found")
+            else:
+                acknowledge_mutation(False, "invalid_mutation")
 
         elif msg_type == "lode_set_progress":
             lode_id = message.get("lode_id")
@@ -1718,6 +1817,17 @@ class Server:
                     save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
                     logger.info(f"Lode {lode_id} progress: {lode['last_progress_summary']}")
+
+        elif msg_type == "lode_set_pane_activity":
+            lode_id = message.get("lode_id")
+            observed_at = message.get("observed_at")
+            if lode_id and isinstance(observed_at, int) and not isinstance(observed_at, bool):
+                lode = self._find_lode(lode_id)
+                if lode:
+                    lode["last_pane_activity_at"] = observed_at
+                    touch(lode)
+                    save_lodes(self.lodes)
+                    self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_status":
             lode_id = message.get("lode_id")
@@ -1770,8 +1880,34 @@ class Server:
             if lode_id and claude_stage:
                 lode = self._find_lode(lode_id)
                 if not lode or claude_stage not in lode.get("claude", {}):
+                    acknowledge_mutation(
+                        False,
+                        "lode_not_found" if not lode else "invalid_stage",
+                    )
                     return
                 if message.get("spawn"):
+                    force = message.get("force") is True
+                    generation = lode.get("run_generation")
+                    if force and generation and (lode_id, generation) in self.pending_disconnects:
+                        acknowledge_mutation(False, "pending_runner_result")
+                        return
+                    if force:
+                        pane = lode.get("tmux_pane")
+                        runner_pid = lode.get("pid") or (get_pane_pid(pane) if pane else None)
+                        if runner_pid is None and (
+                            lode.get("active")
+                            or (pane and pane_liveness(pane) is not Liveness.GONE)
+                        ):
+                            acknowledge_mutation(False, "runner_identity_unknown")
+                            return
+                        if runner_pid and not _terminate_runner_process_group(runner_pid):
+                            acknowledge_mutation(False, "termination_failed")
+                            return
+                        if generation:
+                            self.runner_results.pop((lode_id, generation), None)
+                        lode["active"] = False
+                        lode["tmux_pane"] = None
+                        lode["pid"] = None
                     proj = find_project(lode.get("project", ""))
                     project_path = proj.path if proj else None
 
@@ -1791,10 +1927,18 @@ class Server:
                     )
                     if outcome is SpawnOutcome.SPAWNED:
                         logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
+                        acknowledge_mutation(True, "spawned")
+                    elif outcome is SpawnOutcome.ALREADY_LIVE:
+                        acknowledge_mutation(False, "already_live")
+                    elif outcome is SpawnOutcome.REFUSED_UNKNOWN:
+                        acknowledge_mutation(False, "tmux_unreachable")
+                    else:
+                        acknowledge_mutation(False, "spawn_failed")
                 else:
                     reset_lode_claude_stage(self.lodes, lode_id, claude_stage)
                     logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
+                    acknowledge_mutation(True, "reset")
 
         elif msg_type == "lode_resume_refine":
             # Compound: apply refine state only when the gated spawn is allowed.
@@ -1852,7 +1996,7 @@ class Server:
                 return
 
             pane_id = lode.get("tmux_pane")
-            result = _deliver_pane_input(lode_id, pane_id, text, paste=True)
+            result = _deliver_lode_pane_input(self.lodes, lode, text, paste=True)
             reason = result["reason"]
             accepted = reason in _ACCEPTED_DELIVERY_REASONS
             paste_attempted = reason not in _PRE_PASTE_REASONS
@@ -1941,7 +2085,7 @@ class Server:
                 return
 
             pane_id = lode.get("tmux_pane")
-            result = _deliver_pane_input(lode_id, pane_id, text, paste=paste)
+            result = _deliver_lode_pane_input(self.lodes, lode, text, paste=paste)
             reason = result["reason"]
             if reason in _ACCEPTED_DELIVERY_REASONS:
                 response = {

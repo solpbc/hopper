@@ -32,6 +32,7 @@ from hopper.client import (
     send_pane_input,
     set_lode_progress,
     set_lode_state,
+    set_lode_state_acknowledged,
     set_lode_title,
 )
 from hopper.server import Server
@@ -63,7 +64,7 @@ def _read_request(conn: socket.socket) -> dict:
     return json.loads(line.decode("utf-8"))
 
 
-def _exchange_with_responder(socket_path, responder, *, wait=True, timeout=0.2):
+def _exchange_with_responder(socket_path, responder, *, wait=True, timeout=0.2, invoke=None):
     """Run one client exchange against a handcrafted response callback."""
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
@@ -80,12 +81,15 @@ def _exchange_with_responder(socket_path, responder, *, wait=True, timeout=0.2):
     thread = threading.Thread(target=respond)
     thread.start()
     try:
-        result = _exchange_message(
-            socket_path,
-            {"type": "ping"},
-            timeout=timeout,
-            wait_for_response=wait,
-        )
+        if invoke:
+            result = invoke(socket_path)
+        else:
+            result = _exchange_message(
+                socket_path,
+                {"type": "ping"},
+                timeout=timeout,
+                wait_for_response=wait,
+            )
     finally:
         thread.join(timeout=1)
         listener.close()
@@ -761,17 +765,63 @@ def test_lode_exists_found(server, socket_path):
 def test_set_lode_state_no_server(socket_path):
     """set_lode_state returns False when server not running."""
     result = set_lode_state(socket_path, "any-session", "running", "Test message", timeout=0.5)
-    # Fire-and-forget still returns True if send attempt was made
-    # but the underlying send_message will fail silently
-    assert result is True  # The try succeeds, send_message handles the error
+    assert result is False
 
 
 def test_fire_and_forget_attaches_runner_generation(socket_path):
-    with patch("hopper.client.send_message") as send:
+    with patch("hopper.client._exchange_message") as send:
         assert set_lode_state(socket_path, "test-id", "running", "Working") is True
 
     message = send.call_args.args[1]
     assert message["run_generation"] == TEST_RUN_GENERATION
+    assert send.call_args.kwargs["wait_for_response"] is False
+
+
+def test_set_lode_state_acknowledged_round_trips_real_socket(server, socket_path):
+    server.lodes = [
+        {
+            "id": "test-id",
+            "stage": "mill",
+            "state": "running",
+            "status": "Working",
+            "failure_kind": None,
+            "run_generation": TEST_RUN_GENERATION,
+        }
+    ]
+
+    response = set_lode_state_acknowledged(
+        socket_path,
+        "test-id",
+        "completed",
+        "Mill complete",
+    )
+
+    assert response is not None
+    assert response["accepted"] is True
+    assert response["reason"] == "accepted"
+    assert server.lodes[0]["state"] == "completed"
+
+
+def test_set_lode_state_acknowledged_old_server_returns_unknown(socket_path):
+    def responder(_conn, _request):
+        return None
+
+    response, request = _exchange_with_responder(
+        socket_path,
+        responder,
+        timeout=0.1,
+        invoke=lambda path: set_lode_state_acknowledged(
+            path,
+            "test-id",
+            "completed",
+            "Mill complete",
+            timeout=0.1,
+        ),
+    )
+
+    assert response is None
+    assert request["ack_requested"] is True
+    assert request["exchange_id"]
 
 
 def test_persistent_connection_attaches_runner_generation(socket_path):
@@ -873,11 +923,9 @@ def test_set_lode_progress_bogus_socket_returns_false():
 
 
 def test_set_lode_title_no_server(socket_path):
-    """set_lode_title returns True even when server not running (fire-and-forget)."""
+    """set_lode_title reports a failed transport when the server is absent."""
     result = set_lode_title(socket_path, "any-session", "Test Title", timeout=0.5)
-    # Fire-and-forget still returns True if send attempt was made
-    # but the underlying send_message will fail silently
-    assert result is True
+    assert result is False
 
 
 def test_set_lode_title_sends_message(server, socket_path):
@@ -912,11 +960,11 @@ def test_reload_projects_success(server, socket_path):
 
 
 def test_reload_projects_no_server(socket_path):
-    """reload_projects returns True when no server (fire-and-forget)."""
+    """reload_projects reports a failed transport when the server is absent."""
     from hopper.client import reload_projects
 
     result = reload_projects(socket_path, timeout=0.5)
-    assert result is True
+    assert result is False
 
 
 class TestHopperConnection:

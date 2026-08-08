@@ -71,6 +71,8 @@ def make_lode():
             "codex_thread_id": None,
             "last_progress_at": None,
             "last_progress_summary": "",
+            "last_pane_activity_at": None,
+            "pane_title_observation": None,
             "backlog": None,
             "runs": overrides.get("runs", {}),
             "claude": {

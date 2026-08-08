@@ -47,6 +47,7 @@ _GATE_FEEDBACK_DESCRIPTION = (
 HELP_SKILL_REMINDER = "Note for AI agent sessions: load the `hop` skill before using this CLI."
 WATCH_RECONCILE_SECONDS = 30.0
 WATCH_OBSERVER_TIMEOUT_SECONDS = 300.0
+LOAD_WARNING_PER_CPU = 1.0
 _watch_monotonic = time.monotonic
 
 
@@ -234,6 +235,26 @@ def validate_hopper_lid() -> int | None:
 def get_hopper_lid() -> str | None:
     """Get HOPPER_LID from environment if set."""
     return os.environ.get("HOPPER_LID")
+
+
+def _warn_target_load(socket_path: Path) -> None:
+    """Best-effort warning about target-host load without gating submission."""
+    try:
+        one, five, fifteen = os.getloadavg()
+        logical_cpus = os.cpu_count()
+        if not logical_cpus or one / logical_cpus < LOAD_WARNING_PER_CPU:
+            return
+        from hopper.client import list_lodes
+
+        registered_runners = sum(lode.get("active") is True for lode in list_lodes(socket_path))
+        print(
+            f"warning: target load 1m={one:.2f} 5m={five:.2f} 15m={fifteen:.2f} "
+            f"across {logical_cpus} logical CPUs; lodes with a registered runner="
+            f"{registered_runners}; creating anyway",
+            file=sys.stderr,
+        )
+    except Exception:
+        return
 
 
 _CODING_AGENTS = {
@@ -994,7 +1015,7 @@ def cmd_screenshot(args: list[str]) -> int:
 @command("processed", "Signal stage completion with output", group="lode")
 def cmd_processed(args: list[str]) -> int:
     """Read stage output from stdin and signal stage completion."""
-    from hopper.client import get_lode, set_lode_state
+    from hopper.client import get_lode, set_lode_state_acknowledged
     from hopper.lodes import get_lode_dir
 
     parser = make_parser(
@@ -1025,7 +1046,7 @@ def cmd_processed(args: list[str]) -> int:
     # Get lode's current stage from server
     lode = get_lode(_socket(), lode_id)
     if not lode:
-        print(f"Lode {lode_id} not found.")
+        print(f"Lode {lode_id} not found or archived.")
         return 1
 
     stage = lode.get("stage", "")
@@ -1046,12 +1067,47 @@ def cmd_processed(args: list[str]) -> int:
     tmp_path = output_path.with_suffix(".md.tmp")
     tmp_path.write_text(output)
     os.replace(tmp_path, output_path)
+    print(f"Saved to {output_path}")
 
     # Signal completion
     status = f"{stage.capitalize()} complete"
-    set_lode_state(_socket(), lode_id, "completed", status)
+    acknowledgement = set_lode_state_acknowledged(_socket(), lode_id, "completed", status)
+    if acknowledgement is None or (
+        acknowledgement.get("accepted") is not True and acknowledgement.get("accepted") is not False
+    ):
+        print(
+            "warning: completion disposition is UNKNOWN because the server did not "
+            f"acknowledge it. Check with `hop lode status {lode_id}`.",
+            file=sys.stderr,
+        )
+        return 0
+    if acknowledgement["accepted"] is False:
+        reason = acknowledgement.get("reason")
+        refusal_messages = {
+            "lode_not_found": f"Lode {lode_id} not found or archived.",
+            "missing_run_generation": (
+                "Completion was refused because this command has no runner generation. "
+                "Run it inside the current lode runner, then retry."
+            ),
+            "stale_run_generation": (
+                "Completion was refused because this runner generation is stale. "
+                f"Check `hop lode status {lode_id}` and use the current runner."
+            ),
+            "terminal_failure": (
+                "Completion was refused because this lode has a terminal failure. "
+                f"Check `hop lode status {lode_id}` before recovering it."
+            ),
+        }
+        print(
+            refusal_messages.get(
+                reason,
+                "Completion was refused by the server. "
+                f"Check `hop lode status {lode_id}` for its current state.",
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
-    print(f"Saved to {output_path}")
     return 0
 
 
@@ -2420,6 +2476,7 @@ def cmd_lode(args: list[str]) -> int:
         err = require_server()
         if err:
             return err
+        _warn_target_load(socket_path)
         lode = client.create_lode(socket_path, project_name, scope, spawn=True)
         if getattr(parsed, "json_output", False):
             if not lode:
@@ -2572,18 +2629,16 @@ def cmd_lode(args: list[str]) -> int:
             suffix = f" Checked remote hosts: {checked}." if checked else ""
             print(f"Lode not found: {lode_id}.{suffix}")
             return 1
-        if lode.get("active"):
-            pane = lode.get("tmux_pane")
-            pane_dead = not pane or capture_pane(pane, plain=True) is None
-            if not (parsed.force and pane_dead):
-                print(f"Cannot restart: lode {lode_id} is active")
-                if pane_dead:
-                    print("pane appears dead; pass --force to restart anyway")
-                return 1
-            print(f"Detected active lode with dead pane {pane}; restarting with --force")
+        if lode.get("active") and not parsed.force:
+            print(f"Cannot restart: lode {lode_id} has a registered runner.")
+            print(f"Attach to it, or retry with: hop lode restart {lode_id} --force")
+            return 1
+        if lode.get("active") and parsed.force:
+            print(f"Terminating the registered runner for lode {lode_id} before restart.")
         stage = lode.get("stage", "")
         if stage not in ("mill", "refine", "ship"):
-            print(f"Cannot restart: lode {lode_id} stage is {stage}")
+            print(f"Cannot restart: lode {lode_id} stage is {stage}.")
+            print(f"Check its current state with: hop lode status {lode_id}")
             return 1
         started = bool(lode.get("claude", {}).get(stage, {}).get("started"))
         if started and not parsed.force and lode.get("state") != "error":
@@ -2592,7 +2647,64 @@ def cmd_lode(args: list[str]) -> int:
             print("Pass --force to override:")
             print(f"  hop lode restart {lode_id} --force")
             return 1
-        client.restart_lode(socket_path, lode_id, stage)
+        acknowledgement = client.restart_lode(
+            socket_path,
+            lode_id,
+            stage,
+            force=parsed.force,
+        )
+        if acknowledgement is None:
+            print(
+                "Restart disposition is UNKNOWN because the server did not acknowledge it. "
+                f"Check `hop lode status {lode_id}` before retrying."
+            )
+            return 1
+        if acknowledgement.get("accepted") is not True:
+            reason = acknowledgement.get("reason")
+            messages = {
+                "lode_not_found": (
+                    f"Restart refused: lode {lode_id} was not found. Check the ID with "
+                    "`hop lode list`, then retry."
+                ),
+                "invalid_stage": (
+                    f"Restart refused: stage {stage} is not restartable. Check "
+                    f"`hop lode status {lode_id}`."
+                ),
+                "pending_runner_result": (
+                    "Restart refused while the prior guarded runner result is pending. "
+                    "Wait about 60 seconds, check "
+                    f"`hop lode status {lode_id}`, then retry."
+                ),
+                "runner_identity_unknown": (
+                    "Restart refused because the existing runner identity could not be "
+                    f"verified. Inspect `hop lode status {lode_id}`, then retry after the "
+                    "runner is gone."
+                ),
+                "termination_failed": (
+                    "Restart refused because the existing runner did not exit. Inspect "
+                    f"`hop lode status {lode_id}`, then retry after it exits."
+                ),
+                "already_live": (
+                    "Restart refused because a runner is still live. Attach to it, or retry "
+                    f"with `hop lode restart {lode_id} --force`."
+                ),
+                "tmux_unreachable": (
+                    "Restart refused because tmux liveness is unknown. Verify tmux is "
+                    f"running, check `hop lode status {lode_id}`, then retry."
+                ),
+                "spawn_failed": (
+                    "Restart failed while creating the replacement pane. Verify tmux is "
+                    f"running, check `hop lode status {lode_id}`, then retry."
+                ),
+            }
+            print(
+                messages.get(
+                    reason,
+                    "Restart was refused by the server. "
+                    f"Check `hop lode status {lode_id}`, then retry.",
+                )
+            )
+            return 1
         print(f"Restarting {stage} for {lode_id}")
         return 0
 
