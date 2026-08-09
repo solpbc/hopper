@@ -5339,9 +5339,11 @@ def test_lode_status_json_display_matches_human_status(capsys, make_lode):
 
 def test_format_lode_detail_pane_activity_age(make_lode):
     """Detailed output shows the relative age of observed pane activity."""
-    lode = make_lode(last_pane_activity_at=current_time_ms() - 3 * 60_000)
+    now = current_time_ms()
+    lode = make_lode(last_pane_activity_at=now - 3 * 60_000)
 
-    output = format_lode_detail(lode)
+    with patch("hopper.lodes.current_time_ms", return_value=now):
+        output = format_lode_detail(lode)
 
     assert "  activity: 3m ago" in output.splitlines()
 
