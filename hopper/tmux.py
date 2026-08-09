@@ -137,6 +137,7 @@ def read_pane_input(pane_text: str) -> str | None:
     return None
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _QUESTION_SELECTOR_RE = re.compile(r"^\s*\u276f\s*\d+\.", re.MULTILINE)
 _QUESTION_CHROME_RE = re.compile(
     r"(?:\u2191/\u2193 to navigate|Esc to cancel|Enter to select|Type something)",
@@ -152,10 +153,16 @@ def pane_needs_answer(snapshot: str) -> bool:
     free text must consult this first -- pasting into a selector leaves the text
     staged with nothing to submit it, and every retry appends to whatever is
     already sitting there.
+
+    Escapes are stripped first because `capture_pane` keeps them by default
+    (`-e`) and Claude colorizes the selector: raw, the cursor and its number are
+    separated by a colour sequence, so an anchored match cannot succeed. Both
+    call sites matter -- one passes a plain capture and one does not.
     """
-    return bool(
-        snapshot and _QUESTION_SELECTOR_RE.search(snapshot) and _QUESTION_CHROME_RE.search(snapshot)
-    )
+    if not snapshot:
+        return False
+    text = _ANSI_ESCAPE_RE.sub("", snapshot)
+    return bool(_QUESTION_SELECTOR_RE.search(text) and _QUESTION_CHROME_RE.search(text))
 
 
 def new_window(

@@ -20,6 +20,7 @@ from hopper.tmux import (
     is_tmux_server_running,
     kill_pane,
     pane_liveness,
+    pane_needs_answer,
     pane_title,
     paste_buffer,
     read_pane_input,
@@ -456,3 +457,40 @@ class TestPasteBuffer:
             result = paste_buffer("%1", "hello")
 
         assert result is False
+
+
+def test_pane_needs_answer_detects_a_colorized_selector():
+    """Real captures carry ANSI escapes; the detector must see through them.
+
+    `capture_pane` keeps escapes by default (`-e`), and the runner's prompt
+    gating passes exactly that. Measured 2026-08-09: the gating had never once
+    fired in production because Claude colorizes the selector, so the cursor and
+    its number are separated by a colour sequence.
+    """
+    colorized = (
+        "Which cutover should I take?\n"
+        "\x1b[36m❯\x1b[39m \x1b[1m1.\x1b[22m Delete the Python wire now\n"
+        "  \x1b[1m2.\x1b[22m Keep both behind a flag\n"
+        "  \x1b[1m3.\x1b[22m Type something.\n"
+        "\x1b[2m↑/↓ to navigate · Enter to select · Esc to cancel\x1b[22m\n"
+    )
+    assert pane_needs_answer(colorized) is True
+
+
+def test_pane_needs_answer_detects_a_plain_selector():
+    plain = (
+        "Which cutover should I take?\n"
+        "❯ 1. Delete the Python wire now\n"
+        "  2. Keep both behind a flag\n"
+        "  3. Type something.\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+    assert pane_needs_answer(plain) is True
+
+
+def test_pane_needs_answer_ignores_an_ordinary_composer():
+    """The other direction: a normal pane must never read as a selector."""
+    assert pane_needs_answer("─────\n❯ Please revise\n─────\n") is False
+    assert pane_needs_answer("") is False
+    # Numbered prose without selector chrome is not a prompt.
+    assert pane_needs_answer("❯ 1. first item\n❯ 2. second item\n") is False
