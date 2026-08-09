@@ -60,6 +60,8 @@ from hopper.cli import (
 from hopper.client import RUN_GENERATION_ENV
 from hopper.lodes import (
     PARK_PANE_GONE_STATUS,
+    current_time_ms,
+    format_age,
     format_park_status,
     format_terminal_failure_status,
     get_lode_dir,
@@ -5333,6 +5335,66 @@ def test_lode_status_json_display_matches_human_status(capsys, make_lode):
         json_status = json.loads(capsys.readouterr().out)["status_display"]
 
     assert json_status == human_status
+
+
+def test_format_lode_detail_pane_activity_age(make_lode):
+    """Detailed output shows the relative age of observed pane activity."""
+    lode = make_lode(last_pane_activity_at=current_time_ms() - 3 * 60_000)
+
+    output = format_lode_detail(lode)
+
+    assert "  activity: 3m ago" in output.splitlines()
+
+
+def test_format_lode_detail_pane_activity_unmeasured(make_lode):
+    """Detailed output shows unmeasured when pane activity is None."""
+    now = current_time_ms()
+    lode = make_lode(
+        created_at=now - 2 * 60_000,
+        updated_at=now - 60_000,
+        last_pane_activity_at=None,
+    )
+
+    output = format_lode_detail(lode)
+    activity_line = next(line for line in output.splitlines() if line.startswith("  activity:"))
+
+    assert activity_line == "  activity: unmeasured"
+    assert " ago" not in activity_line
+    assert f"{format_age(0)} ago" not in output
+
+
+def test_format_lode_detail_pane_activity_key_absent(make_lode):
+    """Detailed output shows unmeasured when the pane activity key is absent."""
+    lode = make_lode()
+    lode.pop("last_pane_activity_at")
+
+    output = format_lode_detail(lode)
+
+    assert "  activity: unmeasured" in output.splitlines()
+
+
+def test_format_lode_detail_zero_pane_activity_is_unmeasured(make_lode):
+    """Detailed output treats a zero pane activity timestamp as unmeasured."""
+    lode = make_lode(last_pane_activity_at=0)
+
+    output = format_lode_detail(lode)
+
+    assert "  activity: unmeasured" in output.splitlines()
+
+
+def test_lode_status_json_keeps_raw_pane_activity(capsys, make_lode):
+    pane_activity_at = current_time_ms() - 3 * 60_000
+    lode = make_lode(id="test-id", host="local", last_pane_activity_at=pane_activity_at)
+
+    with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["last_pane_activity_at"] == pane_activity_at
+    assert "activity" not in payload
+    assert "activity_age" not in payload
+    assert "pane_activity_age" not in payload
+    assert set(payload) == set(lode) | {"status_display", "pane_liveness"}
 
 
 def test_format_lode_detail_pane_active(make_lode):

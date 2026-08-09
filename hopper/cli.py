@@ -1616,8 +1616,11 @@ def format_lode_detail(lode: dict) -> str:
     created_age = format_age(lode.get("created_at", 0))
     updated_at = lode.get("updated_at", 0) or lode.get("created_at", 0)
     updated_age = format_age(updated_at)
+    pane_activity_at = lode.get("last_pane_activity_at")
+    activity_text = f"{format_age(pane_activity_at)} ago" if pane_activity_at else "unmeasured"
     lines.append(f"  created:  {created_age} ago")
     lines.append(f"  updated:  {updated_age} ago")
+    lines.append(f"  activity: {activity_text}")
     lines.append(f"  active:   {'yes' if lode.get('active') else 'no'}")
     if lode.get("active") and lode.get("tmux_pane"):
         lines.append(f"  pane:     {lode['tmux_pane']}")
