@@ -1643,6 +1643,8 @@ class TestBaseRunnerDismiss:
 
         def on_wait(timeout):
             wait_calls.append(timeout)
+            if len(wait_calls) > 3:
+                raise AssertionError("dismiss worker did not resume after completion re-arm")
             if len(wait_calls) == 1:
                 send.assert_not_called()
                 runner._on_server_message(
@@ -1669,6 +1671,57 @@ class TestBaseRunnerDismiss:
         assert runner._done_at_ms == 2_000
         assert not runner._dismiss_deadline_parked
         assert [entry.args[1] for entry in send.call_args_list] == ["C-d"]
+
+    def test_wait_and_dismiss_restarts_stabilization_after_rearm(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._dismiss_attempt = 1
+        now = [1_000]
+        wait_calls = []
+        capture_calls = [0]
+        sends = []
+        message = {
+            "type": "lode_updated",
+            "lode": {"id": "test-session", "state": "completed"},
+        }
+
+        def on_wait(_timeout):
+            wait_calls.append(_timeout)
+            if len(wait_calls) > 4:
+                raise AssertionError("dismiss worker did not finish fresh stabilization")
+            return False
+
+        def on_capture(_pane_id):
+            capture_calls[0] += 1
+            if capture_calls[0] == 2:
+                now[0] = 1_000 + DISMISS_DEADLINE_MS
+                runner._check_activity()
+                assert runner._dismiss_deadline_parked
+                now[0] = 400_000
+                runner._on_server_message(message)
+                assert not runner._dismiss_deadline_parked
+            return "stable"
+
+        def on_send_keys(_pane_id, key):
+            sends.append((capture_calls[0], key))
+            runner._monitor_stop.set()
+            return True
+
+        with (
+            patch.object(runner._monitor_stop, "wait", side_effect=on_wait),
+            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
+            patch("hopper.runner.time.monotonic", return_value=0),
+            patch.object(runner, "_park_idle") as park,
+            patch("hopper.runner.capture_pane", side_effect=on_capture),
+            patch("hopper.runner.send_keys", side_effect=on_send_keys),
+        ):
+            runner._on_server_message(message)
+            runner._wait_and_dismiss_claude()
+
+        park.assert_called_once_with(
+            "completion was signalled, but the agent did not exit within 5 min"
+        )
+        assert sends == [(4, "C-d")]
 
     def test_parked_completion_ignores_pane_changes_without_rearming(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))

@@ -267,6 +267,8 @@ class BaseRunner:
         self._claude_proc: subprocess.Popen | None = None
         # Completion tracking
         self._done = threading.Event()
+        # _done_lock guards the timestamp/latch pair. Completion signalled while
+        # parked re-bases the timestamp and clears the latch to re-arm the deadline.
         self._done_lock = threading.Lock()
         self._done_at_ms: int | None = None
         self._dismiss_deadline_parked = False
@@ -692,8 +694,8 @@ class BaseRunner:
 
     def _stop_monitor(self) -> None:
         """Stop the activity monitor thread."""
+        self._monitor_stop.set()
         if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_stop.set()
             self._monitor_thread.join(timeout=1.0)
             logger.debug("Stopped activity monitor")
 
