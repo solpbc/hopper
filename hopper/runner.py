@@ -261,6 +261,7 @@ class BaseRunner:
         self._last_pane_activity_ms: int | None = None
         self._last_pane_activity_emitted_ms: int | None = None
         self._pane_capture_failures = 0
+        self._pane_capture_outage_started_ms: int | None = None
         self._activity_capture_disabled = False
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
@@ -817,6 +818,8 @@ class BaseRunner:
         """Capture the pane while keeping capture failures recoverable."""
         snapshot = capture_pane(self._pane_id)
         if snapshot is None:
+            if self._pane_capture_failures == 0:
+                self._pane_capture_outage_started_ms = current_time_ms()
             self._pane_capture_failures += 1
             logger.debug(
                 f"failed to capture pane lode={self.lode_id} failures={self._pane_capture_failures}"
@@ -826,13 +829,18 @@ class BaseRunner:
             return None
 
         capture_recovered = self._pane_capture_failures > 0
+        recovered_at = current_time_ms() if capture_recovered else None
         if self._activity_capture_disabled:
             logger.info(f"pane capture recovered lode={self.lode_id}")
         self._activity_capture_disabled = False
         self._pane_capture_failures = 0
-        if capture_recovered:
-            self._last_pane_activity_ms = current_time_ms()
-            self._stuck_since = None
+        if recovered_at is not None and self._pane_capture_outage_started_ms is not None:
+            outage_ms = max(0, recovered_at - self._pane_capture_outage_started_ms)
+            if self._last_pane_activity_ms is not None:
+                self._last_pane_activity_ms += outage_ms
+            if self._stuck_since is not None:
+                self._stuck_since += outage_ms
+        self._pane_capture_outage_started_ms = None
         return snapshot
 
     def _record_pane_snapshot(self, snapshot: str, observed_at: int) -> None:

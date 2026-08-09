@@ -321,15 +321,16 @@ def _process_group_exited(process_group: int, timeout: float) -> bool:
         time.sleep(min(PAUSE_PROCESS_POLL_SEC, remaining))
 
 
-def _terminate_runner_process_group(pid: int) -> bool:
+def _terminate_runner_process_group(pid: int, *, process_group: int | None = None) -> bool:
     """Terminate a runner and every child that can retain its Claude session."""
-    try:
-        process_group = os.getpgid(pid)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        logger.error("cannot inspect runner pid %s: permission denied", pid)
-        return False
+    if process_group is None:
+        try:
+            process_group = os.getpgid(pid)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            logger.error("cannot inspect runner pid %s: permission denied", pid)
+            return False
 
     if process_group == os.getpgrp():
         logger.error(
@@ -357,12 +358,26 @@ def _terminate_runner_process_group(pid: int) -> bool:
     return False
 
 
-def _runner_process_group_matches_pane(runner_pid: int, pane_pid: int) -> bool:
-    """Return whether the registered runner belongs to the pane's process group."""
+def _corroborated_runner_process_group(runner_pid: int, pane_pid: int) -> int | None:
+    """Resolve the shared process group for a registered runner and pane owner."""
     try:
-        return os.getpgid(runner_pid) == os.getpgid(pane_pid)
+        runner_group = os.getpgid(runner_pid)
+        if runner_group == os.getpgid(pane_pid):
+            return runner_group
+    except (OSError, TypeError):
+        pass
+    return None
+
+
+def _runner_process_exited(pid: int) -> bool:
+    """Return whether a registered runner PID is definitely gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
     except (OSError, TypeError):
         return False
+    return False
 
 
 def _set_spawn_refusal(lode: dict, message: str) -> bool:
@@ -1914,18 +1929,20 @@ class Server:
                     if force:
                         pane = lode.get("tmux_pane")
                         runner_pid = lode.get("pid")
+                        process_group = None
                         if pane:
                             liveness = pane_liveness(pane)
                             if liveness is Liveness.ALIVE:
                                 pane_pid = get_pane_pid(pane)
-                                if (
-                                    runner_pid is None
-                                    or pane_pid is None
-                                    or not _runner_process_group_matches_pane(runner_pid, pane_pid)
-                                ):
+                                if runner_pid is None or pane_pid is None:
                                     acknowledge_mutation(False, "runner_identity_unverified")
                                     return
-                                runner_pid = pane_pid
+                                process_group = _corroborated_runner_process_group(
+                                    runner_pid, pane_pid
+                                )
+                                if process_group is None:
+                                    acknowledge_mutation(False, "runner_identity_unverified")
+                                    return
                             elif (
                                 liveness is Liveness.UNKNOWN
                                 or runner_pid is not None
@@ -1936,12 +1953,17 @@ class Server:
                         elif runner_pid is not None or lode.get("active"):
                             acknowledge_mutation(False, "runner_identity_unverified")
                             return
-                        if runner_pid and not _terminate_runner_process_group(runner_pid):
+                        if runner_pid and not _terminate_runner_process_group(
+                            runner_pid, process_group=process_group
+                        ):
                             acknowledge_mutation(False, "termination_failed")
                             return
-                        if runner_pid and pane and pane_liveness(pane) is not Liveness.GONE:
-                            acknowledge_mutation(False, "termination_failed")
-                            return
+                        if runner_pid:
+                            runner_exited = _runner_process_exited(runner_pid)
+                            pane_gone = not pane or pane_liveness(pane) is Liveness.GONE
+                            if not runner_exited or not pane_gone:
+                                acknowledge_mutation(False, "termination_failed")
+                                return
                         if generation:
                             self.runner_results.pop((lode_id, generation), None)
                         lode["active"] = False

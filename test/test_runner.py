@@ -1228,29 +1228,69 @@ class TestBaseRunnerActivityMonitor:
         assert not runner._activity_capture_disabled
         park.assert_not_called()
 
-    def test_check_activity_capture_recovery_resets_stale_baselines(self):
+    def test_check_activity_capture_recovery_credits_outage(self):
         """Unobservable capture time cannot count toward an immediate park."""
         runner = self._make_runner()
         runner._pane_id = "%1"
         runner._last_snapshot = "unchanged"
         runner._last_pane_activity_ms = 1_000
         runner._stuck_since = 2_000
+        now = [50_000]
 
         with (
             patch("hopper.runner.capture_pane", side_effect=[None, "unchanged"]),
             patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-            patch("hopper.runner.current_time_ms", return_value=100_000),
+            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
             patch("hopper.runner.connect", return_value=None),
             patch.object(runner, "_park_idle") as park,
         ):
             runner._check_activity()
+            now[0] = 100_000
             runner._check_activity()
 
-        assert runner._last_pane_activity_ms == 100_000
+        assert runner._last_pane_activity_ms == 51_000
         assert runner._stuck_since is None
         park.assert_not_called()
+
+    def test_intermittent_capture_failures_do_not_prevent_idle_park(self, monkeypatch):
+        """Known quiet time accumulates across recurring capture outages."""
+        monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_PARK_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 10_000)
+
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "unchanged"
+        runner._last_pane_activity_ms = 1_000
+        now = [1_000]
+        captures = [value for _ in range(12) for value in (None, "unchanged")]
+
+        with (
+            patch("hopper.runner.capture_pane", side_effect=captures),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
+            patch("hopper.runner.connect", return_value=None),
+            patch.object(runner, "_park_idle") as park,
+        ):
+            for pair in range(1, 12):
+                now[0] = 1_000 + (pair * 2 - 1) * 20
+                runner._check_activity()
+                now[0] += 20
+                runner._check_activity()
+            park.assert_not_called()
+
+            now[0] = 1_460
+            runner._check_activity()
+            now[0] = 1_480
+            runner._check_activity()
+
+        park.assert_called_once()
+        assert runner._last_pane_activity_ms == 1_240
+        assert runner._stuck_since == 1_360
 
 
 class TestBaseRunnerServerMessages:

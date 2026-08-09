@@ -1335,8 +1335,9 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
     srv.lodes = [lode]
     conn = _mock_client(srv)
 
-    def terminate(pid):
-        assert pid == 2424
+    def terminate(pid, *, process_group):
+        assert pid == 1415
+        assert process_group == 4567
         assert lode["claude"]["refine"]["session_id"] == old_session_id
         assert lode["active"] is True
         return True
@@ -1349,8 +1350,9 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
     with (
         patch("hopper.server.pane_liveness", side_effect=[Liveness.ALIVE, Liveness.GONE]),
         patch("hopper.server.get_pane_pid", return_value=2424),
-        patch("hopper.server._runner_process_group_matches_pane", return_value=True) as matches,
+        patch("hopper.server._corroborated_runner_process_group", return_value=4567) as corroborate,
         patch("hopper.server._terminate_runner_process_group", side_effect=terminate),
+        patch("hopper.server._runner_process_exited", return_value=True),
         patch("hopper.server.find_project", return_value=Project(path="/repo", name="proj")),
         patch("hopper.server.spawn_claude", side_effect=spawn),
     ):
@@ -1369,7 +1371,7 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
     response = _decode_mock_response(conn)
     assert response["accepted"] is True
     assert response["reason"] == "spawned"
-    matches.assert_called_once_with(1415, 2424)
+    corroborate.assert_called_once_with(1415, 2424)
     assert lode["claude"]["refine"]["started"] is False
     assert lode["run_generation"] != old_generation
     assert lode["tmux_pane"] == "%new"
@@ -1391,7 +1393,7 @@ def test_force_reset_termination_failure_preserves_lode(socket_path, make_lode):
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
         patch("hopper.server.get_pane_pid", return_value=2424),
-        patch("hopper.server._runner_process_group_matches_pane", return_value=True),
+        patch("hopper.server._corroborated_runner_process_group", return_value=4567),
         patch("hopper.server._terminate_runner_process_group", return_value=False),
         patch("hopper.server.spawn_claude") as spawn,
     ):
@@ -1430,8 +1432,9 @@ def test_force_reset_refuses_when_pane_survives_termination(socket_path, make_lo
     with (
         patch("hopper.server.pane_liveness", side_effect=[Liveness.ALIVE, Liveness.ALIVE]),
         patch("hopper.server.get_pane_pid", return_value=2424),
-        patch("hopper.server._runner_process_group_matches_pane", return_value=True),
+        patch("hopper.server._corroborated_runner_process_group", return_value=4567),
         patch("hopper.server._terminate_runner_process_group", return_value=True),
+        patch("hopper.server._runner_process_exited", return_value=True),
         patch("hopper.server.spawn_claude") as spawn,
     ):
         srv._handle_mutation(
@@ -1454,11 +1457,11 @@ def test_force_reset_refuses_when_pane_survives_termination(socket_path, make_lo
 
 
 @pytest.mark.parametrize(
-    ("recorded_pid", "identity_matches"),
-    [(None, None), (1415, False)],
+    ("recorded_pid", "pane_pid", "process_group"),
+    [(None, 2424, None), (1415, None, None), (1415, 2424, None)],
 )
 def test_force_reset_refuses_unverified_live_pane_owner(
-    socket_path, make_lode, recorded_pid, identity_matches
+    socket_path, make_lode, recorded_pid, pane_pid, process_group
 ):
     lode = make_lode(
         id="reset-id",
@@ -1474,11 +1477,11 @@ def test_force_reset_refuses_unverified_live_pane_owner(
 
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
-        patch("hopper.server.get_pane_pid", return_value=2424),
+        patch("hopper.server.get_pane_pid", return_value=pane_pid),
         patch(
-            "hopper.server._runner_process_group_matches_pane",
-            return_value=identity_matches,
-        ) as matches,
+            "hopper.server._corroborated_runner_process_group",
+            return_value=process_group,
+        ) as corroborate,
         patch("hopper.server._terminate_runner_process_group") as terminate,
         patch("hopper.server.spawn_claude") as spawn,
     ):
@@ -1494,16 +1497,57 @@ def test_force_reset_refuses_unverified_live_pane_owner(
             conn,
         )
 
-    if recorded_pid is None:
-        matches.assert_not_called()
+    if recorded_pid is None or pane_pid is None:
+        corroborate.assert_not_called()
     else:
-        matches.assert_called_once_with(recorded_pid, 2424)
+        corroborate.assert_called_once_with(recorded_pid, pane_pid)
     terminate.assert_not_called()
     spawn.assert_not_called()
     assert lode == before
     response = _decode_mock_response(conn)
     assert response["accepted"] is False
     assert response["reason"] == "runner_identity_unverified"
+
+
+def test_force_reset_refuses_when_pane_exits_but_runner_survives(socket_path, make_lode):
+    lode = make_lode(
+        id="reset-id",
+        stage="refine",
+        active=True,
+        tmux_pane="%live",
+        pid=1415,
+    )
+    before = copy.deepcopy(lode)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server.pane_liveness", side_effect=[Liveness.ALIVE, Liveness.GONE]),
+        patch("hopper.server.get_pane_pid", return_value=2424),
+        patch("hopper.server._corroborated_runner_process_group", return_value=4567),
+        patch("hopper.server._terminate_runner_process_group", return_value=True) as terminate,
+        patch("hopper.server._runner_process_exited", return_value=False),
+        patch("hopper.server.spawn_claude") as spawn,
+    ):
+        srv._handle_mutation(
+            {
+                "type": "lode_reset_claude_stage",
+                "lode_id": "reset-id",
+                "claude_stage": "refine",
+                "spawn": True,
+                "force": True,
+                "ack_requested": True,
+            },
+            conn,
+        )
+
+    terminate.assert_called_once_with(1415, process_group=4567)
+    spawn.assert_not_called()
+    assert lode == before
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == "termination_failed"
 
 
 def test_force_reset_pending_result_refuses_before_termination(socket_path, make_lode):
@@ -2848,6 +2892,36 @@ def test_terminate_runner_process_group_waits_for_clean_exit():
 
     mock_killpg.assert_called_once_with(4567, signal.SIGTERM)
     mock_exited.assert_called_once_with(4567, hopper_server.PAUSE_TERM_GRACE_SEC)
+
+
+def test_terminate_runner_process_group_uses_pre_resolved_group():
+    """Force restart never resolves a corroborated pane identity a second time."""
+    with (
+        patch("hopper.server.os.getpgid") as mock_getpgid,
+        patch("hopper.server.os.getpgrp", return_value=7654),
+        patch("hopper.server.os.killpg") as mock_killpg,
+        patch("hopper.server._process_group_exited", return_value=True),
+    ):
+        assert hopper_server._terminate_runner_process_group(12345, process_group=4567) is True
+
+    mock_getpgid.assert_not_called()
+    mock_killpg.assert_called_once_with(4567, signal.SIGTERM)
+
+
+@pytest.mark.parametrize(
+    ("group_lookups", "expected"),
+    [
+        ([4567, 4567], 4567),
+        ([4567, 7654], None),
+        ([4567, ProcessLookupError()], None),
+    ],
+)
+def test_corroborated_runner_process_group(group_lookups, expected):
+    """Runner and pane identities are resolved together and failures close the path."""
+    with patch("hopper.server.os.getpgid", side_effect=group_lookups) as mock_getpgid:
+        assert hopper_server._corroborated_runner_process_group(1415, 2424) == expected
+
+    assert mock_getpgid.call_args_list == [((1415,),), ((2424,),)]
 
 
 def test_terminate_runner_process_group_hard_kills_after_grace():
