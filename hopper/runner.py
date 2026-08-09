@@ -6,7 +6,6 @@
 import json
 import logging
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -18,7 +17,13 @@ from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
 from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
 from hopper.projects import find_project
-from hopper.tmux import capture_pane, get_current_pane_id, rename_window, send_keys
+from hopper.tmux import (
+    capture_pane,
+    get_current_pane_id,
+    pane_needs_answer,
+    rename_window,
+    send_keys,
+)
 from hopper.workspace_trust import WorkspaceTrustError, trust_claude_workspace
 
 logger = logging.getLogger(__name__)
@@ -34,22 +39,11 @@ PANE_CAPTURE_FAILURE_LIMIT = 3
 DISMISS_DEADLINE_MS = 5 * 60_000
 DISMISS_DEADLINE_MIN = DISMISS_DEADLINE_MS // 60_000
 PANE_ACTIVITY_EMIT_INTERVAL_MS = 30_000
-_QUESTION_SELECTOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.MULTILINE)
-_QUESTION_CHROME_RE = re.compile(
-    r"(?:↑/↓ to navigate|Esc to cancel|Enter to select|Type something)", re.IGNORECASE
-)
 DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
 REGISTRATION_TIMEOUT_SEC = 30.0
 BRANCH_PERSIST_TIMEOUT_SEC = 5.0
 PS_SCAN_TIMEOUT_SEC = 5.0
-
-
-def pane_needs_answer(snapshot: str) -> bool:
-    """Return whether a Claude pane is visibly waiting on a numbered answer."""
-    return bool(
-        snapshot and _QUESTION_SELECTOR_RE.search(snapshot) and _QUESTION_CHROME_RE.search(snapshot)
-    )
 
 
 def _write_recovery_record(lode_id: str, record: dict) -> None:

@@ -3940,6 +3940,17 @@ _IDLE_EMPTY_CAPTURE = "─────\n❯ \n─────\n"
 _IDLE_STAGED_CAPTURE = "─────\n❯ Please revise\n─────\n"
 # Constructed from the real processing capture's observed content shape.
 _PROCESSING_CAPTURE = "Please revise\n● Working…\n"
+# A Claude numbered selector whose third option is free-text. Hopper cannot drive
+# this surface: keystrokes move a highlight rather than filling a buffer, so pasted
+# text stages with nothing able to submit it and each retry appends to what is
+# already sitting there.
+_IDLE_QUESTION_CAPTURE = (
+    "Which cutover should I take?\n"
+    "❯ 1. Delete the Python wire now\n"
+    "  2. Keep both behind a flag\n"
+    "  3. Type something.\n"
+    "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+)
 
 
 def _handle_delivery_with_tmux(
@@ -4497,6 +4508,7 @@ def test_delivery_taxonomy_tables_have_identical_failure_key_sets():
         "idle_timeout",
         "pane_state_unknown",
         "pane_frozen",
+        "pane_awaiting_choice",
         "paste_failed",
         "paste_failed_unknown",
         "paste_not_staged",
@@ -4518,11 +4530,16 @@ def test_delivery_taxonomy_tables_have_identical_failure_key_sets():
         "idle_timeout",
         "pane_state_unknown",
         "pane_frozen",
+        "pane_awaiting_choice",
     }
 
 
 def test_preexisting_gate_feedback_failure_contracts_stay_unchanged():
-    assert hopper_server._GATE_FEEDBACK_STATUSES == {
+    # Pre-existing entries must not drift. A NEW outcome is allowed to appear: this
+    # guard exists to catch silent rewording of contracts callers already depend on,
+    # not to freeze the taxonomy against growth. The message half below is checked
+    # the same way, by rendering only the reasons named here.
+    preexisting_statuses = {
         "pane_unavailable": "Feedback blocked: pane unavailable",
         "busy": "Feedback blocked: pane busy",
         "not_sent": "Feedback not sent; gate remains blocked",
@@ -4530,6 +4547,7 @@ def test_preexisting_gate_feedback_failure_contracts_stay_unchanged():
         "pane_state_unknown": "Feedback blocked: pane state unrecognized",
         "pane_frozen": "Feedback blocked: pane appears frozen",
     }
+    assert preexisting_statuses.items() <= hopper_server._GATE_FEEDBACK_STATUSES.items()
     expected = {
         "pane_unavailable": (
             "Feedback was not sent because pane %1 is unavailable. No feedback was pasted "
@@ -4810,6 +4828,7 @@ def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_
         ("idle_timeout", "busy", logging.WARNING),
         ("pane_state_unknown", "pane_state_unknown", logging.WARNING),
         ("pane_frozen", "pane_frozen", logging.WARNING),
+        ("pane_awaiting_choice", "awaiting_choice", logging.WARNING),
         ("paste_failed", "not_sent", logging.WARNING),
         ("paste_failed_unknown", "unverified", logging.WARNING),
         ("paste_not_staged", "unverified", logging.WARNING),
@@ -6059,3 +6078,81 @@ class TestOomLifecycle:
         assert lode["failure_kind"] == "oom"
         assert lode["status"] == format_terminal_failure_status("oom", "test-id")
         release.assert_called_once_with("systemctl", "hopper-test.scope")
+
+
+def test_pane_delivery_refuses_to_paste_into_a_numbered_selector():
+    """A selector is not a text box: refuse before touching it.
+
+    Measured 2026-08-09: a lode asked a question whose third option was
+    "Type something." Nudge pasted into it 42 times over 15 minutes; the text
+    stayed staged with nothing able to submit it, and each retry appended to
+    what was already there.
+    """
+    with (
+        patch("hopper.server.capture_pane", return_value=_IDLE_QUESTION_CAPTURE),
+        patch("hopper.server.pane_title", return_value="✳ Ready"),
+        patch("hopper.server.paste_buffer", return_value=True) as mock_paste,
+        patch("hopper.server.send_keys") as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "use option 3", paste=True)
+
+    assert result["reason"] == "pane_awaiting_choice"
+    # The whole point: nothing reached the pane, so nothing can accumulate.
+    mock_paste.assert_not_called()
+    mock_send.assert_not_called()
+
+
+def test_pane_delivery_still_answers_a_numbered_selector():
+    """`hop lode answer` must keep working on exactly the pane nudge refuses.
+
+    Without this, the fix above would close the one path that does work.
+    """
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[
+                _IDLE_QUESTION_CAPTURE,
+                _IDLE_QUESTION_CAPTURE,
+                _PROCESSING_CAPTURE,
+            ],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready", "⠐ Working"]),
+        patch("hopper.server.send_keys", return_value=True) as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "3", paste=False)
+
+    assert result["reason"] == "auto_submitted"
+    mock_send.assert_called_once_with("%1", "3")
+
+
+def test_pane_delivery_still_pastes_into_an_ordinary_composer():
+    """The refusal must not fire on a normal pane -- the other direction."""
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _PROCESSING_CAPTURE,
+            ],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready", "⠐ Working"]),
+        patch("hopper.server.paste_buffer", return_value=True) as mock_paste,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "continue", paste=True)
+
+    assert result["reason"] == "auto_submitted"
+    mock_paste.assert_called_once_with("%1", "continue")
+
+
+def test_pane_awaiting_choice_message_names_the_verb_that_works():
+    """The refusal has to hand the operator the next action, not just a diagnosis."""
+    message = hopper_server._PANE_INPUT_MESSAGES["pane_awaiting_choice"].format(
+        pane="%1", lode_id="abc12345", title="✳ Ready"
+    )
+    assert "hop lode answer abc12345" in message
+    assert "Nothing was pasted" in message
+    assert "Type something" in message

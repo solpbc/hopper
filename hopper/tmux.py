@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 import subprocess
 from enum import Enum
 
@@ -134,6 +135,27 @@ def read_pane_input(pane_text: str) -> str | None:
         if prompt_line.startswith("\u276f"):
             return prompt_line[1:].lstrip("\u00a0").strip()
     return None
+
+
+_QUESTION_SELECTOR_RE = re.compile(r"^\s*\u276f\s*\d+\.", re.MULTILINE)
+_QUESTION_CHROME_RE = re.compile(
+    r"(?:\u2191/\u2193 to navigate|Esc to cancel|Enter to select|Type something)",
+    re.IGNORECASE,
+)
+
+
+def pane_needs_answer(snapshot: str) -> bool:
+    """Return whether a Claude pane is visibly waiting on a numbered answer.
+
+    A numbered selector is a different input surface from the ordinary composer:
+    keystrokes drive a highlight, not a text buffer. Any caller about to paste
+    free text must consult this first -- pasting into a selector leaves the text
+    staged with nothing to submit it, and every retry appends to whatever is
+    already sitting there.
+    """
+    return bool(
+        snapshot and _QUESTION_SELECTOR_RE.search(snapshot) and _QUESTION_CHROME_RE.search(snapshot)
+    )
 
 
 def new_window(

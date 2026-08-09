@@ -71,6 +71,7 @@ from hopper.tmux import (
     classify_pane_phase,
     get_pane_pid,
     pane_liveness,
+    pane_needs_answer,
     pane_title,
     paste_buffer,
     read_pane_input,
@@ -109,6 +110,7 @@ _DELIVERY_FAILURE_OUTCOMES = {
     "idle_timeout": "busy",
     "pane_state_unknown": "pane_state_unknown",
     "pane_frozen": "pane_frozen",
+    "pane_awaiting_choice": "awaiting_choice",
     "paste_failed": "not_sent",
     "paste_failed_unknown": "unverified",
     "paste_not_staged": "unverified",
@@ -124,6 +126,7 @@ _GATE_FEEDBACK_STATUSES = {
     "unverified": "Feedback outcome unknown; inspect pane",
     "pane_state_unknown": "Feedback blocked: pane state unrecognized",
     "pane_frozen": "Feedback blocked: pane appears frozen",
+    "awaiting_choice": "Feedback blocked: pane awaiting a numbered choice",
 }
 _GATE_FEEDBACK_MESSAGES = {
     "pane_unavailable": (
@@ -146,6 +149,11 @@ _GATE_FEEDBACK_MESSAGES = {
         "Feedback was not sent because pane {pane} has reported the same processing title "
         f"for at least {FROZEN_PANE_THRESHOLD_MIN} min. Inspect with `hop lode peek "
         "{lode_id}` before deciding whether to retry."
+    ),
+    "pane_awaiting_choice": (
+        "Feedback was not sent. Pane {pane} is waiting on a numbered choice, which is a "
+        "selector rather than a text box. Nothing was pasted. Read the options with "
+        "`hop lode peek {lode_id}`, then answer with `hop lode answer {lode_id} <n>`."
     ),
     "paste_failed": (
         "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
@@ -210,6 +218,15 @@ _PANE_INPUT_MESSAGES = {
         f"at least {FROZEN_PANE_THRESHOLD_MIN} min. Inspect with `hop lode peek "
         "{lode_id}` before deciding whether to retry."
     ),
+    "pane_awaiting_choice": (
+        "Input was not sent. Pane {pane} is waiting on a numbered choice, which is a "
+        "selector rather than a text box -- pasted text would sit in it with nothing able "
+        "to submit it, and each retry would append to what is already there. Nothing was "
+        "pasted. Read the options with `hop lode peek {lode_id}`, then answer with "
+        "`hop lode answer {lode_id} <n>`. If the option you want is free-text "
+        '("Type something"), Hopper cannot drive it: select it with `hop lode answer`, '
+        "then type into pane {pane} directly."
+    ),
     "paste_failed": (
         "Input was not sent because Hopper could not deliver it to pane {pane}. Retry the "
         "same input."
@@ -250,7 +267,13 @@ _PANE_INPUT_MESSAGES = {
 }
 # Any future reason returned before delivery must be added here.
 _PRE_PASTE_REASONS = frozenset(
-    {"pane_unavailable", "idle_timeout", "pane_state_unknown", "pane_frozen"}
+    {
+        "pane_unavailable",
+        "idle_timeout",
+        "pane_state_unknown",
+        "pane_frozen",
+        "pane_awaiting_choice",
+    }
 )
 
 
@@ -455,6 +478,16 @@ def _attempt_pane_delivery(
         elif phase is PanePhase.IDLE:
             if pane_title_observation is not None:
                 pane_title_observation.clear()
+            if paste and pane_needs_answer(latest_capture):
+                # A numbered selector is not a text composer. Pasting free text into
+                # one stages it with nothing able to submit it, and each retry appends
+                # to what is already there -- so refuse before touching the pane and
+                # name the verb that does work.
+                return {
+                    "reason": "pane_awaiting_choice",
+                    "capture": latest_capture,
+                    "title": observed_title,
+                }
             pre_delivery_input = read_pane_input(latest_capture)
             break
         else:
