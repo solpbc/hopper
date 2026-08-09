@@ -13,6 +13,7 @@ import pytest
 
 from hopper.lodes import current_time_ms, format_park_status
 from hopper.runner import (
+    DISMISS_DEADLINE_MS,
     BaseRunner,
     _descendant_pids,
     _parse_ps_time,
@@ -1630,6 +1631,76 @@ class TestBaseRunnerDismiss:
 
         assert send_keys_calls == []
 
+    def test_wait_and_dismiss_pauses_while_parked_then_resumes(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._done.set()
+        runner._done_at_ms = 1_000
+        runner._dismiss_deadline_parked = True
+        runner._dismiss_attempt = 1
+        now = [2_000]
+        wait_calls = []
+
+        def on_wait(timeout):
+            wait_calls.append(timeout)
+            if len(wait_calls) == 1:
+                send.assert_not_called()
+                runner._on_server_message(
+                    {
+                        "type": "lode_updated",
+                        "lode": {"id": "test-session", "state": "completed"},
+                    }
+                )
+            return False
+
+        def on_send_keys(*_args):
+            runner._monitor_stop.set()
+            return True
+
+        with (
+            patch.object(runner._monitor_stop, "wait", side_effect=on_wait),
+            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
+            patch("hopper.runner.time.monotonic", return_value=0),
+            patch("hopper.runner.send_keys", side_effect=on_send_keys) as send,
+        ):
+            runner._wait_and_dismiss_claude()
+
+        assert wait_calls[0] == 1.0
+        assert runner._done_at_ms == 2_000
+        assert not runner._dismiss_deadline_parked
+        assert [entry.args[1] for entry in send.call_args_list] == ["C-d"]
+
+    def test_parked_completion_ignores_pane_changes_without_rearming(self):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._last_snapshot = "before park"
+        now = [1_000]
+
+        with (
+            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
+            patch("hopper.runner.capture_pane", return_value="operator changed pane") as capture,
+            patch.object(runner, "_park_idle") as park,
+        ):
+            runner._on_server_message(
+                {
+                    "type": "lode_updated",
+                    "lode": {"id": "test-session", "state": "completed"},
+                }
+            )
+            now[0] += DISMISS_DEADLINE_MS
+            runner._check_activity()
+
+            done_at_ms = runner._done_at_ms
+            now[0] += DISMISS_DEADLINE_MS
+            runner._check_activity()
+
+        assert runner._dismiss_deadline_parked
+        assert runner._done_at_ms == done_at_ms
+        park.assert_called_once_with(
+            "completion was signalled, but the agent did not exit within 5 min"
+        )
+        capture.assert_not_called()
+
 
 def test_completion_deadline_latch_preserves_done_and_allows_advance():
     runner = BaseRunner("test-session", Path("/tmp/test.sock"))
@@ -1679,3 +1750,123 @@ def test_completion_deadline_latch_preserves_done_and_allows_advance():
 
     emit_state.assert_called_once_with("ready", "Done")
     emit_stage.assert_called_once_with("refine")
+
+
+def test_completion_deadline_rearms_and_allows_advance():
+    now = [1_000]
+    message = {
+        "type": "lode_updated",
+        "lode": {"id": "test-session", "state": "completed"},
+    }
+
+    with (
+        patch("hopper.runner.capture_pane", return_value="stable"),
+        patch("hopper.runner.send_keys"),
+        patch("hopper.runner.get_current_pane_id", return_value="%test"),
+        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+        patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
+    ):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._next_stage = "refine"
+        runner._registration_complete.set()
+        runner._registration_accepted = True
+
+        with patch.object(runner, "_park_idle") as park:
+            runner._on_server_message(message)
+            assert runner._done.is_set()
+            assert runner._done_at_ms == 1_000
+
+            now[0] = 2_000
+            runner._on_server_message(message)
+            assert runner._done_at_ms == 1_000
+
+            now[0] = 1_000 + DISMISS_DEADLINE_MS
+            runner._check_activity()
+            assert runner._dismiss_deadline_parked
+            park.assert_called_once()
+
+            second_signal_ms = 400_000
+            now[0] = second_signal_ms
+            runner._on_server_message(message)
+            assert runner._done.is_set()
+            assert runner._done_at_ms == second_signal_ms
+            assert not runner._dismiss_deadline_parked
+
+            runner._check_activity()
+            now[0] = second_signal_ms + DISMISS_DEADLINE_MS - 1
+            runner._check_activity()
+            park.assert_called_once()
+
+            now[0] = second_signal_ms + DISMISS_DEADLINE_MS
+            runner._check_activity()
+            assert runner._done.is_set()
+            assert runner._dismiss_deadline_parked
+            assert park.call_count == 2
+
+            lode = {"active": False, "claude": {"": {}}, "project": ""}
+            connection = MagicMock()
+            with (
+                patch("hopper.runner.signal.signal", return_value=signal.SIG_DFL),
+                patch("hopper.runner.reap_swiftpm_testing_helpers"),
+                patch("hopper.runner.connect", return_value={"lode": lode}),
+                patch("hopper.runner.HopperConnection", return_value=connection),
+                patch.object(runner, "_setup", return_value=None),
+                patch.object(runner, "_run_claude", return_value=(0, None)),
+                patch.object(runner, "_emit_state", return_value=True) as emit_state,
+                patch.object(runner, "_emit_stage") as emit_stage,
+                patch.object(runner, "_stop_monitor"),
+                patch.object(runner, "_terminate_claude_process"),
+            ):
+                assert runner.run() == 0
+
+        assert runner._done.is_set()
+        emit_state.assert_called_once_with("ready", "Done")
+        emit_stage.assert_called_once_with("refine")
+
+
+def test_healthy_completion_advances_without_park_stuck_or_gated():
+    now = [1_000]
+
+    with (
+        patch("hopper.runner.capture_pane", return_value="stable"),
+        patch("hopper.runner.send_keys"),
+        patch("hopper.runner.get_current_pane_id", return_value="%test"),
+        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+        patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
+    ):
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._next_stage = "refine"
+        runner._registration_complete.set()
+        runner._registration_accepted = True
+        runner._on_server_message(
+            {
+                "type": "lode_updated",
+                "lode": {"id": "test-session", "state": "completed"},
+            }
+        )
+
+        lode = {"active": False, "claude": {"": {}}, "project": ""}
+        connection = MagicMock()
+        with (
+            patch("hopper.runner.signal.signal", return_value=signal.SIG_DFL),
+            patch("hopper.runner.reap_swiftpm_testing_helpers"),
+            patch("hopper.runner.connect", return_value={"lode": lode}),
+            patch("hopper.runner.HopperConnection", return_value=connection),
+            patch.object(runner, "_setup", return_value=None),
+            patch.object(runner, "_run_claude", return_value=(0, None)),
+            patch.object(runner, "_emit_state", return_value=True) as emit_state,
+            patch.object(runner, "_emit_stage") as emit_stage,
+            patch.object(runner, "_park_idle") as park,
+            patch.object(runner, "_stop_monitor"),
+            patch.object(runner, "_terminate_claude_process"),
+        ):
+            assert runner.run() == 0
+
+    states = [entry.args[0] for entry in emit_state.call_args_list]
+    assert states == ["ready"]
+    assert "stuck" not in states
+    assert "gated" not in states
+    emit_state.assert_called_once_with("ready", "Done")
+    emit_stage.assert_called_once_with("refine")
+    park.assert_not_called()

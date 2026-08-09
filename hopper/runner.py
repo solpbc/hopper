@@ -267,6 +267,7 @@ class BaseRunner:
         self._claude_proc: subprocess.Popen | None = None
         # Completion tracking
         self._done = threading.Event()
+        self._done_lock = threading.Lock()
         self._done_at_ms: int | None = None
         self._dismiss_deadline_parked = False
         self._dismiss_attempt = 0
@@ -576,9 +577,17 @@ class BaseRunner:
             ):
                 self._branch_persisted.set()
         if lode.get("state") == "completed":
-            if not self._done.is_set():
-                self._done_at_ms = current_time_ms()
-                self._done.set()
+            now = current_time_ms()
+            with self._done_lock:
+                if not self._done.is_set():
+                    self._done_at_ms = now
+                    self._done.set()
+                elif self._dismiss_deadline_parked:
+                    # Completion signalled a second time while parked proves the agent
+                    # resumed and reached a fresh terminal point. Pane activity alone
+                    # cannot distinguish resumed work from incidental terminal output.
+                    self._done_at_ms = now
+                    self._dismiss_deadline_parked = False
             logger.debug(f"{self._done_label} signal received lode={self.lode_id}")
         elif lode.get("state") == "gated":
             self._open_gate()
@@ -600,16 +609,26 @@ class BaseRunner:
             return
 
         while not self._monitor_stop.is_set():
-            if self._dismiss_deadline_parked:
-                return
+            with self._done_lock:
+                deadline_parked = self._dismiss_deadline_parked
+                done_at_ms = self._done_at_ms
+            while deadline_parked:
+                if self._monitor_stop.wait(timeout=1.0):
+                    return
+                with self._done_lock:
+                    deadline_parked = self._dismiss_deadline_parked
+                    done_at_ms = self._done_at_ms
             logger.debug(f"{self._done_label}, waiting for screen to stabilize lode={self.lode_id}")
 
             last_snapshot = None
             capture_failures = 0
+            parked_during_stabilization = False
             stabilization_deadline = time.monotonic() + DISMISS_STABILIZATION_TIMEOUT_SEC
             while not self._monitor_stop.is_set():
-                if self._dismiss_deadline_parked:
-                    return
+                with self._done_lock:
+                    if self._dismiss_deadline_parked:
+                        parked_during_stabilization = True
+                        break
                 remaining = stabilization_deadline - time.monotonic()
                 if remaining <= 0:
                     logger.warning(
@@ -635,18 +654,25 @@ class BaseRunner:
             if self._monitor_stop.is_set():
                 return
 
-            if self._dismiss_deadline_parked:
-                return
-            if last_snapshot is None:
-                logger.warning(f"dismissing without a stable pane capture lode={self.lode_id}")
-            self._dismiss_attempt += 1
-            if self._dismiss_attempt == 1:
-                logger.debug(f"sending Ctrl-C dismiss keystrokes lode={self.lode_id}")
-                send_keys(self._pane_id, "C-c")
-                send_keys(self._pane_id, "C-c")
-            else:
-                logger.debug(f"sending Ctrl-D dismiss keystroke lode={self.lode_id}")
-                send_keys(self._pane_id, "C-d")
+            with self._done_lock:
+                # A re-arm can clear the latch after this cycle's last check, so its
+                # changed completion time keeps a pre-park snapshot from being trusted.
+                may_dismiss = (
+                    not parked_during_stabilization
+                    and not self._dismiss_deadline_parked
+                    and self._done_at_ms == done_at_ms
+                )
+            if may_dismiss:
+                if last_snapshot is None:
+                    logger.warning(f"dismissing without a stable pane capture lode={self.lode_id}")
+                self._dismiss_attempt += 1
+                if self._dismiss_attempt == 1:
+                    logger.debug(f"sending Ctrl-C dismiss keystrokes lode={self.lode_id}")
+                    send_keys(self._pane_id, "C-c")
+                    send_keys(self._pane_id, "C-c")
+                else:
+                    logger.debug(f"sending Ctrl-D dismiss keystroke lode={self.lode_id}")
+                    send_keys(self._pane_id, "C-d")
 
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""
@@ -695,10 +721,17 @@ class BaseRunner:
 
         if self._done.is_set():
             now = current_time_ms()
-            if self._done_at_ms is None:
-                self._done_at_ms = now
-            if not self._dismiss_deadline_parked and now - self._done_at_ms >= DISMISS_DEADLINE_MS:
-                self._dismiss_deadline_parked = True
+            should_park = False
+            with self._done_lock:
+                if self._done_at_ms is None:
+                    self._done_at_ms = now
+                if (
+                    not self._dismiss_deadline_parked
+                    and now - self._done_at_ms >= DISMISS_DEADLINE_MS
+                ):
+                    self._dismiss_deadline_parked = True
+                    should_park = True
+            if should_park:
                 reason = (
                     "completion was signalled, but the agent did not exit within "
                     f"{DISMISS_DEADLINE_MIN} min"
@@ -871,9 +904,8 @@ class BaseRunner:
         stage that is merely waiting for an operator must never be executed for waiting.
 
         So a quiet stage is parked, not killed: the agent stays alive, the reason is
-        recorded, and the lode waits. The monitor keeps watching, so the moment the
-        pane changes (an operator answers, nudges, or the stage resumes on its own)
-        the existing gated branch clears the gate and the stage carries on.
+        recorded, and the lode waits. For an ordinary non-completion idle park, pane
+        movement lets the existing gated branch clear the gate and carry on.
 
         Only an explicit operator action through the hop CLI may end a stage.
         """
