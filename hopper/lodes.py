@@ -23,6 +23,8 @@ Lodes are plain dicts with these fields:
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
+- last_pane_activity_at: int | None - timestamp of most recent real pane change (default None)
+- pane_title_observation: dict | None - cross-attempt processing-title observation (default None)
 - backlog: dict | None - original backlog item data if promoted (default None)
 - archived_at: int | None - milliseconds since epoch when archived
   (default None, set by archive_lode)

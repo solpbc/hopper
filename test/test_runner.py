@@ -441,7 +441,7 @@ class TestBaseRunnerActivityMonitor:
         assert "No output for " in stuck_emissions[0][1]["status"]
         assert "s" in stuck_emissions[0][1]["status"]
 
-    def test_check_activity_gates_numbered_question_instead_of_killing(self):
+    def test_check_activity_gates_numbered_question_and_records_change(self):
         """Claude AskUserQuestion UI is operator wait state, not a stuck stage."""
         runner = self._make_runner()
         runner._pane_id = "%1"
@@ -459,7 +459,13 @@ class TestBaseRunnerActivityMonitor:
         mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
         runner.connection = mock_conn
 
-        with patch("hopper.runner.capture_pane", return_value=snapshot):
+        with (
+            patch("hopper.runner.capture_pane", return_value=snapshot),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+            patch("hopper.runner.current_time_ms", return_value=100_000),
+        ):
             runner._check_activity()
 
         assert runner._gated.is_set()
@@ -471,6 +477,10 @@ class TestBaseRunnerActivityMonitor:
             for event, body in emitted
         )
         assert not any(body.get("state") == "stuck" for _, body in emitted)
+        assert any(
+            event == "lode_set_pane_activity" and body["observed_at"] == 100_000
+            for event, body in emitted
+        )
 
     def test_check_activity_detects_running(self):
         """Monitor detects running state when pane content changes."""
@@ -629,11 +639,11 @@ class TestBaseRunnerActivityMonitor:
         """An idle stage is PARKED as gated and left alive. Hopper never kills it.
 
         A quiet stage may be blocked on a prompt, stalled on a model stream, or hung.
-        Hopper cannot tell from the outside, and killing it destroys agent context a
-        human could often resume in one keystroke. So it parks and waits.
+        Hopper cannot tell from the outside, and killing it destroys agent context an
+        operator could often resume in one keystroke. So it parks and waits.
         """
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_PARK_THRESHOLD_MS", 100)
 
         runner = self._make_runner()
         runner._pane_id = "%1"
@@ -654,6 +664,9 @@ class TestBaseRunnerActivityMonitor:
                 "hopper.runner.connect",
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             runner._check_activity()
 
@@ -733,6 +746,9 @@ class TestBaseRunnerActivityMonitor:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", side_effect=[1000, 2000]),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             runner._check_activity()
             runner._check_activity()
@@ -748,7 +764,7 @@ class TestBaseRunnerActivityMonitor:
     def test_flat_descendant_cpu_parks_never_terminates(self, monkeypatch):
         """Flat descendant CPU does not veto the normal stuck timeout."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_PARK_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 351_000)
 
         runner = self._make_runner()
@@ -767,6 +783,9 @@ class TestBaseRunnerActivityMonitor:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=1000),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             runner._check_activity()
 
@@ -794,6 +813,9 @@ class TestBaseRunnerActivityMonitor:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=2000),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             runner._check_activity()
 
@@ -832,9 +854,9 @@ class TestBaseRunnerActivityMonitor:
         mock_fail.assert_called_once_with(expected)
 
     def test_refreshed_heartbeat_carries_pane_silent_stage_past_stuck_timeout(self, monkeypatch):
-        """Recurring progress prevents the ordinary stuck kill across enough quiet ticks."""
+        """Recurring progress prevents an idle park across enough quiet ticks."""
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 200)
+        monkeypatch.setattr("hopper.runner.STUCK_PARK_THRESHOLD_MS", 200)
         monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 10_000)
         now = [1_000]
         monkeypatch.setattr("hopper.runner.current_time_ms", lambda: now[0])
@@ -862,6 +884,9 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.connect", side_effect=heartbeat),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=0) as mock_cpu,
             patch.object(runner, "_park_idle") as mock_fail,
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             for tick in range(1_000, 1_701, 100):
                 now[0] = tick
@@ -1093,9 +1118,8 @@ class TestBaseRunnerActivityMonitor:
 
         Regression: `hop gate` prints "Gate set..." and Claude renders the end of
         its turn AFTER the gate opens. The monitor compared that against the
-        pre-gate pane, called it "Gate resumed", cleared the gate, and the now
-        unprotected (and correctly idle) stage was stuck-killed 350s later.
-        Lodes ymxf4qpm and imexf5si died this way on 2026-07-13.
+        pre-gate pane, called it "Gate resumed", cleared the gate, and left the
+        correctly idle stage eligible for parking.
         """
         runner = self._make_runner()
         runner._pane_id = "%1"
@@ -1106,6 +1130,9 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.capture_pane", return_value="Gate set. Review saved."),
             patch("hopper.runner.current_time_ms", return_value=12345),
             patch.object(runner, "_emit_state", return_value=True) as mock_emit,
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             runner._check_activity()
 
@@ -1140,15 +1167,14 @@ class TestBaseRunnerActivityMonitor:
         assert runner._gated.is_set()
         mock_emit.assert_not_called()
 
-    def test_gated_stage_is_never_stuck_killed_while_it_waits(self, monkeypatch):
+    def test_gated_stage_is_never_parked_while_it_waits(self, monkeypatch):
         """An open gate protects a correctly-idle stage for as long as it waits.
 
-        This is the end-to-end shape of the 2026-07-13 incident: the agent opens a
-        review gate and idles at its prompt, exactly as instructed. The pane never
-        changes again. It must never be killed or parked for that.
+        The agent opens a review gate and idles at its prompt, exactly as instructed.
+        The pane never changes again. It must never be parked for that.
         """
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 200)
+        monkeypatch.setattr("hopper.runner.STUCK_PARK_THRESHOLD_MS", 200)
         monkeypatch.setattr("hopper.runner.ABSOLUTE_CAP_MS", 500)
         now = [1_000]
         monkeypatch.setattr("hopper.runner.current_time_ms", lambda: now[0])
@@ -1164,6 +1190,9 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.connect", return_value=None),
             patch.object(runner, "_emit_state", return_value=True),
             patch.object(runner, "_park_idle") as mock_park,
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             for tick in range(1_000, 5_001, 100):
                 now[0] = tick
@@ -1197,6 +1226,30 @@ class TestBaseRunnerActivityMonitor:
 
         assert not runner._monitor_stop.is_set()
         assert not runner._activity_capture_disabled
+        park.assert_not_called()
+
+    def test_check_activity_capture_recovery_resets_stale_baselines(self):
+        """Unobservable capture time cannot count toward an immediate park."""
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._last_snapshot = "unchanged"
+        runner._last_pane_activity_ms = 1_000
+        runner._stuck_since = 2_000
+
+        with (
+            patch("hopper.runner.capture_pane", side_effect=[None, "unchanged"]),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
+            patch("hopper.runner.current_time_ms", return_value=100_000),
+            patch("hopper.runner.connect", return_value=None),
+            patch.object(runner, "_park_idle") as park,
+        ):
+            runner._check_activity()
+            runner._check_activity()
+
+        assert runner._last_pane_activity_ms == 100_000
+        assert runner._stuck_since is None
         park.assert_not_called()
 
 
@@ -1445,7 +1498,7 @@ class TestBaseRunnerDismiss:
         snapshots = iter(
             [
                 "prompt v1",
-                "prompt v1",  # first stability → Ctrl-D
+                "prompt v1",  # first stability → Ctrl-C
                 "new output",  # screen changed, not stable
                 "prompt v2",
                 "prompt v2",  # second stability → Ctrl-D

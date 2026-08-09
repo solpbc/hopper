@@ -1503,25 +1503,50 @@ def test_lode_restart_active(capsys):
     assert "--force" in out
 
 
-def test_lode_restart_pending_result_gives_wait_and_status_next_step(capsys):
+def test_lode_restart_unknown_ack_gives_status_next_step(capsys):
+    lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.get_lode", return_value=lode),
+        patch("hopper.client.restart_lode", return_value=None),
+    ):
+        assert cmd_lode(["restart", "test1234", "--force"]) == 1
+
+    out = capsys.readouterr().out
+    assert "disposition is UNKNOWN" in out
+    assert "hop lode status test1234" in out
+
+
+@pytest.mark.parametrize(
+    ("reason", "next_steps"),
+    [
+        ("lode_not_found", ("hop lode list", "retry")),
+        ("invalid_stage", ("hop lode status test1234",)),
+        ("pending_runner_result", ("Wait about 60 seconds", "hop lode status test1234", "retry")),
+        ("runner_identity_unknown", ("hop lode status test1234", "runner is gone")),
+        ("runner_identity_unverified", ("hop lode status test1234", "the pane", "runner is gone")),
+        ("termination_failed", ("hop lode status test1234", "after it exits")),
+        ("already_live", ("Attach to it", "hop lode restart test1234 --force")),
+        ("tmux_unreachable", ("Verify tmux is running", "hop lode status test1234", "retry")),
+        ("spawn_failed", ("Verify tmux is running", "hop lode status test1234", "retry")),
+        ("future_refusal", ("hop lode status test1234", "retry")),
+    ],
+)
+def test_lode_restart_refusal_names_operator_next_steps(reason, next_steps, capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.get_lode", return_value=lode),
         patch(
             "hopper.client.restart_lode",
-            return_value={
-                "type": "mutation_ack",
-                "accepted": False,
-                "reason": "pending_runner_result",
-            },
+            return_value={"type": "mutation_ack", "accepted": False, "reason": reason},
         ),
     ):
         assert cmd_lode(["restart", "test1234", "--force"]) == 1
 
     out = capsys.readouterr().out
-    assert "Wait about 60 seconds" in out
-    assert "hop lode status test1234" in out
+    for next_step in next_steps:
+        assert next_step in out
 
 
 def test_lode_restart_shipped(capsys):
@@ -3641,7 +3666,30 @@ def test_processed_no_ack_is_unknown_but_keeps_written_output(temp_config, capsy
     assert f"hop lode status {lode_id}" in captured.err
 
 
-def test_processed_explicit_refusal_is_nonzero_with_written_output(temp_config, capsys):
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        ("lode_not_found", "Lode test-session not found or archived."),
+        (
+            "missing_run_generation",
+            "Completion was refused because this command has no runner generation. "
+            "Run it inside the current lode runner, then retry.",
+        ),
+        (
+            "stale_run_generation",
+            "Completion was refused because this runner generation is stale. "
+            "Check `hop lode status test-session` and use the current runner.",
+        ),
+        (
+            "terminal_failure",
+            "Completion was refused because this lode has a terminal failure. "
+            "Check `hop lode status test-session` before recovering it.",
+        ),
+    ],
+)
+def test_processed_each_explicit_refusal_is_distinct_and_nonzero(
+    temp_config, capsys, reason, message
+):
     from io import StringIO
 
     lode_id = "test-session"
@@ -3653,14 +3701,14 @@ def test_processed_explicit_refusal_is_nonzero_with_written_output(temp_config, 
         patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
         patch(
             "hopper.client.set_lode_state_acknowledged",
-            return_value={"accepted": False, "reason": "lode_not_found"},
+            return_value={"accepted": False, "reason": reason},
         ),
         patch("sys.stdin", StringIO(output)),
     ):
         assert cmd_processed([]) == 1
 
     assert (temp_config / "lodes" / lode_id / "mill_out.md").read_text() == output
-    assert f"Lode {lode_id} not found or archived." in capsys.readouterr().err
+    assert capsys.readouterr().err.strip() == message
 
 
 def test_processed_acknowledges_over_real_server_socket(

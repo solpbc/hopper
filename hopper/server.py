@@ -88,6 +88,7 @@ PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
 GUARDED_DISCONNECT_HOLD_SEC = 60.0
 assert oom.SCOPE_RESULT_SETTLE_SEC < GUARDED_DISCONNECT_HOLD_SEC
 FROZEN_PANE_THRESHOLD_MS = 10 * 60_000
+FROZEN_PANE_THRESHOLD_MIN = FROZEN_PANE_THRESHOLD_MS // 60_000
 _FEEDBACK_POLL_INTERVAL = 0.25
 _FEEDBACK_IDLE_POLL_COUNT = 12
 _FEEDBACK_SETTLE_POLL_COUNT = 4
@@ -143,8 +144,8 @@ _GATE_FEEDBACK_MESSAGES = {
     ),
     "pane_frozen": (
         "Feedback was not sent because pane {pane} has reported the same processing title "
-        "for at least 10 min. Inspect with `hop lode peek {lode_id}` before deciding "
-        "whether to retry."
+        f"for at least {FROZEN_PANE_THRESHOLD_MIN} min. Inspect with `hop lode peek "
+        "{lode_id}` before deciding whether to retry."
     ),
     "paste_failed": (
         "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
@@ -206,8 +207,8 @@ _PANE_INPUT_MESSAGES = {
     ),
     "pane_frozen": (
         "Input was not sent because pane {pane} has reported the same processing title for "
-        "at least 10 min. Inspect with `hop lode peek {lode_id}` before deciding whether "
-        "to retry."
+        f"at least {FROZEN_PANE_THRESHOLD_MIN} min. Inspect with `hop lode peek "
+        "{lode_id}` before deciding whether to retry."
     ),
     "paste_failed": (
         "Input was not sent because Hopper could not deliver it to pane {pane}. Retry the "
@@ -356,6 +357,14 @@ def _terminate_runner_process_group(pid: int) -> bool:
     return False
 
 
+def _runner_process_group_matches_pane(runner_pid: int, pane_pid: int) -> bool:
+    """Return whether the registered runner belongs to the pane's process group."""
+    try:
+        return os.getpgid(runner_pid) == os.getpgid(pane_pid)
+    except (OSError, TypeError):
+        return False
+
+
 def _set_spawn_refusal(lode: dict, message: str) -> bool:
     """Set a visible spawn refusal without changing workflow or runner state."""
     status = f"spawn refused: {message}"
@@ -379,9 +388,9 @@ def _render_observed_title(title: str | None) -> str:
     return f'"{title}"' if title is not None else "<no title reported>"
 
 
-def _observe_pane_title(title: str | None, observation: dict | None) -> bool:
-    """Update a cross-attempt title observation and report a frozen pane."""
-    if title is None or observation is None:
+def _observe_processing_pane_title(title: str, observation: dict | None) -> bool:
+    """Update cross-attempt processing evidence and report a frozen pane."""
+    if observation is None:
         return False
     now = current_time_ms()
     if observation.get("title") != title or not isinstance(observation.get("observed_at"), int):
@@ -409,6 +418,7 @@ def _attempt_pane_delivery(
 
     pre_delivery_input = None
     saw_processing = False
+    processing_frozen = False
     for _ in range(_FEEDBACK_IDLE_POLL_COUNT):
         time.sleep(_FEEDBACK_POLL_INTERVAL)
         capture = capture_pane(pane_id, plain=True)
@@ -420,20 +430,29 @@ def _attempt_pane_delivery(
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
-        if _observe_pane_title(observed_title, pane_title_observation):
-            return {
-                "reason": "pane_frozen",
-                "capture": latest_capture,
-                "title": observed_title,
-            }
         phase = classify_pane_phase(observed_title)
         if phase is PanePhase.PROCESSING:
             saw_processing = True
+            processing_frozen = _observe_processing_pane_title(
+                observed_title,
+                pane_title_observation,
+            )
         elif phase is PanePhase.IDLE:
+            if pane_title_observation is not None:
+                pane_title_observation.clear()
             pre_delivery_input = read_pane_input(latest_capture)
             break
+        else:
+            processing_frozen = False
+            if pane_title_observation is not None:
+                pane_title_observation.clear()
     else:
-        reason = "idle_timeout" if saw_processing else "pane_state_unknown"
+        if not saw_processing:
+            reason = "pane_state_unknown"
+        elif processing_frozen:
+            reason = "pane_frozen"
+        else:
+            reason = "idle_timeout"
         return {"reason": reason, "capture": latest_capture, "title": observed_title}
 
     delivered = paste_buffer(pane_id, text) if paste else send_keys(pane_id, text)
@@ -575,8 +594,9 @@ def _deliver_lode_pane_input(lodes: list[dict], lode: dict, text: str, *, paste:
         paste=paste,
         pane_title_observation=observation,
     )
-    if observation and observation != prior_observation:
-        lode["pane_title_observation"] = observation
+    updated_observation = observation or None
+    if updated_observation != prior_observation:
+        lode["pane_title_observation"] = updated_observation
         save_lodes(lodes)
     return result
 
@@ -1893,14 +1913,33 @@ class Server:
                         return
                     if force:
                         pane = lode.get("tmux_pane")
-                        runner_pid = lode.get("pid") or (get_pane_pid(pane) if pane else None)
-                        if runner_pid is None and (
-                            lode.get("active")
-                            or (pane and pane_liveness(pane) is not Liveness.GONE)
-                        ):
-                            acknowledge_mutation(False, "runner_identity_unknown")
+                        runner_pid = lode.get("pid")
+                        if pane:
+                            liveness = pane_liveness(pane)
+                            if liveness is Liveness.ALIVE:
+                                pane_pid = get_pane_pid(pane)
+                                if (
+                                    runner_pid is None
+                                    or pane_pid is None
+                                    or not _runner_process_group_matches_pane(runner_pid, pane_pid)
+                                ):
+                                    acknowledge_mutation(False, "runner_identity_unverified")
+                                    return
+                                runner_pid = pane_pid
+                            elif (
+                                liveness is Liveness.UNKNOWN
+                                or runner_pid is not None
+                                or lode.get("active")
+                            ):
+                                acknowledge_mutation(False, "runner_identity_unverified")
+                                return
+                        elif runner_pid is not None or lode.get("active"):
+                            acknowledge_mutation(False, "runner_identity_unverified")
                             return
                         if runner_pid and not _terminate_runner_process_group(runner_pid):
+                            acknowledge_mutation(False, "termination_failed")
+                            return
+                        if runner_pid and pane and pane_liveness(pane) is not Liveness.GONE:
                             acknowledge_mutation(False, "termination_failed")
                             return
                         if generation:

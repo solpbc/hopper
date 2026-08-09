@@ -27,11 +27,12 @@ ERROR_LINES = 5  # Number of stderr lines to capture on error
 MONITOR_INTERVAL = 5.0  # Seconds between activity checks
 MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
-STUCK_FAIL_THRESHOLD_MS = 5 * 60_000
+STUCK_PARK_THRESHOLD_MS = 5 * 60_000
 ABSOLUTE_CAP_MS = 60 * 60_000
 DISMISS_STABILIZATION_TIMEOUT_SEC = 30.0
 PANE_CAPTURE_FAILURE_LIMIT = 3
 DISMISS_DEADLINE_MS = 5 * 60_000
+DISMISS_DEADLINE_MIN = DISMISS_DEADLINE_MS // 60_000
 PANE_ACTIVITY_EMIT_INTERVAL_MS = 30_000
 _QUESTION_SELECTOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.MULTILINE)
 _QUESTION_CHROME_RE = re.compile(
@@ -52,7 +53,7 @@ def pane_needs_answer(snapshot: str) -> bool:
 
 
 def _write_recovery_record(lode_id: str, record: dict) -> None:
-    """Atomically persist a stuck-kill recovery record for a lode."""
+    """Atomically persist a park recovery record for a lode."""
     lode_dir = get_lode_dir(lode_id)
     lode_dir.mkdir(parents=True, exist_ok=True)
     recovery_path = lode_dir / "recovery.json"
@@ -697,7 +698,10 @@ class BaseRunner:
                 self._done_at_ms = now
             if not self._dismiss_deadline_parked and now - self._done_at_ms >= DISMISS_DEADLINE_MS:
                 self._dismiss_deadline_parked = True
-                reason = "completion was signalled, but the agent did not exit within 5 min"
+                reason = (
+                    "completion was signalled, but the agent did not exit within "
+                    f"{DISMISS_DEADLINE_MIN} min"
+                )
                 logger.warning(f"dismiss deadline reached lode={self.lode_id}: {reason}")
                 self._park_idle(reason)
             return
@@ -718,7 +722,7 @@ class BaseRunner:
                 #
                 # Arming can only be delayed, never skipped, so the worst case is
                 # a gate that only `hop gate feedback` can resume -- never a gate
-                # that silently drops its protection and lets the stuck-killer in.
+                # that silently drops its protection and lets idle parking resume.
                 if snapshot == self._gate_snapshot:
                     self._gate_armed = True
                 self._gate_snapshot = snapshot
@@ -739,7 +743,7 @@ class BaseRunner:
             return
 
         if pane_needs_answer(snapshot):
-            self._last_snapshot = snapshot
+            self._record_pane_snapshot(snapshot, current_time_ms())
             self._stuck_since = None
             self._emit_state("gated", "Awaiting operator answer")
             self._open_gate()
@@ -777,8 +781,8 @@ class BaseRunner:
             duration_sec = (now - last_activity) // 1000
             self._emit_state("stuck", f"No output for {duration_sec}s")
             stuck_for = now - self._stuck_since
-            if stuck_for > STUCK_FAIL_THRESHOLD_MS and not self._gated.is_set():
-                # NEVER terminate an idle stage. Park it and wait for a human.
+            if stuck_for > STUCK_PARK_THRESHOLD_MS and not self._gated.is_set():
+                # NEVER terminate an idle stage. Park it and wait for an operator.
                 self._park_idle(f"no pane output, heartbeat, or CPU activity for {duration_sec}s")
                 return
         else:
@@ -787,7 +791,7 @@ class BaseRunner:
                 and not self._gated.is_set()
             ):
                 # Sustained only by heartbeat/CPU with a silent pane for an hour.
-                # Surface it to a human -- but do not kill it; it may be a long,
+                # Surface it to an operator -- but do not kill it; it may be a long,
                 # legitimately quiet build. The gate clears itself the moment the
                 # pane moves again.
                 self._park_idle(
@@ -821,10 +825,14 @@ class BaseRunner:
                 self._activity_capture_disabled = True
             return None
 
+        capture_recovered = self._pane_capture_failures > 0
         if self._activity_capture_disabled:
             logger.info(f"pane capture recovered lode={self.lode_id}")
         self._activity_capture_disabled = False
         self._pane_capture_failures = 0
+        if capture_recovered:
+            self._last_pane_activity_ms = current_time_ms()
+            self._stuck_since = None
         return snapshot
 
     def _record_pane_snapshot(self, snapshot: str, observed_at: int) -> None:
@@ -847,12 +855,12 @@ class BaseRunner:
             self._last_pane_activity_emitted_ms = observed_at
 
     def _park_idle(self, reason: str) -> None:
-        """Park an idle stage as gated and wait for a human. NEVER terminate it.
+        """Park an idle stage as gated and wait for an operator. NEVER terminate it.
 
         Hopper cannot tell, from the outside, whether a quiet stage is blocked on a
         prompt, stalled on a model stream, or genuinely hung. Killing it destroys
-        agent context that a human can often resume with one keystroke -- and a stage
-        that is merely *waiting for a person* must never be executed for waiting.
+        agent context that an operator can often resume with one keystroke -- and a
+        stage that is merely waiting for an operator must never be executed for waiting.
 
         So a quiet stage is parked, not killed: the agent stays alive, the reason is
         recorded, and the lode waits. The monitor keeps watching, so the moment the

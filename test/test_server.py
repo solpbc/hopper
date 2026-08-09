@@ -1319,6 +1319,7 @@ def test_reset_with_spawn_applies_reset_only_when_spawn_succeeds(socket_path, ma
 
 
 def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_lode):
+    old_generation = "1" * 32
     lode = make_lode(
         id="reset-id",
         stage="refine",
@@ -1326,6 +1327,7 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
         active=True,
         tmux_pane="%live",
         pid=1415,
+        run_generation=old_generation,
     )
     lode["claude"]["refine"]["started"] = True
     old_session_id = lode["claude"]["refine"]["session_id"]
@@ -1334,7 +1336,7 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
     conn = _mock_client(srv)
 
     def terminate(pid):
-        assert pid == 1415
+        assert pid == 2424
         assert lode["claude"]["refine"]["session_id"] == old_session_id
         assert lode["active"] is True
         return True
@@ -1345,6 +1347,9 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
         return "%new"
 
     with (
+        patch("hopper.server.pane_liveness", side_effect=[Liveness.ALIVE, Liveness.GONE]),
+        patch("hopper.server.get_pane_pid", return_value=2424),
+        patch("hopper.server._runner_process_group_matches_pane", return_value=True) as matches,
         patch("hopper.server._terminate_runner_process_group", side_effect=terminate),
         patch("hopper.server.find_project", return_value=Project(path="/repo", name="proj")),
         patch("hopper.server.spawn_claude", side_effect=spawn),
@@ -1364,8 +1369,9 @@ def test_force_reset_terminates_before_mutating_and_spawning(socket_path, make_l
     response = _decode_mock_response(conn)
     assert response["accepted"] is True
     assert response["reason"] == "spawned"
+    matches.assert_called_once_with(1415, 2424)
     assert lode["claude"]["refine"]["started"] is False
-    assert lode["run_generation"] is not None
+    assert lode["run_generation"] != old_generation
     assert lode["tmux_pane"] == "%new"
 
 
@@ -1383,6 +1389,9 @@ def test_force_reset_termination_failure_preserves_lode(socket_path, make_lode):
     conn = _mock_client(srv)
 
     with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.get_pane_pid", return_value=2424),
+        patch("hopper.server._runner_process_group_matches_pane", return_value=True),
         patch("hopper.server._terminate_runner_process_group", return_value=False),
         patch("hopper.server.spawn_claude") as spawn,
     ):
@@ -1403,6 +1412,98 @@ def test_force_reset_termination_failure_preserves_lode(socket_path, make_lode):
     response = _decode_mock_response(conn)
     assert response["accepted"] is False
     assert response["reason"] == "termination_failed"
+
+
+def test_force_reset_refuses_when_pane_survives_termination(socket_path, make_lode):
+    lode = make_lode(
+        id="reset-id",
+        stage="refine",
+        active=True,
+        tmux_pane="%live",
+        pid=1415,
+    )
+    before = copy.deepcopy(lode)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server.pane_liveness", side_effect=[Liveness.ALIVE, Liveness.ALIVE]),
+        patch("hopper.server.get_pane_pid", return_value=2424),
+        patch("hopper.server._runner_process_group_matches_pane", return_value=True),
+        patch("hopper.server._terminate_runner_process_group", return_value=True),
+        patch("hopper.server.spawn_claude") as spawn,
+    ):
+        srv._handle_mutation(
+            {
+                "type": "lode_reset_claude_stage",
+                "lode_id": "reset-id",
+                "claude_stage": "refine",
+                "spawn": True,
+                "force": True,
+                "ack_requested": True,
+            },
+            conn,
+        )
+
+    spawn.assert_not_called()
+    assert lode == before
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == "termination_failed"
+
+
+@pytest.mark.parametrize(
+    ("recorded_pid", "identity_matches"),
+    [(None, None), (1415, False)],
+)
+def test_force_reset_refuses_unverified_live_pane_owner(
+    socket_path, make_lode, recorded_pid, identity_matches
+):
+    lode = make_lode(
+        id="reset-id",
+        stage="refine",
+        active=recorded_pid is not None,
+        tmux_pane="%live",
+        pid=recorded_pid,
+    )
+    before = copy.deepcopy(lode)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.get_pane_pid", return_value=2424),
+        patch(
+            "hopper.server._runner_process_group_matches_pane",
+            return_value=identity_matches,
+        ) as matches,
+        patch("hopper.server._terminate_runner_process_group") as terminate,
+        patch("hopper.server.spawn_claude") as spawn,
+    ):
+        srv._handle_mutation(
+            {
+                "type": "lode_reset_claude_stage",
+                "lode_id": "reset-id",
+                "claude_stage": "refine",
+                "spawn": True,
+                "force": True,
+                "ack_requested": True,
+            },
+            conn,
+        )
+
+    if recorded_pid is None:
+        matches.assert_not_called()
+    else:
+        matches.assert_called_once_with(recorded_pid, 2424)
+    terminate.assert_not_called()
+    spawn.assert_not_called()
+    assert lode == before
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == "runner_identity_unverified"
 
 
 def test_force_reset_pending_result_refuses_before_termination(socket_path, make_lode):
@@ -3794,15 +3895,6 @@ def _handle_delivery_with_tmux(
     return mock_capture, mock_title, mock_paste, mock_send, mock_sleep
 
 
-def _assert_only_pane_observation_changed(actual, before, expected_title):
-    observation = actual["pane_title_observation"]
-    assert observation["title"] == expected_title
-    assert isinstance(observation["observed_at"], int)
-    normalized = copy.deepcopy(actual)
-    normalized["pane_title_observation"] = before["pane_title_observation"]
-    assert normalized == before
-
-
 def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     """Idle staged feedback resumes only after the title becomes processing."""
     srv = Server(socket_path)
@@ -4050,33 +4142,107 @@ def test_gate_feedback_busy_for_entire_idle_wait_never_touches_pane(socket_path,
     assert "reason=idle_timeout outcome=busy" in caplog.text
 
 
-def test_gate_feedback_identical_old_title_is_frozen_before_delivery(socket_path, make_lode):
+def test_gate_feedback_identical_old_processing_title_is_frozen_after_idle_wait(
+    socket_path, make_lode
+):
+    idle_poll_window_ms = int(hopper_server._FEEDBACK_IDLE_WAIT_SECONDS * 1000)
+    assert hopper_server.FROZEN_PANE_THRESHOLD_MS > idle_poll_window_ms * 100
+    observed_at = 1_000
     srv = Server(socket_path)
     srv.lodes = [
         make_lode(
             id="test-id",
             state="gated",
             tmux_pane="%1",
-            pane_title_observation={"title": "⠐ Working", "observed_at": 1_000},
+            pane_title_observation={"title": "⠐ Working", "observed_at": observed_at},
         )
     ]
     conn = _mock_client(srv)
 
-    with patch("hopper.server.current_time_ms", return_value=601_000):
+    with patch(
+        "hopper.server.current_time_ms",
+        return_value=observed_at + hopper_server.FROZEN_PANE_THRESHOLD_MS,
+    ):
         _capture, mock_title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
             srv,
             conn,
-            captures=[_PROCESSING_CAPTURE, _PROCESSING_CAPTURE],
-            titles=["⠐ Working"],
+            captures=[_PROCESSING_CAPTURE] * 13,
+            titles=["⠐ Working"] * 12,
         )
 
-    mock_title.assert_called_once()
-    assert mock_sleep.call_count == 1
+    assert mock_title.call_count == 12
+    assert mock_sleep.call_count == 12
     mock_paste.assert_not_called()
     mock_send.assert_not_called()
     response = _decode_mock_response(conn)
     assert response["outcome"] == "pane_frozen"
-    assert "at least 10 min" in response["error"]
+    assert f"at least {hopper_server.FROZEN_PANE_THRESHOLD_MS // 60_000} min" in response["error"]
+
+
+def test_gate_feedback_old_idle_title_still_delivers(socket_path, make_lode):
+    observed_at = 1_000
+    srv = Server(socket_path)
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            state="gated",
+            tmux_pane="%1",
+            pane_title_observation={"title": "✳ Ready", "observed_at": observed_at},
+        )
+    ]
+    conn = _mock_client(srv)
+
+    with patch(
+        "hopper.server.current_time_ms",
+        return_value=observed_at + hopper_server.FROZEN_PANE_THRESHOLD_MS,
+    ):
+        _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
+            srv,
+            conn,
+            captures=[
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_STAGED_CAPTURE,
+                _PROCESSING_CAPTURE,
+            ],
+            titles=["✳ Ready", "✳ Ready", "⠐ Working"],
+        )
+
+    mock_paste.assert_called_once_with("%1", "Please revise")
+    mock_send.assert_called_once_with("%1", "Enter")
+    assert _decode_mock_response(conn)["type"] == "feedback_sent"
+    assert srv.lodes[0]["pane_title_observation"] is None
+
+
+def test_gate_feedback_old_unknown_title_remains_unknown(socket_path, make_lode):
+    observed_at = 1_000
+    unknown_title = "_ Waiting for an external state"
+    srv = Server(socket_path)
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            state="gated",
+            tmux_pane="%1",
+            pane_title_observation={"title": unknown_title, "observed_at": observed_at},
+        )
+    ]
+    conn = _mock_client(srv)
+
+    with patch(
+        "hopper.server.current_time_ms",
+        return_value=observed_at + hopper_server.FROZEN_PANE_THRESHOLD_MS,
+    ):
+        _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
+            srv,
+            conn,
+            captures=[_PROCESSING_CAPTURE] * 13,
+            titles=[unknown_title] * 12,
+        )
+
+    mock_paste.assert_not_called()
+    mock_send.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "pane_state_unknown"
+    assert srv.lodes[0]["pane_title_observation"] is None
 
 
 def test_gate_feedback_changed_title_resets_observation_and_keeps_polling(socket_path, make_lode):
@@ -4465,7 +4631,7 @@ def test_lode_send_pane_input_answer_auto_submits_without_state_write(socket_pat
 
     mock_paste.assert_not_called()
     mock_send.assert_called_once_with("%1", "1")
-    _assert_only_pane_observation_changed(srv.lodes[0], before, "✳ Ask user to choose")
+    assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
     response = _decode_mock_response(conn)
     assert {key: response[key] for key in ("type", "lode_id", "tmux_pane")} == {
@@ -4498,7 +4664,7 @@ def test_lode_send_pane_input_nudge_uses_paste_without_state_write(socket_path, 
 
     mock_paste.assert_called_once_with("%1", "continue")
     mock_send.assert_called_once_with("%1", "Enter")
-    _assert_only_pane_observation_changed(srv.lodes[0], before, "✳ Ready")
+    assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
     assert _decode_mock_response(conn)["type"] == "pane_input_sent"
 
@@ -4521,7 +4687,7 @@ def test_lode_send_pane_input_digit_without_processing_is_unverified(socket_path
 
     mock_paste.assert_not_called()
     mock_send.assert_called_once_with("%1", "1")
-    _assert_only_pane_observation_changed(srv.lodes[0], before, "✳ Ask user to choose")
+    assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
@@ -4554,7 +4720,7 @@ def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_
 
     mock_paste.assert_not_called()
     mock_send.assert_not_called()
-    _assert_only_pane_observation_changed(srv.lodes[0], before, "_ Land native skills port to main")
+    assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
     response = _decode_mock_response(conn)
     assert response["outcome"] == "pane_state_unknown"

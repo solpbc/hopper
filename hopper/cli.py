@@ -2680,6 +2680,11 @@ def cmd_lode(args: list[str]) -> int:
                     f"verified. Inspect `hop lode status {lode_id}`, then retry after the "
                     "runner is gone."
                 ),
+                "runner_identity_unverified": (
+                    "Restart refused because the registered runner could not be matched to "
+                    f"its live tmux pane. Inspect `hop lode status {lode_id}` and the pane, "
+                    "then retry after the runner is gone."
+                ),
                 "termination_failed": (
                     "Restart refused because the existing runner did not exit. Inspect "
                     f"`hop lode status {lode_id}`, then retry after it exits."

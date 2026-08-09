@@ -334,7 +334,7 @@ class TestIdleParking:
         (worktree / "new.txt").write_text("new\n")
 
         monkeypatch.setattr("hopper.runner.IDLE_THRESHOLD_MS", 100)
-        monkeypatch.setattr("hopper.runner.STUCK_FAIL_THRESHOLD_MS", 100)
+        monkeypatch.setattr("hopper.runner.STUCK_PARK_THRESHOLD_MS", 100)
         monkeypatch.setattr("hopper.runner.current_time_ms", lambda: 1_000)
 
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
@@ -355,6 +355,9 @@ class TestIdleParking:
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=0),
             patch("hopper.runner._descendant_pids", return_value=[]),
+            patch("hopper.runner.send_keys"),
+            patch("hopper.runner.get_current_pane_id", return_value="%test"),
+            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
             runner._check_activity()
 
