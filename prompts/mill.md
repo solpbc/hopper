@@ -128,6 +128,13 @@ EOF
 
 This completes your work.
 
+⛔ **`hop processed` is the LAST thing you do. Stop immediately after it returns.**
+Do not run another command, add a closing summary, re-read a file, or "just check"
+one more thing. Hopper dismisses your session once you signal completion, and it
+can only do that between turns — if you are still working, the dismissal lands
+mid-turn and does nothing. The stage then sits completed-but-not-advanced until a
+human notices. Signal, then stop.
+
 Formatting requirements:
 - Be concise but complete. Use numbered lists.
 - Every repo reference should include file paths and (where possible) symbol names.
