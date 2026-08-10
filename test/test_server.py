@@ -4014,6 +4014,52 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     assert "tail" not in response
 
 
+def test_feedback_state_change_is_logged(socket_path, make_lode, caplog):
+    """A state write with no log line is unreconstructable afterwards.
+
+    `lode_send_feedback` wrote `running` over a park and left no record, so the
+    eight hours in which that lode looked alive had nothing explaining why. Every
+    writer logs, and `via` names which one.
+    """
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    with caplog.at_level(logging.INFO, logger="hopper.server"):
+        _handle_delivery_with_tmux(
+            srv,
+            conn,
+            captures=[
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_STAGED_CAPTURE,
+                _PROCESSING_CAPTURE,
+            ],
+            titles=["✳ Ready", "✳ Ready", "⠐ Working"],
+            text="Looks good",
+        )
+
+    assert srv.lodes[0]["state"] == "running"
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("Lode test-id state=running" in line and "via=feedback" in line for line in lines), (
+        lines
+    )
+
+
+def test_kill_and_pause_state_changes_are_logged(socket_path, make_lode, caplog):
+    """The same contract for the other writers that used to be silent."""
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="running")]
+    with (
+        caplog.at_level(logging.INFO, logger="hopper.server"),
+        patch("hopper.server._terminate_runner_process_group", return_value=True),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._handle_mutation({"type": "lode_pause", "lode_id": "test-id"}, None)
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("state=paused" in line and "via=pause" in line for line in lines), lines
+
+
 def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
     """Dead pane feedback stays gated and requires an explicit resume."""
     srv = Server(socket_path)

@@ -649,6 +649,18 @@ def _deliver_lode_pane_input(lodes: list[dict], lode: dict, text: str, *, paste:
     return result
 
 
+def _log_state_change(lode_id: str, state: str, status: str, via: str) -> None:
+    """Log every state mutation in one shape, whoever made it.
+
+    `state` is the only field readers treat as current truth, and it is really
+    just the last thing anything wrote. A mutation that leaves no log line is
+    unreconstructable afterwards: `lode_send_feedback` wrote `running` over a
+    park and the eight hours that followed had no record of why the lode looked
+    alive. Every writer logs, and `via` says which one.
+    """
+    logger.info(f"Lode {lode_id} state={state} status={status} via={via}")
+
+
 def get_git_hash() -> str | None:
     """Get the short git hash of the current HEAD."""
     try:
@@ -927,6 +939,8 @@ class Server:
                 for field in ("state", "status", "failure_kind"):
                     updates.pop(field, None)
             lode.update(updates)
+            if "state" in updates:
+                _log_state_change(lode["id"], updates["state"], updates.get("status", ""), "spawn")
         run_generation = uuid.uuid4().hex
         lode["run_generation"] = run_generation
         lode["oom_scope"] = (
@@ -1220,6 +1234,8 @@ class Server:
         if changed:
             touch(lode)
         save_lodes(self.lodes)
+        if changed:
+            _log_state_change(lode["id"], "error", status, f"terminal_failure:{failure_kind}")
         if changed and broadcast:
             self.broadcast({"type": "lode_updated", "lode": lode})
         return changed
@@ -1342,6 +1358,7 @@ class Server:
             lode["failure_kind"] = None
             lode["state"] = "running"
             lode["status"] = f"Starting {lode.get('stage', '')}"
+            _log_state_change(lode_id, "running", lode["status"], "register_recovery")
         touch(lode)
         save_lodes(self.lodes)
         self.broadcast({"type": "lode_updated", "lode": lode})
@@ -1707,6 +1724,7 @@ class Server:
                 kill_pane(pane)
             lode["state"] = "paused"
             lode["status"] = "Paused by user; worktree retained"
+            _log_state_change(lode_id, "paused", lode["status"], "pause")
             lode["failure_kind"] = None
             lode["active"] = False
             lode["tmux_pane"] = None
@@ -1798,6 +1816,7 @@ class Server:
                         kill_pane(tmux_pane)
                     lode["state"] = "error"
                     lode["status"] = "Killed by user"
+                    _log_state_change(lode_id, "error", "Killed by user", "kill")
                     lode["failure_kind"] = None
                     lode["active"] = False
                     lode["tmux_pane"] = None
@@ -2107,6 +2126,7 @@ class Server:
                 state = "gated"
             updated = update_lode_state(self.lodes, lode_id, state, status)
             if updated:
+                _log_state_change(lode_id, state, status, "feedback")
                 self.broadcast({"type": "lode_updated", "lode": updated})
             if conn:
                 if accepted:
