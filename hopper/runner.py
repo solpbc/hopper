@@ -661,14 +661,27 @@ class BaseRunner:
             if may_dismiss:
                 if last_snapshot is None:
                     logger.warning(f"dismissing without a stable pane capture lode={self.lode_id}")
+                # Every attempt sends the same pair, because Ctrl-D is not a
+                # stronger Ctrl-C -- it is inert. Measured against a live pane:
+                # Ctrl-D exits Claude Code from no state at all (idle prompt,
+                # composer holding unsubmitted text, or the "Exit anyway / Move
+                # to background and exit / Stay" confirmation a Ctrl-C raises
+                # while a tool call is still running). The Ctrl-C pair exits
+                # from every one of those, including that confirmation.
+                #
+                # This deliberately restores the pre-2026-08-08 unbounded retry.
+                # Escalating attempt 2+ to Ctrl-D, with an attempt counter that
+                # never reset, meant the only keystroke that works was sent at
+                # most once per runner: a single mistimed first attempt spent
+                # the rest of the stage pressing a key nothing responds to.
+                # Self-healing on a missed dismissal fell from 84% to 29%.
                 self._dismiss_attempt += 1
-                if self._dismiss_attempt == 1:
-                    logger.debug(f"sending Ctrl-C dismiss keystrokes lode={self.lode_id}")
-                    send_keys(self._pane_id, "C-c")
-                    send_keys(self._pane_id, "C-c")
-                else:
-                    logger.debug(f"sending Ctrl-D dismiss keystroke lode={self.lode_id}")
-                    send_keys(self._pane_id, "C-d")
+                logger.debug(
+                    f"sending Ctrl-C dismiss keystrokes lode={self.lode_id} "
+                    f"attempt={self._dismiss_attempt}"
+                )
+                send_keys(self._pane_id, "C-c")
+                send_keys(self._pane_id, "C-c")
 
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""

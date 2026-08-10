@@ -1526,7 +1526,7 @@ class TestBaseRunnerDismiss:
         mock_send_keys.assert_not_called()
 
     def test_wait_and_dismiss_retries_when_process_survives(self):
-        """Dismiss escalates from a Ctrl-C pair to one Ctrl-D."""
+        """Every retry re-sends the Ctrl-C pair; Ctrl-D exits Claude from no state."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
         runner._pane_id = "%1"
         runner._done.set()
@@ -1542,13 +1542,13 @@ class TestBaseRunnerDismiss:
                 "prompt v1",  # first stability → Ctrl-C
                 "new output",  # screen changed, not stable
                 "prompt v2",
-                "prompt v2",  # second stability → Ctrl-D
+                "prompt v2",  # second stability → another Ctrl-C pair
             ]
         )
 
         def on_send_keys(w, k):
             send_keys_calls.append((w, k))
-            if len(send_keys_calls) == 3:
+            if len(send_keys_calls) == 4:
                 runner._monitor_stop.set()
             return True
 
@@ -1561,8 +1561,40 @@ class TestBaseRunnerDismiss:
         assert send_keys_calls == [
             ("%1", "C-c"),
             ("%1", "C-c"),
-            ("%1", "C-d"),
+            ("%1", "C-c"),
+            ("%1", "C-c"),
         ]
+
+    def test_dismiss_never_sends_ctrl_d(self):
+        """Ctrl-D is inert against Claude Code, so it must never be a retry step.
+
+        Measured against a live pane: Ctrl-D exits from no state -- not an idle
+        prompt, not a composer holding unsubmitted text, not the exit
+        confirmation a Ctrl-C raises while a tool call is running. Sending it
+        instead of the Ctrl-C pair on attempt 2+ is what turned one mistimed
+        dismissal into a permanently stalled stage.
+        """
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._pane_id = "%1"
+        runner._done.set()
+        sends = []
+
+        def on_send_keys(_w, k):
+            sends.append(k)
+            if len(sends) >= 12:
+                runner._monitor_stop.set()
+            return True
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="stable"),
+            patch("hopper.runner.send_keys", side_effect=on_send_keys),
+        ):
+            runner._wait_and_dismiss_claude()
+
+        assert sends, "dismiss sent nothing at all"
+        assert "C-d" not in sends
+        assert set(sends) == {"C-c"}
+        assert len(sends) % 2 == 0, "Ctrl-C must always be sent as a pair"
 
     def test_wait_and_dismiss_acts_after_capture_failure_limit(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
@@ -1670,7 +1702,7 @@ class TestBaseRunnerDismiss:
         assert wait_calls[0] == 1.0
         assert runner._done_at_ms == 2_000
         assert not runner._dismiss_deadline_parked
-        assert [entry.args[1] for entry in send.call_args_list] == ["C-d"]
+        assert [entry.args[1] for entry in send.call_args_list] == ["C-c", "C-c"]
 
     def test_wait_and_dismiss_restarts_stabilization_after_rearm(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
@@ -1721,7 +1753,7 @@ class TestBaseRunnerDismiss:
         park.assert_called_once_with(
             "completion was signalled, but the agent did not exit within 5 min"
         )
-        assert sends == [(4, "C-d")]
+        assert sends == [(4, "C-c"), (4, "C-c")]
 
     def test_parked_completion_ignores_pane_changes_without_rearming(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
