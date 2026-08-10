@@ -156,12 +156,34 @@ records include `status_display`, the human-facing derived status, and
 `status` field remains the stored string; consumers opt into the derived view through
 `status_display`.
 
+`hop lode status` also prints an `unpushed:` line whenever the lode still has a
+worktree — the number of commits on its branch that are **not** reachable from
+`origin/main` (or the first default base that resolves). Read it before you
+believe a finished-looking lode is finished: only `stage: shipped` pushes, so a
+lode that stalled earlier can be complete, committed, clean, and entirely absent
+from the remote. `UNKNOWN` means the comparison could not be made — it never
+means zero.
+
 Restart an inactive lode (error, stuck, or failed ship):
 
 ```bash
 hop lode restart <lode-id>
 hop lode restart <lode-id> --force   # also restarts active lodes with a dead pane
 ```
+
+Kill a lode (the pane and process go; the worktree and branch are retained):
+
+```bash
+hop lode kill <lode-id>
+hop lode kill <lode-id> --force   # kill despite unpushed commits
+hop kill <lode-id>                # alias
+```
+
+**Kill refuses when the branch carries commits that are not on the default
+base**, and it refuses just as hard when it cannot prove the count. A clean
+worktree is not evidence the work is safe — commits merged into a *local* main
+but never pushed still count. The refusal prints the worktree path, the commands
+to inspect and push, and the `--force` escape. Push first, then kill.
 
 Runner spawn problems remain visible in lode status. `spawn refused:` means
 hopper did not launch a duplicate: attach when the recorded pane is live, or

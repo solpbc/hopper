@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -65,6 +66,7 @@ from hopper.lodes import (
     format_park_status,
     format_terminal_failure_status,
     get_lode_dir,
+    get_worktree_dir,
     save_lodes,
 )
 from hopper.projects import Project, load_projects, save_projects
@@ -4383,7 +4385,8 @@ def test_show_alias_unavailable_has_exact_message(capsys):
     assert result == 2
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'missing'. "
+        "Lode status unavailable for 'missing': local could not be probed, "
+        "so this is NOT evidence the lode is gone. "
         "Probes: local=unavailable (server not running at /tmp/server.sock).\n"
     )
     assert captured.err == ""
@@ -4663,7 +4666,8 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
     assert result == 2
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'busy-id'. "
+        "Lode status unavailable for 'busy-id': fedora.local, local could not be probed, "
+        "so this is NOT evidence the lode is gone. "
         "Probes: local=unavailable (server did not respond within 2s); "
         "fedora.local=unreadable.\n"
     )
@@ -4825,7 +4829,8 @@ def test_lode_status_local_unavailable_remote_absent_exits_2(capsys):
     assert result == 2
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'abc'. "
+        "Lode status unavailable for 'abc': local could not be probed, "
+        "so this is NOT evidence the lode is gone. "
         "Probes: local=unavailable (server not running at /tmp/server.sock); "
         "fedora.local=absent.\n"
     )
@@ -4846,7 +4851,8 @@ def test_outside_status_local_unavailable_prints_honest_error(capsys):
     require.assert_not_called()
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'abc'. "
+        "Lode status unavailable for 'abc': local could not be probed, "
+        "so this is NOT evidence the lode is gone. "
         "Probes: local=unavailable (server not running at /tmp/server.sock).\n"
     )
     assert captured.err == ""
@@ -7107,3 +7113,205 @@ def test_check_command_not_found_stops_heartbeat(monkeypatch, capsys):
     assert cmd_check(["--", "hopper-no-such-command-heartbeat"]) == 127
     assert stopped == [True]
     assert "not found" in capsys.readouterr().err
+
+
+# --- unpushed-commit guard on kill -------------------------------------------
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def lode_worktree(temp_config, monkeypatch):
+    """Build a real clone plus lode worktree at the path hopper would use."""
+    if shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+
+    root = temp_config / "git"
+    root.mkdir()
+    remote = root / "origin.git"
+    _git(root, "init", "--bare", "-b", "main", str(remote))
+
+    seed = root / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-b", "main")
+    _git(seed, "config", "user.email", "test@example.com")
+    _git(seed, "config", "user.name", "Test User")
+    (seed / "README.md").write_text("init\n")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-m", "init")
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "-u", "origin", "main")
+
+    clone = root / "clone"
+    _git(root, "clone", str(remote), str(clone))
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "Test User")
+
+    worktree = get_worktree_dir("test1234")
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git(clone, "worktree", "add", str(worktree), "-b", "hopper-test1234")
+
+    def add_commits(n):
+        for i in range(n):
+            (worktree / f"w{i}.txt").write_text(str(i))
+            _git(worktree, "add", ".")
+            _git(worktree, "commit", "-m", f"work {i}")
+
+    return worktree, add_commits
+
+
+def _kill(lode_id, extra=None):
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "running",
+        "active": True,
+        "branch": "hopper-test1234",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.get_lode", return_value=lode),
+        patch("hopper.client.kill_lode", return_value=True) as mock_kill,
+    ):
+        rc = cmd_lode(["kill", lode_id, *(extra or [])])
+    return rc, mock_kill
+
+
+def test_lode_kill_refuses_when_the_branch_has_unpushed_commits(lode_worktree, capsys):
+    _worktree, add_commits = lode_worktree
+    add_commits(11)
+
+    rc, mock_kill = _kill("test1234")
+
+    assert rc == 1
+    mock_kill.assert_not_called()
+    err = capsys.readouterr().err
+    assert "Refusing to kill test1234: 11 commits on hopper-test1234 are not on origin/main." in err
+    assert "push:" in err
+    assert "hop lode kill test1234 --force" in err
+
+
+def test_lode_kill_allows_a_branch_whose_work_is_already_on_the_base(lode_worktree, capsys):
+    _worktree, _add_commits = lode_worktree
+
+    rc, mock_kill = _kill("test1234")
+
+    assert rc == 0
+    mock_kill.assert_called_once()
+    assert "Killed lode test1234" in capsys.readouterr().out
+
+
+def test_lode_kill_force_overrides_the_unpushed_guard(lode_worktree, capsys):
+    _worktree, add_commits = lode_worktree
+    add_commits(2)
+
+    rc, mock_kill = _kill("test1234", ["--force"])
+
+    assert rc == 0
+    mock_kill.assert_called_once()
+    assert "Refusing to kill" not in capsys.readouterr().err
+
+
+def test_lode_kill_refuses_when_the_count_cannot_be_proven(lode_worktree, capsys):
+    _worktree, add_commits = lode_worktree
+    add_commits(1)
+
+    with patch("hopper.git.unpushed_commits", return_value=(None, "origin/main")):
+        rc, mock_kill = _kill("test1234")
+
+    assert rc == 1
+    mock_kill.assert_not_called()
+    assert "could not check whether hopper-test1234" in capsys.readouterr().err
+
+
+def test_lode_kill_singular_commit_reads_naturally(lode_worktree, capsys):
+    _worktree, add_commits = lode_worktree
+    add_commits(1)
+
+    rc, _mock_kill = _kill("test1234")
+
+    assert rc == 1
+    assert "1 commit on hopper-test1234 is not on origin/main." in capsys.readouterr().err
+
+
+# --- status surfaces that would have made the stall visible ------------------
+
+
+@pytest.mark.parametrize(
+    ("unpushed", "expected"),
+    [
+        ({"count": 11, "base": "origin/main"}, "  unpushed: 11 commits NOT on origin/main"),
+        ({"count": 1, "base": "origin/main"}, "  unpushed: 1 commit NOT on origin/main"),
+        (
+            {"count": 0, "base": "origin/main"},
+            "  unpushed: none — every commit is already on origin/main",
+        ),
+        (
+            {"count": None, "base": "origin/main"},
+            "  unpushed: UNKNOWN — could not compare this worktree against origin/main",
+        ),
+    ],
+)
+def test_format_lode_detail_reports_unpushed_commits(make_lode, unpushed, expected):
+    lode = make_lode(id="test1234", branch="hopper-test1234", unpushed=unpushed)
+
+    assert expected in format_lode_detail(lode)
+
+
+def test_format_lode_detail_omits_unpushed_without_a_worktree(make_lode):
+    assert "unpushed:" not in format_lode_detail(make_lode(id="test1234"))
+
+
+def test_lode_status_annotates_unpushed_from_the_owning_host(lode_worktree, capsys, make_lode):
+    _worktree, add_commits = lode_worktree
+    add_commits(3)
+    lode = make_lode(id="test1234", branch="hopper-test1234")
+
+    with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        assert cmd_lode(["status", "test1234"]) == 0
+
+    assert "  unpushed: 3 commits NOT on origin/main" in capsys.readouterr().out
+
+
+def test_progress_line_carries_its_age(make_lode):
+    lode = make_lode(
+        id="test1234",
+        last_progress_summary="make ci — running 8m30s",
+        last_progress_at=current_time_ms() - 2 * 60 * 60 * 1000,
+    )
+
+    detail = format_lode_detail(lode)
+
+    assert "  progress: make ci — running 8m30s (2h ago)" in detail
+
+
+def test_progress_line_without_a_timestamp_stays_bare(make_lode):
+    lode = make_lode(id="test1234", last_progress_summary="make ci — running 8m30s")
+
+    assert "  progress: make ci — running 8m30s\n" in format_lode_detail(lode) + "\n"
+
+
+def test_park_record_renders_as_a_park_not_an_empty_failure(make_lode):
+    """The park record is the durable proof the lifecycle stopped."""
+    recovery = {
+        "parked_at": current_time_ms() - 5 * 60 * 1000,
+        "state": "gated",
+        "stage": "mill",
+        "reason": "completion was signalled, but the agent did not exit within 5 min",
+        "branch": "hopper-test1234",
+        "worktree_path": "/tmp/worktree",
+        "terminated": False,
+    }
+    lode = make_lode(id="test1234", state="running", recovery=recovery)
+
+    detail = format_lode_detail(lode)
+
+    assert "    parked:    5m ago" in detail
+    assert "    agent:     alive, NOT terminated" in detail
+    assert "    stage:     mill" in detail
+    assert "outcome:" not in detail
+    assert "failed_at:" not in detail

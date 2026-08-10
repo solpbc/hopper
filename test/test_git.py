@@ -24,6 +24,7 @@ from hopper.git import (
     is_dirty,
     quarantine_dirty_repo,
     remove_worktree,
+    unpushed_commits,
 )
 
 
@@ -136,6 +137,7 @@ class TestCreateWorktree:
                 cwd="/repo",
                 capture_output=True,
                 text=True,
+                timeout=None,
             ),
             call(
                 [
@@ -242,6 +244,7 @@ class TestCreateWorktree:
                 cwd="/repo",
                 capture_output=True,
                 text=True,
+                timeout=None,
             ),
             call(
                 [
@@ -1344,3 +1347,99 @@ class TestRemoveWorktreeIntegration:
         )
         assert str(worktree_path) not in list_result.stdout
         assert "prunable" not in list_result.stdout
+
+
+class TestUnpushedCommits:
+    """The count that decides whether killing a lode can strand a day of work."""
+
+    def _clone_with_worktree(self, tmp_path, *, branch="main"):
+        remote = _init_git_repo(tmp_path, name="origin.git", branch=branch, bare=True)
+        seed = _init_git_repo(tmp_path, name="seed", branch=branch)
+        _run_git(seed, "remote", "add", "origin", str(remote))
+        _run_git(seed, "push", "-u", "origin", branch)
+
+        clone = tmp_path / "clone"
+        _run_git(tmp_path, "clone", str(remote), str(clone))
+        _run_git(clone, "config", "user.email", "test@example.com")
+        _run_git(clone, "config", "user.name", "Test User")
+
+        worktree = tmp_path / "wt"
+        _run_git(clone, "worktree", "add", str(worktree), "-b", "hopper-testid11")
+        return clone, worktree
+
+    def _commit(self, worktree, name):
+        (worktree / name).write_text(name)
+        _run_git(worktree, "add", ".")
+        _run_git(worktree, "commit", "-m", name)
+
+    def test_counts_commits_absent_from_the_remote_base(self, tmp_path):
+        _clone, worktree = self._clone_with_worktree(tmp_path)
+        for name in ("one.txt", "two.txt", "three.txt"):
+            self._commit(worktree, name)
+
+        assert unpushed_commits(str(worktree)) == (3, "origin/main")
+
+    def test_zero_when_the_branch_adds_nothing(self, tmp_path):
+        _clone, worktree = self._clone_with_worktree(tmp_path)
+
+        assert unpushed_commits(str(worktree)) == (0, "origin/main")
+
+    def test_local_main_does_not_absolve_unpushed_work(self, tmp_path):
+        """Merged-but-unpushed is the dangerous case: the remote ref must win."""
+        clone, worktree = self._clone_with_worktree(tmp_path)
+        self._commit(worktree, "one.txt")
+        _run_git(clone, "merge", "--ff-only", "hopper-testid11")
+
+        count, base = unpushed_commits(str(worktree))
+
+        assert base == "origin/main"
+        assert count == 1
+
+    def test_falls_back_to_a_local_base_without_a_remote(self, tmp_path):
+        repo = _init_git_repo(tmp_path, name="solo", branch="main")
+        worktree = tmp_path / "solo-wt"
+        _run_git(repo, "worktree", "add", str(worktree), "-b", "hopper-testid11")
+        self._commit(worktree, "one.txt")
+
+        assert unpushed_commits(str(worktree)) == (1, "main")
+
+    def test_unknown_rather_than_zero_when_no_base_resolves(self, tmp_path):
+        repo = _init_git_repo(tmp_path, name="odd", branch="trunk")
+        worktree = tmp_path / "odd-wt"
+        _run_git(repo, "worktree", "add", str(worktree), "-b", "hopper-testid11")
+        self._commit(worktree, "one.txt")
+
+        assert unpushed_commits(str(worktree)) == (None, None)
+
+    def test_unknown_when_the_path_is_not_a_worktree(self, tmp_path):
+        assert unpushed_commits(str(tmp_path / "gone")) == (None, None)
+
+    def test_unknown_when_rev_list_fails(self, tmp_path):
+        _clone, worktree = self._clone_with_worktree(tmp_path)
+
+        with patch("hopper.git.subprocess.run") as run:
+            run.side_effect = [
+                MagicMock(returncode=0, stdout="abc123\n"),
+                MagicMock(returncode=128, stdout="", stderr="fatal: bad revision"),
+            ]
+            assert unpushed_commits(str(worktree)) == (None, "origin/main")
+
+    def test_a_slow_host_degrades_to_unknown_rather_than_spending_the_budget(self, tmp_path):
+        """This runs inside an ssh deadline; blowing it is how a live lode reads gone."""
+        _clone, worktree = self._clone_with_worktree(tmp_path)
+
+        with patch("hopper.git.subprocess.run") as run:
+            run.side_effect = [
+                MagicMock(returncode=0, stdout="abc123\n"),
+                subprocess.TimeoutExpired(cmd="git rev-list", timeout=2.0),
+            ]
+            assert unpushed_commits(str(worktree)) == (None, "origin/main")
+
+    def test_probe_calls_are_bounded(self, tmp_path):
+        _clone, worktree = self._clone_with_worktree(tmp_path)
+
+        with patch("hopper.git.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="1\n")
+            unpushed_commits(str(worktree), timeout=0.25)
+
+        assert [call.kwargs["timeout"] for call in run.call_args_list] == [0.25, 0.25]

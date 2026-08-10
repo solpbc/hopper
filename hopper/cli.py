@@ -1580,6 +1580,75 @@ def _load_lode_recovery(lode_id: str) -> dict | None:
         return None
 
 
+def _lode_unpushed(lode_id: str) -> dict | None:
+    """Probe a local lode's worktree for commits that never reached the base.
+
+    Returns None when there is no worktree to lose anything from. Otherwise the
+    record always carries a ``count``, which is None when the comparison could
+    not be made -- callers must not read that as zero.
+    """
+    from hopper.git import unpushed_commits
+    from hopper.lodes import get_worktree_dir
+
+    try:
+        worktree = get_worktree_dir(lode_id)
+        if not worktree.is_dir():
+            return None
+    except OSError as exc:
+        logger.warning(f"Failed to locate worktree for {lode_id}: {exc}")
+        return None
+    count, base = unpushed_commits(str(worktree))
+    return {"count": count, "base": base, "worktree": str(worktree)}
+
+
+def _unpushed_kill_refusal(lode: dict) -> str | None:
+    """Refuse a kill that cannot be shown not to strand unpushed commits.
+
+    Kill retains the worktree and branch, but nothing downstream records that
+    the work was never pushed, and a finished-looking lode is exactly what an
+    operator reaches to clean up. An unprovable answer refuses too: only a
+    verified zero clears the guard.
+    """
+    lode_id = lode["id"]
+    probe = _lode_unpushed(lode_id)
+    if probe is None or probe["count"] == 0:
+        return None
+    count = probe["count"]
+    base = probe["base"] or "origin/main"
+    worktree = probe["worktree"]
+    branch = lode.get("branch", "") or f"hopper-{lode_id}"
+    if count is None:
+        headline = (
+            f"Refusing to kill {lode_id}: could not check whether {branch} carries commits "
+            f"that are not on {base}, so this kill cannot be shown to be safe."
+        )
+    else:
+        headline = (
+            f"Refusing to kill {lode_id}: {count} commit{'' if count == 1 else 's'} "
+            f"on {branch} {'is' if count == 1 else 'are'} not on {base}."
+        )
+    return "\n".join(
+        [
+            headline,
+            f"  worktree: {worktree}",
+            f"  see them: git -C {worktree} log --oneline {base}..HEAD",
+            f"  push:     git -C {worktree} push -u origin {branch}",
+            f"Kill anyway: hop lode kill {lode_id} --force",
+        ]
+    )
+
+
+def _format_unpushed_line(unpushed: dict) -> str:
+    """Render the one status field that makes stranded work visible at a glance."""
+    count = unpushed.get("count")
+    base = unpushed.get("base") or "the default base"
+    if count is None:
+        return f"  unpushed: UNKNOWN — could not compare this worktree against {base}"
+    if count == 0:
+        return f"  unpushed: none — every commit is already on {base}"
+    return f"  unpushed: {count} commit{'' if count == 1 else 's'} NOT on {base}"
+
+
 def format_lode_detail(lode: dict) -> str:
     """Format a lode as a multi-line detailed view."""
     lines = [format_lode_line(lode)]
@@ -1599,7 +1668,11 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(f"  status:   {status_text}")
     progress_text = lode.get("last_progress_summary", "")
     if progress_text:
-        lines.append(f"  progress: {progress_text}")
+        # A progress line with no clock reads as current. This one described a
+        # `make ci` that had finished two hours earlier.
+        progress_at = lode.get("last_progress_at")
+        progress_age = f" ({format_age(progress_at)} ago)" if progress_at else ""
+        lines.append(f"  progress: {progress_text}{progress_age}")
 
     title = lode.get("title", "")
     if title:
@@ -1612,6 +1685,10 @@ def format_lode_detail(lode: dict) -> str:
     branch = lode.get("branch", "")
     if branch:
         lines.append(f"  branch:   {branch}")
+
+    unpushed = lode.get("unpushed")
+    if isinstance(unpushed, dict):
+        lines.append(_format_unpushed_line(unpushed))
 
     created_age = format_age(lode.get("created_at", 0))
     updated_at = lode.get("updated_at", 0) or lode.get("created_at", 0)
@@ -1629,12 +1706,20 @@ def format_lode_detail(lode: dict) -> str:
         snapshot = recovery.get("snapshot", {})
         lines.append("")
         lines.append("  recovery:")
-        lines.append(f"    outcome:   {snapshot.get('outcome', '')}")
-        if snapshot.get("sha"):
-            lines.append(f"    sha:       {snapshot['sha']}")
-        if snapshot.get("git_error"):
-            lines.append(f"    git_error: {snapshot['git_error']}")
-        lines.append(f"    failed_at: {recovery.get('failed_at', '')}")
+        if snapshot or "failed_at" in recovery:
+            lines.append(f"    outcome:   {snapshot.get('outcome', '')}")
+            if snapshot.get("sha"):
+                lines.append(f"    sha:       {snapshot['sha']}")
+            if snapshot.get("git_error"):
+                lines.append(f"    git_error: {snapshot['git_error']}")
+            lines.append(f"    failed_at: {recovery.get('failed_at', '')}")
+        if recovery.get("parked_at"):
+            # A park record is the durable proof the lifecycle stopped. `state:`
+            # above is only the last thing anything wrote, and a later write --
+            # `hop gate feedback` sets `running` -- outlives the park silently.
+            lines.append(f"    parked:    {format_age(recovery['parked_at'])} ago")
+            agent = "terminated" if recovery.get("terminated") else "alive, NOT terminated"
+            lines.append(f"    agent:     {agent}")
         lines.append(f"    stage:     {recovery.get('stage', '')}")
         lines.append(f"    branch:    {recovery.get('branch') or 'unavailable'}")
         lines.append(f"    worktree:  {recovery.get('worktree_path') or 'unavailable'}")
@@ -1657,6 +1742,11 @@ def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) ->
         recovery = _load_lode_recovery(result["canonical_id"])
         if recovery is not None:
             display_lode["recovery"] = recovery
+        # Probed only on the owning host. A remote lookup re-runs this same
+        # command there, so the annotation travels back inside its JSON.
+        unpushed = _lode_unpushed(result["canonical_id"])
+        if unpushed is not None:
+            display_lode["unpushed"] = unpushed
     if json_output:
         display_lode = lode_with_status_annotations(display_lode)
         print(json.dumps(display_lode, indent=2))
@@ -1902,6 +1992,7 @@ def _failed_resolution(
     prefix: str,
     probes: list[str],
     matches: list[tuple[str, str]] | None = None,
+    unreadable: list[str] | None = None,
 ) -> dict:
     """Return a failed resolution with one truthful, actionable message."""
     summary = "; ".join(probes)
@@ -1909,7 +2000,17 @@ def _failed_resolution(
         match_text = ", ".join(f"{host}:{lode_id}" for host, lode_id in matches or [])
         error = f"Ambiguous lode prefix '{prefix}'. Matches: {match_text}. Probes: {summary}."
     elif outcome == "unavailable":
-        error = f"Lode status unavailable for '{prefix}'. Probes: {summary}."
+        # A probe that failed and a source that never had the lode read the same
+        # way in a bare probe list, so the headline has to name the difference:
+        # the search was not exhaustive and absence was not established.
+        sources = ", ".join(sorted(set(unreadable or [])))
+        if sources:
+            error = (
+                f"Lode status unavailable for '{prefix}': {sources} could not be probed, "
+                f"so this is NOT evidence the lode is gone. Probes: {summary}."
+            )
+        else:
+            error = f"Lode status unavailable for '{prefix}'. Probes: {summary}."
     else:
         error = f"Lode '{prefix}' not found. Probes: {summary}."
     return _resolution_result(
@@ -1938,6 +2039,7 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
         )
     ]
     matches: list[tuple[str, dict]] = []
+    unreadable_sources: list[str] = ["local"] if local_outcome == "unavailable" else []
     unavailable = local_outcome == "unavailable"
 
     if local_outcome == "found":
@@ -1951,7 +2053,7 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
     hosts = _remote_hosts()
     if not hosts:
         if unavailable:
-            return _failed_resolution("unavailable", prefix, probes)
+            return _failed_resolution("unavailable", prefix, probes, unreadable=unreadable_sources)
         if matches:
             return _found_resolution(matches[0][1], matches[0][0], probes)
         return _failed_resolution("absent", prefix, probes)
@@ -1975,6 +2077,7 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
             ]
             return _failed_resolution("ambiguous", prefix, probes, found_ids)
         elif state == "unreadable":
+            unreadable_sources.append(cached_host)
             unavailable = True
 
     lock = threading.Lock()
@@ -2005,6 +2108,7 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
         elif state == "ambiguous":
             matches.extend((host, {"id": lode_id}) for lode_id in ambiguity_matches)
         elif state == "unreadable" or thread.is_alive():
+            unreadable_sources.append(host)
             unavailable = True
 
     if exact_matches:
@@ -2016,7 +2120,7 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
         found_ids = [(host, lode["id"]) for host, lode in matches]
         return _failed_resolution("ambiguous", prefix, probes, found_ids)
     if unavailable:
-        return _failed_resolution("unavailable", prefix, probes)
+        return _failed_resolution("unavailable", prefix, probes, unreadable=unreadable_sources)
     if matches:
         host, lode = matches[0]
         if host != "local":
@@ -2336,7 +2440,12 @@ def cmd_lode(args: list[str]) -> int:
     log_p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
     kill_p = subs.add_parser("kill", help="Kill a running lode", exit_on_error=False)
     kill_p.add_argument("lode_id", help="Lode ID to kill")
-    kill_p.add_argument("-f", "--force", action="store_true", help="Force kill (no confirmation)")
+    kill_p.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Kill even when the branch has commits that are not on the default base",
+    )
     peek_p = subs.add_parser("peek", help="Show plain text from a lode pane", exit_on_error=False)
     peek_p.add_argument("lode_id", help="Lode ID to inspect")
     peek_p.add_argument("-n", "--lines", type=int, default=40, help="Number of lines to show")
@@ -2854,6 +2963,11 @@ def cmd_lode(args: list[str]) -> int:
         if lode.get("stage") == "shipped":
             print(f"Lode {lode['id']} has already shipped.")
             return 0
+        if not parsed.force:
+            refusal = _unpushed_kill_refusal(lode)
+            if refusal:
+                print(refusal, file=sys.stderr)
+                return 1
         if not client.kill_lode(socket_path, lode["id"]):
             print(f"Failed to kill lode {lode['id']}")
             return 1
@@ -3102,7 +3216,12 @@ def cmd_kill(args: list[str]) -> int:
     if "-h" in args or "--help" in args:
         p = make_parser("kill", "Kill a running lode (alias for lode kill)")
         p.add_argument("lode_id", help="Lode ID to kill")
-        p.add_argument("-f", "--force", action="store_true", help="Force kill (no confirmation)")
+        p.add_argument(
+            "-f",
+            "--force",
+            action="store_true",
+            help="Kill even when the branch has commits that are not on the default base",
+        )
         try:
             parse_args(p, args)
         except SystemExit:

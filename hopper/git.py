@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 UPSTREAM_REMOTE = "origin"
 DEFAULT_BRANCH_NAMES = ("main", "master")
 GIT_FETCH_TIMEOUT_SEC = 120
+UNPUSHED_PROBE_TIMEOUT_SEC = 2.0
 
 
 def _branch_exists(repo_dir: str, branch_name: str) -> bool | None:
@@ -63,12 +64,14 @@ def _force_delete_branch(repo_dir: str, branch_name: str) -> bool:
 
 
 def _resolve_default_branch(
-    repo_dir: str, *, allow_local: bool
+    repo_dir: str, *, allow_local: bool, timeout: float | None = None
 ) -> tuple[str | None, tuple[str, ...]]:
     """Resolve the first default-branch ref and report every candidate probed.
 
     Remote refs are preferred. Local refs are included only when ``allow_local``
-    is true. This function never fetches.
+    is true. This function never fetches. ``timeout`` bounds each probe for
+    callers running inside someone else's deadline; a timeout raises, so those
+    callers handle it as an unresolvable base.
     """
     remote_candidates = tuple(
         f"{UPSTREAM_REMOTE}/{branch_name}" for branch_name in DEFAULT_BRANCH_NAMES
@@ -80,6 +83,7 @@ def _resolve_default_branch(
             cwd=repo_dir,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             return candidate, candidates
@@ -198,6 +202,65 @@ def create_worktree(
         error = "git command not found"
         logger.error(error)
         return False, error
+
+
+def unpushed_commits(
+    worktree_path: str, *, timeout: float = UNPUSHED_PROBE_TIMEOUT_SEC
+) -> tuple[int | None, str | None]:
+    """Count commits on HEAD that no default base branch already contains.
+
+    Returns ``(count, base_ref)``. ``count`` is None whenever the answer cannot
+    be proven -- the path is not a directory, no default base resolves, or git
+    fails or times out -- and a caller guarding a destructive operation must
+    read None as "this may be losing work", never as zero.
+
+    Remote refs win over local ones (``_resolve_default_branch`` orders them
+    that way), so commits fast-forwarded onto a local main but never pushed
+    still count as unpushed -- which is the case this exists for. This never
+    fetches: a stale base can only over-count, and over-counting is the side
+    that fails safe.
+
+    ``timeout`` bounds each git invocation. This runs inside the same status
+    call a remote host answers under an ssh deadline, and a loaded host that
+    blew that deadline is how a live lode reads as unreadable -- so a slow
+    answer degrades to UNKNOWN rather than spending the caller's budget.
+    """
+    try:
+        if not Path(worktree_path).is_dir():
+            return None, None
+    except OSError as exc:
+        logger.warning(f"failed to stat worktree {worktree_path}: {exc}")
+        return None, None
+    try:
+        base, _candidates = _resolve_default_branch(
+            worktree_path, allow_local=True, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"failed to resolve default branch in {worktree_path}: {exc}")
+        return None, None
+    if base is None:
+        return None, None
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"{base}..HEAD"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"failed to count unpushed commits in {worktree_path}: {exc}")
+        return None, base
+    if result.returncode != 0:
+        logger.warning(
+            f"git rev-list {base}..HEAD failed in {worktree_path}: {result.stderr.strip()}"
+        )
+        return None, base
+    try:
+        return int(result.stdout.strip()), base
+    except ValueError:
+        logger.warning(f"git rev-list {base}..HEAD returned no count in {worktree_path}")
+        return None, base
 
 
 def is_dirty(repo_dir: str) -> bool:
