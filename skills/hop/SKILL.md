@@ -329,6 +329,27 @@ When `hop lode status` shows a lode in `stuck` state, inspect it through hop:
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
 
+**When the SCOPE is the problem, the recovery is kill-and-resubmit — not restart.** Used 4×
+in one session:
+
+    # 1. fix the scope file
+    hop lode kill <lode-id>          # add --force if commits live only in its worktree
+    # 2. resubmit the corrected scope
+
+⚠ **`hop lode restart --force` will not do this.** Its `--force` means *"restart even if
+Claude has already started for this stage"* — it is about the **stage**, not about a parked
+or wrong-premise lode, and it refuses a parked lode. Restart re-runs the lode you already
+have, which is exactly what you do not want when the premise was wrong.
+
+⛔ `hop lode kill` retains **both** the worktree and the branch, so "killed" is not "cleaned
+up": push the branch → verify the SHA from a **second** clone → kill → `git worktree remove
+--force` → confirm with `ls ~/.hopper/worktrees/`. One killed lode with zero commits held
+4.4 GB.
+
+📌 Both verbs are in § Lode management above; the recovery *pattern* is repeated here because
+this is the section a session reads when a lode is stuck, and it was previously findable only
+in the other one.
+
 **Workspace trust is Hopper-managed.** Immediately before opening Claude,
 Hopper records trust in the Claude profile inherited by that lode. Registered
 project roots are trusted exactly; lode worktrees inherit one trust grant on
