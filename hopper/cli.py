@@ -1597,8 +1597,8 @@ def _lode_unpushed(lode_id: str) -> dict | None:
     except OSError as exc:
         logger.warning(f"Failed to locate worktree for {lode_id}: {exc}")
         return None
-    count, base = unpushed_commits(str(worktree))
-    return {"count": count, "base": base, "worktree": str(worktree)}
+    count, basis = unpushed_commits(str(worktree))
+    return {"count": count, "basis": basis, "worktree": str(worktree)}
 
 
 def _unpushed_kill_refusal(lode: dict) -> str | None:
@@ -1614,39 +1614,48 @@ def _unpushed_kill_refusal(lode: dict) -> str | None:
     if probe is None or probe["count"] == 0:
         return None
     count = probe["count"]
-    base = probe["base"] or "origin/main"
     worktree = probe["worktree"]
     branch = lode.get("branch", "") or f"hopper-{lode_id}"
     if count is None:
         headline = (
-            f"Refusing to kill {lode_id}: could not check whether {branch} carries commits "
-            f"that are not on {base}, so this kill cannot be shown to be safe."
+            f"Refusing to kill {lode_id}: could not check {branch} for commits that exist "
+            "only in this worktree, so this kill cannot be shown to be safe."
         )
+        see_them = f"  see them: git -C {worktree} log --oneline @{{u}}..HEAD"
     else:
+        plural = "" if count == 1 else "s"
         headline = (
-            f"Refusing to kill {lode_id}: {count} commit{'' if count == 1 else 's'} "
-            f"on {branch} {'is' if count == 1 else 'are'} not on {base}."
+            f"Refusing to kill {lode_id}: {count} commit{plural} on {branch} "
+            f"exist{'s' if count == 1 else ''} only in this worktree."
         )
+        see_them = f"  see them: git -C {worktree} log --oneline HEAD --not --remotes"
     return "\n".join(
         [
             headline,
             f"  worktree: {worktree}",
-            f"  see them: git -C {worktree} log --oneline {base}..HEAD",
+            see_them,
             f"  push:     git -C {worktree} push -u origin {branch}",
             f"Kill anyway: hop lode kill {lode_id} --force",
         ]
     )
 
 
+def _age_phrase(timestamp_ms: int) -> str:
+    """Render an age as a phrase. `format_age` returns "now", so "now ago" is wrong."""
+    age = format_age(timestamp_ms)
+    return age if age == "now" else f"{age} ago"
+
+
 def _format_unpushed_line(unpushed: dict) -> str:
     """Render the one status field that makes stranded work visible at a glance."""
     count = unpushed.get("count")
-    base = unpushed.get("base") or "the default base"
+    basis = unpushed.get("basis") or "anywhere else"
     if count is None:
-        return f"  unpushed: UNKNOWN — could not compare this worktree against {base}"
+        return "  unpushed: UNKNOWN — could not check this worktree for unpushed commits"
     if count == 0:
-        return f"  unpushed: none — every commit is already on {base}"
-    return f"  unpushed: {count} commit{'' if count == 1 else 's'} NOT on {base}"
+        return f"  unpushed: none — every commit is on {basis}"
+    plural = "" if count == 1 else "s"
+    return f"  unpushed: {count} commit{plural} exist{'s' if count == 1 else ''} ONLY here"
 
 
 def format_lode_detail(lode: dict) -> str:
@@ -1671,7 +1680,7 @@ def format_lode_detail(lode: dict) -> str:
         # A progress line with no clock reads as current. This one described a
         # `make ci` that had finished two hours earlier.
         progress_at = lode.get("last_progress_at")
-        progress_age = f" ({format_age(progress_at)} ago)" if progress_at else ""
+        progress_age = f" ({_age_phrase(progress_at)})" if progress_at else ""
         lines.append(f"  progress: {progress_text}{progress_age}")
 
     title = lode.get("title", "")
@@ -1694,7 +1703,7 @@ def format_lode_detail(lode: dict) -> str:
     updated_at = lode.get("updated_at", 0) or lode.get("created_at", 0)
     updated_age = format_age(updated_at)
     pane_activity_at = lode.get("last_pane_activity_at")
-    activity_text = f"{format_age(pane_activity_at)} ago" if pane_activity_at else "unmeasured"
+    activity_text = _age_phrase(pane_activity_at) if pane_activity_at else "unmeasured"
     lines.append(f"  created:  {created_age} ago")
     lines.append(f"  updated:  {updated_age} ago")
     lines.append(f"  activity: {activity_text}")
@@ -1717,7 +1726,7 @@ def format_lode_detail(lode: dict) -> str:
             # A park record is the durable proof the lifecycle stopped. `state:`
             # above is only the last thing anything wrote, and a later write --
             # `hop gate feedback` sets `running` -- outlives the park silently.
-            lines.append(f"    parked:    {format_age(recovery['parked_at'])} ago")
+            lines.append(f"    parked:    {_age_phrase(recovery['parked_at'])}")
             agent = "terminated" if recovery.get("terminated") else "alive, NOT terminated"
             lines.append(f"    agent:     {agent}")
         lines.append(f"    stage:     {recovery.get('stage', '')}")
@@ -2444,7 +2453,7 @@ def cmd_lode(args: list[str]) -> int:
         "-f",
         "--force",
         action="store_true",
-        help="Kill even when the branch has commits that are not on the default base",
+        help="Kill even when commits exist only in this lode's worktree",
     )
     peek_p = subs.add_parser("peek", help="Show plain text from a lode pane", exit_on_error=False)
     peek_p.add_argument("lode_id", help="Lode ID to inspect")
@@ -3220,7 +3229,7 @@ def cmd_kill(args: list[str]) -> int:
             "-f",
             "--force",
             action="store_true",
-            help="Kill even when the branch has commits that are not on the default base",
+            help="Kill even when commits exist only in this lode's worktree",
         )
         try:
             parse_args(p, args)

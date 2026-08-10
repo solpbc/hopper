@@ -7190,7 +7190,10 @@ def test_lode_kill_refuses_when_the_branch_has_unpushed_commits(lode_worktree, c
     assert rc == 1
     mock_kill.assert_not_called()
     err = capsys.readouterr().err
-    assert "Refusing to kill test1234: 11 commits on hopper-test1234 are not on origin/main." in err
+    assert (
+        "Refusing to kill test1234: 11 commits on hopper-test1234 "
+        "exist only in this worktree." in err
+    )
     assert "push:" in err
     assert "hop lode kill test1234 --force" in err
 
@@ -7203,6 +7206,19 @@ def test_lode_kill_allows_a_branch_whose_work_is_already_on_the_base(lode_worktr
     assert rc == 0
     mock_kill.assert_called_once()
     assert "Killed lode test1234" in capsys.readouterr().out
+
+
+def test_lode_kill_allows_a_branch_that_was_pushed_but_not_merged(lode_worktree, capsys):
+    """Pushing the branch is the documented way to make a stalled lode safe."""
+    worktree, add_commits = lode_worktree
+    add_commits(4)
+    _git(worktree, "push", "-u", "origin", "hopper-test1234")
+
+    rc, mock_kill = _kill("test1234")
+
+    assert rc == 0
+    mock_kill.assert_called_once()
+    assert "Refusing to kill" not in capsys.readouterr().err
 
 
 def test_lode_kill_force_overrides_the_unpushed_guard(lode_worktree, capsys):
@@ -7220,12 +7236,12 @@ def test_lode_kill_refuses_when_the_count_cannot_be_proven(lode_worktree, capsys
     _worktree, add_commits = lode_worktree
     add_commits(1)
 
-    with patch("hopper.git.unpushed_commits", return_value=(None, "origin/main")):
+    with patch("hopper.git.unpushed_commits", return_value=(None, "a remote branch")):
         rc, mock_kill = _kill("test1234")
 
     assert rc == 1
     mock_kill.assert_not_called()
-    assert "could not check whether hopper-test1234" in capsys.readouterr().err
+    assert "could not check hopper-test1234 for commits" in capsys.readouterr().err
 
 
 def test_lode_kill_singular_commit_reads_naturally(lode_worktree, capsys):
@@ -7235,7 +7251,7 @@ def test_lode_kill_singular_commit_reads_naturally(lode_worktree, capsys):
     rc, _mock_kill = _kill("test1234")
 
     assert rc == 1
-    assert "1 commit on hopper-test1234 is not on origin/main." in capsys.readouterr().err
+    assert "1 commit on hopper-test1234 exists only in this worktree." in capsys.readouterr().err
 
 
 # --- status surfaces that would have made the stall visible ------------------
@@ -7244,15 +7260,25 @@ def test_lode_kill_singular_commit_reads_naturally(lode_worktree, capsys):
 @pytest.mark.parametrize(
     ("unpushed", "expected"),
     [
-        ({"count": 11, "base": "origin/main"}, "  unpushed: 11 commits NOT on origin/main"),
-        ({"count": 1, "base": "origin/main"}, "  unpushed: 1 commit NOT on origin/main"),
         (
-            {"count": 0, "base": "origin/main"},
-            "  unpushed: none — every commit is already on origin/main",
+            {"count": 11, "basis": "a remote branch"},
+            "  unpushed: 11 commits exist ONLY here",
         ),
         (
-            {"count": None, "base": "origin/main"},
-            "  unpushed: UNKNOWN — could not compare this worktree against origin/main",
+            {"count": 1, "basis": "a remote branch"},
+            "  unpushed: 1 commit exists ONLY here",
+        ),
+        (
+            {"count": 0, "basis": "a remote branch"},
+            "  unpushed: none — every commit is on a remote branch",
+        ),
+        (
+            {"count": 0, "basis": "main"},
+            "  unpushed: none — every commit is on main",
+        ),
+        (
+            {"count": None, "basis": "a remote branch"},
+            "  unpushed: UNKNOWN — could not check this worktree for unpushed commits",
         ),
     ],
 )
@@ -7274,7 +7300,7 @@ def test_lode_status_annotates_unpushed_from_the_owning_host(lode_worktree, caps
     with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
         assert cmd_lode(["status", "test1234"]) == 0
 
-    assert "  unpushed: 3 commits NOT on origin/main" in capsys.readouterr().out
+    assert "  unpushed: 3 commits exist ONLY here" in capsys.readouterr().out
 
 
 def test_progress_line_carries_its_age(make_lode):
@@ -7315,3 +7341,19 @@ def test_park_record_renders_as_a_park_not_an_empty_failure(make_lode):
     assert "    stage:     mill" in detail
     assert "outcome:" not in detail
     assert "failed_at:" not in detail
+
+
+def test_ages_under_a_minute_do_not_read_as_now_ago(make_lode):
+    now = current_time_ms()
+    lode = make_lode(
+        id="test1234",
+        last_progress_summary="make ci — running 4m00s",
+        last_progress_at=now,
+        last_pane_activity_at=now,
+    )
+
+    detail = format_lode_detail(lode)
+
+    assert "  progress: make ci — running 4m00s (now)" in detail
+    assert "  activity: now" in detail.splitlines()
+    assert "now ago" not in detail

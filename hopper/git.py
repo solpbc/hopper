@@ -204,21 +204,42 @@ def create_worktree(
         return False, error
 
 
+def _git_probe(
+    worktree_path: str, args: list[str], timeout: float | None
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one bounded read-only git probe, returning None if it could not run."""
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"git {' '.join(args)} failed in {worktree_path}: {exc}")
+        return None
+
+
 def unpushed_commits(
     worktree_path: str, *, timeout: float = UNPUSHED_PROBE_TIMEOUT_SEC
 ) -> tuple[int | None, str | None]:
-    """Count commits on HEAD that no default base branch already contains.
+    """Count commits that exist only in this worktree.
 
-    Returns ``(count, base_ref)``. ``count`` is None whenever the answer cannot
-    be proven -- the path is not a directory, no default base resolves, or git
-    fails or times out -- and a caller guarding a destructive operation must
-    read None as "this may be losing work", never as zero.
+    Returns ``(count, basis)``. ``count`` is None whenever the answer cannot be
+    proven -- the path is not a directory, no basis resolves, or git fails or
+    times out -- and a caller guarding a destructive operation must read None as
+    "this may be losing work", never as zero.
 
-    Remote refs win over local ones (``_resolve_default_branch`` orders them
-    that way), so commits fast-forwarded onto a local main but never pushed
-    still count as unpushed -- which is the case this exists for. This never
-    fetches: a stale base can only over-count, and over-counting is the side
-    that fails safe.
+    The question is durability, not landing: a commit reachable from any
+    remote-tracking ref has a copy somewhere else, even if it has not been
+    merged. Anything else lives on this disk alone. Counting against the default
+    base instead would keep flagging a branch that was pushed precisely to make
+    it safe, and a guard people routinely override stops being read.
+
+    A project with no remote at all falls back to its local default branch,
+    where "not merged" is the only durability question there is. This never
+    fetches: a stale view can only over-count, which is the side that fails safe.
 
     ``timeout`` bounds each git invocation. This runs inside the same status
     call a remote host answers under an ssh deadline, and a loaded host that
@@ -231,36 +252,38 @@ def unpushed_commits(
     except OSError as exc:
         logger.warning(f"failed to stat worktree {worktree_path}: {exc}")
         return None, None
-    try:
-        base, _candidates = _resolve_default_branch(
-            worktree_path, allow_local=True, timeout=timeout
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning(f"failed to resolve default branch in {worktree_path}: {exc}")
+
+    remotes = _git_probe(worktree_path, ["for-each-ref", "--count=1", "refs/remotes"], timeout)
+    if remotes is None or remotes.returncode != 0:
         return None, None
-    if base is None:
-        return None, None
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", f"{base}..HEAD"],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning(f"failed to count unpushed commits in {worktree_path}: {exc}")
-        return None, base
+
+    if remotes.stdout.strip():
+        basis = "a remote branch"
+        rev_list_args = ["rev-list", "--count", "HEAD", "--not", "--remotes"]
+    else:
+        try:
+            base, _candidates = _resolve_default_branch(
+                worktree_path, allow_local=True, timeout=timeout
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(f"failed to resolve default branch in {worktree_path}: {exc}")
+            return None, None
+        if base is None:
+            return None, None
+        basis = base
+        rev_list_args = ["rev-list", "--count", f"{base}..HEAD"]
+
+    result = _git_probe(worktree_path, rev_list_args, timeout)
+    if result is None:
+        return None, basis
     if result.returncode != 0:
-        logger.warning(
-            f"git rev-list {base}..HEAD failed in {worktree_path}: {result.stderr.strip()}"
-        )
-        return None, base
+        logger.warning(f"unpushed count failed in {worktree_path}: {result.stderr.strip()}")
+        return None, basis
     try:
-        return int(result.stdout.strip()), base
+        return int(result.stdout.strip()), basis
     except ValueError:
-        logger.warning(f"git rev-list {base}..HEAD returned no count in {worktree_path}")
-        return None, base
+        logger.warning(f"unpushed count returned no number in {worktree_path}")
+        return None, basis
 
 
 def is_dirty(repo_dir: str) -> bool:
