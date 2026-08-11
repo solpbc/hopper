@@ -66,11 +66,14 @@ hop -H local lode list
 ```
 
 `hop remote set` replaces the ordered pool, deduplicating hosts by first
-appearance. `hop remote list --json` returns
-`{"remotes": [{"project": str, "hosts": [str, ...]}]}`. In Hopper JSON,
-`host` is always one selected or resident host; `hosts` is always the complete
-pool. `hop remote set` refuses active local projects, so disable a moved project
-first.
+appearance. Host values beginning with `-`, containing control characters, or
+equal to the reserved local-source name `local` are refused. `hop remote list
+--json` returns
+`{"remotes": [{"project": str, "hosts": [str, ...]}]}`. In JSON output,
+`host` on session and create results is one selected or resident host; inside
+`unavailable_hosts`, it is the source that failed. `hosts` is always the
+complete pool. `hop remote set` refuses active local projects, so disable a
+moved project first.
 
 Pooled readiness depends on `hop project list --json` being installed on every
 remote host. Upgrade the fleet after this version lands. An older host probes as
@@ -305,12 +308,13 @@ hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
 
 In the ship stage, `hop processed` runs an independent landing proof against the
-canonical lode worktree. The worktree must be clean, and HEAD must be contained
-in a freshly fetched upstream `main` or `master`. A repository confirmed to have
-no `origin` still must be clean, and Hopper does not claim push verification.
-Hopper verifies only: it never merges, rebases, commits, or pushes. If completion
-is refused, follow the printed recovery command and retry `hop processed` only
-after the repository satisfies the proof.
+canonical session worktree. The worktree must be clean, and HEAD must be
+contained in freshly fetched upstream `main`, falling back to upstream `master`
+only when `main` is absent. Without `origin`, the same stable, clean HEAD must be
+contained in local `main`, or local `master` only when `main` is absent.
+`hop processed` verifies only: it never merges, rebases, commits, or pushes. If
+completion is refused, follow the printed recovery guidance and retry
+`hop processed` only after the repository satisfies the proof.
 
 ## Responding to a gate
 

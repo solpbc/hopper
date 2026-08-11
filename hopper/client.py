@@ -472,9 +472,9 @@ def read_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
     return None
 
 
-def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
-    """List all active lodes, returning an empty list when unavailable."""
-    return read_lodes(socket_path, timeout=timeout) or []
+def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
+    """List active lodes without collapsing an unavailable server to empty."""
+    return read_lodes(socket_path, timeout=timeout)
 
 
 def read_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
@@ -491,9 +491,9 @@ def read_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] |
     return None
 
 
-def list_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
-    """List archived lodes, returning an empty list when unavailable."""
-    return read_archived_lodes(socket_path, timeout=timeout) or []
+def list_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
+    """List archived lodes without collapsing an unavailable server to empty."""
+    return read_archived_lodes(socket_path, timeout=timeout)
 
 
 def create_lode(

@@ -201,6 +201,44 @@ def _request_local_reconcile(state: dict, lid: str | None = None) -> None:
         state["condition"].notify()
 
 
+def _probe_remote_observation(
+    lid: str,
+    host: str,
+    probe_timeout_s: float,
+    probe_remote: Callable,
+) -> dict:
+    """Return one normalized remote observation without mutating supervisor state."""
+    try:
+        snapshot, probe_state = probe_remote(host, lid, timeout=probe_timeout_s)
+        if probe_state == "found":
+            kind = "found"
+            detail = ""
+        elif probe_state == "absent":
+            kind = "absent"
+            detail = "lode absent"
+        else:
+            kind = "unreadable"
+            detail = "remote status unreadable"
+        return {
+            "id": lid,
+            "kind": kind,
+            "payload": snapshot,
+            "detail": detail,
+            "failure_key": kind,
+            "observed_ts": _monotonic(),
+        }
+    except Exception as error:
+        logger.debug("Unexpected remote observer error for %s on %s", lid, host, exc_info=True)
+        return {
+            "id": lid,
+            "kind": "observer_error",
+            "payload": None,
+            "detail": f"unexpected {type(error).__name__}",
+            "failure_key": f"observer_error:{type(error).__name__}",
+            "observed_ts": _monotonic(),
+        }
+
+
 def _remote_worker(
     state: dict,
     lid: str,
@@ -209,66 +247,73 @@ def _remote_worker(
     probe_timeout_s: float,
     probe_remote: Callable,
 ) -> None:
-    """Post every bounded remote probe result without classifying it."""
+    """Post every bounded remote probe result for one lode."""
     while not state["stop_event"].is_set():
         with state["condition"]:
             if state["shutdown"] or lid not in state["pending"]:
                 return
-        try:
-            snapshot, probe_state = probe_remote(host, lid, timeout=probe_timeout_s)
-            if probe_state == "found":
-                kind = "found"
-                detail = ""
-            elif probe_state == "absent":
-                kind = "absent"
-                detail = "lode absent"
-            else:
-                kind = "unreadable"
-                detail = "remote status unreadable"
-            observation = {
-                "id": lid,
-                "kind": kind,
-                "payload": snapshot,
-                "detail": detail,
-                "failure_key": kind,
-                "observed_ts": _monotonic(),
-            }
-        except Exception as error:
-            logger.debug("Unexpected remote observer error for %s on %s", lid, host, exc_info=True)
-            observation = {
-                "id": lid,
-                "kind": "observer_error",
-                "payload": None,
-                "detail": f"unexpected {type(error).__name__}",
-                "failure_key": f"observer_error:{type(error).__name__}",
-                "observed_ts": _monotonic(),
-            }
-        _post_observation(state, observation)
+        _post_observation(
+            state,
+            _probe_remote_observation(lid, host, probe_timeout_s, probe_remote),
+        )
         if state["stop_event"].wait(interval_s):
             return
 
 
+def _remote_worker_group(
+    state: dict,
+    assignments: list[tuple[str, str]],
+    interval_s: float,
+    probe_timeout_s: float,
+    probe_remote: Callable,
+) -> None:
+    """Observe a bounded shard of remote lodes from one reusable worker."""
+    while not state["stop_event"].is_set():
+        any_pending = False
+        for lid, host in assignments:
+            with state["condition"]:
+                if state["shutdown"]:
+                    return
+                pending = lid in state["pending"]
+            if not pending:
+                continue
+            any_pending = True
+            _post_observation(
+                state,
+                _probe_remote_observation(lid, host, probe_timeout_s, probe_remote),
+            )
+        if not any_pending or state["stop_event"].wait(interval_s):
+            return
+
+
 def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
-    """Start one daemon observer for each pending remote lode."""
-    for lid in list(state["pending"]):
-        record = state["records"][lid]
-        if not record["remote"]:
-            continue
+    """Start a fixed-size set of daemon observers for pending remote lodes."""
+    assignments = [
+        (lid, state["records"][lid]["host"])
+        for lid in state["pending"]
+        if state["records"][lid]["remote"]
+    ]
+    if not assignments:
+        return
+    worker_count = min(remote.REMOTE_MAX_WORKERS, len(assignments))
+    shards: list[list[tuple[str, str]]] = [[] for _ in range(worker_count)]
+    for index, assignment in enumerate(assignments):
+        shards[index % worker_count].append(assignment)
+    for index, shard in enumerate(shards):
         thread = threading.Thread(
-            target=_remote_worker,
+            target=_remote_worker_group,
             args=(
                 state,
-                lid,
-                record["host"],
+                shard,
                 state["poll_s"],
                 state["probe_timeout_s"],
                 probe_remote,
             ),
             daemon=True,
-            name=f"wait-remote-{lid}",
+            name=f"wait-remote-{index}",
         )
         thread.start()
-        state["workers"][lid] = thread
+        state["workers"][f"group-{index}"] = thread
 
 
 def _stop_remote_workers(state: dict) -> None:

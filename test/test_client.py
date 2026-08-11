@@ -188,10 +188,10 @@ def test_read_lodes_preserves_valid_lists(socket_path, lodes):
     "response",
     [None, {"type": "wrong", "lodes": []}, {"type": "lode_list", "lodes": "bad"}],
 )
-def test_read_lodes_preserves_unavailable_while_legacy_list_degrades(socket_path, response):
+def test_lode_list_wrappers_preserve_unavailable(socket_path, response):
     with patch("hopper.client.send_message", return_value=response):
         assert read_lodes(socket_path) is None
-        assert list_lodes(socket_path) == []
+        assert list_lodes(socket_path) is None
 
 
 @pytest.mark.parametrize("lodes", [[], [{"id": "archived-id"}]])
@@ -204,7 +204,7 @@ def test_read_archived_lodes_preserves_valid_lists(socket_path, lodes):
 def test_read_archived_lodes_returns_none_when_unreachable(socket_path):
     with patch("hopper.client.send_message", return_value=None):
         assert read_archived_lodes(socket_path) is None
-        assert list_archived_lodes(socket_path) == []
+        assert list_archived_lodes(socket_path) is None
 
 
 @pytest.mark.parametrize(

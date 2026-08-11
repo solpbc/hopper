@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -30,6 +31,7 @@ REMOTE_CREATE_TIMEOUT_SEC = 180.0
 REMOTE_SET_PING_TIMEOUT_SEC = 15.0
 REMOTE_CACHE_LOCK_TIMEOUT_SEC = 5.0
 REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC = 0.05
+REMOTE_MAX_WORKERS = 16
 
 RemoteRunner = Callable[..., subprocess.CompletedProcess[str]]
 FanoutResult = TypeVar("FanoutResult")
@@ -106,6 +108,8 @@ def run_remote_streaming(host: str, hop_args: list[str]) -> int:
 
 def _remote_command(host: str, hop_args: list[str], *, unbuffered: bool = False) -> list[str]:
     """Build the ssh argv for one remote hop invocation."""
+    if not _valid_host(host):
+        raise ValueError(f"invalid remote host: {host!r}")
     quoted_args = " ".join(_quote_remote_arg(arg) for arg in hop_args)
     remote_command = 'export HOP_NO_ROUTE=1; exec "$HOME/.local/bin/hop"'
     if unbuffered:
@@ -120,8 +124,8 @@ def _remote_command(host: str, hop_args: list[str], *, unbuffered: bool = False)
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=10",
-        host,
         "--",
+        host,
         remote_command,
     ]
 
@@ -135,18 +139,27 @@ def _quote_remote_arg(arg: str) -> str:
     return shlex.quote(arg)
 
 
+def _valid_host(host: object) -> bool:
+    """Reject SSH option-like, sentinel-conflicting, or control-bearing hosts."""
+    return (
+        isinstance(host, str)
+        and bool(host)
+        and host == host.strip()
+        and not host.startswith("-")
+        and host != "local"
+        and not any(unicodedata.category(character) == "Cc" for character in host)
+    )
+
+
 def _normalized_pool(value: object) -> list[str] | None:
     """Validate one configured host pool without rewriting its entries."""
     if not isinstance(value, list) or not value:
         return None
     hosts: list[str] = []
     for host in value:
-        if not isinstance(host, str):
+        if not _valid_host(host):
             return None
-        normalized = host.strip()
-        if not normalized or host != normalized:
-            return None
-        hosts.append(host)
+        hosts.append(host)  # type: ignore[arg-type]
     if len(set(hosts)) != len(hosts):
         return None
     return hosts
@@ -280,18 +293,59 @@ def _validate_project_readiness(
     return None
 
 
+def validate_lode_record(
+    raw: object,
+    *,
+    expected_id: str | None = None,
+    canonical_id: bool = True,
+) -> dict | None:
+    """Return one copied lode only when its routing-critical fields are typed."""
+    if not isinstance(raw, dict):
+        return None
+    lode_id = raw.get("id")
+    valid_id = (
+        is_canonical_lode_id(lode_id)
+        if canonical_id
+        else isinstance(lode_id, str) and bool(lode_id)
+    )
+    if not valid_id or (expected_id is not None and lode_id != expected_id):
+        return None
+    if not all(
+        isinstance(raw.get(field), str) for field in ("project", "stage", "state", "status")
+    ):
+        return None
+    if not isinstance(raw.get("active"), bool):
+        return None
+    return dict(raw)
+
+
+def validate_lode_records(raw: object, *, canonical_ids: bool = True) -> list[dict] | None:
+    """Validate a complete lode collection; one malformed row rejects the source."""
+    if not isinstance(raw, list):
+        return None
+    validated: list[dict] = []
+    for row in raw:
+        lode = validate_lode_record(row, canonical_id=canonical_ids)
+        if lode is None:
+            return None
+        validated.append(lode)
+    return validated
+
+
 def _validate_lode_inventory(
     payload: dict[str, object],
+    *,
+    canonical_ids: bool = True,
 ) -> tuple[list[dict] | None, str | None]:
     """Validate the strict lode-list contract shared by probing and discovery."""
     lodes = payload.get("lodes")
     if set(payload) != {"lodes"} or not isinstance(lodes, list):
         return None, "lode inventory violated its JSON contract"
 
-    for lode in lodes:
-        if not isinstance(lode, dict) or not isinstance(lode.get("active"), bool):
-            return None, "lode inventory contained a record without a boolean active field"
-    return [dict(lode) for lode in lodes], None
+    validated = validate_lode_records(lodes, canonical_ids=canonical_ids)
+    if validated is None:
+        return None, "lode inventory contained a malformed lode record"
+    return validated, None
 
 
 def _inventory_load(
@@ -419,7 +473,7 @@ def _discover_host(
         return HostDiscovery(host, (), "lode listing returned malformed JSON")
     if not isinstance(payload, dict):
         return HostDiscovery(host, (), "lode inventory violated its JSON contract")
-    rows, reason = _validate_lode_inventory(payload)
+    rows, reason = _validate_lode_inventory(payload, canonical_ids=host != "local")
     if reason is not None:
         return HostDiscovery(host, (), reason)
     assert rows is not None
@@ -440,11 +494,16 @@ def _bounded_host_fanout(
         return []
 
     deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SEC
-    executor = ThreadPoolExecutor(max_workers=len(ordered_hosts))
-    futures = {executor.submit(operation, host): host for host in ordered_hosts}
+    executor = ThreadPoolExecutor(max_workers=min(REMOTE_MAX_WORKERS, len(ordered_hosts)))
+    futures = {}
+    results: dict[str, FanoutResult] = {}
     try:
+        for host in ordered_hosts:
+            try:
+                futures[executor.submit(operation, host)] = host
+            except Exception as error:
+                results[host] = unexpected(host, error)
         done, pending = wait(futures, timeout=max(0.0, deadline - monotonic()))
-        results: dict[str, FanoutResult] = {}
         for future in done:
             host = futures[future]
             try:
@@ -567,12 +626,7 @@ def _read_lode_cache() -> tuple[dict[str, dict], bool]:
             raise LodeCacheError(path, "wrong_shape")
         host = entry.get("host")
         project = entry.get("project")
-        if (
-            not isinstance(host, str)
-            or not host.strip()
-            or host != host.strip()
-            or not isinstance(project, str)
-        ):
+        if not _valid_host(host) or not isinstance(project, str):
             raise LodeCacheError(path, "wrong_shape")
         has_created_ms = "created_ms" in entry
         has_created_at = "created_at" in entry
@@ -583,7 +637,7 @@ def _read_lode_cache() -> tuple[dict[str, dict], bool]:
             raise LodeCacheError(path, "wrong_shape")
         if "last_seen_ms" in entry and not _valid_timestamp(entry["last_seen_ms"]):
             raise LodeCacheError(path, "wrong_shape")
-        needs_migration = needs_migration or has_created_at
+        needs_migration = needs_migration or has_created_at or "last_seen_ms" not in entry
         cache[lode_id] = dict(entry)
     return cache, needs_migration
 
@@ -595,6 +649,7 @@ def _migrate_lode_cache(cache: dict[str, dict]) -> dict[str, dict]:
         migrated_entry = dict(entry)
         if "created_at" in migrated_entry:
             migrated_entry["created_ms"] = migrated_entry.pop("created_at")
+        migrated_entry.setdefault("last_seen_ms", migrated_entry["created_ms"])
         migrated[lode_id] = migrated_entry
     return migrated
 
@@ -610,7 +665,13 @@ def _save_lode_cache(cache: dict[str, dict]) -> None:
         with os.fdopen(fd, "w") as stream:
             stream.write(json.dumps(cache, indent=2, sort_keys=True) + "\n")
             stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp, path)
+        directory_fd = os.open(data_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         try:
             tmp.unlink(missing_ok=True)
@@ -624,8 +685,8 @@ def prune_lode_cache(cache: dict[str, dict], now_ms: int | None = None) -> dict[
     now = current_time_ms() if now_ms is None else now_ms
     pruned: dict[str, dict] = {}
     for lode_id, entry in cache.items():
-        created = entry["created_ms"]
-        if now - created < REMOTE_LODE_CACHE_MAX_AGE_MS:
+        last_seen = entry.get("last_seen_ms", entry["created_ms"])
+        if now - last_seen < REMOTE_LODE_CACHE_MAX_AGE_MS:
             pruned[lode_id] = entry
     return pruned
 
@@ -641,22 +702,20 @@ def remember_lode(
     created = now if created_ms is None else created_ms
     if (
         not is_canonical_lode_id(lode_id)
-        or not isinstance(host, str)
-        or not host.strip()
-        or host != host.strip()
+        or not _valid_host(host)
         or not isinstance(project, str)
         or not _valid_timestamp(created)
     ):
         raise LodeCacheError(remote_lode_cache_path(), "wrong_shape")
     with _lode_cache_lock():
-        cache, needs_migration = _read_lode_cache()
+        cache, _needs_migration = _read_lode_cache()
         migrated = _migrate_lode_cache(cache)
         cache = prune_lode_cache(migrated, now)
-        changed = needs_migration or cache != migrated
         existing = cache.get(lode_id)
         if existing and existing.get("host") == host:
-            if changed:
-                _save_lode_cache(cache)
+            existing["project"] = project
+            existing["last_seen_ms"] = now
+            _save_lode_cache(cache)
             return
 
         if existing and "created_ms" in existing:
@@ -668,3 +727,17 @@ def remember_lode(
             "last_seen_ms": now,
         }
         _save_lode_cache(cache)
+
+
+def forget_lode(lode_id: str) -> bool:
+    """Forget one confirmed-stale resident route under the cache lock."""
+    if not is_canonical_lode_id(lode_id):
+        raise LodeCacheError(remote_lode_cache_path(), "wrong_shape")
+    with _lode_cache_lock():
+        cache, _needs_migration = _read_lode_cache()
+        cache = _migrate_lode_cache(cache)
+        if lode_id not in cache:
+            return False
+        del cache[lode_id]
+        _save_lode_cache(cache)
+        return True

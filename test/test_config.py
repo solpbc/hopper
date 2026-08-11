@@ -171,7 +171,7 @@ def test_transaction_fsyncs_and_publishes_unique_temp(temp_config, monkeypatch):
         stored["name"] = "sol"
 
     assert config.load_config() == {"name": "sol"}
-    assert len(fsync_calls) == 1
+    assert len(fsync_calls) == 2
     assert not list(temp_config.glob("config.json.*.tmp"))
 
 

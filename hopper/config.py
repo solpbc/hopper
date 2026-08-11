@@ -111,6 +111,11 @@ def _publish_config(data: dict[str, object], path: Path) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException as exc:
         if fd >= 0:
             try:

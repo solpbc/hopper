@@ -973,6 +973,19 @@ def test_lode_list_empty(capsys):
     assert "No active lodes" in out
 
 
+@pytest.mark.parametrize("rows", [None, [{"id": "abc23456", "active": False}]])
+def test_lode_list_refuses_unavailable_or_malformed_server_rows(rows, capsys):
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=rows),
+    ):
+        assert cmd_lode(["list", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "server response was missing or malformed" in captured.err
+
+
 def test_lode_list_with_lodes(capsys):
     """List shows lodes sorted by stage order with correct icons."""
     lodes = [
@@ -3754,7 +3767,7 @@ def test_processed_help(capsys):
     assert "usage: hop processed" in captured.out
     help_text = " ".join(captured.out.split())
     assert "canonical worktree is clean" in help_text
-    assert "freshly fetched upstream main or master" in help_text
+    assert "freshly fetched when origin exists" in help_text
     assert "never merges, rebases, commits, or pushes" in help_text
 
 
@@ -3929,14 +3942,6 @@ def test_processed_non_ship_stage_never_runs_landing_proof(temp_config, stage):
             "ancestry_contained",
             "HEAD is contained in freshly fetched origin/main",
         ),
-        ShipLandingVerdict(
-            "clean",
-            "origin_absent",
-            None,
-            "remote_detection_origin_absent",
-            "canonical worktree is clean; origin is not configured, so push containment "
-            "was not verified",
-        ),
     ],
 )
 def test_processed_ship_accepts_proven_landing_without_extra_claims(
@@ -4008,7 +4013,7 @@ def test_ship_landing_recovery_mapping_covers_every_literal_cause(tmp_path):
     assert len(hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE) == len(cause_values)
     assert set(hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE) == set(cause_values)
     for cause in cause_values:
-        if cause.startswith(("worktree_", "cleanliness_")):
+        if cause.startswith(("worktree_", "cleanliness_", "head_")):
             expected_kind = "status"
         elif cause.startswith("remote_detection_"):
             expected_kind = "remote"
@@ -5315,17 +5320,36 @@ def test_remote_lode_probe_rejects_invalid_or_mismatched_success_id(lode_id):
     assert state == "unreadable"
 
 
-@pytest.mark.parametrize(
-    ("returncode", "diagnostic", "expected"),
-    [
-        (1, "generic remote failure", "absent"),
-        (2, "lode not found", "unreadable"),
-    ],
-)
-def test_remote_lode_probe_uses_exit_code_not_prose_for_absence(returncode, diagnostic, expected):
+def test_remote_lode_probe_accepts_only_fully_typed_snapshot():
     from hopper.cli import _remote_lode_status
 
-    result = subprocess.CompletedProcess([], returncode, stdout="", stderr=diagnostic)
+    lode = {
+        "id": "abc23456",
+        "project": "journal",
+        "stage": "refine",
+        "state": "running",
+        "status": "working",
+        "active": True,
+    }
+    result = subprocess.CompletedProcess([], 0, stdout=json.dumps(lode), stderr="")
+    with patch("hopper.remote.run_remote", return_value=result):
+        observed, state = _remote_lode_status("fedora.local", "abc")
+
+    assert state == "found"
+    assert observed == {**lode, "host": "fedora.local"}
+
+
+@pytest.mark.parametrize(
+    ("returncode", "failure", "expected"),
+    [
+        (1, {"outcome": "absent", "query": "abc", "error": "not found"}, "absent"),
+        (2, {"outcome": "unavailable", "query": "abc", "error": "failed"}, "unreadable"),
+    ],
+)
+def test_remote_lode_probe_requires_structured_nonzero_outcome(returncode, failure, expected):
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess([], returncode, stdout="", stderr=json.dumps(failure))
     with patch("hopper.remote.run_remote", return_value=result):
         lode, state = _remote_lode_status("fedora.local", "abc")
 
@@ -5333,42 +5357,44 @@ def test_remote_lode_probe_uses_exit_code_not_prose_for_absence(returncode, diag
     assert state == expected
 
 
-@pytest.mark.parametrize(
-    "diagnostic",
-    [
-        (
-            "Ambiguous lode prefix 'abc'. Matches: "
-            "local:abc11111, local:abc22222. Probes: local=ambiguous.\n"
-        ),
-        "Ambiguous prefix 'abc', matches: abc11111, abc22222\n",
-    ],
-)
-def test_remote_lode_probe_preserves_ambiguity_ids(diagnostic):
-    from hopper.cli import _remote_lode_status
-
-    result = subprocess.CompletedProcess([], 1, stdout=diagnostic, stderr="")
-    with patch("hopper.remote.run_remote", return_value=result):
-        lode, state = _remote_lode_status("fedora.local", "abc")
-
-    assert lode is None
-    assert state == "ambiguous"
-    assert state.matches == ("abc11111", "abc22222")
-
-
-def test_remote_lode_probe_uses_exit_one_when_ambiguity_detail_is_malformed():
+def test_remote_lode_probe_preserves_structured_ambiguity_ids():
     from hopper.cli import _remote_lode_status
 
     result = subprocess.CompletedProcess(
         [],
         1,
-        stdout="Ambiguous lode prefix 'abc'. Matches: one match only.\n",
-        stderr="",
+        stdout="",
+        stderr=json.dumps(
+            {
+                "outcome": "ambiguous",
+                "query": "abc",
+                "error": "ambiguous",
+                "matches": ["abc22222", "abc33333"],
+            }
+        ),
     )
     with patch("hopper.remote.run_remote", return_value=result):
         lode, state = _remote_lode_status("fedora.local", "abc")
 
     assert lode is None
-    assert state == "absent"
+    assert state == "ambiguous"
+    assert state.matches == ("abc22222", "abc33333")
+
+
+def test_remote_lode_probe_treats_unstructured_exit_one_as_unreadable():
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess(
+        [],
+        1,
+        stdout="",
+        stderr="generic remote failure",
+    )
+    with patch("hopper.remote.run_remote", return_value=result):
+        lode, state = _remote_lode_status("fedora.local", "abc")
+
+    assert lode is None
+    assert state == "unreadable"
     assert state.matches == ()
 
 
@@ -5569,12 +5595,12 @@ def test_lode_list_all_hosts_probes_stamped_local_parked_lode(capsys, make_lode)
 
 
 def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(capsys, make_lode):
-    stored = format_park_status("quiet", "remote-id")
+    stored = format_park_status("quiet", "abc23456")
     remote_lode = make_lode(
-        id="remote-id",
+        id="abc23456",
         state="gated",
         status=stored,
-        branch="hopper-remote-id",
+        branch="hopper-abc23456",
         tmux_pane="%remote",
         status_display="remote-computed correction",
         pane_liveness="gone",
@@ -6174,6 +6200,25 @@ def test_remote_set_requires_a_non_empty_host_and_does_not_write(capsys, args):
     ]
 
 
+@pytest.mark.parametrize(
+    ("host", "diagnostic"),
+    [
+        ("-oProxyCommand=bad", "unrecognized arguments"),
+        ("local", "invalid remote host 'local'"),
+        ("bad\nhost", "invalid remote host 'bad\\nhost'"),
+        ("host\n", "invalid remote host 'host\\n'"),
+        ("bad\x85host", "invalid remote host 'bad\\x85host'"),
+    ],
+)
+def test_remote_set_rejects_unsafe_host_before_probe_or_write(host, diagnostic, capsys):
+    with patch("hopper.remote.run_remote") as probe:
+        assert cmd_remote(["set", "journal", host]) == 1
+
+    probe.assert_not_called()
+    assert config.load_config() == {}
+    assert diagnostic in capsys.readouterr().out
+
+
 def test_remote_list_json(capsys):
     with patch(
         "hopper.remote.run_remote", return_value=subprocess.CompletedProcess([], 0, "pong", "")
@@ -6618,6 +6663,7 @@ def test_lode_list_json_envelope(capsys):
         "state": "running",
         "active": True,
         "project": "proj",
+        "status": "",
     }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.list_lodes", return_value=[lode]):
@@ -6962,6 +7008,56 @@ def test_resident_route_failure_never_fans_out(state):
     hosts.assert_not_called()
 
 
+def test_confirmed_stale_resident_route_preserves_unique_local_prefix_match():
+    from hopper.cli import _resolve_lode
+
+    local = {"id": "abc23456", "project": "local"}
+    cache = {
+        "abc34567": {
+            "host": "former.example",
+            "project": "remote",
+            "created_ms": 4_000_000_000_000,
+        }
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", local)),
+        patch("hopper.remote.load_lode_cache", return_value=cache),
+        patch("hopper.cli._remote_lode_status", return_value=(None, "absent")),
+        patch("hopper.remote.forget_lode", return_value=True) as forget,
+    ):
+        result = _resolve_lode(Path("sock"), "abc")
+
+    assert result["outcome"] == "found"
+    assert result["host"] == "local"
+    assert result["canonical_id"] == "abc23456"
+    forget.assert_called_once_with("abc34567")
+
+
+def test_discovered_remote_route_persistence_failure_refuses_mutation(capsys):
+    remote_lode = {
+        "id": "abc23456",
+        "project": "journal",
+        "stage": "refine",
+        "state": "running",
+        "status": "working",
+        "active": True,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value={}),
+        patch("hopper.cli._remote_hosts", return_value=["worker.example"]),
+        patch("hopper.cli._remote_lode_status", return_value=(remote_lode, "found")),
+        patch("hopper.cli._remember_lode_route", return_value=OSError("disk full")),
+        patch("hopper.cli._run_remote_cli") as mutate,
+    ):
+        assert cmd_lode(["pause", "abc23456"]) == 2
+
+    mutate.assert_not_called()
+    output = capsys.readouterr().out
+    assert "could not be saved: disk full" in output
+    assert "did NOT route or mutate" in output
+
+
 def test_expired_resident_route_is_not_authoritative():
     from hopper.cli import _resolve_lode
     from hopper.remote import REMOTE_LODE_CACHE_MAX_AGE_MS
@@ -7080,11 +7176,15 @@ def test_resolver_one_remote_host_ambiguity_refuses_without_mutation(
     result = subprocess.CompletedProcess(
         [],
         1,
-        stdout=(
-            "Ambiguous lode prefix 'abc'. Matches: "
-            "local:abc11111, local:abc22222. Probes: local=ambiguous.\n"
+        stdout="",
+        stderr=json.dumps(
+            {
+                "outcome": "ambiguous",
+                "query": "abc",
+                "error": "ambiguous",
+                "matches": ["abc22222", "abc33333"],
+            }
         ),
-        stderr="",
     )
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
@@ -7099,8 +7199,8 @@ def test_resolver_one_remote_host_ambiguity_refuses_without_mutation(
     mutate.assert_not_called()
     run_remote.assert_not_called()
     out = capsys.readouterr().out
-    assert "one.example:abc11111, one.example:abc22222" in out
-    assert "one.example=ambiguous (abc11111, abc22222)" in out
+    assert "one.example:abc22222, one.example:abc33333" in out
+    assert "one.example=ambiguous (abc22222, abc33333)" in out
 
 
 @pytest.mark.parametrize(
@@ -7532,7 +7632,11 @@ def test_lode_path_absent_candidate_is_never_printed(temp_config, capsys):
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "No worktree exists for lode 'abc12345'.\n"
+    assert json.loads(captured.err) == {
+        "outcome": "no_worktree",
+        "id": "abc12345",
+        "error": "No worktree exists for lode 'abc12345'.",
+    }
     assert str(candidate) not in captured.err
     assert "exists:true" not in captured.err
 
@@ -7573,7 +7677,10 @@ def test_lode_path_json_resolution_errors_have_no_stdout(outcome, error, exit_co
     run_remote.assert_not_called()
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == f"{error}\n"
+    expected = {"outcome": outcome, "query": "abc", "error": error}
+    if outcome == "ambiguous":
+        expected["matches"] = []
+    assert json.loads(captured.err) == expected
 
 
 @pytest.mark.parametrize(
@@ -7608,14 +7715,26 @@ def test_lode_path_remote_spawn_failure_has_no_stdout(failure, capsys):
         (
             1,
             "",
-            "No worktree exists for lode 'abc12345'.",
+            json.dumps(
+                {
+                    "outcome": "no_worktree",
+                    "id": "abc12345",
+                    "error": "No worktree exists for lode 'abc12345'.",
+                }
+            ),
             1,
             "No worktree exists for lode 'abc12345' on resident.example.\n",
         ),
         (
             1,
-            "Lode 'abc12345' not found.",
             "",
+            json.dumps(
+                {
+                    "outcome": "absent",
+                    "query": "abc12345",
+                    "error": "not found",
+                }
+            ),
             1,
             "Lode 'abc12345' not found on resident.example.\n",
         ),

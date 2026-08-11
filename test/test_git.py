@@ -16,8 +16,10 @@ from hopper.git import (
     SHIP_CLEANLINESS_TIMEOUT_SEC,
     SHIP_DEFAULT_REF_TIMEOUT_SEC,
     SHIP_FETCH_TIMEOUT_SEC,
+    SHIP_HEAD_TIMEOUT_SEC,
     SHIP_LANDING_TIMEOUT_SEC,
     SHIP_REMOTE_DETECTION_TIMEOUT_SEC,
+    SHIP_REVALIDATION_TIMEOUT_SEC,
     UPSTREAM_FETCH_REFSPEC,
     _resolve_default_branch,
     commit_all,
@@ -727,7 +729,7 @@ class TestShipLandingVerdictIntegration:
         )
         assert missing.returncode != 0
 
-    def test_clean_repo_with_only_differently_named_remote_relaxes_containment(self, tmp_path):
+    def test_repo_without_origin_or_local_default_is_indeterminate(self, tmp_path):
         repo = _init_git_repo(tmp_path, name="different-remote", branch="topic")
         remote = _init_git_repo(tmp_path, name="different-upstream.git", branch="topic", bare=True)
         _run_git(repo, "remote", "add", "upstream", str(remote))
@@ -735,9 +737,27 @@ class TestShipLandingVerdictIntegration:
         verdict = ship_landing_verdict(repo)
 
         assert verdict.cleanliness == "clean"
-        assert verdict.containment == "origin_absent"
+        assert verdict.containment == "indeterminate"
         assert verdict.base_ref is None
-        assert "not verified" in verdict.detail
+        assert "no local default branch" in verdict.detail
+
+    def test_repo_without_origin_requires_local_default_containment(self, tmp_path):
+        repo = _init_git_repo(tmp_path, name="local-main", branch="main")
+
+        contained = ship_landing_verdict(repo)
+
+        assert contained.containment == "contained"
+        assert contained.base_ref == "main"
+
+        _run_git(repo, "switch", "-c", "feature")
+        (repo / "feature.txt").write_text("feature\n")
+        _run_git(repo, "add", ".")
+        _run_git(repo, "commit", "-m", "feature")
+
+        not_contained = ship_landing_verdict(repo)
+
+        assert not_contained.containment == "not_contained"
+        assert not_contained.base_ref == "main"
 
     @pytest.mark.parametrize("dirty_kind", ["staged", "unstaged", "untracked"])
     def test_canonical_changes_are_not_hidden_by_clean_cwd(self, tmp_path, monkeypatch, dirty_kind):
@@ -758,7 +778,7 @@ class TestShipLandingVerdictIntegration:
         assert verdict.containment == "indeterminate"
 
     def test_dirty_unrelated_cwd_does_not_taint_clean_canonical_tree(self, tmp_path, monkeypatch):
-        canonical = _init_git_repo(tmp_path, name="clean-canonical", branch="topic")
+        canonical = _init_git_repo(tmp_path, name="clean-canonical", branch="main")
         dirty_cwd = _init_git_repo(tmp_path, name="dirty-cwd")
         (dirty_cwd / "untracked.txt").write_text("dirty\n")
         monkeypatch.chdir(dirty_cwd)
@@ -766,7 +786,8 @@ class TestShipLandingVerdictIntegration:
         verdict = ship_landing_verdict(canonical)
 
         assert verdict.cleanliness == "clean"
-        assert verdict.containment == "origin_absent"
+        assert verdict.containment == "contained"
+        assert verdict.base_ref == "main"
 
     def test_missing_worktree_is_indeterminate(self, tmp_path):
         verdict = ship_landing_verdict(tmp_path / "missing")
@@ -789,7 +810,10 @@ class TestShipLandingVerdictDeadlines:
     def test_each_stage_uses_its_named_deadline_and_total_budget(self, tmp_path):
         results = [
             MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
             MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="base123\n"),
             MagicMock(returncode=0, stdout=""),
             MagicMock(returncode=0, stdout="abc123\n"),
             MagicMock(returncode=0, stdout=""),
@@ -803,17 +827,22 @@ class TestShipLandingVerdictDeadlines:
         assert verdict.containment == "contained"
         assert [item.kwargs["timeout"] for item in run.call_args_list] == [
             SHIP_CLEANLINESS_TIMEOUT_SEC,
+            SHIP_HEAD_TIMEOUT_SEC,
             SHIP_REMOTE_DETECTION_TIMEOUT_SEC,
             SHIP_FETCH_TIMEOUT_SEC,
             SHIP_DEFAULT_REF_TIMEOUT_SEC,
             SHIP_ANCESTRY_TIMEOUT_SEC,
+            SHIP_REVALIDATION_TIMEOUT_SEC,
+            SHIP_REVALIDATION_TIMEOUT_SEC,
         ]
         assert (
             SHIP_CLEANLINESS_TIMEOUT_SEC
+            + SHIP_HEAD_TIMEOUT_SEC
             + SHIP_REMOTE_DETECTION_TIMEOUT_SEC
             + SHIP_FETCH_TIMEOUT_SEC
             + SHIP_DEFAULT_REF_TIMEOUT_SEC
             + SHIP_ANCESTRY_TIMEOUT_SEC
+            + 2 * SHIP_REVALIDATION_TIMEOUT_SEC
             == SHIP_LANDING_TIMEOUT_SEC
         )
 
@@ -866,6 +895,7 @@ class TestShipLandingVerdictDeadlines:
                 "hopper.git.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="abc123\n"),
                     subprocess.TimeoutExpired(["git", "remote"], SHIP_REMOTE_DETECTION_TIMEOUT_SEC),
                 ],
             ) as run,
@@ -882,6 +912,7 @@ class TestShipLandingVerdictDeadlines:
                 "hopper.git.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="abc123\n"),
                     MagicMock(returncode=128, stdout="", stderr="fatal: remotes"),
                 ],
             ),
@@ -898,6 +929,7 @@ class TestShipLandingVerdictDeadlines:
                 "hopper.git.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="abc123\n"),
                     MagicMock(returncode=0, stdout="origin\n"),
                     subprocess.TimeoutExpired(["git", "fetch"], SHIP_FETCH_TIMEOUT_SEC),
                 ],
@@ -916,6 +948,7 @@ class TestShipLandingVerdictDeadlines:
                 "hopper.git.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="abc123\n"),
                     MagicMock(returncode=0, stdout="origin\n"),
                     MagicMock(returncode=128, stdout="", stderr="fatal: fetch"),
                 ],
@@ -933,6 +966,7 @@ class TestShipLandingVerdictDeadlines:
                 "hopper.git.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="abc123\n"),
                     MagicMock(returncode=0, stdout="origin\n"),
                     MagicMock(returncode=0, stdout=""),
                     subprocess.TimeoutExpired(["git", "rev-parse"], SHIP_DEFAULT_REF_TIMEOUT_SEC),
@@ -948,6 +982,7 @@ class TestShipLandingVerdictDeadlines:
     def test_ancestry_nonzero_other_than_one_is_indeterminate(self, tmp_path):
         results = [
             MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
             MagicMock(returncode=0, stdout="origin\n"),
             MagicMock(returncode=0, stdout=""),
             MagicMock(returncode=0, stdout="abc123\n"),
@@ -966,6 +1001,7 @@ class TestShipLandingVerdictDeadlines:
     def test_ancestry_timeout_fails_closed(self, tmp_path):
         results = [
             MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
             MagicMock(returncode=0, stdout="origin\n"),
             MagicMock(returncode=0, stdout=""),
             MagicMock(returncode=0, stdout="abc123\n"),
@@ -980,6 +1016,46 @@ class TestShipLandingVerdictDeadlines:
         assert verdict.containment == "indeterminate"
         assert verdict.base_ref == "origin/main"
         assert run.call_args.kwargs["timeout"] == SHIP_ANCESTRY_TIMEOUT_SEC
+
+    def test_head_change_after_ancestry_fails_closed(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="first123\n"),
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="base123\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="second12\n"),
+        ]
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch("hopper.git.subprocess.run", side_effect=results),
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert verdict.cause == "head_changed"
+
+    def test_worktree_becoming_dirty_after_ancestry_fails_closed(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc12345\n"),
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="base1234\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc12345\n"),
+            MagicMock(returncode=0, stdout="?? late.txt\n"),
+        ]
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch("hopper.git.subprocess.run", side_effect=results),
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.cleanliness == "dirty"
+        assert verdict.containment == "indeterminate"
+        assert verdict.cause == "cleanliness_dirty"
 
     def test_overall_monotonic_deadline_stops_before_next_probe(self, tmp_path):
         with (

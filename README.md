@@ -88,9 +88,13 @@ hop remote list --json
 
 `hop remote set` replaces the pool and removes duplicate hosts while preserving
 their first-seen order. JSON keeps the top-level `remotes` key and returns rows
-shaped as `{"project": str, "hosts": [str, ...]}`. In Hopper JSON, `host`
-always names one selected or resident host; `hosts` always names the complete
-ordered pool.
+shaped as `{"project": str, "hosts": [str, ...]}`. In JSON output, `host`
+on session and create results names one selected or resident host; inside
+`unavailable_hosts`, it names the source that failed. `hosts` always names the
+complete ordered pool. Host values beginning with `-`, containing control
+characters, or equal to the reserved local-source name `local` are refused.
+`hop remote set` also refuses active local projects; disable a moved project
+before assigning its remote pool.
 
 Pooled creation checks project readiness and active-lode load on every member,
 then creates once on a least-loaded eligible host. It does not reserve capacity
@@ -115,11 +119,13 @@ when results are partial.
 ### Ship completion proof
 
 During the ship stage, `hop processed` refuses completion unless the canonical
-lode worktree is clean and its HEAD is contained in a freshly fetched upstream
-`main` or `master`. A confirmed repository without `origin` still must be clean,
-but Hopper does not claim push verification. Hopper performs this proof only; it
-never merges, rebases, commits, or pushes. A refusal keeps the lode and worktree
-intact and prints the command needed to inspect, clean, fetch, or land before
+session worktree is clean and its HEAD is contained in a freshly fetched
+upstream `main`, falling back to upstream `master` only when `main` is absent.
+Without `origin`, the same stable, clean HEAD must be contained in local `main`,
+or local `master` only when `main` is absent; missing or unlanded local defaults
+fail closed. `hop processed` performs this proof only; it never merges, rebases,
+commits, or pushes. A refusal keeps the session and its worktree intact and
+prints recovery guidance for inspecting, cleaning, fetching, or landing before
 retrying.
 
 ## Key concepts

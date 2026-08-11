@@ -1141,6 +1141,39 @@ def test_remote_worker_converts_every_outcome_to_observation(probe_result, expec
     assert state["observations"][0]["kind"] == expected_kind
 
 
+def test_remote_wait_workers_are_capped_and_shard_all_targets(monkeypatch):
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon, name):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.name = name
+
+        def start(self):
+            started.append(self)
+
+    monkeypatch.setattr(wait.threading, "Thread", FakeThread)
+    records = {
+        f"lode-{index}": {"remote": True, "host": f"host-{index}.example"} for index in range(24)
+    }
+    state = {
+        "records": records,
+        "pending": set(records),
+        "poll_s": 30,
+        "probe_timeout_s": 5,
+        "workers": {},
+    }
+
+    wait._start_remote_workers(state, lambda *_args, **_kwargs: None)
+
+    assert len(started) == wait.remote.REMOTE_MAX_WORKERS
+    assignments = [assignment for thread in started for assignment in thread.args[1]]
+    assert set(assignments) == {(lode_id, record["host"]) for lode_id, record in records.items()}
+    assert max(len(thread.args[1]) for thread in started) == 2
+
+
 def test_remote_worker_join_is_bounded_and_logs_timeout(caplog):
     class StuckThread:
         def __init__(self):
