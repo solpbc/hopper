@@ -7553,6 +7553,118 @@ def test_explicit_host_bypasses_unavailable_resident_cache(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("argv", "forwarded_prefix", "verb"),
+    [
+        (["lode", "pause", "abc"], ["lode", "pause"], "pause"),
+        (["lode", "restart", "abc"], ["lode", "restart"], "restart"),
+        (["lode", "kill", "abc"], ["lode", "kill"], "kill"),
+        (["lode", "kill", "--force", "abc"], ["lode", "kill", "--force"], "kill"),
+        (["restart", "abc"], ["restart"], "restart"),
+        (["kill", "abc"], ["kill"], "kill"),
+        (["kill", "-f", "abc"], ["kill", "-f"], "kill"),
+    ],
+)
+def test_explicit_host_manual_action_mints_identity_before_forwarding(
+    argv,
+    forwarded_prefix,
+    verb,
+    monkeypatch,
+):
+    lode = {
+        "id": "abc12345",
+        "active": True,
+        "stage": "mill",
+        "state": "running",
+        "run_generation": "b" * 32,
+        "pending_action": None,
+        "action_results": [],
+    }
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "known.example", *argv])
+    with (
+        patch(
+            "hopper.cli._remote_lode_status",
+            return_value=(lode, hopper_cli._RemoteLodeProbeState("found")),
+        ) as status,
+        patch("hopper.cli.uuid.uuid4", return_value=MagicMock(hex="a" * 32)),
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+    ):
+        assert main() == 0
+
+    status.assert_called_once_with("known.example", "abc", timeout=8.0)
+    forwarded = run_remote.call_args.args[1]
+    assert forwarded[: len(forwarded_prefix)] == forwarded_prefix
+    assert forwarded[len(forwarded_prefix)] == "abc12345"
+    assert forwarded[forwarded.index("--action-id") + 1] == "a" * 32
+    assert forwarded[forwarded.index("--expected-generation") + 1] == "b" * 32
+    assert run_remote.call_args.kwargs == {
+        "reason": "-H known.example",
+        "stdin_text": None,
+        "annotate_json": False,
+    }
+
+
+def test_explicit_host_manual_action_retry_preserves_supplied_identity(monkeypatch):
+    args = [
+        "lode",
+        "kill",
+        "abc12345",
+        "--action-id",
+        "a" * 32,
+        "--expected-generation",
+        "b" * 32,
+    ]
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "known.example", *args])
+    with (
+        patch("hopper.cli._remote_lode_status") as status,
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+    ):
+        assert main() == 0
+
+    status.assert_not_called()
+    assert run_remote.call_args.args[1] == args
+
+
+def test_explicit_host_manual_action_refuses_when_generation_probe_is_unreadable(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hop", "-H", "known.example", "lode", "kill", "abc12345"],
+    )
+    with (
+        patch(
+            "hopper.cli._remote_lode_status",
+            return_value=(None, hopper_cli._RemoteLodeProbeState("unreadable")),
+        ),
+        patch("hopper.cli._run_remote_cli") as run_remote,
+    ):
+        assert main() == 2
+
+    run_remote.assert_not_called()
+    assert "No action identity was minted and no mutation was sent" in capsys.readouterr().err
+
+
+def test_routed_manual_action_transport_failure_prints_exact_identity_retry(capsys):
+    args = [
+        "lode",
+        "kill",
+        "abc12345",
+        "--action-id",
+        "a" * 32,
+        "--expected-generation",
+        "b" * 32,
+    ]
+    with patch("hopper.remote.run_remote", side_effect=subprocess.TimeoutExpired("ssh", 30)):
+        assert hopper_cli._run_remote_cli("known.example", args, reason="test") == 1
+
+    error = capsys.readouterr().err
+    assert "remote command timed out" in error
+    assert "retry the same action with:" in error
+    assert shlex.join(["hop", "-H", "known.example", *args]) in error
+
+
+@pytest.mark.parametrize(
     ("verb", "mutation"),
     [("pause", "pause_lode"), ("resume", "resume_lode")],
 )

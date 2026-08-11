@@ -80,6 +80,7 @@ from hopper.tmux import (
     capture_pane,
     classify_pane_phase,
     completion_action_panes,
+    pane_answer_choices,
     pane_identity,
     pane_liveness,
     pane_needs_answer,
@@ -341,6 +342,13 @@ _DELIVERY_FAILURE_OUTCOMES = {
     "pane_state_unknown": "pane_state_unknown",
     "pane_frozen": "pane_frozen",
     "pane_awaiting_choice": "awaiting_choice",
+    "pane_not_awaiting_choice": "not_sent",
+    "choice_unavailable": "not_sent",
+    "choice_requires_text": "not_sent",
+    "choice_navigation_failed_unknown": "unverified",
+    "choice_navigation_unverified": "unverified",
+    "pane_lost_after_choice_navigation": "unverified",
+    "choice_submit_failed": "unverified",
     "paste_failed": "not_sent",
     "paste_failed_unknown": "unverified",
     "paste_not_staged": "unverified",
@@ -453,9 +461,40 @@ _PANE_INPUT_MESSAGES = {
         "selector rather than a text box -- pasted text would sit in it with nothing able "
         "to submit it, and each retry would append to what is already there. Nothing was "
         "pasted. Read the options with `hop lode peek {lode_id}`, then answer with "
-        "`hop lode answer {lode_id} <n>`. If the option you want is free-text "
-        '("Type something"), Hopper cannot drive it: select it with `hop lode answer`, '
-        "then type into pane {pane} directly."
+        "`hop lode answer {lode_id} <n>`. Hopper cannot drive the free-text entry "
+        '("Type something"); inspect pane {pane} and enter that answer directly.'
+    ),
+    "pane_not_awaiting_choice": (
+        "Choice was not sent because pane {pane} is not a recognized numbered selector. "
+        "Nothing was typed. Inspect with `hop lode peek {lode_id}` before retrying."
+    ),
+    "choice_unavailable": (
+        "Choice was not sent because the requested option is not visible in pane {pane}. "
+        "Nothing was typed or submitted. Read the available options with `hop lode peek "
+        "{lode_id}`, then retry with one of those numbers."
+    ),
+    "choice_requires_text": (
+        "Choice was not sent because the requested option is the free-text entry in pane "
+        "{pane}, not a terminal numbered answer. Nothing was submitted. Hopper cannot drive "
+        "that entry; inspect with `hop lode peek {lode_id}` and enter the text directly."
+    ),
+    "choice_navigation_failed_unknown": (
+        "Hopper could not complete choice navigation in pane {pane}. The highlight may have "
+        "moved, but Enter was not sent. Inspect with `hop lode peek {lode_id}` before retrying."
+    ),
+    "choice_navigation_unverified": (
+        "Hopper moved the selector in pane {pane}, but could not verify that the requested row "
+        "was highlighted. Enter was not sent. Inspect with `hop lode peek {lode_id}` before "
+        "retrying."
+    ),
+    "pane_lost_after_choice_navigation": (
+        "Hopper moved the selector in pane {pane}, but the pane became unavailable before the "
+        "requested row could be verified. Enter was not sent. Resume and inspect lode "
+        "{lode_id} before retrying."
+    ),
+    "choice_submit_failed": (
+        "Hopper verified the requested row in pane {pane}, but could not press Enter. The "
+        "choice was not submitted. Inspect with `hop lode peek {lode_id}` before retrying."
     ),
     "paste_failed": (
         "Input was not sent because Hopper could not deliver it to pane {pane}. Retry the "
@@ -665,6 +704,36 @@ def _observe_processing_pane_title(title: str, observation: dict | None) -> bool
     return now - observation["observed_at"] >= FROZEN_PANE_THRESHOLD_MS
 
 
+def _observe_pane_acceptance(
+    pane_id: str,
+    latest_capture: str,
+    observed_title: str | None,
+) -> dict:
+    """Verify that one submitted input started a new processing turn."""
+    for _ in range(_FEEDBACK_ACCEPTANCE_POLL_COUNT):
+        time.sleep(_FEEDBACK_POLL_INTERVAL)
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return {
+                "reason": "pane_lost_after_submit",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        latest_capture = capture
+        observed_title = pane_title(pane_id)
+        if classify_pane_phase(observed_title) is PanePhase.PROCESSING:
+            return {
+                "reason": "enter_accepted",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+    return {
+        "reason": "acceptance_timeout",
+        "capture": latest_capture,
+        "title": observed_title,
+    }
+
+
 def _attempt_pane_delivery(
     pane_id: str | None,
     text: str,
@@ -682,6 +751,7 @@ def _attempt_pane_delivery(
         return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
 
     pre_delivery_input = None
+    answer_state = None
     saw_processing = False
     processing_frozen = False
     for _ in range(_FEEDBACK_IDLE_POLL_COUNT):
@@ -715,6 +785,14 @@ def _attempt_pane_delivery(
                     "capture": latest_capture,
                     "title": observed_title,
                 }
+            if not paste:
+                answer_state = pane_answer_choices(latest_capture)
+                if answer_state is None:
+                    return {
+                        "reason": "pane_not_awaiting_choice",
+                        "capture": latest_capture,
+                        "title": observed_title,
+                    }
             pre_delivery_input = read_pane_input(latest_capture)
             break
         else:
@@ -729,6 +807,64 @@ def _attempt_pane_delivery(
         else:
             reason = "idle_timeout"
         return {"reason": reason, "capture": latest_capture, "title": observed_title}
+
+    if not paste:
+        try:
+            target_choice = int(text)
+        except (TypeError, ValueError):
+            target_choice = -1
+        selected_choice, visible_choices, free_text_choices = answer_state
+        if target_choice not in visible_choices:
+            return {
+                "reason": "choice_unavailable",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        if target_choice in free_text_choices:
+            return {
+                "reason": "choice_requires_text",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+
+        selected_position = visible_choices.index(selected_choice)
+        target_position = visible_choices.index(target_choice)
+        direction = "Down" if target_position > selected_position else "Up"
+        for _ in range(abs(target_position - selected_position)):
+            if not send_keys(pane_id, direction):
+                return {
+                    "reason": "choice_navigation_failed_unknown",
+                    "capture": latest_capture,
+                    "title": observed_title,
+                }
+
+        time.sleep(_FEEDBACK_POLL_INTERVAL)
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return {
+                "reason": "pane_lost_after_choice_navigation",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        latest_capture = capture
+        moved_state = pane_answer_choices(latest_capture)
+        if moved_state is None or moved_state[0] != target_choice:
+            return {
+                "reason": "choice_navigation_unverified",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        if not send_keys(pane_id, "Enter"):
+            return {
+                "reason": "choice_submit_failed",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        return _observe_pane_acceptance(
+            pane_id,
+            latest_capture,
+            observed_title,
+        )
 
     delivered = paste_buffer(pane_id, text) if paste else send_keys(pane_id, text)
     if not delivered:
@@ -782,28 +918,11 @@ def _attempt_pane_delivery(
             "title": observed_title,
         }
 
-    for _ in range(_FEEDBACK_ACCEPTANCE_POLL_COUNT):
-        time.sleep(_FEEDBACK_POLL_INTERVAL)
-        capture = capture_pane(pane_id, plain=True)
-        if capture is None:
-            return {
-                "reason": "pane_lost_after_submit",
-                "capture": latest_capture,
-                "title": observed_title,
-            }
-        latest_capture = capture
-        observed_title = pane_title(pane_id)
-        if classify_pane_phase(observed_title) is PanePhase.PROCESSING:
-            return {
-                "reason": "enter_accepted",
-                "capture": latest_capture,
-                "title": observed_title,
-            }
-    return {
-        "reason": "acceptance_timeout",
-        "capture": latest_capture,
-        "title": observed_title,
-    }
+    return _observe_pane_acceptance(
+        pane_id,
+        latest_capture,
+        observed_title,
+    )
 
 
 def _deliver_pane_input(

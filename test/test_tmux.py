@@ -22,6 +22,7 @@ from hopper.tmux import (
     is_inside_tmux,
     is_tmux_server_running,
     kill_pane,
+    pane_answer_choices,
     pane_identity,
     pane_liveness,
     pane_needs_answer,
@@ -555,6 +556,7 @@ def test_pane_needs_answer_detects_a_colorized_selector():
         "\x1b[2m↑/↓ to navigate · Enter to select · Esc to cancel\x1b[22m\n"
     )
     assert pane_needs_answer(colorized) is True
+    assert pane_answer_choices(colorized) == (1, (1, 2, 3), frozenset({3}))
 
 
 def test_pane_needs_answer_detects_a_plain_selector():
@@ -566,6 +568,36 @@ def test_pane_needs_answer_detects_a_plain_selector():
         "↑/↓ to navigate · Enter to select · Esc to cancel\n"
     )
     assert pane_needs_answer(plain) is True
+    assert pane_answer_choices(plain) == (1, (1, 2, 3), frozenset({3}))
+
+
+def test_pane_answer_choices_recognizes_edited_free_text_row_before_rule():
+    capture = (
+        "  2. Keep both behind a flag\n"
+        "  3. deny.toml-only stopgap for it\n"
+        "❯ 4. 3\n"
+        "────────────────────────────────────────────────────────────────\n"
+        "  5. Chat about this\n"
+        "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+    )
+
+    assert pane_answer_choices(capture) == (4, (2, 3, 4, 5), frozenset({4}))
+
+
+def test_pane_answer_choices_ignores_numbered_prose_above_current_selector():
+    capture = (
+        "Earlier plan:\n"
+        "  1. inspect the repository\n"
+        "  2. run the gate\n"
+        "\n"
+        "Which cutover should I take?\n"
+        "  1. Delete the Python wire now\n"
+        "❯ 2. Keep both behind a flag\n"
+        "  3. Type something.\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+
+    assert pane_answer_choices(capture) == (2, (1, 2, 3), frozenset({3}))
 
 
 def test_pane_needs_answer_ignores_an_ordinary_composer():

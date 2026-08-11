@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -6601,16 +6601,31 @@ _IDLE_EMPTY_CAPTURE = "─────\n❯ \n─────\n"
 _IDLE_STAGED_CAPTURE = "─────\n❯ Please revise\n─────\n"
 # Constructed from the real processing capture's observed content shape.
 _PROCESSING_CAPTURE = "Please revise\n● Working…\n"
-# A Claude numbered selector whose third option is free-text. Hopper cannot drive
-# this surface: keystrokes move a highlight rather than filling a buffer, so pasted
-# text stages with nothing able to submit it and each retry appends to what is
-# already sitting there.
+# A Claude numbered selector whose third option is free-text. Free-text paste still
+# cannot drive this surface; numbered answers navigate the highlight explicitly.
 _IDLE_QUESTION_CAPTURE = (
     "Which cutover should I take?\n"
     "❯ 1. Delete the Python wire now\n"
     "  2. Keep both behind a flag\n"
     "  3. Type something.\n"
     "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+)
+_IDLE_QUESTION_THIRD_CAPTURE = (
+    "Which cutover should I take?\n"
+    "  1. Delete the Python wire now\n"
+    "  2. Keep both behind a flag\n"
+    "❯ 3. Ship the Rust wire\n"
+    "  4. Type something.\n"
+    "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+)
+_EDITED_FREE_TEXT_QUESTION_CAPTURE = (
+    "  1. Widen scope to include it\n"
+    "  2. Leave it; relax AC1\n"
+    "  3. deny.toml-only stopgap for it\n"
+    "❯ 4. 3\n"
+    "────────────────────────────────────────────────────────────────\n"
+    "  5. Chat about this\n"
+    "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
 )
 
 
@@ -7195,8 +7210,8 @@ def test_gate_feedback_pane_lost_after_enter_is_unverified(socket_path, make_lod
     assert "acceptance could be verified" in response["error"]
 
 
-def test_delivery_taxonomy_tables_have_identical_failure_key_sets():
-    expected = {
+def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
+    shared = {
         "pane_unavailable",
         "idle_timeout",
         "pane_state_unknown",
@@ -7210,10 +7225,19 @@ def test_delivery_taxonomy_tables_have_identical_failure_key_sets():
         "acceptance_timeout",
         "pane_lost_after_submit",
     }
+    choice_only = {
+        "pane_not_awaiting_choice",
+        "choice_unavailable",
+        "choice_requires_text",
+        "choice_navigation_failed_unknown",
+        "choice_navigation_unverified",
+        "pane_lost_after_choice_navigation",
+        "choice_submit_failed",
+    }
 
-    assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == expected
-    assert set(hopper_server._GATE_FEEDBACK_MESSAGES) == expected
-    assert set(hopper_server._PANE_INPUT_MESSAGES) == expected
+    assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == shared | choice_only
+    assert set(hopper_server._GATE_FEEDBACK_MESSAGES) == shared
+    assert set(hopper_server._PANE_INPUT_MESSAGES) == shared | choice_only
     assert hopper_server._ACCEPTED_DELIVERY_REASONS == {
         "auto_submitted",
         "enter_accepted",
@@ -7407,7 +7431,12 @@ def test_lode_send_pane_input_answer_auto_submits_without_state_write(socket_pat
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
         srv,
         conn,
-        captures=[_IDLE_EMPTY_CAPTURE, _IDLE_EMPTY_CAPTURE, _PROCESSING_CAPTURE],
+        captures=[
+            _IDLE_QUESTION_CAPTURE,
+            _IDLE_QUESTION_CAPTURE,
+            _IDLE_QUESTION_CAPTURE,
+            _PROCESSING_CAPTURE,
+        ],
         titles=["✳ Ask user to choose", "⠂ Ask user to choose"],
         text="1",
         message_type="lode_send_pane_input",
@@ -7415,7 +7444,7 @@ def test_lode_send_pane_input_answer_auto_submits_without_state_write(socket_pat
     )
 
     mock_paste.assert_not_called()
-    mock_send.assert_called_once_with("%1", "1")
+    mock_send.assert_called_once_with("%1", "Enter")
     assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
     response = _decode_mock_response(conn)
@@ -7454,7 +7483,7 @@ def test_lode_send_pane_input_nudge_uses_paste_without_state_write(socket_path, 
     assert _decode_mock_response(conn)["type"] == "pane_input_sent"
 
 
-def test_lode_send_pane_input_digit_without_processing_is_unverified(socket_path, make_lode):
+def test_lode_send_pane_input_answer_without_processing_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     before = copy.deepcopy(srv.lodes[0])
@@ -7463,21 +7492,21 @@ def test_lode_send_pane_input_digit_without_processing_is_unverified(socket_path
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
         srv,
         conn,
-        captures=[_IDLE_EMPTY_CAPTURE] * 6,
-        titles=["✳ Ask user to choose"] * 5,
+        captures=[_IDLE_QUESTION_CAPTURE] * 15,
+        titles=["✳ Ask user to choose"] * 13,
         text="1",
         message_type="lode_send_pane_input",
         input_paste=False,
     )
 
     mock_paste.assert_not_called()
-    mock_send.assert_called_once_with("%1", "1")
+    mock_send.assert_called_once_with("%1", "Enter")
     assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["outcome"] == "unverified"
-    assert "no new user turn or staged input was observed within 1.0s" in response["error"]
+    assert "did not observe the required idle-to-processing transition" in response["error"]
 
 
 def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_path, make_lode):
@@ -8773,16 +8802,14 @@ def test_pane_delivery_refuses_to_paste_into_a_numbered_selector():
 
 
 def test_pane_delivery_still_answers_a_numbered_selector():
-    """`hop lode answer` must keep working on exactly the pane nudge refuses.
-
-    Without this, the fix above would close the one path that does work.
-    """
+    """The requested row is selected even when another row owns the cursor."""
     with (
         patch(
             "hopper.server.capture_pane",
             side_effect=[
-                _IDLE_QUESTION_CAPTURE,
-                _IDLE_QUESTION_CAPTURE,
+                _EDITED_FREE_TEXT_QUESTION_CAPTURE,
+                _EDITED_FREE_TEXT_QUESTION_CAPTURE,
+                _IDLE_QUESTION_THIRD_CAPTURE,
                 _PROCESSING_CAPTURE,
             ],
         ),
@@ -8792,8 +8819,34 @@ def test_pane_delivery_still_answers_a_numbered_selector():
     ):
         result = hopper_server._attempt_pane_delivery("%1", "3", paste=False)
 
-    assert result["reason"] == "auto_submitted"
-    mock_send.assert_called_once_with("%1", "3")
+    assert result["reason"] == "enter_accepted"
+    assert mock_send.call_args_list == [call("%1", "Up"), call("%1", "Enter")]
+
+
+def test_pane_delivery_refuses_free_text_choice_without_submitting_staged_text():
+    with (
+        patch("hopper.server.capture_pane", return_value=_EDITED_FREE_TEXT_QUESTION_CAPTURE),
+        patch("hopper.server.pane_title", return_value="✳ Ready"),
+        patch("hopper.server.send_keys") as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "4", paste=False)
+
+    assert result["reason"] == "choice_requires_text"
+    mock_send.assert_not_called()
+
+
+def test_pane_delivery_refuses_number_key_in_an_ordinary_composer():
+    with (
+        patch("hopper.server.capture_pane", return_value=_IDLE_EMPTY_CAPTURE),
+        patch("hopper.server.pane_title", return_value="✳ Ready"),
+        patch("hopper.server.send_keys") as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "3", paste=False)
+
+    assert result["reason"] == "pane_not_awaiting_choice"
+    mock_send.assert_not_called()
 
 
 def test_pane_delivery_still_pastes_into_an_ordinary_composer():

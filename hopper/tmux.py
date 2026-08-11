@@ -176,11 +176,60 @@ def read_pane_input(pane_text: str) -> str | None:
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_QUESTION_SELECTOR_RE = re.compile(r"^\s*\u276f\s*\d+\.", re.MULTILINE)
+_QUESTION_OPTION_RE = re.compile(
+    r"^\s*(?P<cursor>\u276f)?\s*(?P<number>\d+)\.(?:\s|$)",
+)
 _QUESTION_CHROME_RE = re.compile(
     r"(?:\u2191/\u2193 to navigate|Esc to cancel|Enter to select|Type something)",
     re.IGNORECASE,
 )
+
+
+def pane_answer_choices(snapshot: str) -> tuple[int, tuple[int, ...], frozenset[int]] | None:
+    """Return the selected row, visible choices, and free-text rows for a selector."""
+    if not snapshot:
+        return None
+    text = _ANSI_ESCAPE_RE.sub("", snapshot)
+    lines = text.splitlines()
+    chrome_lines = [index for index, line in enumerate(lines) if _QUESTION_CHROME_RE.search(line)]
+    if not chrome_lines:
+        return None
+
+    rows: list[tuple[int, int, str, bool]] = []
+    chrome_line = chrome_lines[-1]
+    for index, line in enumerate(lines[:chrome_line]):
+        match = _QUESTION_OPTION_RE.match(line)
+        if match is None:
+            continue
+        number = int(match.group("number"))
+        label = line[match.end() :].strip()
+        rows.append((index, number, label, match.group("cursor") is not None))
+
+    selected_positions = [index for index, row in enumerate(rows) if row[3]]
+    if not selected_positions:
+        return None
+    selected_position = selected_positions[-1]
+
+    first = selected_position
+    while first > 0 and rows[first - 1][1] == rows[first][1] - 1:
+        first -= 1
+    last = selected_position
+    while last + 1 < len(rows) and rows[last + 1][1] == rows[last][1] + 1:
+        last += 1
+    rows = rows[first : last + 1]
+    selected = rows[selected_position - first][1]
+    choices = tuple(number for _index, number, _label, _cursor in rows)
+
+    free_text: set[int] = set()
+    for index, number, label, _cursor in rows:
+        if "type something" in label.lower():
+            free_text.add(number)
+            continue
+        following = next((line.strip() for line in lines[index + 1 :] if line.strip()), "")
+        if following and set(following) == {"\u2500"}:
+            free_text.add(number)
+
+    return selected, choices, frozenset(free_text)
 
 
 def pane_needs_answer(snapshot: str) -> bool:
@@ -197,10 +246,7 @@ def pane_needs_answer(snapshot: str) -> bool:
     separated by a colour sequence, so an anchored match cannot succeed. Both
     call sites matter -- one passes a plain capture and one does not.
     """
-    if not snapshot:
-        return False
-    text = _ANSI_ESCAPE_RE.sub("", snapshot)
-    return bool(_QUESTION_SELECTOR_RE.search(text) and _QUESTION_CHROME_RE.search(text))
+    return pane_answer_choices(snapshot) is not None
 
 
 def new_window(

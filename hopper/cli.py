@@ -535,9 +535,19 @@ def _run_remote_cli(
             result = run_remote(host, hop_args, stdin_bytes=stdin_bytes)
     except subprocess.TimeoutExpired as e:
         print(f"remote command timed out on {host}: {e}", file=sys.stderr)
+        if "--action-id" in hop_args:
+            print(
+                "retry the same action with: " + shlex.join(["hop", "-H", host, *hop_args]),
+                file=sys.stderr,
+            )
         return 1
     except OSError as e:
         print(f"remote command failed on {host}: {e}", file=sys.stderr)
+        if "--action-id" in hop_args:
+            print(
+                "retry the same action with: " + shlex.join(["hop", "-H", host, *hop_args]),
+                file=sys.stderr,
+            )
         return 1
 
     _remote_process_output(
@@ -546,6 +556,90 @@ def _run_remote_cli(
         annotate_json=annotate_json,
     )
     return result.returncode
+
+
+def _bind_explicit_manual_action(
+    host: str,
+    command: str,
+    command_args: list[str],
+) -> tuple[list[str] | None, int | None]:
+    """Mint a lifecycle action identity before an explicit routed mutation."""
+    verbs = {"pause", "restart", "kill"}
+    if command == "lode" and len(command_args) >= 2 and command_args[0] in verbs:
+        verb = command_args[0]
+        candidate_indexes = range(1, len(command_args))
+    elif command in {"restart", "kill"} and command_args:
+        verb = command
+        candidate_indexes = range(len(command_args))
+    else:
+        return command_args, None
+    if any(arg in {"-h", "--help"} for arg in command_args):
+        return command_args, None
+
+    has_action_id = "--action-id" in command_args
+    has_generation = "--expected-generation" in command_args
+    if has_action_id or has_generation:
+        # The remote parser validates the all-or-none pair. A retry carrying both
+        # must cross this boundary byte-for-byte without generating a new identity.
+        return command_args, None
+
+    lode_index = next(
+        (index for index in candidate_indexes if command_args[index] not in {"-f", "--force"}),
+        None,
+    )
+    if lode_index is None:
+        # Let the owning parser render its ordinary missing-positional error.
+        return command_args, None
+
+    lode_ref = command_args[lode_index]
+    lode, probe_state = _remote_lode_status(host, lode_ref, timeout=8.0)
+    if lode is None:
+        if probe_state == "ambiguous":
+            matches = ", ".join(probe_state.matches)
+            print(
+                f"error: lode prefix {lode_ref!r} is ambiguous on {host}: {matches}. "
+                "No action identity was minted and no mutation was sent.",
+                file=sys.stderr,
+            )
+            return None, 1
+        if probe_state == "absent":
+            print(
+                f"error: lode {lode_ref!r} was not found on {host}. "
+                "No action identity was minted and no mutation was sent.",
+                file=sys.stderr,
+            )
+            return None, 1
+        print(
+            f"error: lode status for {lode_ref!r} is unreadable on {host}. "
+            "No action identity was minted and no mutation was sent. Retry status with: "
+            + shlex.join(["hop", "-H", host, "lode", "status", lode_ref, "--json"]),
+            file=sys.stderr,
+        )
+        return None, 2
+
+    parsed = argparse.Namespace(
+        action_id=None,
+        expected_generation=None,
+        force=any(arg in {"-f", "--force"} for arg in command_args),
+    )
+    identity = _manual_action_identity(parsed, lode, verb)
+    if identity is None:
+        return None, 1
+
+    bound_args = list(command_args)
+    bound_args[lode_index] = lode["id"]
+    if verb in {"restart", "kill"} and identity["force_consent"]:
+        if not any(arg in {"-f", "--force"} for arg in bound_args):
+            bound_args.append("--force")
+    bound_args.extend(
+        [
+            "--action-id",
+            identity["action_id"],
+            "--expected-generation",
+            identity["expected_generation"] or "none",
+        ]
+    )
+    return bound_args, None
 
 
 def _remember_lode_route(lode_id: str, host: str, project: str = "") -> Exception | None:
@@ -4023,6 +4117,10 @@ def _main() -> int:
                 file=sys.stderr,
             )
             return 2
+        cmd_args, bind_error = _bind_explicit_manual_action(explicit_host, cmd, cmd_args)
+        if bind_error is not None:
+            return bind_error
+        assert cmd_args is not None
         if cmd == "watch" or (cmd == "lode" and cmd_args[:1] == ["watch"]):
             from hopper.remote import run_remote_streaming
 
