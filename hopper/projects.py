@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from hopper.config import config_transaction, load_config
+from hopper.config import ConfigError, config_path, config_transaction, load_config
 from hopper.lodes import current_time_ms
 
 
@@ -17,7 +17,7 @@ class Project:
 
     path: str  # Absolute path to git directory
     name: str  # Basename of directory
-    disabled: bool = False  # True if removed but has existing sessions
+    disabled: bool = False  # True if removed but has existing lodes
     disabled_reason: str = ""  # human-readable why, only meaningful when disabled is True
     last_used_at: int = 0
 
@@ -82,20 +82,43 @@ def _projects_from_config(config: dict[str, object]) -> list[Project]:
     """Build project records from an already loaded config object."""
     projects_data = config.get("projects", [])
     if not isinstance(projects_data, list):
-        return []
+        raise ConfigError(config_path(), "wrong_shape")
 
     projects = []
     for item in projects_data:
-        if isinstance(item, dict) and "path" in item and "name" in item:
-            projects.append(
-                Project(
-                    path=item["path"],
-                    name=item["name"],
-                    disabled=item.get("disabled", False),
-                    disabled_reason=item.get("disabled_reason", ""),
-                    last_used_at=item.get("last_used_at", 0),
-                )
+        allowed_fields = {
+            "path",
+            "name",
+            "disabled",
+            "disabled_reason",
+            "last_used_at",
+        }
+        if not isinstance(item, dict) or set(item) - allowed_fields:
+            raise ConfigError(config_path(), "wrong_shape")
+        path = item.get("path")
+        name = item.get("name")
+        disabled = item.get("disabled", False)
+        disabled_reason = item.get("disabled_reason", "")
+        last_used_at = item.get("last_used_at", 0)
+        if (
+            not isinstance(path, str)
+            or not isinstance(name, str)
+            or not isinstance(disabled, bool)
+            or not isinstance(disabled_reason, str)
+            or not isinstance(last_used_at, int)
+            or isinstance(last_used_at, bool)
+            or last_used_at < 0
+        ):
+            raise ConfigError(config_path(), "wrong_shape")
+        projects.append(
+            Project(
+                path=path,
+                name=name,
+                disabled=disabled,
+                disabled_reason=disabled_reason,
+                last_used_at=last_used_at,
             )
+        )
     return projects
 
 
@@ -129,6 +152,7 @@ def save_projects(projects: list[Project]) -> None:
         projects: List of projects to save.
     """
     with config_transaction() as config:
+        _projects_from_config(config)
         _store_projects(config, projects)
 
 

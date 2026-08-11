@@ -3,11 +3,12 @@
 
 """Tests for project management."""
 
+import json
 import subprocess
 
 import pytest
 
-from hopper.config import config_transaction, load_config
+from hopper.config import ConfigError, config_transaction, load_config
 from hopper.projects import (
     Project,
     add_project,
@@ -83,6 +84,52 @@ def test_load_projects_empty(mock_config):
     assert projects == []
 
 
+@pytest.mark.parametrize(
+    "projects",
+    [
+        {"name": "not-a-list"},
+        ["not-an-object"],
+        [{"path": "/tmp/project"}],
+        [{"path": "/tmp/project", "name": 1}],
+        [{"path": "/tmp/project", "name": "project", "disabled": 0}],
+        [{"path": "/tmp/project", "name": "project", "unknown": True}],
+    ],
+)
+def test_load_projects_refuses_every_wrong_nested_shape(mock_config, projects):
+    mock_config.write_text(json.dumps({"projects": projects}) + "\n")
+
+    with pytest.raises(ConfigError) as raised:
+        load_projects()
+
+    assert raised.value.reason == "wrong_shape"
+
+
+def test_malformed_project_survives_unrelated_mutation_without_publication(mock_config):
+    original = (
+        b'{\n  "name": "sol",\n  "projects": [\n'
+        b'    {"path": "/tmp/good", "name": "good"},\n'
+        b'    {"path": "/tmp/bad", "name": 42}\n  ]\n}\n'
+    )
+    mock_config.write_bytes(original)
+
+    with pytest.raises(ConfigError) as raised:
+        touch_project("good")
+
+    assert raised.value.reason == "wrong_shape"
+    assert mock_config.read_bytes() == original
+
+
+def test_save_projects_refuses_to_overwrite_malformed_project_data(mock_config):
+    original = b'{"projects":[{"path":"/tmp/bad","name":42}],"name":"sol"}\n'
+    mock_config.write_bytes(original)
+
+    with pytest.raises(ConfigError) as raised:
+        save_projects([Project(path="/tmp/new", name="new")])
+
+    assert raised.value.reason == "wrong_shape"
+    assert mock_config.read_bytes() == original
+
+
 def test_save_and_load_projects(mock_config):
     """save_projects and load_projects roundtrip."""
     projects = [
@@ -112,8 +159,6 @@ def test_disabled_reason_roundtrip(mock_config):
 
 def test_load_projects_preserves_other_config(mock_config):
     """save_projects preserves other config keys."""
-    import json
-
     mock_config.write_text('{"name": "jer", "other": "value"}')
 
     projects = [Project(path="/path/to/foo", name="foo")]

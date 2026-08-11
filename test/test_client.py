@@ -22,11 +22,13 @@ from hopper.client import (
     connect,
     get_gate,
     list_archived_lodes,
+    list_lodes,
     lode_exists,
     ping,
     probe_server,
     read_archived_lodes,
     read_lode_snapshot,
+    read_lodes,
     send_gate_feedback,
     send_message,
     send_pane_input,
@@ -173,6 +175,23 @@ def test_connect_with_lode_id_not_found(server, socket_path):
     assert result is not None
     assert result["lode_found"] is False
     assert result["lode"] is None
+
+
+@pytest.mark.parametrize("lodes", [[], [{"id": "active-id"}]])
+def test_read_lodes_preserves_valid_lists(socket_path, lodes):
+    response = {"type": "lode_list", "lodes": lodes}
+    with patch("hopper.client.send_message", return_value=response):
+        assert read_lodes(socket_path) == lodes
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, {"type": "wrong", "lodes": []}, {"type": "lode_list", "lodes": "bad"}],
+)
+def test_read_lodes_preserves_unavailable_while_legacy_list_degrades(socket_path, response):
+    with patch("hopper.client.send_message", return_value=response):
+        assert read_lodes(socket_path) is None
+        assert list_lodes(socket_path) == []
 
 
 @pytest.mark.parametrize("lodes", [[], [{"id": "archived-id"}]])

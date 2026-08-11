@@ -150,8 +150,8 @@ def _resolve_targets(
     return records
 
 
-def _publish_remote_mappings(records: dict[str, dict]) -> None:
-    """Publish only new or changed initial remote mappings, warning once on failure."""
+def _publish_resident_routes(records: dict[str, dict]) -> None:
+    """Publish only new or changed initial resident routes, warning once on failure."""
     remote_records = [record for record in records.values() if record["remote"]]
     if not remote_records:
         return
@@ -631,7 +631,7 @@ def wait_for_lodes(
         if not isinstance(records, dict):
             print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
             return records if isinstance(records, int) else 1
-        _publish_remote_mappings(records)
+        _publish_resident_routes(records)
 
         start_ts = min(record["last_valid_ts"] for record in records.values())
         condition = threading.Condition()

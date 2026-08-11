@@ -17,20 +17,22 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 from hopper import config
-from hopper.lodes import ID_ALPHABET, ID_LEN, current_time_ms
+from hopper.lodes import current_time_ms, is_canonical_lode_id
 
 REMOTE_CONFIG_PREFIX = "remote."
 REMOTE_LODE_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC = 8.0
 REMOTE_POOL_PROBE_TIMEOUT_SEC = 10.0
 REMOTE_CREATE_TIMEOUT_SEC = 180.0
+REMOTE_SET_PING_TIMEOUT_SEC = 15.0
 REMOTE_CACHE_LOCK_TIMEOUT_SEC = 5.0
 REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC = 0.05
 
 RemoteRunner = Callable[..., subprocess.CompletedProcess[str]]
+FanoutResult = TypeVar("FanoutResult")
 
 
 @dataclass(frozen=True)
@@ -193,7 +195,7 @@ def set_remote(project: str, hosts: list[str]) -> None:
 
 
 def remove_remote(project: str) -> bool:
-    """Remove a project -> remote host mapping."""
+    """Remove a project's configured host pool."""
     key = f"{REMOTE_CONFIG_PREFIX}{project.strip()}"
     with config.config_transaction() as cfg:
         if key not in cfg:
@@ -278,26 +280,30 @@ def _validate_project_readiness(
     return None
 
 
+def _validate_lode_inventory(
+    payload: dict[str, object],
+) -> tuple[list[dict] | None, str | None]:
+    """Validate the strict lode-list contract shared by probing and discovery."""
+    lodes = payload.get("lodes")
+    if set(payload) != {"lodes"} or not isinstance(lodes, list):
+        return None, "lode inventory violated its JSON contract"
+
+    for lode in lodes:
+        if not isinstance(lode, dict) or not isinstance(lode.get("active"), bool):
+            return None, "lode inventory contained a record without a boolean active field"
+    return [dict(lode) for lode in lodes], None
+
+
 def _inventory_load(
     host: str,
     payload: dict[str, object],
 ) -> tuple[int | None, CandidateProbe | None]:
     args = ["lode", "list", "--json"]
-    lodes = payload.get("lodes")
-    if set(payload) != {"lodes"} or not isinstance(lodes, list):
-        return None, _unavailable(host, "lode inventory violated its JSON contract", args)
-
-    load = 0
-    for lode in lodes:
-        if not isinstance(lode, dict) or not isinstance(lode.get("active"), bool):
-            return None, _unavailable(
-                host,
-                "lode inventory contained a record without a boolean active field",
-                args,
-            )
-        if lode["active"] is True:
-            load += 1
-    return load, None
+    lodes, reason = _validate_lode_inventory(payload)
+    if reason is not None:
+        return None, _unavailable(host, reason, args)
+    assert lodes is not None
+    return sum(lode["active"] is True for lode in lodes), None
 
 
 def probe_candidate(
@@ -356,40 +362,21 @@ def probe_candidates(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> list[CandidateProbe]:
     """Probe unique pool members concurrently under one aggregate deadline."""
-    ordered_hosts = list(dict.fromkeys(hosts))
-    if not ordered_hosts:
-        return []
-
-    deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SEC
-    executor = ThreadPoolExecutor(max_workers=len(ordered_hosts))
-    futures = {
-        executor.submit(probe_candidate, host, project, runner): host for host in ordered_hosts
-    }
-    try:
-        remaining = max(0.0, deadline - monotonic())
-        done, pending = wait(futures, timeout=remaining)
-        results: dict[str, CandidateProbe] = {}
-        for future in done:
-            host = futures[future]
-            try:
-                results[host] = future.result()
-            except Exception as error:
-                results[host] = _unavailable(
-                    host,
-                    f"candidate probe failed unexpectedly: {error}",
-                    ["project", "list", "--json"],
-                )
-        for future in pending:
-            host = futures[future]
-            future.cancel()
-            results[host] = _unavailable(
-                host,
-                "aggregate pool probe deadline expired",
-                ["project", "list", "--json"],
-            )
-        return [results[host] for host in ordered_hosts]
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    return _bounded_host_fanout(
+        hosts,
+        lambda host: probe_candidate(host, project, runner),
+        lambda host, error: _unavailable(
+            host,
+            f"candidate probe failed unexpectedly: {error}",
+            ["project", "list", "--json"],
+        ),
+        lambda host: _unavailable(
+            host,
+            "aggregate pool probe deadline expired",
+            ["project", "list", "--json"],
+        ),
+        monotonic=monotonic,
+    )
 
 
 def select_candidate(
@@ -430,12 +417,47 @@ def _discover_host(
         payload = json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
         return HostDiscovery(host, (), "lode listing returned malformed JSON")
-    if not isinstance(payload, dict) or set(payload) != {"lodes"}:
-        return HostDiscovery(host, (), "lode listing violated its JSON contract")
-    rows = payload["lodes"]
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        return HostDiscovery(host, (), "lode listing contained a malformed lode")
-    return HostDiscovery(host, tuple(dict(row) for row in rows), None)
+    if not isinstance(payload, dict):
+        return HostDiscovery(host, (), "lode inventory violated its JSON contract")
+    rows, reason = _validate_lode_inventory(payload)
+    if reason is not None:
+        return HostDiscovery(host, (), reason)
+    assert rows is not None
+    return HostDiscovery(host, tuple(rows), None)
+
+
+def _bounded_host_fanout(
+    hosts: Sequence[str],
+    operation: Callable[[str], FanoutResult],
+    unexpected: Callable[[str, Exception], FanoutResult],
+    deadline_expired: Callable[[str], FanoutResult],
+    *,
+    monotonic: Callable[[], float],
+) -> list[FanoutResult]:
+    """Run one operation per unique host within the shared pool deadline."""
+    ordered_hosts = list(dict.fromkeys(hosts))
+    if not ordered_hosts:
+        return []
+
+    deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SEC
+    executor = ThreadPoolExecutor(max_workers=len(ordered_hosts))
+    futures = {executor.submit(operation, host): host for host in ordered_hosts}
+    try:
+        done, pending = wait(futures, timeout=max(0.0, deadline - monotonic()))
+        results: dict[str, FanoutResult] = {}
+        for future in done:
+            host = futures[future]
+            try:
+                results[host] = future.result()
+            except Exception as error:
+                results[host] = unexpected(host, error)
+        for future in pending:
+            host = futures[future]
+            future.cancel()
+            results[host] = deadline_expired(host)
+        return [results[host] for host in ordered_hosts]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def discover_lodes(
@@ -446,37 +468,21 @@ def discover_lodes(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> list[HostDiscovery]:
     """Discover lodes concurrently under one pool-wide deadline."""
-    ordered_hosts = list(dict.fromkeys(hosts))
-    if not ordered_hosts:
-        return []
-
-    deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SEC
-    executor = ThreadPoolExecutor(max_workers=len(ordered_hosts))
-    futures = {executor.submit(_discover_host, host, args, runner): host for host in ordered_hosts}
-    try:
-        done, pending = wait(futures, timeout=max(0.0, deadline - monotonic()))
-        results: dict[str, HostDiscovery] = {}
-        for future in done:
-            host = futures[future]
-            try:
-                results[host] = future.result()
-            except Exception as error:
-                results[host] = HostDiscovery(
-                    host,
-                    (),
-                    f"lode listing failed unexpectedly: {error}",
-                )
-        for future in pending:
-            host = futures[future]
-            future.cancel()
-            results[host] = HostDiscovery(
-                host,
-                (),
-                "aggregate discovery deadline expired",
-            )
-        return [results[host] for host in ordered_hosts]
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    return _bounded_host_fanout(
+        hosts,
+        lambda host: _discover_host(host, args, runner),
+        lambda host, error: HostDiscovery(
+            host,
+            (),
+            f"lode listing failed unexpectedly: {error}",
+        ),
+        lambda host: HostDiscovery(
+            host,
+            (),
+            "aggregate discovery deadline expired",
+        ),
+        monotonic=monotonic,
+    )
 
 
 def remote_lode_cache_path() -> Path:
@@ -527,19 +533,11 @@ def load_lode_cache() -> dict[str, dict]:
         if needs_migration:
             migrated = _migrate_lode_cache(cache)
             try:
-                save_lode_cache(migrated)
+                _save_lode_cache(migrated)
             except OSError as error:
                 raise LodeCacheError(remote_lode_cache_path(), "unreadable") from error
             cache = migrated
     return cache
-
-
-def _valid_lode_id(lode_id: object) -> bool:
-    return (
-        isinstance(lode_id, str)
-        and len(lode_id) == ID_LEN
-        and all(character in ID_ALPHABET for character in lode_id)
-    )
 
 
 def _valid_timestamp(value: object) -> bool:
@@ -565,7 +563,7 @@ def _read_lode_cache() -> tuple[dict[str, dict], bool]:
     cache: dict[str, dict] = {}
     needs_migration = False
     for lode_id, entry in raw.items():
-        if not _valid_lode_id(lode_id) or not isinstance(entry, dict):
+        if not is_canonical_lode_id(lode_id) or not isinstance(entry, dict):
             raise LodeCacheError(path, "wrong_shape")
         host = entry.get("host")
         project = entry.get("project")
@@ -601,8 +599,8 @@ def _migrate_lode_cache(cache: dict[str, dict]) -> dict[str, dict]:
     return migrated
 
 
-def save_lode_cache(cache: dict[str, dict]) -> None:
-    """Save the lode id -> host cache atomically."""
+def _save_lode_cache(cache: dict[str, dict]) -> None:
+    """Publish the resident-route cache while its transaction lock is held."""
     data_dir = config.hopper_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     path = remote_lode_cache_path()
@@ -642,7 +640,7 @@ def remember_lode(
     now = current_time_ms()
     created = now if created_ms is None else created_ms
     if (
-        not _valid_lode_id(lode_id)
+        not is_canonical_lode_id(lode_id)
         or not isinstance(host, str)
         or not host.strip()
         or host != host.strip()
@@ -658,7 +656,7 @@ def remember_lode(
         existing = cache.get(lode_id)
         if existing and existing.get("host") == host:
             if changed:
-                save_lode_cache(cache)
+                _save_lode_cache(cache)
             return
 
         if existing and "created_ms" in existing:
@@ -669,4 +667,4 @@ def remember_lode(
             "created_ms": created,
             "last_seen_ms": now,
         }
-        save_lode_cache(cache)
+        _save_lode_cache(cache)

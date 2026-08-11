@@ -76,6 +76,7 @@ from hopper.projects import Project, load_projects, save_projects
 from hopper.remote import (
     REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
     REMOTE_CREATE_TIMEOUT_SEC,
+    REMOTE_SET_PING_TIMEOUT_SEC,
     CandidateProbe,
 )
 from hopper.server import Server
@@ -1852,7 +1853,9 @@ def test_lode_kill_not_found(capsys):
 
     assert rc == 1
     out = capsys.readouterr().out
-    assert "Lode 'missing' not found." in out
+    assert "Observed: lode 'missing' was not found." in out
+    assert "Hopper did not route or mutate a lode." in out
+    assert "Recover with: hop lode list --all-hosts --json." in out
 
 
 def test_lode_kill_missing_id(capsys):
@@ -2923,7 +2926,7 @@ def test_lode_wait_multi_one_not_found(capsys):
 
 def test_lode_wait_remote_poll_json_shipped(capsys):
     initial = {
-        "id": "remote123",
+        "id": "abc23456",
         "stage": "mill",
         "state": "running",
         "status": "Working",
@@ -2947,7 +2950,7 @@ def test_lode_wait_remote_poll_json_shipped(capsys):
             ),
         ),
     ):
-        result = cmd_lode(["wait", "remote123", "--json", "--timeout", "1"])
+        result = cmd_lode(["wait", "abc23456", "--json", "--timeout", "1"])
 
     assert result == 0
     payload = json.loads(capsys.readouterr().out)
@@ -3095,8 +3098,12 @@ def test_config_delete_missing(temp_config, capsys):
     result = cmd_config(["delete", "nope"])
     assert result == 1
     assert config_file.read_bytes() == original
-    captured = capsys.readouterr()
-    assert "not set" in captured.out
+    assert capsys.readouterr().out.splitlines() == [
+        "error: config deletion refused",
+        "observed: config key 'nope' is not set",
+        "Hopper did not change config.json.",
+        "recover with: hop config list",
+    ]
 
 
 def test_config_delete_missing_key_arg(capsys):
@@ -3116,8 +3123,12 @@ def test_config_delete_complex_blocked(temp_config, capsys):
     result = cmd_config(["delete", "projects"])
     assert result == 1
     assert config_file.read_bytes() == original
-    captured = capsys.readouterr()
-    assert "Cannot delete complex key" in captured.out
+    assert capsys.readouterr().out.splitlines() == [
+        "error: config deletion refused",
+        "observed: config key 'projects' contains a complex value",
+        "Hopper did not change config.json.",
+        "recover with: hop config json",
+    ]
 
 
 def test_config_get_existing(temp_config, capsys):
@@ -3218,7 +3229,7 @@ def test_migration_publication_failure_stops_predispatch_routing(
     assert lines[0] == "error: Hopper config is unavailable"
     assert str(path) in lines[1]
     assert "did not treat the config as empty" in lines[2]
-    assert "python -m json.tool" in lines[3]
+    assert lines[3].startswith("recover with: `ls -ld ")
 
 
 @pytest.mark.parametrize(
@@ -3248,9 +3259,33 @@ def test_invalid_config_fails_unavailable_without_remote_contact(
     assert str(path) in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("reason", ["malformed", "wrong_shape", "unreadable", "locked"])
+def test_wrong_shaped_projects_stop_pooled_routing_without_contact(
+    temp_config, monkeypatch, capsys
+):
+    path = temp_config / "config.json"
+    original = b'{"projects":[{"path":"/srv/journal","name":7}],"remote.journal":["a"]}\n'
+    path.write_bytes(original)
+    monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal"])
+
+    with patch("hopper.remote.run_remote") as remote_probe:
+        assert main() == 2
+
+    remote_probe.assert_not_called()
+    assert path.read_bytes() == original
+    assert str(path) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("reason", "recovery"),
+    [
+        ("malformed", "python -m json.tool"),
+        ("wrong_shape", "vi"),
+        ("unreadable", "ls -ld"),
+        ("locked", "fuser"),
+    ],
+)
 def test_main_renders_every_config_error_reason_as_four_line_unavailable_refusal(
-    temp_config, capsys, reason
+    temp_config, capsys, reason, recovery
 ):
     error = config.ConfigError(temp_config / "config.json", reason)
 
@@ -3262,7 +3297,7 @@ def test_main_renders_every_config_error_reason_as_four_line_unavailable_refusal
     assert lines[0] == "error: Hopper config is unavailable"
     assert str(error.path) in lines[1]
     assert "did not treat the config as empty" in lines[2]
-    assert lines[3].startswith("recover with:")
+    assert lines[3].startswith(f"recover with: `{recovery} ")
 
 
 def test_config_set_updates_existing(temp_config, capsys):
@@ -4238,7 +4273,12 @@ def test_gate_show_reports_when_no_gate_is_set(capsys):
     ):
         assert cmd_gate(["show", "gate1234"]) == 1
 
-    assert capsys.readouterr().out == "Error: no gate is set for lode gate1234.\n"
+    assert capsys.readouterr().out.splitlines() == [
+        "error: gate display refused",
+        "observed: no gate is set for lode gate1234",
+        "Hopper did not display gate feedback or change the lode.",
+        "recover with: hop lode status gate1234",
+    ]
 
 
 def test_gate_feedback_with_text_arg_calls_client(capsys):
@@ -4646,7 +4686,10 @@ def test_status_outside_lode_not_found(capsys):
     require.assert_not_called()
     assert result == 1
     captured = capsys.readouterr()
-    assert captured.out == "Lode 'bad_id' not found. Probes: local=absent.\n"
+    assert captured.out == (
+        "Observed: lode 'bad_id' was not found. Hopper did not route or mutate a lode. "
+        "Recover with: hop lode list --all-hosts --json. Probes: local=absent.\n"
+    )
     assert captured.err == ""
 
 
@@ -4751,6 +4794,9 @@ def test_list_help_shows_list(capsys):
     out = capsys.readouterr().out
     assert "hop list" in out
     assert "--project" in out
+    assert "every pool host" in out
+    assert "unavailable_hosts" in out
+    assert "exit 2" in out
 
 
 def test_list_archived_flag(capsys):
@@ -4862,7 +4908,10 @@ def test_show_alias_absent_has_exact_message(capsys):
 
     assert result == 1
     captured = capsys.readouterr()
-    assert captured.out == "Lode 'missing' not found. Probes: local=absent.\n"
+    assert captured.out == (
+        "Observed: lode 'missing' was not found. Hopper did not route or mutate a lode. "
+        "Recover with: hop lode list --all-hosts --json. Probes: local=absent.\n"
+    )
     assert captured.err == ""
 
 
@@ -4878,8 +4927,9 @@ def test_show_alias_unavailable_has_exact_message(capsys):
     assert result == 2
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'missing': local could not be probed, "
-        "so this is NOT evidence the lode is gone. "
+        "Observed: lode status for 'missing' is unavailable because local could not be "
+        "probed. Hopper did not treat the lode as absent or route the command. "
+        "Recover with: hop lode list --json. "
         "Probes: local=unavailable (server not running at /tmp/server.sock).\n"
     )
     assert captured.err == ""
@@ -5094,7 +5144,8 @@ def test_lode_show_ambiguous_prefix(capsys):
     captured = capsys.readouterr()
     assert captured.out == (
         "Ambiguous lode prefix 'abc'. Matches: local:abc12345, local:abc99999. "
-        "Probes: local=ambiguous (abc12345, abc99999).\n"
+        "Probes: local=ambiguous (abc12345, abc99999). Hopper did not choose a lode "
+        "or route the command. Recover with: hop lode status abc12345 --json.\n"
     )
     assert captured.err == ""
 
@@ -5105,7 +5156,10 @@ def test_lode_show_not_found(capsys):
         result = cmd_lode(["show", "bad_id"])
     assert result == 1
     captured = capsys.readouterr()
-    assert captured.out == "Lode 'bad_id' not found. Probes: local=absent.\n"
+    assert captured.out == (
+        "Observed: lode 'bad_id' was not found. Hopper did not route or mutate a lode. "
+        "Recover with: hop lode list --all-hosts --json. Probes: local=absent.\n"
+    )
     assert captured.err == ""
 
 
@@ -5139,7 +5193,11 @@ def test_lode_status_not_found(capsys):
         result = cmd_lode(["status", "bad_id"])
     assert result == 1
     captured = capsys.readouterr()
-    assert captured.out == ("Lode 'bad_id' not found. Probes: local=absent; fedora.local=absent.\n")
+    assert captured.out == (
+        "Observed: lode 'bad_id' was not found. Hopper did not route or mutate a lode. "
+        "Recover with: hop lode list --all-hosts --json. "
+        "Probes: local=absent; fedora.local=absent.\n"
+    )
     assert captured.err == ""
 
 
@@ -5159,8 +5217,9 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
     assert result == 2
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'busy-id': fedora.local, local could not be probed, "
-        "so this is NOT evidence the lode is gone. "
+        "Observed: lode status for 'busy-id' is unavailable because fedora.local, local "
+        "could not be probed. Hopper did not treat the lode as absent or route the command. "
+        "Recover with: hop -H fedora.local lode list --json. "
         "Probes: local=unavailable (server did not respond within 2s); "
         "fedora.local=unreadable.\n"
     )
@@ -5182,8 +5241,9 @@ def test_lode_status_local_unavailable_remote_absent_exits_2(capsys):
     assert result == 2
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'abc': local could not be probed, "
-        "so this is NOT evidence the lode is gone. "
+        "Observed: lode status for 'abc' is unavailable because local could not be probed. "
+        "Hopper did not treat the lode as absent or route the command. "
+        "Recover with: hop lode list --json. "
         "Probes: local=unavailable (server not running at /tmp/server.sock); "
         "fedora.local=absent.\n"
     )
@@ -5204,8 +5264,9 @@ def test_outside_status_local_unavailable_prints_honest_error(capsys):
     require.assert_not_called()
     captured = capsys.readouterr()
     assert captured.out == (
-        "Lode status unavailable for 'abc': local could not be probed, "
-        "so this is NOT evidence the lode is gone. "
+        "Observed: lode status for 'abc' is unavailable because local could not be probed. "
+        "Hopper did not treat the lode as absent or route the command. "
+        "Recover with: hop lode list --json. "
         "Probes: local=unavailable (server not running at /tmp/server.sock).\n"
     )
     assert captured.err == ""
@@ -5237,6 +5298,42 @@ def test_remote_lode_probe_classifies_malformed_output_as_unreadable(stdout):
 
 
 @pytest.mark.parametrize(
+    "lode_id",
+    [1, "abc12345", "bcd23456"],
+    ids=["non-string", "non-canonical", "prefix-mismatch"],
+)
+def test_remote_lode_probe_rejects_invalid_or_mismatched_success_id(lode_id):
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess(
+        [], 0, stdout=json.dumps({"id": lode_id, "project": "journal"}), stderr=""
+    )
+    with patch("hopper.remote.run_remote", return_value=result):
+        lode, state = _remote_lode_status("fedora.local", "abc")
+
+    assert lode is None
+    assert state == "unreadable"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "diagnostic", "expected"),
+    [
+        (1, "generic remote failure", "absent"),
+        (2, "lode not found", "unreadable"),
+    ],
+)
+def test_remote_lode_probe_uses_exit_code_not_prose_for_absence(returncode, diagnostic, expected):
+    from hopper.cli import _remote_lode_status
+
+    result = subprocess.CompletedProcess([], returncode, stdout="", stderr=diagnostic)
+    with patch("hopper.remote.run_remote", return_value=result):
+        lode, state = _remote_lode_status("fedora.local", "abc")
+
+    assert lode is None
+    assert state == expected
+
+
+@pytest.mark.parametrize(
     "diagnostic",
     [
         (
@@ -5258,7 +5355,7 @@ def test_remote_lode_probe_preserves_ambiguity_ids(diagnostic):
     assert state.matches == ("abc11111", "abc22222")
 
 
-def test_remote_lode_probe_rejects_malformed_ambiguity_as_unreadable():
+def test_remote_lode_probe_uses_exit_one_when_ambiguity_detail_is_malformed():
     from hopper.cli import _remote_lode_status
 
     result = subprocess.CompletedProcess(
@@ -5271,7 +5368,7 @@ def test_remote_lode_probe_rejects_malformed_ambiguity_as_unreadable():
         lode, state = _remote_lode_status("fedora.local", "abc")
 
     assert lode is None
-    assert state == "unreadable"
+    assert state == "absent"
     assert state.matches == ()
 
 
@@ -5459,7 +5556,7 @@ def test_lode_list_all_hosts_probes_stamped_local_parked_lode(capsys, make_lode)
 
     with (
         patch("hopper.client.probe_server", return_value="up"),
-        patch("hopper.client.list_lodes", return_value=[lode]),
+        patch("hopper.client.read_lodes", return_value=[lode]),
         patch("hopper.remote.remote_registry", return_value={}),
         patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness,
     ):
@@ -5491,7 +5588,7 @@ def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(ca
 
     with (
         patch("hopper.client.probe_server", return_value="up"),
-        patch("hopper.client.list_lodes", return_value=[]),
+        patch("hopper.client.read_lodes", return_value=[]),
         patch("hopper.remote.remote_registry", return_value={"proj": ["builder.example"]}),
         patch("hopper.remote.run_remote", return_value=remote_result),
         patch(
@@ -5517,7 +5614,7 @@ def test_lode_list_all_hosts_uses_unique_union_of_pool_members(capsys):
     )
     with (
         patch("hopper.client.probe_server", return_value="up"),
-        patch("hopper.client.list_lodes", return_value=[]),
+        patch("hopper.client.read_lodes", return_value=[]),
         patch(
             "hopper.remote.remote_registry",
             return_value={
@@ -5537,6 +5634,28 @@ def test_lode_list_all_hosts_uses_unique_union_of_pool_members(capsys):
     assert json.loads(capsys.readouterr().out) == {
         "lodes": [],
         "unavailable_hosts": [],
+    }
+
+
+def test_lode_list_all_hosts_marks_local_read_failure_unavailable(capsys):
+    with (
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.read_lodes", return_value=None),
+        patch("hopper.remote.remote_registry", return_value={}),
+    ):
+        assert cmd_lode(["list", "--all-hosts", "--json"]) == 2
+
+    assert json.loads(capsys.readouterr().out) == {
+        "lodes": [],
+        "unavailable_hosts": [
+            {
+                "host": "local",
+                "reason": (
+                    "lode listing exited 1: server lode listing could not be read after "
+                    "the server answered; retry with: hop lode list --json"
+                ),
+            }
+        ],
     }
 
 
@@ -5635,8 +5754,8 @@ def test_lode_list_all_hosts_human_reports_partial_sources(capsys, make_lode):
     assert "abc23456" in captured.out
     assert "ready.example" in captured.out
     assert (
-        "Unavailable host local: lode listing exited 1: server did not answer within 2s"
-        in captured.err
+        "Unavailable host local: lode listing exited 1: server did not answer within "
+        f"{hopper_cli.LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC:g}s" in captured.err
     )
     assert (
         "Unavailable host down.example: lode listing transport failed: network down" in captured.err
@@ -5988,9 +6107,23 @@ def test_remote_set_refuses_active_local_project(capsys):
     rc = cmd_remote(["set", "myproj", "fedora.local"])
 
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "active locally" in out
-    assert "hop project disable myproj" in out
+    assert capsys.readouterr().out.splitlines() == [
+        "error: remote pool update refused",
+        "observed: project 'myproj' is active locally",
+        "Hopper did not change config.json.",
+        "recover with: hop project disable myproj --reason 'moved to fedora.local'",
+    ]
+
+
+def test_remote_rm_absent_has_complete_refusal(capsys):
+    assert cmd_remote(["rm", "journal"]) == 1
+
+    assert capsys.readouterr().out.splitlines() == [
+        "error: remote pool removal refused",
+        "observed: project 'journal' has no configured host pool",
+        "Hopper did not change config.json.",
+        "recover with: hop remote list",
+    ]
 
 
 def test_remote_set_warns_but_saves_when_unreachable(capsys):
@@ -6018,8 +6151,8 @@ def test_remote_set_replaces_with_ordered_deduplicated_pool_and_pings_each_host(
         )
 
     assert ping.call_args_list == [
-        (("first.example", ["ping"]), {"timeout": 15}),
-        (("second.example", ["ping"]), {"timeout": 15}),
+        (("first.example", ["ping"]), {"timeout": REMOTE_SET_PING_TIMEOUT_SEC}),
+        (("second.example", ["ping"]), {"timeout": REMOTE_SET_PING_TIMEOUT_SEC}),
     ]
     assert config.load_config()["remote.journal"] == ["first.example", "second.example"]
     captured = capsys.readouterr()
@@ -6033,7 +6166,12 @@ def test_remote_set_requires_a_non_empty_host_and_does_not_write(capsys, args):
     assert cmd_remote(args) == 1
 
     assert config.load_config() == {}
-    assert "require" in capsys.readouterr().out
+    assert capsys.readouterr().out.splitlines() == [
+        "error: remote pool update refused",
+        "observed: the requested pool contains no usable host",
+        "Hopper did not change config.json.",
+        "recover with: hop remote set journal <host> [host ...]",
+    ]
 
 
 def test_remote_list_json(capsys):
@@ -6218,6 +6356,7 @@ def test_pooled_create_with_no_eligible_host_refuses_without_create(
     captured = capsys.readouterr()
     if json_output:
         payload = json.loads(captured.out)
+        assert payload["creation_attempted"] is False
         assert payload["unavailable_hosts"] == [
             {"host": probe.host, "reason": probe.reason} for probe in probes
         ]

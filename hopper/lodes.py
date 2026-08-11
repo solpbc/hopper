@@ -49,6 +49,15 @@ ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
 
 
+def is_canonical_lode_id(value: object) -> bool:
+    """Return whether a value is a canonical Hopper lode ID."""
+    return (
+        isinstance(value, str)
+        and len(value) == ID_LEN
+        and all(character in ID_ALPHABET for character in value)
+    )
+
+
 def current_time_ms() -> int:
     """Return current time in milliseconds since epoch."""
     return int(time.time() * 1000)

@@ -19,6 +19,7 @@ from hopper import config
 from hopper.cli import main
 from hopper.projects import Project
 from hopper.remote import (
+    REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC,
     REMOTE_CACHE_LOCK_TIMEOUT_SEC,
     REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
     REMOTE_POOL_PROBE_TIMEOUT_SEC,
@@ -516,7 +517,13 @@ def test_select_candidate_uses_minimum_load_and_injected_tie_break():
 
 
 def test_discover_lodes_preserves_rows_and_every_unavailable_reason():
-    hosts = ["ready.example", "timeout.example", "failed.example", "malformed.example"]
+    hosts = [
+        "ready.example",
+        "timeout.example",
+        "failed.example",
+        "malformed.example",
+        "weak-row.example",
+    ]
     calls = []
 
     def runner(host, args, *, timeout):
@@ -527,6 +534,10 @@ def test_discover_lodes_preserves_rows_and_every_unavailable_reason():
             return subprocess.CompletedProcess([], 7, stdout="", stderr="server failed")
         if host == "malformed.example":
             return subprocess.CompletedProcess([], 0, stdout="{", stderr="")
+        if host == "weak-row.example":
+            return subprocess.CompletedProcess(
+                [], 0, stdout='{"lodes": [{"id": "abc23456"}]}', stderr=""
+            )
         return subprocess.CompletedProcess(
             [],
             0,
@@ -545,6 +556,11 @@ def test_discover_lodes_preserves_rows_and_every_unavailable_reason():
         HostDiscovery("timeout.example", (), "lode listing timed out"),
         HostDiscovery("failed.example", (), "lode listing exited 7: server failed"),
         HostDiscovery("malformed.example", (), "lode listing returned malformed JSON"),
+        HostDiscovery(
+            "weak-row.example",
+            (),
+            "lode inventory contained a record without a boolean active field",
+        ),
     ]
     assert len(calls) == len(hosts)
     assert all(call[2] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC for call in calls)
@@ -640,6 +656,13 @@ if role == "B":
     control_file.write(b"ATTEMPT B\n")
 
 original_publish = config._publish_config
+original_acquire = config._acquire_config_lock
+
+def synchronized_acquire(lock_file, path):
+    if role == "A":
+        control_file.write(b"ACQUIRE_READY A\n")
+        assert control_file.readline() == b"ACQUIRE\n"
+    original_acquire(lock_file, path)
 
 def synchronized_publish(data, path):
     payload = json.dumps(data, sort_keys=True)
@@ -648,6 +671,7 @@ def synchronized_publish(data, path):
     original_publish(data, path)
 
 config._publish_config = synchronized_publish
+config._acquire_config_lock = synchronized_acquire
 projects.current_time_ms = lambda: 100 if role == "A" else 200
 
 if operation == "migration":
@@ -713,6 +737,11 @@ control_file.write(f"DONE {role}\n".encode())
             files[role] = control_file
 
         files["A"].write(b"GO\n")
+        assert files["A"].readline() == b"ACQUIRE_READY A\n"
+        out_of_band = json.loads(config_path.read_text())
+        out_of_band["parent-published-before-a-lock"] = True
+        config_path.write_text(json.dumps(out_of_band, indent=2) + "\n")
+        files["A"].write(b"ACQUIRE\n")
         publish, role, _payload = files["A"].readline().decode().strip().split(" ", 2)
         assert (publish, role) == ("PUBLISH_READY", "A")
 
@@ -750,6 +779,7 @@ control_file.write(f"DONE {role}\n".encode())
     final = json.loads(config_path.read_text())
     assert final == merged
     assert final["name"] == "sol"
+    assert final["parent-published-before-a-lock"] is True
     assert not list(data_dir.glob("config.json.*.tmp"))
     for operation, role in [(first, "a"), (second, "b")]:
         if operation == "migration":
@@ -793,7 +823,7 @@ def test_remember_lode_same_host_does_not_publish(temp_config, monkeypatch):
     published = []
     times = iter([200, 300])
     monkeypatch.setattr("hopper.remote.current_time_ms", lambda: next(times))
-    monkeypatch.setattr("hopper.remote.save_lode_cache", lambda cache: published.append(cache))
+    monkeypatch.setattr("hopper.remote._save_lode_cache", lambda cache: published.append(cache))
 
     remember_lode("knownid2", "fedora.local", "renamed-project")
     remember_lode("knownid2", "fedora.local", "another-project")
@@ -964,22 +994,21 @@ def test_legacy_cache_migration_failure_preserves_original_bytes(temp_config, mo
     assert cache_path.read_bytes() == original
 
 
-def test_lode_cache_lock_deadline_is_bounded_without_sleep(temp_config, monkeypatch):
-    clock = iter([0.0, REMOTE_CACHE_LOCK_TIMEOUT_SEC])
+def test_lode_cache_lock_deadline_uses_named_timeout_and_poll(temp_config, monkeypatch):
+    clock = iter([0.0, 0.0, REMOTE_CACHE_LOCK_TIMEOUT_SEC])
+    sleeps = []
     monkeypatch.setattr("hopper.remote.time.monotonic", lambda: next(clock))
     monkeypatch.setattr(
         "hopper.remote.fcntl.flock",
         lambda *_args: (_ for _ in ()).throw(BlockingIOError()),
     )
-    monkeypatch.setattr(
-        "hopper.remote.time.sleep",
-        lambda *_args: pytest.fail("deadline should expire before sleeping"),
-    )
+    monkeypatch.setattr("hopper.remote.time.sleep", sleeps.append)
 
     with pytest.raises(LodeCacheError) as raised:
         remember_lode("abc23456", "resident.example", "journal")
 
     assert raised.value.reason == "locked"
+    assert sleeps == [REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC]
 
 
 def test_concurrent_remember_lode_processes_preserve_complete_cache(tmp_path):
@@ -1000,7 +1029,7 @@ assert control_file.readline() == b"GO\n"
 if role == "B":
     control_file.write(b"ATTEMPT B\n")
 
-original_save = remote.save_lode_cache
+original_save = remote._save_lode_cache
 
 def synchronized_save(cache):
     payload = json.dumps(cache, sort_keys=True)
@@ -1008,7 +1037,7 @@ def synchronized_save(cache):
     assert control_file.readline() == b"RELEASE\n"
     original_save(cache)
 
-remote.save_lode_cache = synchronized_save
+remote._save_lode_cache = synchronized_save
 remote.remember_lode(lode_id, remote_host, f"project-{role.lower()}")
 control_file.write(f"DONE {role}\n".encode())
 """

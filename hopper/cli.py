@@ -23,12 +23,11 @@ from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
 from hopper.git import UPSTREAM_FETCH_REFSPEC, ShipLandingCause, ShipLandingVerdict
 from hopper.lodes import (
-    ID_ALPHABET,
-    ID_LEN,
     current_time_ms,
     format_age,
     get_lode_dir,
     get_worktree_dir,
+    is_canonical_lode_id,
     is_terminal_failure_kind,
     lode_icon,
     lode_status_for_display,
@@ -50,6 +49,7 @@ _GATE_FEEDBACK_DESCRIPTION = (
 HELP_SKILL_REMINDER = "Note for AI agent sessions: load the `hop` skill before using this CLI."
 WATCH_RECONCILE_SECONDS = 30.0
 WATCH_OBSERVER_TIMEOUT_SECONDS = 300.0
+LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC = 2.0
 LOAD_WARNING_PER_CPU = 1.0
 _watch_monotonic = time.monotonic
 
@@ -417,11 +417,7 @@ def _validate_remote_create_response(result, project: str) -> tuple[dict[str, st
         return None, "returned a response outside the exact create JSON contract"
 
     lode_id = payload.get("id")
-    if (
-        not isinstance(lode_id, str)
-        or len(lode_id) != ID_LEN
-        or any(character not in ID_ALPHABET for character in lode_id)
-    ):
+    if not is_canonical_lode_id(lode_id):
         return None, "returned a non-canonical lode ID"
     if payload.get("project") != project:
         return None, f"returned project {payload.get('project')!r}, expected {project!r}"
@@ -465,7 +461,7 @@ def _run_authoritative_remote_create(
 
     cache_error = _remember_lode_route(payload["id"], host, project)
     if cache_error is not None:
-        print("error: remote lode route was not saved", file=sys.stderr)
+        print("error: resident route was not saved", file=sys.stderr)
         print(
             f"observed: selected host {host} returned valid lode ID {payload['id']}, but its "
             f"resident route was not saved: {cache_error}.",
@@ -545,7 +541,7 @@ def _run_remote_cli(
 
 
 def _remember_lode_route(lode_id: str, host: str, project: str = "") -> Exception | None:
-    """Cache a remote route and return a persistence error to strict callers."""
+    """Cache a resident route and return a persistence error to strict callers."""
     from hopper.remote import remember_lode
 
     try:
@@ -981,10 +977,16 @@ def cmd_config(args: list[str]) -> int:
             return 1
         with config_transaction() as cfg:
             if parsed.key not in cfg:
-                print(f"Config '{parsed.key}' not set.")
+                print("error: config deletion refused")
+                print(f"observed: config key '{parsed.key}' is not set")
+                print("Hopper did not change config.json.")
+                print("recover with: hop config list")
                 return 1
             if not _is_simple_value(cfg[parsed.key]):
-                print(f"Cannot delete complex key '{parsed.key}'. Use its own command.")
+                print("error: config deletion refused")
+                print(f"observed: config key '{parsed.key}' contains a complex value")
+                print("Hopper did not change config.json.")
+                print("recover with: hop config json")
                 return 1
             del cfg[parsed.key]
         print(f"Deleted '{parsed.key}'.")
@@ -1029,7 +1031,13 @@ def cmd_config(args: list[str]) -> int:
 def cmd_remote(args: list[str]) -> int:
     """Manage project -> ordered remote host pools."""
     from hopper.projects import find_project
-    from hopper.remote import remote_registry, remove_remote, run_remote, set_remote
+    from hopper.remote import (
+        REMOTE_SET_PING_TIMEOUT_SEC,
+        remote_registry,
+        remove_remote,
+        run_remote,
+        set_remote,
+    )
 
     parser = make_parser(
         "remote",
@@ -1050,7 +1058,7 @@ def cmd_remote(args: list[str]) -> int:
         exit_on_error=False,
     )
     set_p.add_argument("project", help="Project name")
-    set_p.add_argument("hosts", nargs="+", help="Ordered remote host pool")
+    set_p.add_argument("hosts", nargs="*", help="Ordered remote host pool")
     rm_p = subs.add_parser(
         "rm",
         aliases=["remove"],
@@ -1085,24 +1093,40 @@ def cmd_remote(args: list[str]) -> int:
     if subcommand == "set":
         # Command input is canonicalized once. Stored pools remain strict: an
         # already-written duplicate or whitespace-bearing entry is corrupt.
+        if not parsed.hosts or any(not raw_host.strip() for raw_host in parsed.hosts):
+            recovery = f"hop remote set {shlex.quote(parsed.project)} <host> [host ...]"
+            print("error: remote pool update refused")
+            print("observed: the requested pool contains no usable host")
+            print("Hopper did not change config.json.")
+            print(f"recover with: {recovery}")
+            return 1
         hosts = []
         seen = set()
         for raw_host in parsed.hosts:
             host = raw_host.strip()
-            if not host:
-                print("error: remote set requires at least one non-empty host")
-                return 1
             if host not in seen:
                 seen.add(host)
                 hosts.append(host)
         project = find_project(parsed.project)
         if project and not project.disabled:
-            print(f"error: project '{parsed.project}' is active locally; disable it before routing")
-            print(f'  hop project disable {parsed.project} --reason "moved to {hosts[0]}"')
+            recovery = shlex.join(
+                [
+                    "hop",
+                    "project",
+                    "disable",
+                    parsed.project,
+                    "--reason",
+                    f"moved to {hosts[0]}",
+                ]
+            )
+            print("error: remote pool update refused")
+            print(f"observed: project '{parsed.project}' is active locally")
+            print("Hopper did not change config.json.")
+            print(f"recover with: {recovery}")
             return 1
         for host in hosts:
             try:
-                result = run_remote(host, ["ping"], timeout=15)
+                result = run_remote(host, ["ping"], timeout=REMOTE_SET_PING_TIMEOUT_SEC)
                 failed = result.returncode != 0
                 detail = (result.stderr or result.stdout or "remote ping failed").strip()
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -1119,7 +1143,10 @@ def cmd_remote(args: list[str]) -> int:
 
     if subcommand in ("rm", "remove"):
         if not remove_remote(parsed.project):
-            print(f"Remote project '{parsed.project}' not set.")
+            print("error: remote pool removal refused")
+            print(f"observed: project '{parsed.project}' has no configured host pool")
+            print("Hopper did not change config.json.")
+            print("recover with: hop remote list")
             return 1
         print(f"Removed remote.{parsed.project}")
         return 0
@@ -1386,7 +1413,11 @@ def _cmd_gate_show(args: list[str]) -> int:
 
     gate_data = client.get_gate(_socket(), resolved["canonical_id"])
     if not gate_data:
-        print(f"Error: no gate is set for lode {resolved['canonical_id']}.")
+        canonical_id = resolved["canonical_id"]
+        print("error: gate display refused")
+        print(f"observed: no gate is set for lode {canonical_id}")
+        print("Hopper did not display gate feedback or change the lode.")
+        print(f"recover with: {shlex.join(['hop', 'lode', 'status', canonical_id])}")
         return 1
 
     lode = gate_data["lode"]
@@ -2040,21 +2071,26 @@ def _remote_lode_status(
         return None, _RemoteLodeProbeState("unreadable")
     if result.returncode != 0:
         output = f"{result.stdout}\n{result.stderr}"
+        # Exit 1 also carries ambiguity, whose legacy command surface has no
+        # structured body. Parse only that diagnostic; absence itself is the
+        # durable exit-code convention and never depends on prose.
         ambiguity_matches = _remote_ambiguity_matches(output)
         if result.returncode == 1 and ambiguity_matches:
             return None, _RemoteLodeProbeState(
                 "ambiguous",
                 matches=ambiguity_matches,
             )
-        state = (
-            "absent" if result.returncode == 1 and "not found" in output.lower() else "unreadable"
-        )
+        state = "absent" if result.returncode == 1 else "unreadable"
         return None, _RemoteLodeProbeState(state)
     try:
         lode = json.loads(result.stdout)
     except json.JSONDecodeError:
         return None, _RemoteLodeProbeState("unreadable")
-    if not isinstance(lode, dict) or not lode.get("id"):
+    if (
+        not isinstance(lode, dict)
+        or not is_canonical_lode_id(lode.get("id"))
+        or not lode["id"].startswith(lode_id)
+    ):
         return None, _RemoteLodeProbeState("unreadable")
     lode["host"] = host
     return lode, _RemoteLodeProbeState("found")
@@ -2126,21 +2162,44 @@ def _failed_resolution(
     summary = "; ".join(probes)
     if outcome == "ambiguous":
         match_text = ", ".join(f"{host}:{lode_id}" for host, lode_id in matches or [])
-        error = f"Ambiguous lode prefix '{prefix}'. Matches: {match_text}. Probes: {summary}."
+        recovery_host, recovery_id = (matches or [("local", prefix)])[0]
+        recovery_args = ["hop"]
+        if recovery_host != "local":
+            recovery_args.extend(["-H", recovery_host])
+        recovery_args.extend(["lode", "status", recovery_id, "--json"])
+        error = (
+            f"Ambiguous lode prefix '{prefix}'. Matches: {match_text}. Probes: {summary}. "
+            f"Hopper did not choose a lode or route the command. "
+            f"Recover with: {shlex.join(recovery_args)}."
+        )
     elif outcome == "unavailable":
         # A probe that failed and a source that never had the lode read the same
         # way in a bare probe list, so the headline has to name the difference:
         # the search was not exhaustive and absence was not established.
         sources = ", ".join(sorted(set(unreadable or [])))
+        first_source = sorted(set(unreadable or []))[0] if unreadable else None
+        recovery_args = ["hop"]
+        if first_source and first_source != "local":
+            recovery_args.extend(["-H", first_source])
+        recovery_args.extend(["lode", "list", "--json"])
         if sources:
             error = (
-                f"Lode status unavailable for '{prefix}': {sources} could not be probed, "
-                f"so this is NOT evidence the lode is gone. Probes: {summary}."
+                f"Observed: lode status for '{prefix}' is unavailable because {sources} "
+                "could not be probed. Hopper did not treat the lode as absent or route "
+                f"the command. Recover with: {shlex.join(recovery_args)}. Probes: {summary}."
             )
         else:
-            error = f"Lode status unavailable for '{prefix}'. Probes: {summary}."
+            error = (
+                f"Observed: lode status for '{prefix}' is unavailable. Hopper did not treat "
+                "the lode as absent or route the command. Recover with: "
+                f"{shlex.join(recovery_args)}. Probes: {summary}."
+            )
     else:
-        error = f"Lode '{prefix}' not found. Probes: {summary}."
+        recovery = shlex.join(["hop", "lode", "list", "--all-hosts", "--json"])
+        error = (
+            f"Observed: lode '{prefix}' was not found. Hopper did not route or mutate a lode. "
+            f"Recover with: {recovery}. Probes: {summary}."
+        )
     return _resolution_result(
         outcome,
         error=error,
@@ -2502,6 +2561,21 @@ def _create_alias_help(cmd_name: str, description: str, args: list[str]) -> int 
     return None
 
 
+def _add_lode_list_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared lode-list arguments to the command and its alias."""
+    parser.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
+    parser.add_argument("-p", "--project", help="Filter by project name")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    parser.add_argument(
+        "--all-hosts",
+        action="store_true",
+        help=(
+            "Concurrently aggregate local and every pool host; partial results report "
+            "unavailable_hosts and exit 2"
+        ),
+    )
+
+
 @command("lode", "Manage lodes")
 def cmd_lode(args: list[str]) -> int:
     """Manage lodes — list, create, restart, watch, wait."""
@@ -2516,17 +2590,7 @@ def cmd_lode(args: list[str]) -> int:
     list_p = subs.add_parser(
         "list", aliases=["ls"], help="List lodes (default)", exit_on_error=False
     )
-    list_p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
-    list_p.add_argument("-p", "--project", help="Filter by project name")
-    list_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
-    list_p.add_argument(
-        "--all-hosts",
-        action="store_true",
-        help=(
-            "Concurrently aggregate local and every pool host; partial results report "
-            "unavailable_hosts and exit 2"
-        ),
-    )
+    _add_lode_list_args(list_p)
 
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
     _add_create_args(create_p)
@@ -2629,17 +2693,32 @@ def cmd_lode(args: list[str]) -> int:
         archived = getattr(parsed, "archived", False)
         project_filter = getattr(parsed, "project", None)
 
-        def local_lodes() -> list[dict]:
+        def prepare_local_lodes(rows: list[dict]) -> list[dict]:
+            rows = list(rows)
             if archived:
-                rows = client.list_archived_lodes(socket_path)
                 rows.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
             else:
-                rows = client.list_lodes(socket_path)
                 rows = [lode for lode in rows if lode.get("stage") in STAGE_ORDER]
                 rows.sort(key=lambda lode: STAGE_ORDER.get(lode.get("stage", "mill"), 99))
             if project_filter:
                 rows = [lode for lode in rows if lode.get("project") == project_filter]
             return rows
+
+        def local_lodes() -> list[dict]:
+            rows = (
+                client.list_archived_lodes(socket_path)
+                if archived
+                else client.list_lodes(socket_path)
+            )
+            return prepare_local_lodes(rows)
+
+        def read_local_lodes(timeout: float) -> list[dict] | None:
+            rows = (
+                client.read_archived_lodes(socket_path, timeout=timeout)
+                if archived
+                else client.read_lodes(socket_path, timeout=timeout)
+            )
+            return None if rows is None else prepare_local_lodes(rows)
 
         lodes = [] if all_hosts else [dict(lode) for lode in local_lodes()]
         unavailable_hosts: list[dict[str, str]] = []
@@ -2656,7 +2735,8 @@ def cmd_lode(args: list[str]) -> int:
             def discovery_runner(host, args, *, timeout):
                 if host != "local":
                     return run_remote(host, args, timeout=timeout)
-                local_status = client.probe_server(socket_path, timeout=min(timeout, 2.0))
+                local_timeout = min(timeout, LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC)
+                local_status = client.probe_server(socket_path, timeout=local_timeout)
                 if local_status == "down":
                     return subprocess.CompletedProcess(
                         [],
@@ -2669,12 +2749,26 @@ def cmd_lode(args: list[str]) -> int:
                         [],
                         1,
                         stdout="",
-                        stderr="server did not answer within 2s; retry or stop it if wedged",
+                        stderr=(
+                            "server did not answer within "
+                            f"{LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC:g}s; retry or stop it if wedged"
+                        ),
+                    )
+                rows = read_local_lodes(local_timeout)
+                if rows is None:
+                    return subprocess.CompletedProcess(
+                        [],
+                        1,
+                        stdout="",
+                        stderr=(
+                            "server lode listing could not be read after the server answered; "
+                            "retry with: hop lode list --json"
+                        ),
                     )
                 return subprocess.CompletedProcess(
                     [],
                     0,
-                    stdout=json.dumps({"lodes": local_lodes()}),
+                    stdout=json.dumps({"lodes": rows}),
                     stderr="",
                 )
 
@@ -3230,10 +3324,7 @@ def cmd_list(args: list[str]) -> int:
     """Alias for hop lode list."""
     if "-h" in args or "--help" in args:
         p = make_parser("list", "List lodes (alias for lode list)")
-        p.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
-        p.add_argument("-p", "--project", help="Filter by project name")
-        p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
-        p.add_argument("--all-hosts", action="store_true", help="Aggregate remote hosts")
+        _add_lode_list_args(p)
         try:
             parse_args(p, args)
         except SystemExit:
@@ -3678,6 +3769,7 @@ def _main() -> int:
                             json.dumps(
                                 {
                                     "error": f"no eligible host for project {project!r}",
+                                    "creation_attempted": False,
                                     "unavailable_hosts": unavailable_hosts,
                                 }
                             )
@@ -3729,6 +3821,12 @@ def main() -> int:
             "locked": "could not be locked before the acquisition deadline",
         }[error.reason]
         quoted_path = shlex.quote(str(error.path))
+        recovery = {
+            "malformed": f"python -m json.tool {quoted_path}",
+            "wrong_shape": f"vi {quoted_path}",
+            "unreadable": shlex.join(["ls", "-ld", str(error.path.parent), str(error.path)]),
+            "locked": shlex.join(["fuser", str(config.config_lock_path())]),
+        }[error.reason]
         print("error: Hopper config is unavailable", file=sys.stderr)
         print(f"observed: {error.path} {observed}.", file=sys.stderr)
         print(
@@ -3736,8 +3834,7 @@ def main() -> int:
             file=sys.stderr,
         )
         print(
-            f"recover with: inspect `python -m json.tool {quoted_path}`, repair the config, "
-            "then retry.",
+            f"recover with: `{recovery}`, resolve the reported condition, then retry.",
             file=sys.stderr,
         )
         return 2

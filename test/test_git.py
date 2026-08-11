@@ -6,6 +6,7 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -385,7 +386,10 @@ class TestCreateWorktree:
         ) as mock_run:
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
 
-        assert result == (False, "git fetch origin timed out after 120 seconds")
+        assert result == (
+            False,
+            f"git fetch origin timed out after {SHIP_FETCH_TIMEOUT_SEC:g} seconds",
+        )
         assert mock_run.call_count == 2
 
     def test_resolution_failure_returns_detail_before_add(self, tmp_path):
@@ -771,9 +775,18 @@ class TestShipLandingVerdictIntegration:
         assert verdict.containment == "indeterminate"
         assert "missing" in verdict.detail
 
+    def test_unreadable_worktree_is_indeterminate(self, tmp_path):
+        with patch.object(Path, "is_dir", side_effect=OSError("permission denied")):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.cleanliness == "indeterminate"
+        assert verdict.containment == "indeterminate"
+        assert verdict.cause == "worktree_unreadable"
+        assert "permission denied" in verdict.detail
+
 
 class TestShipLandingVerdictDeadlines:
-    def test_each_stage_uses_its_named_deadline_and_total_is_140_seconds(self, tmp_path):
+    def test_each_stage_uses_its_named_deadline_and_total_budget(self, tmp_path):
         results = [
             MagicMock(returncode=0, stdout=""),
             MagicMock(returncode=0, stdout="origin\n"),
@@ -802,7 +815,6 @@ class TestShipLandingVerdictDeadlines:
             + SHIP_DEFAULT_REF_TIMEOUT_SEC
             + SHIP_ANCESTRY_TIMEOUT_SEC
             == SHIP_LANDING_TIMEOUT_SEC
-            == 140.0
         )
 
     def test_cleanliness_timeout_is_immediately_indeterminate(self, tmp_path):
@@ -835,6 +847,18 @@ class TestShipLandingVerdictDeadlines:
         assert verdict.cleanliness == "indeterminate"
         assert "fatal: status" in verdict.detail
 
+    def test_cleanliness_transport_error_is_indeterminate(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch("hopper.git.subprocess.run", side_effect=OSError("git unavailable")) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.cleanliness == "indeterminate"
+        assert verdict.containment == "indeterminate"
+        assert verdict.cause == "cleanliness_unavailable"
+        assert run.call_args.kwargs["timeout"] == SHIP_CLEANLINESS_TIMEOUT_SEC
+
     def test_remote_detection_timeout_fails_closed(self, tmp_path):
         with (
             patch("hopper.git.time.monotonic", return_value=0),
@@ -842,7 +866,7 @@ class TestShipLandingVerdictDeadlines:
                 "hopper.git.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
-                    subprocess.TimeoutExpired(["git", "remote"], 5),
+                    subprocess.TimeoutExpired(["git", "remote"], SHIP_REMOTE_DETECTION_TIMEOUT_SEC),
                 ],
             ) as run,
         ):
@@ -875,7 +899,7 @@ class TestShipLandingVerdictDeadlines:
                 side_effect=[
                     MagicMock(returncode=0, stdout=""),
                     MagicMock(returncode=0, stdout="origin\n"),
-                    subprocess.TimeoutExpired(["git", "fetch"], 120),
+                    subprocess.TimeoutExpired(["git", "fetch"], SHIP_FETCH_TIMEOUT_SEC),
                 ],
             ) as run,
         ):
@@ -911,7 +935,7 @@ class TestShipLandingVerdictDeadlines:
                     MagicMock(returncode=0, stdout=""),
                     MagicMock(returncode=0, stdout="origin\n"),
                     MagicMock(returncode=0, stdout=""),
-                    subprocess.TimeoutExpired(["git", "rev-parse"], 5),
+                    subprocess.TimeoutExpired(["git", "rev-parse"], SHIP_DEFAULT_REF_TIMEOUT_SEC),
                 ],
             ) as run,
         ):
@@ -945,7 +969,7 @@ class TestShipLandingVerdictDeadlines:
             MagicMock(returncode=0, stdout="origin\n"),
             MagicMock(returncode=0, stdout=""),
             MagicMock(returncode=0, stdout="abc123\n"),
-            subprocess.TimeoutExpired(["git", "merge-base"], 5),
+            subprocess.TimeoutExpired(["git", "merge-base"], SHIP_ANCESTRY_TIMEOUT_SEC),
         ]
         with (
             patch("hopper.git.time.monotonic", return_value=0),
@@ -959,7 +983,10 @@ class TestShipLandingVerdictDeadlines:
 
     def test_overall_monotonic_deadline_stops_before_next_probe(self, tmp_path):
         with (
-            patch("hopper.git.time.monotonic", side_effect=[0, 0, 141]),
+            patch(
+                "hopper.git.time.monotonic",
+                side_effect=[0, 0, SHIP_LANDING_TIMEOUT_SEC + 1],
+            ),
             patch(
                 "hopper.git.subprocess.run", return_value=MagicMock(returncode=0, stdout="")
             ) as run,

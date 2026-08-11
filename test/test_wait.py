@@ -172,7 +172,7 @@ def run_remote_wait(
     monkeypatch.setattr(wait, "_monotonic", clock)
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
     if not publish:
-        monkeypatch.setattr(wait, "_publish_remote_mappings", lambda records: None)
+        monkeypatch.setattr(wait, "_publish_resident_routes", lambda records: None)
 
     def resolver(socket_path, lid):
         lode = initials[lid]
@@ -1171,7 +1171,7 @@ def test_keyboard_interrupt_returns_130_and_joins_remote_workers(monkeypatch):
     original_stop = wait._stop_remote_workers
 
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
-    monkeypatch.setattr(wait, "_publish_remote_mappings", lambda records: None)
+    monkeypatch.setattr(wait, "_publish_resident_routes", lambda records: None)
     monkeypatch.setattr(
         wait,
         "_condition_wait",
@@ -1210,7 +1210,7 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
     shipped = snapshot(lid="ship123", host="one.local", stage="shipped", active=False)
 
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
-    monkeypatch.setattr(wait, "_publish_remote_mappings", lambda records: None)
+    monkeypatch.setattr(wait, "_publish_resident_routes", lambda records: None)
 
     def resolver(socket_path, lid):
         return {

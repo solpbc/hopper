@@ -316,10 +316,9 @@ def _probe_worktree_cleanliness(
 def ship_landing_verdict(worktree_dir: str | Path) -> ShipLandingVerdict:
     """Prove a clean ship worktree is contained in a fresh upstream default ref.
 
-    The five Git stages share one 140-second monotonic budget: cleanliness (5),
-    remote detection (5), fetch (120), default-ref resolution (5), and ancestry
-    (5). A confirmed repository without ``origin`` requires cleanliness but does
-    not require containment. Every uncertainty fails closed.
+    The five Git stages share the named aggregate monotonic budget. A confirmed
+    repository without ``origin`` requires cleanliness but does not require
+    containment. Every uncertainty fails closed.
     """
     worktree_path = str(worktree_dir)
     deadline = time.monotonic() + SHIP_LANDING_TIMEOUT_SEC

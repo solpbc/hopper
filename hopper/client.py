@@ -461,14 +461,20 @@ def read_lode_snapshot(socket_path: Path, prefix: str, timeout: float = 2.0) -> 
     return "ambiguous", matches
 
 
-def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
-    """List all active lodes from the server."""
+def read_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
+    """Read active lodes, preserving an unreachable or malformed server as None."""
     response = send_message(
         socket_path, {"type": "lode_list"}, timeout=timeout, wait_for_response=True
     )
     if response and response.get("type") == "lode_list":
-        return response.get("lodes", [])
-    return []
+        lodes = response.get("lodes")
+        return lodes if isinstance(lodes, list) else None
+    return None
+
+
+def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict]:
+    """List all active lodes, returning an empty list when unavailable."""
+    return read_lodes(socket_path, timeout=timeout) or []
 
 
 def read_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
