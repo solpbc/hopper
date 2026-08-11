@@ -35,6 +35,7 @@ from hopper.remote import (
     remote_registry,
     remove_remote,
     run_remote,
+    run_remote_streaming,
     select_candidate,
     set_remote,
 )
@@ -129,6 +130,28 @@ def test_run_remote_preserves_arbitrary_binary_stdin(monkeypatch):
     assert calls[0]["text"] is False
     assert result.stdout == "ok\n"
     assert result.stderr == ""
+
+
+def test_run_remote_streaming_devnulls_stdin(monkeypatch):
+    """Streaming (used by `hop watch`) must not inherit real stdin either."""
+
+    class FakeProcess:
+        stdout = iter([])
+
+        def wait(self):
+            return 0
+
+    calls = []
+
+    def popen(command, **kwargs):
+        calls.append(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("hopper.remote.subprocess.Popen", popen)
+
+    run_remote_streaming("suze.local", ["lode", "watch", "abc123"])
+
+    assert calls[0]["stdin"] is subprocess.DEVNULL
 
 
 def test_run_remote_expands_preserved_tilde_on_remote(monkeypatch):

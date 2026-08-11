@@ -110,6 +110,7 @@ def run_remote_streaming(host: str, hop_args: list[str]) -> int:
     """Run remote hop while forwarding stdout and inheriting stderr live."""
     process = subprocess.Popen(
         _remote_command(host, hop_args, unbuffered=True),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         text=True,
         bufsize=1,
