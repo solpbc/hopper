@@ -38,6 +38,7 @@ from hopper.cli import (
     cmd_ping,
     cmd_process,
     cmd_processed,
+    cmd_project,
     cmd_projects,
     cmd_remote,
     cmd_restart,
@@ -72,6 +73,7 @@ from hopper.lodes import (
     save_lodes,
 )
 from hopper.projects import Project, load_projects, save_projects
+from hopper.remote import REMOTE_CREATE_TIMEOUT_SECONDS, CandidateProbe
 from hopper.server import Server
 from hopper.tmux import Liveness
 
@@ -3304,12 +3306,50 @@ def test_project_list_shows_projects(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("hopper.projects.load_projects", lambda: projects)
     result = cmd_project(["list"])
     assert result == 0
-    captured = capsys.readouterr()
-    assert "foo" in captured.out
-    assert "/path/to/foo" in captured.out
-    assert "bar" in captured.out
-    assert "(disabled)" in captured.out
-    assert "baz (disabled: paused)" in captured.out
+    assert capsys.readouterr().out == (
+        "foo\n"
+        "  /path/to/foo\n"
+        "bar (disabled)\n"
+        "  /path/to/bar\n"
+        "baz (disabled: paused)\n"
+        "  /path/to/baz\n"
+    )
+
+
+@pytest.mark.parametrize("command", [cmd_project, cmd_projects], ids=["project-list", "projects"])
+def test_project_list_json_exact_contract(monkeypatch, capsys, command):
+    projects = [
+        Project(
+            path="/path/to/foo",
+            name="foo",
+            disabled=True,
+            disabled_reason="maintenance",
+            last_used_at=12345,
+        )
+    ]
+    monkeypatch.setattr("hopper.projects.load_projects", lambda: projects)
+
+    args = ["list", "--json"] if command is cmd_project else ["--json"]
+    assert command(args) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "projects": [
+            {
+                "name": "foo",
+                "path": "/path/to/foo",
+                "disabled": True,
+                "disabled_reason": "maintenance",
+            }
+        ]
+    }
+
+
+def test_project_list_json_empty_is_still_an_envelope(monkeypatch, capsys):
+    monkeypatch.setattr("hopper.projects.load_projects", lambda: [])
+
+    assert cmd_project(["list", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"projects": []}
 
 
 def test_project_add_missing_path(capsys):
@@ -5541,6 +5581,35 @@ def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(ca
     assert payload["pane_liveness"] == "not_probed"
 
 
+def test_lode_list_all_hosts_uses_unique_union_of_pool_members(capsys):
+    remote_result = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout='{"lodes": []}\n',
+        stderr="",
+    )
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[]),
+        patch(
+            "hopper.remote.remote_registry",
+            return_value={
+                "one": ["shared.example", "one.example"],
+                "two": ["two.example", "shared.example"],
+            },
+        ),
+        patch("hopper.remote.run_remote", return_value=remote_result) as remote,
+    ):
+        assert cmd_lode(["list", "--all-hosts", "--json"]) == 0
+
+    assert [call.args[0] for call in remote.call_args_list] == [
+        "one.example",
+        "shared.example",
+        "two.example",
+    ]
+    assert json.loads(capsys.readouterr().out) == {"lodes": []}
+
+
 def test_rendering_parked_gone_does_not_mutate_memory_or_files(temp_config, make_lode):
     reason = "no pane output"
     lode = make_lode(
@@ -5902,6 +5971,38 @@ def test_remote_set_warns_but_saves_when_unreachable(capsys):
     assert "remote.journal=fedora.local" in capsys.readouterr().out
 
 
+def test_remote_set_replaces_with_ordered_deduplicated_pool_and_pings_each_host(capsys):
+    with config.config_transaction() as stored:
+        stored["remote.journal"] = ["old.example"]
+    results = [
+        subprocess.CompletedProcess([], 0, stdout="pong", stderr=""),
+        subprocess.CompletedProcess([], 255, stdout="", stderr="no route"),
+    ]
+    with patch("hopper.remote.run_remote", side_effect=results) as ping:
+        assert (
+            cmd_remote(["set", "journal", " first.example ", "second.example", "first.example"])
+            == 0
+        )
+
+    assert ping.call_args_list == [
+        (("first.example", ["ping"]), {"timeout": 15}),
+        (("second.example", ["ping"]), {"timeout": 15}),
+    ]
+    assert config.load_config()["remote.journal"] == ["first.example", "second.example"]
+    captured = capsys.readouterr()
+    assert captured.out == "remote.journal=first.example,second.example\n"
+    assert "second.example did not answer" in captured.err
+    assert "first.example did not answer" not in captured.err
+
+
+@pytest.mark.parametrize("args", [["set", "journal"], ["set", "journal", " "]])
+def test_remote_set_requires_a_non_empty_host_and_does_not_write(capsys, args):
+    assert cmd_remote(args) == 1
+
+    assert config.load_config() == {}
+    assert "require" in capsys.readouterr().out
+
+
 def test_remote_list_json(capsys):
     with patch(
         "hopper.remote.run_remote", return_value=subprocess.CompletedProcess([], 0, "pong", "")
@@ -5911,27 +6012,357 @@ def test_remote_list_json(capsys):
     assert cmd_remote(["list", "--json"]) == 0
     out = capsys.readouterr().out
     payload = json.loads(out[out.index("{") :])
-    assert payload["remotes"] == [{"project": "journal", "host": "fedora.local"}]
+    assert payload == {"remotes": [{"project": "journal", "hosts": ["fedora.local"]}]}
+
+
+def test_remote_list_human_exposes_complete_pool(capsys):
+    with patch(
+        "hopper.remote.run_remote",
+        return_value=subprocess.CompletedProcess([], 0, stdout="pong", stderr=""),
+    ):
+        assert cmd_remote(["set", "journal", "first.example", "second.example"]) == 0
+    capsys.readouterr()
+
+    assert cmd_remote(["list"]) == 0
+
+    assert capsys.readouterr().out == "journal                  first.example, second.example\n"
+
+
+@pytest.fixture
+def emitted_create_json(monkeypatch, capsys):
+    """Capture the real local lode-create JSON emitter for remote response fixtures."""
+    from io import StringIO
+
+    created_lode = {"id": "abcdefgh", "project": "journal", "stage": "mill"}
+    project = Project(path="/srv/journal", name="journal")
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch("hopper.client.create_lode", return_value=created_lode),
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        monkeypatch.setattr(sys, "argv", ["hop", "lode", "create", "journal", "--json"])
+        assert main() == 0
+    output = capsys.readouterr().out
+    assert json.loads(output) == {
+        "id": "abcdefgh",
+        "project": "journal",
+        "host": "local",
+    }
+    return output
+
+
+def test_active_local_project_bypasses_pool_selection():
+    with (
+        patch("hopper.projects.find_project", return_value=Project("/srv/journal", "journal")),
+        patch("hopper.remote.remote_registry") as registry,
+        patch("hopper.remote.probe_candidates") as probes,
+    ):
+        assert hopper_cli._remote_pool_for_create("journal") is None
+
+    registry.assert_not_called()
+    probes.assert_not_called()
+
+
+def test_explicit_host_create_bypasses_pool_selection(
+    emitted_create_json,
+    monkeypatch,
+    capsys,
+):
+    from io import StringIO
+
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "explicit.example", "implement", "journal"])
+    monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
+    result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
+    with (
+        patch("hopper.cli._remote_pool_for_create") as pool_selection,
+        patch("hopper.remote.run_remote", return_value=result) as create,
+        patch("hopper.remote.remember_lode") as remember,
+    ):
+        assert main() == 0
+
+    pool_selection.assert_not_called()
+    create.assert_called_once()
+    assert create.call_args.args[:2] == (
+        "explicit.example",
+        ["implement", "journal", "--json"],
+    )
+    remember.assert_called_once_with("abcdefgh", "explicit.example", "journal")
+    assert capsys.readouterr().out == "Created lode abcdefgh (journal) on explicit.example\n"
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
+def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
+    emitted_create_json,
+    monkeypatch,
+    capsys,
+    json_output,
+):
+    from io import StringIO
+
+    selected = CandidateProbe("ready.example", eligible=True, load=1, reason=None)
+    unavailable = CandidateProbe(
+        "down.example",
+        eligible=False,
+        load=None,
+        reason="project listing timed out; inspect with: hop -H down.example project list --json",
+    )
+    args = ["hop", "implement", "journal"]
+    if json_output:
+        args.append("--json")
+    monkeypatch.setattr(sys, "argv", args)
+    monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
+    result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
+    with (
+        patch(
+            "hopper.cli._remote_pool_for_create",
+            return_value=(selected, [unavailable, selected]),
+        ),
+        patch("hopper.remote.run_remote", return_value=result) as create,
+        patch("hopper.remote.remember_lode") as remember,
+    ):
+        assert main() == 0
+
+    create.assert_called_once()
+    assert create.call_args.args[0] == "ready.example"
+    assert create.call_args.args[1][-1] == "--json"
+    assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SECONDS
+    remember.assert_called_once_with("abcdefgh", "ready.example", "journal")
+    captured = capsys.readouterr()
+    if json_output:
+        assert json.loads(captured.out) == {
+            "id": "abcdefgh",
+            "project": "journal",
+            "host": "ready.example",
+            "unavailable_hosts": [
+                {
+                    "host": "down.example",
+                    "reason": unavailable.reason,
+                }
+            ],
+        }
+        assert "pool host down.example unavailable" not in captured.err
+    else:
+        assert captured.out == "Created lode abcdefgh (journal) on ready.example\n"
+        assert f"warning: pool host down.example unavailable: {unavailable.reason}" in captured.err
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
+def test_pooled_create_with_no_eligible_host_refuses_without_create(
+    monkeypatch,
+    capsys,
+    json_output,
+):
+    from io import StringIO
+
+    probes = [
+        CandidateProbe(
+            "one.example",
+            False,
+            None,
+            "project missing; inspect with: hop -H one.example project list --json",
+        ),
+        CandidateProbe(
+            "two.example",
+            False,
+            None,
+            "inventory timed out; inspect with: hop -H two.example lode list --json",
+        ),
+    ]
+    args = ["hop", "implement", "journal"]
+    if json_output:
+        args.append("--json")
+    monkeypatch.setattr(sys, "argv", args)
+    monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
+    with (
+        patch("hopper.cli._remote_pool_for_create", return_value=(None, probes)),
+        patch("hopper.remote.run_remote") as create,
+    ):
+        assert main() == 2
+
+    create.assert_not_called()
+    captured = capsys.readouterr()
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["unavailable_hosts"] == [
+            {"host": probe.host, "reason": probe.reason} for probe in probes
+        ]
+    else:
+        assert captured.out == ""
+        assert "Hopper did not attempt lode creation" in captured.err
+        for probe in probes:
+            assert probe.host in captured.err
+            assert probe.reason in captured.err
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "nonzero-valid-body",
+        "human-text",
+        "extra-json-value",
+        "extra-member",
+        "wrong-project",
+        "wrong-host",
+        "malformed-shape",
+        "malformed-json",
+        "invalid-id",
+        "transport",
+        "timeout",
+    ],
+)
+def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys):
+    valid = {"id": "abcdefgh", "project": "journal", "host": "local"}
+    if case == "nonzero-valid-body":
+        outcome = subprocess.CompletedProcess([], 7, stdout=json.dumps(valid), stderr="rejected")
+    elif case == "human-text":
+        outcome = subprocess.CompletedProcess(
+            [], 0, stdout="Created lode abcdefgh (journal)\n", stderr=""
+        )
+    elif case == "extra-json-value":
+        outcome = subprocess.CompletedProcess(
+            [], 0, stdout=f"{json.dumps(valid)}\n{json.dumps(valid)}\n", stderr=""
+        )
+    elif case == "extra-member":
+        outcome = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({**valid, "extra": True}), stderr=""
+        )
+    elif case == "wrong-project":
+        outcome = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({**valid, "project": "other"}), stderr=""
+        )
+    elif case == "wrong-host":
+        outcome = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({**valid, "host": "selected.example"}), stderr=""
+        )
+    elif case == "malformed-shape":
+        outcome = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+    elif case == "malformed-json":
+        outcome = subprocess.CompletedProcess([], 0, stdout="{", stderr="")
+    elif case == "invalid-id":
+        outcome = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({**valid, "id": "abc12345"}), stderr=""
+        )
+    elif case == "transport":
+        outcome = OSError("connection reset")
+    else:
+        outcome = subprocess.TimeoutExpired(["ssh"], REMOTE_CREATE_TIMEOUT_SECONDS)
+
+    runner_patch = (
+        patch("hopper.remote.run_remote", side_effect=outcome)
+        if isinstance(outcome, BaseException)
+        else patch("hopper.remote.run_remote", return_value=outcome)
+    )
+    with runner_patch as create, patch("hopper.remote.remember_lode") as remember:
+        assert (
+            hopper_cli._run_authoritative_remote_create(
+                "selected.example",
+                ["implement", "journal"],
+                reason="remote.journal pool",
+                project="journal",
+                stdin_text=LONG_SCOPE,
+                json_output=False,
+                unavailable_hosts=[],
+            )
+            == 2
+        )
+
+    create.assert_called_once()
+    assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SECONDS
+    remember.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Created lode" not in captured.err
+    assert "creation may have occurred on selected.example" in captured.err
+    assert "no failover ran" in captured.err
+    assert "hop -H selected.example lode list --project journal" in captured.err
+
+
+def test_authoritative_remote_create_buffers_success_until_route_is_cached(
+    emitted_create_json,
+    capsys,
+):
+    result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
+    observed = []
+
+    def persist(lode_id, host, project):
+        observed.append((lode_id, host, project, capsys.readouterr().out))
+
+    with (
+        patch("hopper.remote.run_remote", return_value=result) as create,
+        patch("hopper.remote.remember_lode", side_effect=persist),
+    ):
+        assert (
+            hopper_cli._run_authoritative_remote_create(
+                "selected.example",
+                ["implement", "journal"],
+                reason="remote.journal pool",
+                project="journal",
+                stdin_text=LONG_SCOPE,
+                json_output=False,
+                unavailable_hosts=[],
+            )
+            == 0
+        )
+
+    create.assert_called_once()
+    assert observed == [("abcdefgh", "selected.example", "journal", "")]
+    assert capsys.readouterr().out == "Created lode abcdefgh (journal) on selected.example\n"
+
+
+def test_authoritative_remote_create_cache_failure_reports_explicit_recovery(
+    emitted_create_json,
+    capsys,
+):
+    result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
+    with (
+        patch("hopper.remote.run_remote", return_value=result) as create,
+        patch("hopper.remote.remember_lode", side_effect=OSError("disk full")),
+    ):
+        assert (
+            hopper_cli._run_authoritative_remote_create(
+                "selected.example",
+                ["implement", "journal"],
+                reason="remote.journal pool",
+                project="journal",
+                stdin_text=LONG_SCOPE,
+                json_output=True,
+                unavailable_hosts=[],
+            )
+            == 2
+        )
+
+    create.assert_called_once()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "valid lode ID abcdefgh" in captured.err
+    assert "resident route was not saved" in captured.err
+    assert "creation may have occurred on selected.example" in captured.err
+    assert "no failover ran" in captured.err
+    assert "hop -H selected.example lode status abcdefgh --json" in captured.err
 
 
 def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
     from io import StringIO
 
     save_projects([Project(path="/fake/repo", name="journal", disabled=True)])
+    selected = CandidateProbe("fedora.local", eligible=True, load=0, reason=None)
     with patch("hopper.remote.run_remote") as mock_remote:
         mock_remote.return_value = subprocess.CompletedProcess(
             [],
             0,
-            stdout='{"id": "remote123", "project": "journal", "host": "local"}\n',
+            stdout='{"id": "abcdefgh", "project": "journal", "host": "local"}\n',
             stderr="",
         )
-        with patch("hopper.remote.remote_registry", return_value={"journal": ["fedora.local"]}):
+        with patch("hopper.cli._remote_pool_for_create", return_value=(selected, [selected])):
             monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal", "--json"])
             monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
             rc = main()
 
     assert rc == 0
     assert mock_remote.call_args.args[:2] == ("fedora.local", ["implement", "journal", "--json"])
+    assert mock_remote.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SECONDS
     assert json.loads(capsys.readouterr().out)["host"] == "fedora.local"
 
 

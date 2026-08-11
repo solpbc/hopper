@@ -9,17 +9,27 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from hopper import config
+from hopper.cli import main
+from hopper.projects import Project
 from hopper.remote import (
+    REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+    REMOTE_POOL_PROBE_TIMEOUT_SECONDS,
+    CandidateProbe,
     load_lode_cache,
+    probe_candidate,
+    probe_candidates,
     remember_lode,
     remote_registry,
     remove_remote,
     run_remote,
+    select_candidate,
     set_remote,
 )
 
@@ -94,7 +104,7 @@ def test_run_remote_expands_preserved_tilde_on_remote(monkeypatch):
 
 
 def test_remote_registry_set_remove():
-    set_remote("solstone-android", "suze.local")
+    set_remote("solstone-android", ["suze.local"])
 
     assert remote_registry() == {"solstone-android": ["suze.local"]}
     assert remove_remote("solstone-android") is True
@@ -186,6 +196,321 @@ def test_remote_registry_refuses_empty_scalar_without_rewriting(temp_config):
     assert path.read_bytes() == before
 
 
+@pytest.fixture
+def emitted_project_json(monkeypatch, capsys):
+    """Capture the real local project-list JSON emitter for remote probe fixtures."""
+    projects = [
+        Project(path="/srv/other", name="other"),
+        Project(path="/srv/journal", name="journal", disabled=False, disabled_reason=""),
+    ]
+    monkeypatch.setattr("hopper.projects.load_projects", lambda: projects)
+    monkeypatch.setattr(sys, "argv", ["hop", "project", "list", "--json"])
+
+    assert main() == 0
+    output = capsys.readouterr().out
+    assert json.loads(output) == {
+        "projects": [
+            {
+                "name": "other",
+                "path": "/srv/other",
+                "disabled": False,
+                "disabled_reason": "",
+            },
+            {
+                "name": "journal",
+                "path": "/srv/journal",
+                "disabled": False,
+                "disabled_reason": "",
+            },
+        ]
+    }
+    return output
+
+
+@pytest.fixture
+def emitted_lode_inventory_json(monkeypatch, capsys, make_lode):
+    """Capture the real local lode-list JSON emitter for remote probe fixtures."""
+    lodes = [
+        make_lode(id="aaaaaaaa", project="journal", active=True),
+        make_lode(id="bbbbbbbb", project="other", active=True),
+        make_lode(id="cccccccc", project="journal", active=False),
+    ]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=lodes),
+    ):
+        monkeypatch.setattr(sys, "argv", ["hop", "lode", "list", "--json"])
+        assert main() == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert [row["active"] for row in payload["lodes"]] == [True, True, False]
+    return output
+
+
+def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+):
+    calls = []
+
+    def runner(host, args, *, timeout):
+        calls.append((host, args, timeout))
+        stdout = emitted_project_json if args[0] == "project" else emitted_lode_inventory_json
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate("ready.example", "journal", runner, monotonic=lambda: 0.0)
+
+    assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
+    assert calls == [
+        (
+            "ready.example",
+            ["project", "list", "--json"],
+            REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+        ),
+        (
+            "ready.example",
+            ["lode", "list", "--json"],
+            REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("project_payload", "reason"),
+    [
+        ({}, "JSON contract"),
+        ({"projects": "not-a-list"}, "JSON contract"),
+        ({"projects": [{"name": "journal"}]}, "malformed project"),
+        (
+            {
+                "projects": [
+                    {
+                        "name": "other",
+                        "path": "/srv/other",
+                        "disabled": False,
+                        "disabled_reason": "",
+                    }
+                ]
+            },
+            "not registered",
+        ),
+        (
+            {
+                "projects": [
+                    {
+                        "name": "journal",
+                        "path": "/one",
+                        "disabled": False,
+                        "disabled_reason": "",
+                    },
+                    {
+                        "name": "journal",
+                        "path": "/two",
+                        "disabled": False,
+                        "disabled_reason": "",
+                    },
+                ]
+            },
+            "more than once",
+        ),
+        (
+            {
+                "projects": [
+                    {
+                        "name": "journal",
+                        "path": "/srv/journal",
+                        "disabled": True,
+                        "disabled_reason": "maintenance",
+                    }
+                ]
+            },
+            "was disabled",
+        ),
+    ],
+)
+def test_probe_candidate_refuses_invalid_project_contract(project_payload, reason):
+    def runner(_host, args, *, timeout):
+        assert args == ["project", "list", "--json"]
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(project_payload), stderr="")
+
+    probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
+
+    assert probe.eligible is False
+    assert probe.load is None
+    assert reason in probe.reason
+    assert "hop -H bad.example" in probe.reason
+
+
+@pytest.mark.parametrize(
+    ("inventory", "reason"),
+    [
+        ({}, "JSON contract"),
+        ({"lodes": "not-a-list"}, "JSON contract"),
+        ({"lodes": ["not-an-object"]}, "boolean active"),
+        ({"lodes": [{}]}, "boolean active"),
+        ({"lodes": [{"active": 1}]}, "boolean active"),
+        ({"lodes": [{"active": "yes"}]}, "boolean active"),
+    ],
+)
+def test_probe_candidate_refuses_invalid_inventory_contract(
+    emitted_project_json,
+    inventory,
+    reason,
+):
+    def runner(_host, args, *, timeout):
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+        stdout = emitted_project_json if args[0] == "project" else json.dumps(inventory)
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
+
+    assert probe.eligible is False
+    assert probe.load is None
+    assert reason in probe.reason
+
+
+@pytest.mark.parametrize("failed_call", ["project", "lode"])
+@pytest.mark.parametrize("failure", ["malformed", "nonzero", "transport", "timeout"])
+def test_probe_candidate_classifies_every_command_failure(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+    failed_call,
+    failure,
+):
+    calls = []
+
+    def runner(host, args, *, timeout):
+        calls.append((args[0], timeout))
+        if args[0] == failed_call:
+            if failure == "malformed":
+                return subprocess.CompletedProcess([], 0, stdout="{", stderr="")
+            if failure == "nonzero":
+                return subprocess.CompletedProcess([], 7, stdout="", stderr="remote failed")
+            if failure == "transport":
+                raise OSError("network down")
+            raise subprocess.TimeoutExpired(["ssh", host], timeout)
+        stdout = emitted_project_json if args[0] == "project" else emitted_lode_inventory_json
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
+
+    assert probe.eligible is False
+    assert probe.load is None
+    expected = {
+        "malformed": "malformed",
+        "nonzero": "exited",
+        "transport": "transport",
+        "timeout": "timed out",
+    }[failure]
+    assert expected in probe.reason
+    assert calls[-1][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+
+
+def test_probe_candidate_shares_deadline_between_both_calls(emitted_project_json):
+    calls = []
+    clock = iter([0.0, 7.5])
+
+    def runner(_host, args, *, timeout):
+        calls.append((args, timeout))
+        stdout = emitted_project_json if args[0] == "project" else '{"lodes": []}'
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate("slow.example", "journal", runner, monotonic=lambda: next(clock))
+
+    assert probe.eligible is True
+    assert calls[0][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+    assert calls[1][1] == 0.5
+
+
+def test_probe_candidate_refuses_when_first_call_exhausts_shared_deadline(emitted_project_json):
+    calls = []
+    clock = iter([0.0, REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS])
+
+    def runner(_host, args, *, timeout):
+        calls.append((args, timeout))
+        return subprocess.CompletedProcess([], 0, stdout=emitted_project_json, stderr="")
+
+    probe = probe_candidate("slow.example", "journal", runner, monotonic=lambda: next(clock))
+
+    assert probe.eligible is False
+    assert "deadline expired before lode inventory" in probe.reason
+    assert calls == [(["project", "list", "--json"], REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS)]
+
+
+def test_probe_candidates_runs_large_pool_concurrently(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+):
+    hosts = [f"host-{index}.example" for index in range(24)]
+    barrier = threading.Barrier(len(hosts))
+
+    def runner(_host, args, *, timeout):
+        if args[0] == "project":
+            assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+            barrier.wait(timeout=2)
+            stdout = emitted_project_json
+        else:
+            assert 0 < timeout <= REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+            stdout = emitted_lode_inventory_json
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probes = probe_candidates(hosts, "journal", runner)
+
+    assert [probe.host for probe in probes] == hosts
+    assert all(probe.eligible for probe in probes)
+
+
+def test_probe_candidates_pins_aggregate_deadline(monkeypatch):
+    observed = []
+
+    class Pending:
+        def cancel(self):
+            return True
+
+    class Executor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def submit(self, *_args, **_kwargs):
+            return Pending()
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    def fake_wait(futures, *, timeout):
+        observed.append((futures, timeout))
+        return set(), set(futures)
+
+    monkeypatch.setattr("hopper.remote.ThreadPoolExecutor", Executor)
+    monkeypatch.setattr("hopper.remote.wait", fake_wait)
+
+    probes = probe_candidates(
+        ["one.example", "two.example"],
+        "journal",
+        lambda *_args, **_kwargs: None,
+        monotonic=lambda: 0.0,
+    )
+
+    assert observed[0][1] == REMOTE_POOL_PROBE_TIMEOUT_SECONDS
+    assert [probe.eligible for probe in probes] == [False, False]
+
+
+def test_select_candidate_uses_minimum_load_and_injected_tie_break():
+    probes = [
+        CandidateProbe("busy.example", True, 4, None),
+        CandidateProbe("first.example", True, 1, None),
+        CandidateProbe("second.example", True, 1, None),
+        CandidateProbe("down.example", False, None, "unavailable"),
+    ]
+    choices = []
+
+    selected = select_candidate(probes, chooser=lambda tied: (choices.extend(tied), tied[-1])[1])
+
+    assert [probe.host for probe in choices] == ["first.example", "second.example"]
+    assert selected.host == "second.example"
+
+
 @pytest.mark.parametrize(
     ("first", "second"),
     [
@@ -241,7 +566,7 @@ elif operation == "config":
 elif operation == "project":
     projects.touch_project(f"project-{role.lower()}")
 elif operation == "remote":
-    remote.set_remote(f"route-{role.lower()}", f"{role.lower()}.example")
+    remote.set_remote(f"route-{role.lower()}", [f"{role.lower()}.example"])
 else:
     raise AssertionError(operation)
 

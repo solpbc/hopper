@@ -23,6 +23,8 @@ from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
 from hopper.git import UPSTREAM_FETCH_REFSPEC, ShipLandingCause, ShipLandingVerdict
 from hopper.lodes import (
+    ID_ALPHABET,
+    ID_LEN,
     current_time_ms,
     find_lode_by_prefix,
     format_age,
@@ -362,27 +364,140 @@ def _create_wants_json(cmd: str, cmd_args: list[str]) -> bool:
     return "--json" in args
 
 
-def _remote_host_for_create(project: str) -> tuple[str, str] | None:
-    """Resolve a create command to a remote host when local should not handle it."""
+def _remote_pool_for_create(project: str):
+    """Probe a configured pool when an active local project does not take precedence."""
     from hopper.projects import find_project
-    from hopper.remote import remote_registry
+    from hopper.remote import probe_candidates, remote_registry, run_remote, select_candidate
 
-    registry = remote_registry()
-    hosts = registry.get(project)
-    if not hosts:
-        return None
-    host = hosts[0]
     project_record = find_project(project)
     if project_record and not project_record.disabled:
         return None
-    return host, f"remote.{project}"
+    hosts = remote_registry().get(project)
+    if not hosts:
+        return None
+    probes = probe_candidates(hosts, project, run_remote)
+    return select_candidate(probes), probes
+
+
+def _unavailable_host_rows(probes) -> list[dict[str, str]]:
+    """Return stable JSON rows for every unavailable pool member."""
+    return [
+        {"host": probe.host, "reason": probe.reason or "availability was not established"}
+        for probe in probes
+        if not probe.eligible
+    ]
+
+
+def _remote_create_refusal(host: str, project: str, observed: str) -> int:
+    """Render the common four-line refusal after one remote create attempt."""
+    print("error: remote lode creation could not be verified", file=sys.stderr)
+    print(f"observed: selected host {host} {observed}.", file=sys.stderr)
+    print(
+        f"Hopper did not report success; creation may have occurred on {host}, "
+        "and no failover ran.",
+        file=sys.stderr,
+    )
+    print(
+        f"recover with: {shlex.join(['hop', '-H', host, 'lode', 'list', '--project', project])}",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _validate_remote_create_response(result, project: str) -> tuple[dict[str, str] | None, str]:
+    """Validate the authoritative remote-side create JSON before host rewriting."""
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout or "").strip()
+        detail = diagnostic.splitlines()[0] if diagnostic else "no diagnostic"
+        return None, f"returned exit {result.returncode}: {detail}"
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None, "returned malformed JSON"
+    if not isinstance(payload, dict) or set(payload) != {"id", "project", "host"}:
+        return None, "returned a response outside the exact create JSON contract"
+
+    lode_id = payload.get("id")
+    if (
+        not isinstance(lode_id, str)
+        or len(lode_id) != ID_LEN
+        or any(character not in ID_ALPHABET for character in lode_id)
+    ):
+        return None, "returned a non-canonical lode ID"
+    if payload.get("project") != project:
+        return None, f"returned project {payload.get('project')!r}, expected {project!r}"
+    if payload.get("host") != "local":
+        return None, f"returned host {payload.get('host')!r}, expected 'local'"
+    return {"id": lode_id, "project": project, "host": "local"}, ""
+
+
+def _run_authoritative_remote_create(
+    host: str,
+    hop_args: list[str],
+    *,
+    reason: str,
+    project: str,
+    stdin_text: str | None,
+    json_output: bool,
+    unavailable_hosts: list[dict[str, str]],
+) -> int:
+    """Run, validate, cache, and only then render one remote create."""
+    from hopper.remote import REMOTE_CREATE_TIMEOUT_SECONDS, run_remote
+
+    remote_args = list(hop_args)
+    if "--json" not in remote_args:
+        remote_args.append("--json")
+    print(f"→ {host} ({reason})", file=sys.stderr)
+    try:
+        result = run_remote(
+            host,
+            remote_args,
+            stdin_text=stdin_text,
+            timeout=REMOTE_CREATE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return _remote_create_refusal(host, project, "timed out before a response was verified")
+    except OSError as error:
+        return _remote_create_refusal(host, project, f"failed during transport: {error}")
+
+    payload, failure = _validate_remote_create_response(result, project)
+    if payload is None:
+        return _remote_create_refusal(host, project, failure)
+
+    cache_error = _remember_lode_route(payload["id"], host, project)
+    if cache_error is not None:
+        print("error: remote lode route was not saved", file=sys.stderr)
+        print(
+            f"observed: selected host {host} returned valid lode ID {payload['id']}, but its "
+            f"resident route was not saved: {cache_error}.",
+            file=sys.stderr,
+        )
+        print(
+            f"Hopper did not report success; creation may have occurred on {host}, "
+            "and no failover ran.",
+            file=sys.stderr,
+        )
+        recovery = shlex.join(["hop", "-H", host, "lode", "status", payload["id"], "--json"])
+        print(
+            f"recover with: {recovery}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if json_output:
+        rendered = {**payload, "host": host, "unavailable_hosts": unavailable_hosts}
+        print(json.dumps(rendered))
+    else:
+        print(f"Created lode {payload['id']} ({project}) on {host}")
+    return 0
 
 
 def _remote_process_output(
     result,
     *,
     host: str,
-    annotate_create: bool = False,
     annotate_json: bool = False,
 ) -> None:
     """Pass through remote output, optionally adding host context."""
@@ -395,14 +510,6 @@ def _remote_process_output(
                 stdout = json.dumps(payload) + "\n"
         except json.JSONDecodeError:
             pass
-    elif annotate_create and stdout.strip():
-        lines = stdout.splitlines()
-        if lines:
-            match = re.match(r"^(Created lode \S+ \([^)]+\))(.*)$", lines[0])
-            if match and " on " not in lines[0]:
-                lines[0] = f"{match.group(1)} on {host}{match.group(2)}"
-                stdout = "\n".join(lines) + ("\n" if result.stdout.endswith("\n") else "")
-
     if stdout:
         sys.stdout.write(stdout)
     if result.stderr:
@@ -415,9 +522,7 @@ def _run_remote_cli(
     *,
     reason: str,
     stdin_text: str | None = None,
-    annotate_create: bool = False,
     annotate_json: bool = False,
-    remember_project: str | None = None,
 ) -> int:
     """Run a remote hop command and mirror its result locally."""
     from hopper.remote import run_remote
@@ -435,30 +540,18 @@ def _run_remote_cli(
     _remote_process_output(
         result,
         host=host,
-        annotate_create=annotate_create,
         annotate_json=annotate_json,
     )
-    if result.returncode == 0 and remember_project:
-        lode_id = None
-        try:
-            payload = json.loads(result.stdout)
-            if isinstance(payload, dict):
-                lode_id = payload.get("id")
-        except json.JSONDecodeError:
-            match = re.search(r"Created lode (\S+)", result.stdout)
-            if match:
-                lode_id = match.group(1)
-        if isinstance(lode_id, str) and lode_id:
-            _remember_lode_route(lode_id, host, remember_project)
     return result.returncode
 
 
-def _remember_lode_route(lode_id: str, host: str, project: str = "") -> None:
-    """Best-effort cache a remote lode route without failing its command."""
+def _remember_lode_route(lode_id: str, host: str, project: str = "") -> Exception | None:
+    """Cache a remote route and return a persistence error to strict callers."""
     from hopper.remote import remember_lode
 
     try:
         remember_lode(lode_id, host, project)
+        return None
     except Exception as error:
         logger.warning(
             "Could not update remote lode cache for %s on %s: %s",
@@ -466,6 +559,7 @@ def _remember_lode_route(lode_id: str, host: str, project: str = "") -> None:
             host,
             error,
         )
+        return error
 
 
 @command("up", "Start the server and TUI")
@@ -683,6 +777,7 @@ def cmd_project(args: list[str]) -> int:
     parser.add_argument("path", nargs="?", help="Path (for add) or name (for remove/rename)")
     parser.add_argument("new_name", nargs="?", help="New name (for rename)")
     parser.add_argument("reason", nargs="*", help="Reason (for disable)")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -703,6 +798,18 @@ def cmd_project(args: list[str]) -> int:
 
     if parsed.action == "list":
         projects = load_projects()
+        if parsed.json_output:
+            rows = [
+                {
+                    "name": project.name,
+                    "path": project.path,
+                    "disabled": project.disabled,
+                    "disabled_reason": project.disabled_reason,
+                }
+                for project in projects
+            ]
+            print(json.dumps({"projects": rows}))
+            return 0
         if not projects:
             print("No projects configured. Use: hop project add <path>")
             return 0
@@ -925,7 +1032,7 @@ def cmd_remote(args: list[str]) -> int:
     list_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     set_p = subs.add_parser("set", help="Set a project remote", exit_on_error=False)
     set_p.add_argument("project", help="Project name")
-    set_p.add_argument("host", help="Remote host")
+    set_p.add_argument("hosts", nargs="+", help="Ordered remote host pool")
     rm_p = subs.add_parser(
         "rm",
         aliases=["remove"],
@@ -946,9 +1053,7 @@ def cmd_remote(args: list[str]) -> int:
     subcommand = parsed.subcommand or "list"
     if subcommand in ("list", "ls"):
         registry = remote_registry()
-        rows = [
-            {"project": project, "host": hosts[0]} for project, hosts in sorted(registry.items())
-        ]
+        rows = [{"project": project, "hosts": hosts} for project, hosts in sorted(registry.items())]
         if getattr(parsed, "json_output", False):
             print(json.dumps({"remotes": rows}, indent=2))
             return 0
@@ -956,29 +1061,42 @@ def cmd_remote(args: list[str]) -> int:
             print("No remote projects configured.")
             return 0
         for row in rows:
-            print(f"{row['project']:<24} {row['host']}")
+            print(f"{row['project']:<24} {', '.join(row['hosts'])}")
         return 0
 
     if subcommand == "set":
+        # Command input is canonicalized once. Stored pools remain strict: an
+        # already-written duplicate or whitespace-bearing entry is corrupt.
+        hosts = []
+        seen = set()
+        for raw_host in parsed.hosts:
+            host = raw_host.strip()
+            if not host:
+                print("error: remote set requires at least one non-empty host")
+                return 1
+            if host not in seen:
+                seen.add(host)
+                hosts.append(host)
         project = find_project(parsed.project)
         if project and not project.disabled:
             print(f"error: project '{parsed.project}' is active locally; disable it before routing")
-            print(f'  hop project disable {parsed.project} --reason "moved to {parsed.host}"')
+            print(f'  hop project disable {parsed.project} --reason "moved to {hosts[0]}"')
             return 1
-        try:
-            result = run_remote(parsed.host, ["ping"], timeout=15)
-            failed = result.returncode != 0
-            detail = (result.stderr or result.stdout or "remote ping failed").strip()
-        except (OSError, subprocess.TimeoutExpired) as e:
-            failed = True
-            detail = str(e)
-        if failed:
-            print(
-                f"warning: remote host {parsed.host} did not answer hop ping: {detail}",
-                file=sys.stderr,
-            )
-        set_remote(parsed.project, parsed.host)
-        print(f"remote.{parsed.project}={parsed.host}")
+        for host in hosts:
+            try:
+                result = run_remote(host, ["ping"], timeout=15)
+                failed = result.returncode != 0
+                detail = (result.stderr or result.stdout or "remote ping failed").strip()
+            except (OSError, subprocess.TimeoutExpired) as error:
+                failed = True
+                detail = str(error)
+            if failed:
+                print(
+                    f"warning: remote host {host} did not answer hop ping: {detail}",
+                    file=sys.stderr,
+                )
+        set_remote(parsed.project, hosts)
+        print(f"remote.{parsed.project}={','.join(hosts)}")
         return 0
 
     if subcommand in ("rm", "remove"):
@@ -3236,6 +3354,7 @@ def cmd_projects(args: list[str]) -> int:
     """Alias for hop project list."""
     if "-h" in args or "--help" in args:
         p = make_parser("projects", "List projects (alias for project list)")
+        p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
         try:
             parse_args(p, args)
         except SystemExit:
@@ -3634,31 +3753,71 @@ def _main() -> int:
                 print(f"remote command failed on {explicit_host}: {error}", file=sys.stderr)
                 return 2
         stdin_text = _stdin_for_remote(cmd, cmd_args)
+        create_project = _extract_create_project(cmd, cmd_args)
+        if create_project is not None:
+            return _run_authoritative_remote_create(
+                explicit_host,
+                [cmd, *cmd_args],
+                reason=f"-H {explicit_host}",
+                project=create_project,
+                stdin_text=stdin_text,
+                json_output=_create_wants_json(cmd, cmd_args),
+                unavailable_hosts=[],
+            )
         return _run_remote_cli(
             explicit_host,
             [cmd, *cmd_args],
             reason=f"-H {explicit_host}",
             stdin_text=stdin_text,
-            annotate_create=_extract_create_project(cmd, cmd_args) is not None,
             annotate_json=_create_wants_json(cmd, cmd_args),
-            remember_project=_extract_create_project(cmd, cmd_args),
         )
 
     if not explicit_host and not _remote_disabled():
         project = _extract_create_project(cmd, cmd_args)
         if project:
-            remote_target = _remote_host_for_create(project)
-            if remote_target:
-                host, reason = remote_target
+            remote_target = _remote_pool_for_create(project)
+            if remote_target is not None:
+                selected, probes = remote_target
+                unavailable_hosts = _unavailable_host_rows(probes)
+                json_output = _create_wants_json(cmd, cmd_args)
+                if selected is None:
+                    if json_output:
+                        print(
+                            json.dumps(
+                                {
+                                    "error": f"no eligible host for project {project!r}",
+                                    "unavailable_hosts": unavailable_hosts,
+                                }
+                            )
+                        )
+                    else:
+                        print(
+                            "error: no eligible host in the configured pool for "
+                            f"project {project!r}",
+                            file=sys.stderr,
+                        )
+                        for row in unavailable_hosts:
+                            print(
+                                f"observed: {row['host']} unavailable: {row['reason']}",
+                                file=sys.stderr,
+                            )
+                        print("Hopper did not attempt lode creation.", file=sys.stderr)
+                    return 2
+                if not json_output:
+                    for row in unavailable_hosts:
+                        print(
+                            f"warning: pool host {row['host']} unavailable: {row['reason']}",
+                            file=sys.stderr,
+                        )
                 stdin_text = _stdin_for_remote(cmd, cmd_args)
-                return _run_remote_cli(
-                    host,
+                return _run_authoritative_remote_create(
+                    selected.host,
                     [cmd, *cmd_args],
-                    reason=reason,
+                    reason=f"remote.{project} pool",
+                    project=project,
                     stdin_text=stdin_text,
-                    annotate_create=True,
-                    annotate_json=_create_wants_json(cmd, cmd_args),
-                    remember_project=project,
+                    json_output=json_output,
+                    unavailable_hosts=unavailable_hosts,
                 )
 
     # Dispatch to command handler

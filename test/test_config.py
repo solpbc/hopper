@@ -62,7 +62,7 @@ def _project_writer() -> None:
 
 
 def _remote_writer() -> None:
-    set_remote("project", "host.example")
+    set_remote("project", ["host.example"])
 
 
 @pytest.mark.parametrize(
