@@ -163,7 +163,21 @@ EOF
 
 ### 5. Signal completion
 
-When the merge is complete and validated:
+`hop processed` performs one final independent landing proof before it records
+ship completion. It checks the canonical lode worktree, never the current
+directory. That worktree must be clean, and its HEAD must be contained in a
+freshly fetched upstream default branch (`main` first, then `master`). A
+repository confirmed to have no `origin` still must be clean, but Hopper does
+not claim push verification in that case.
+
+Hopper only verifies this invariant. It never merges, rebases, commits, or
+pushes. If `hop processed` refuses, it writes no completion output and sends no
+completed mutation. Read the observed condition and run the exact recovery
+command it prints. Inspect, clean or commit, restore upstream access, or land
+the branch yourself as directed, then rerun any validation invalidated by that
+work and retry `hop processed`.
+
+When the merge is complete, validated, and satisfies that proof:
 
 ```
 hop processed <<'DONE'

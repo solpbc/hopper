@@ -1,10 +1,10 @@
 ---
 name: hop
 description: >
-  Complete CLI reference for hopper — lode management, waiting, diagnostics,
+  Complete CLI reference for hopper: lode management, waiting, diagnostics,
   status reporting. Covers external coordination and in-lode usage. TRIGGER:
   hop implement, hop submit, hop list, hop wait, hop lode, hop project, hop
-  config — creating a scope, checking lode status, reviewing lode output.
+  config: creating a scope, checking lode status, reviewing lode output.
 ---
 
 # hop CLI Reference
@@ -19,10 +19,10 @@ Invoke via Bash: `hop <command> [flags]`.
   management do not.
 - Commands marked **(outside lode only)** are blocked when `HOPPER_LID` is set.
 - Remote hopper hosts are reached through the same `hop` CLI. Use `hop remote`
-  for project routing and `hop -H <host> ...` for an explicit one-off host.
-  Routed commands print `→ <host> (...)` to stderr; remote lodes are cached in
-  `remote-lodes.json` so follow-up status/recovery commands do not need host
-  rediscovery.
+  for ordered project host pools and `hop -H <host> ...` for an explicit
+  one-off host. Routed commands print `→ <host> (...)` to stderr. Hopper stores
+  a resident route for each remote lode so later commands return to its
+  resident host even if the project's pool changes or is removed.
 
 ## Creating work
 
@@ -38,9 +38,11 @@ EOF
 
 `hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data.
 
-If `remote.<project>` is configured and the project is disabled or absent
-locally, `hop implement <project>` forwards to that host automatically. A
-locally active project always wins.
+If `remote.<project>` has a pool and the project is disabled or absent locally,
+`hop implement <project>` probes every pool member concurrently, compares
+active-lode load, and creates once on a least-loaded eligible host. A locally
+active project always wins. There is no reservation or fallback create after an
+attempt.
 
 ## Starting hopper
 
@@ -56,16 +58,24 @@ wedged.
 ```bash
 hop remote list
 hop remote list --json
-hop remote set solstone-android suze.local
-hop remote rm solstone-android
+hop remote set <project> <host> [host ...]
+hop remote rm <project>
 
-hop -H pro5e.local lode list
+hop -H <host> lode list
 hop -H local lode list
 ```
 
-`hop remote set` refuses active local projects; disable a moved project first.
-The remote install contract is `$HOME/.local/bin/hop`, installed by
-`make install-user`.
+`hop remote set` replaces the ordered pool, deduplicating hosts by first
+appearance. `hop remote list --json` returns
+`{"remotes": [{"project": str, "hosts": [str, ...]}]}`. In Hopper JSON,
+`host` is always one selected or resident host; `hosts` is always the complete
+pool. `hop remote set` refuses active local projects, so disable a moved project
+first.
+
+Pooled readiness depends on `hop project list --json` being installed on every
+remote host. Upgrade the fleet after this version lands. An older host probes as
+unavailable; do not add a compatibility fallback. The remote install contract
+is `$HOME/.local/bin/hop`, installed by `make install-user`.
 
 ## Waiting and monitoring
 
@@ -97,12 +107,12 @@ pager.** The pipeline reports the consumer's exit status, which can turn a
 failed wait or status check into false success. Run the command bare and inspect
 its full output.
 
-### Reading the status — three traps
+### Reading the status: three traps
 
 `hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `completed`, `error`, `gated`).
 
-1. **`state: completed` is a STAGE boundary, not the finish.** State flips to `completed` at the end of *each* stage (mill done, refine done, ship done), then the next stage begins. **The only terminal success signal is `stage: shipped`** — key your loop on that, never on `state: completed`.
-2. **Debounce `stuck` — one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` waits ~2 min before treating stuck as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
+1. **`state: completed` is a STAGE boundary, not the finish.** State flips to `completed` at the end of *each* stage (mill done, refine done, ship done), then the next stage begins. **The only terminal success signal is `stage: shipped`.** Key your loop on that, never on `state: completed`.
+2. **Debounce `stuck`: one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` waits ~2 min before treating stuck as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
 3. **Use the complete exit-code table above; do not reconstruct it from this
    example.** In particular, `hop wait` timeout is exit `4`, not gate; gate is
    exit `2`.
@@ -113,8 +123,11 @@ Watch live status events for a lode **(outside lode only)**:
 hop lode watch <lode-id>
 ```
 
-Watch, pause, and resume resolve the lode across configured hosts and route to
-its resident host.
+Watch, wait, status, pane actions, and lifecycle commands first consult the
+resident route. A retained route is authoritative even when its resident host
+has left every pool. If that host reports the lode absent or is unavailable,
+Hopper does not fan out to another pool member; use the printed `hop -H <host>`
+recovery command.
 
 Practical create + blocking-wait workflow:
 
@@ -134,9 +147,14 @@ hop lode list
 hop lode list -a          # include archived
 hop lode list -p PROJECT  # filter by project name
 hop lode list --json
-hop lode list --all-hosts # aggregate configured remote hosts
+hop lode list --all-hosts # aggregate local and all pool hosts
 hop list                  # alias for lode list (same flags)
 ```
+
+`--all-hosts` preserves rows from sources that answer. Its JSON object includes
+`unavailable_hosts`, an array of `{"host": str, "reason": str}` rows. Partial
+discovery exits 2; complete discovery exits 0. Do not discard proven rows just
+because another source failed.
 
 Show detailed status for a lode:
 
@@ -157,11 +175,11 @@ records include `status_display`, the human-facing derived status, and
 `status_display`.
 
 `hop lode status` also prints an `unpushed:` line whenever the lode still has a
-worktree — the number of commits that exist **only** in that worktree, reachable
+worktree. It is the number of commits that exist **only** in that worktree, reachable
 from no remote-tracking ref. Read it before you believe a finished-looking lode
 is finished: only `stage: shipped` merges and pushes, so a lode that stalled
 earlier can be complete, committed, clean, and entirely absent from the remote.
-`UNKNOWN` means the check could not be made — it never means zero.
+`UNKNOWN` means the check could not be made; it never means zero.
 
 Restart an inactive lode (error, stuck, or failed ship):
 
@@ -180,11 +198,12 @@ hop kill <lode-id>                # alias
 
 **Kill refuses when the branch carries commits that exist only in the
 worktree**, and it refuses just as hard when it cannot prove the count. A clean
-worktree is not evidence the work is safe — commits fast-forwarded onto a
+worktree is not evidence the work is safe. Commits fast-forwarded onto a
 *local* main but never pushed still count. Pushing the branch clears the guard
 even without merging, which is the fast way to make a stalled lode safe. The
 refusal prints the worktree path, the commands to inspect and push, and the
-`--force` escape. Push first, then kill.
+`--force` escape. The real-repository refusal and indeterminate paths are pinned
+in `test/test_cli.py`. Push first, then kill.
 
 Runner spawn problems remain visible in lode status. `spawn refused:` means
 hopper did not launch a duplicate: attach when the recorded pane is live, or
@@ -203,11 +222,17 @@ Manage hopper projects. Projects are git directories where lodes run:
 ```bash
 hop project                           # list projects (default action)
 hop project list
+hop project list --json
 hop projects                          # alias for project list
 hop project add /path/to/repo         # register a project
 hop project remove NAME               # unregister a project
 hop project rename NAME NEW_NAME      # rename a project
 ```
+
+Project-list JSON is
+`{"projects": [{"name": str, "path": str, "disabled": bool,
+"disabled_reason": str}]}`. Pooled readiness consumes this exact remote
+contract.
 
 ## Configuration
 
@@ -234,7 +259,7 @@ hop status [-t TITLE] <text...>     # update status text, optionally set title
 
 Run a build/test/lint command bare in a terminal, print only the tail of its
 output, and exit with the command's **real** status. Use this instead of piping
-to a pager — a plain
+to a pager. A plain
 `make ci 2>&1 | tail -30` reports `tail`'s exit code, not make's, so a red build
 silently looks green.
 
@@ -248,7 +273,7 @@ hop check --allow-capture -- make ci   # from a tool call with captured stdout
 `hop check` buffers combined stdout+stderr, prints the trailing lines, then
 prints `hop check: `<cmd>` exited N` and returns N. A non-zero exit is a failed
 check. It refuses non-terminal stdout before starting the command, so a pipe
-cannot make an unrun validation look successful — use `-n` to bound output
+cannot make an unrun validation look successful. Use `-n` to bound output
 instead. Runs locally in the current directory; does not need the server.
 
 **If you are an agent calling this from a tool, add `--allow-capture`.** A tool
@@ -257,12 +282,11 @@ your promise that your stdout is *captured* (your harness hands you the exit
 code) rather than *piped* into another command that would replace it. With it,
 you get the command's real status.
 
-⛔ **Do not work around the refusal by detaching the gate.** `nohup … &` or a
-trailing `&` returns the *launcher's* status, not the job's, so the gate result
-becomes unverifiable — which is the exact failure `hop check` exists to prevent.
-⛔ And do not hand-roll a pty with `pty.spawn`: it returns a **wait-status, not
-an exit code** (256 means exit 1, and it is truthy), so reading it directly is
-the same class of error. Use `--allow-capture`.
+**Warning:** Do not work around the refusal by detaching the gate. `nohup … &`
+or a trailing `&` returns the *launcher's* status, not the job's, so the gate
+result becomes unverifiable. Do not hand-roll a pty with `pty.spawn`, either:
+it returns a **wait-status, not an exit code** (256 means exit 1, and it is
+truthy), so reading it directly has the same problem. Use `--allow-capture`.
 
 ## Internal lode commands (inside a lode only)
 
@@ -279,6 +303,14 @@ EOF
 
 hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
+
+In the ship stage, `hop processed` runs an independent landing proof against the
+canonical lode worktree. The worktree must be clean, and HEAD must be contained
+in a freshly fetched upstream `main` or `master`. A repository confirmed to have
+no `origin` still must be clean, and Hopper does not claim push verification.
+Hopper verifies only: it never merges, rebases, commits, or pushes. If completion
+is refused, follow the printed recovery command and retry `hop processed` only
+after the repository satisfies the proof.
 
 ## Responding to a gate
 
@@ -329,39 +361,33 @@ When `hop lode status` shows a lode in `stuck` state, inspect it through hop:
 Common causes: permission prompt waiting for input, process hung, or waiting for
 human approval.
 
-**When the SCOPE is the problem, the recovery is kill-and-resubmit — not restart.** Used 4×
-in one session:
+**When the SCOPE is the problem, use kill-and-resubmit, not restart:**
 
     # 1. fix the scope file
     hop lode kill <lode-id>          # add --force if commits live only in its worktree
     # 2. resubmit the corrected scope
 
-⚠ **`hop lode restart --force` will not do this.** Its `--force` means *"restart even if
-Claude has already started for this stage"* — it is about the **stage**, not about a parked
-or wrong-premise lode, and it refuses a parked lode. Restart re-runs the lode you already
-have, which is exactly what you do not want when the premise was wrong.
+**Warning:** `hop lode restart --force` will not do this. Its `--force` means
+*"restart even if Claude has already started for this stage"*. It applies to the
+**stage**, not to a parked or wrong-premise lode, and it refuses a parked lode.
+Restart re-runs the lode you already have, which is exactly what you do not want
+when the premise was wrong. `hop lode kill` retains **both** the worktree and the
+branch, so "killed" is not "cleaned up": push the branch, verify the SHA from a
+**second** clone, kill, run `git worktree remove --force`, then confirm with
+`ls ~/.hopper/worktrees/`.
 
-⛔ `hop lode kill` retains **both** the worktree and the branch, so "killed" is not "cleaned
-up": push the branch → verify the SHA from a **second** clone → kill → `git worktree remove
---force` → confirm with `ls ~/.hopper/worktrees/`. One killed lode with zero commits held
-4.4 GB.
-
-📌 Both verbs are in § Lode management above; the recovery *pattern* is repeated here because
-this is the section a session reads when a lode is stuck, and it was previously findable only
-in the other one.
-
-**Workspace trust is Hopper-managed.** Immediately before opening Claude,
-Hopper records trust in the Claude profile inherited by that lode. Registered
-project roots are trusted exactly; lode worktrees inherit one trust grant on
-Hopper's own worktree root. A workspace-trust dialog in a Hopper pane is
-therefore an error, not a routine first-lode cost. Inspect with
+**Workspace trust is Hopper-managed.** Before opening Claude, Hopper attempts to
+record trust in the Claude profile inherited by that lode. Registered project
+roots are trusted exactly; lode worktrees inherit one trust grant on Hopper's
+own worktree root. Treat a workspace-trust dialog in a Hopper pane as a launch
+problem to inspect. Use
 `hop lode peek <lode-id>` and report the lode, stage, path, and effective
 `CLAUDE_CONFIG_DIR`; do not reflexively answer it or add a manual trust entry.
 
 An unrecognised pane state does **not** mean Claude hasn't started: a live,
 fully-titled Claude Code session can also carry a title Hopper does not know,
 and it may be mid-turn. Never send keys to an unrecognised pane on the
-assumption that nothing is running — confirm with `hop lode peek <lode-id>`
+assumption that nothing is running; confirm with `hop lode peek <lode-id>`
 what is actually on screen first.
 
 **Long output-silent test runs are protected by `hop check` heartbeats.** While
@@ -399,9 +425,9 @@ output tail instead of remaining active at the setup status. Codex bootstrap
 is bounded separately.
 
 `hop code` prints a `CODEX TURN FAILED` banner when the backend fails a turn.
-Usage-limit failures are fleet-wide because Hopper uses one shared Codex seat
-across all hosts, so the in-lode agent should implement the stage directly
-under the same review bar rather than retrying `hop code`.
+In deployments that share one Codex seat across all hosts, usage-limit failures
+are fleet-wide. The in-lode agent should implement the stage directly under the
+same review bar rather than retrying `hop code`.
 
 If the action is safe (e.g. a routine permission prompt, a test confirmation),
 use the recovery primitives:
@@ -411,9 +437,9 @@ use the recovery primitives:
 
 Both send only when Hopper sees a recognised idle Claude prompt, and report
 success only after observing acceptance. If either reports an unrecognised
-pane state, Hopper did not send anything and it is safe to retry — but do not
-retry in a loop. Inspect with `hop lode peek <lode-id>`: an unrecognised pane
+pane state, it reports that Hopper did not send anything. Inspect with
+`hop lode peek <lode-id>` before deciding whether to retry; an unrecognised pane
 may be a live session mid-turn, not a stalled one.
 
 If the pane shows something you're not comfortable resolving (destructive action,
-ambiguous approval, sensitive operation), leave it for the founder to resolve.
+ambiguous approval, sensitive operation), leave it for the operator to resolve.

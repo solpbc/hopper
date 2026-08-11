@@ -29,3 +29,12 @@ def test_skill_documents_exec_exit_code_forwarding():
     assert "inspect `r.exit_code` directly" in text
     assert "text(JSON.stringify({exit_code: r.exit_code, output: r.output}))" in text
     assert "never emit only `r.output` when success matters" in text
+
+
+def test_skill_exposes_remote_pool_machine_surfaces():
+    text = SKILL_PATH.read_text()
+
+    assert "hop remote set <project> <host> [host ...]" in text
+    assert '{"remotes": [{"project": str, "hosts": [str, ...]}]}' in text
+    assert "hop project list --json" in text
+    assert '`unavailable_hosts`, an array of `{"host": str, "reason": str}`' in text

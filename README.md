@@ -1,10 +1,10 @@
 # hopper
 
-Hopper pairs Claude Code and Codex for automated end-to-end feature delivery.
+Hopper pairs Claude Code and Codex in a staged feature-delivery workflow.
 
 ## What it does
 Hopper runs a dual-agent workflow through a terminal dashboard inside tmux.
-Claude Code handles scoping in `mill` and merging in `ship` automatically.
+Claude Code handles scoping in `mill` and landing in `ship`.
 Codex handles implementation in `refine` via `hop code`.
 Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a background server persisting state over a Unix socket and broadcasting updates to the TUI.
 
@@ -35,7 +35,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 |---------|-------------|
 | `hop up` | Start the server and TUI |
 | `hop project` | Manage projects |
-| `hop remote` | Manage project-to-host routing for remote hopper instances |
+| `hop remote` | Manage ordered project host pools for remote hopper instances |
 | `hop config` | Get or set config values |
 | `hop screenshot` | Capture TUI window as ANSI text |
 | `hop backlog` | Manage backlog items |
@@ -74,6 +74,53 @@ Use `hop remote` plus the global `-H/--host` flag for remote hopper hosts.
 Quote remote-home paths (`hop -H host project add '~/src/repo'`): an unquoted
 tilde expands locally and is rejected before SSH. `hop lode status` exits 2
 when a remote host is unreadable, distinct from exit 1 for a confirmed absence.
+
+### Remote pools and resident routes
+
+Configure an ordered pool for a project, or remove it:
+
+```bash
+hop remote set <project> <host> [host ...]
+hop remote rm <project>
+hop remote list
+hop remote list --json
+```
+
+`hop remote set` replaces the pool and removes duplicate hosts while preserving
+their first-seen order. JSON keeps the top-level `remotes` key and returns rows
+shaped as `{"project": str, "hosts": [str, ...]}`. In Hopper JSON, `host`
+always names one selected or resident host; `hosts` always names the complete
+ordered pool.
+
+Pooled creation checks project readiness and active-lode load on every member,
+then creates once on a least-loaded eligible host. It does not reserve capacity
+and never tries another host after a create attempt. These probes require `hop
+project list --json` on every remote host. Upgrade the fleet when deploying this
+version. An older host is unavailable to pooled creation; there is no
+compatibility fallback.
+
+After creation, Hopper stores a resident route from the lode ID to its resident
+host. That route survives pool replacement or removal, so status, waiting, pane
+actions, and lifecycle commands continue to reach the same host. Use `-H` for
+explicit recovery when the resident route cannot be read or verified.
+
+`hop lode list --all-hosts` queries local and pooled hosts concurrently. It
+keeps rows from sources that answered. JSON adds `unavailable_hosts`, containing
+`{"host": str, "reason": str}` for each failed source, and the command exits 2
+when results are partial.
+
+`hop project list --json` and its `hop projects` alias emit project records with
+`name`, `path`, `disabled`, and `disabled_reason`.
+
+### Ship completion proof
+
+During the ship stage, `hop processed` refuses completion unless the canonical
+lode worktree is clean and its HEAD is contained in a freshly fetched upstream
+`main` or `master`. A confirmed repository without `origin` still must be clean,
+but Hopper does not claim push verification. Hopper performs this proof only; it
+never merges, rebases, commits, or pushes. A refusal keeps the lode and worktree
+intact and prints the command needed to inspect, clean, fetch, or land before
+retrying.
 
 ## Key concepts
 **Lode** -- a Claude Code session with a unique ID, workflow stage, status, and associated tmux window.
