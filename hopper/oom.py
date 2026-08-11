@@ -316,7 +316,7 @@ def _set_oom_score() -> bool:
 
 
 def arm_worker(*, expect_scope: bool) -> OomCapability:
-    """Arm OOM preference and, when expected, verify systemd group containment."""
+    """Arm OOM score preference and report whether it and group-kill are available."""
     if not is_linux():
         return OomCapability.NON_LINUX
     group_armed = _memory_oom_group_is_armed() if expect_scope else False

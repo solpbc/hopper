@@ -4758,6 +4758,31 @@ def test_runner_registration_clears_spawn_status(socket_path, make_lode, status)
     assert lode["pid"] == 2525
 
 
+@pytest.mark.parametrize("proof_mode", [None, "unknown"])
+def test_runner_registration_refuses_unknown_or_missing_proof_mode(
+    socket_path, make_lode, proof_mode
+):
+    lode = make_lode(
+        id="register-id",
+        active=False,
+        oom_scope="hopper-test.scope",
+        run_generation=TEST_RUN_GENERATION,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    assert not server._register_lode_client(
+        "register-id",
+        MagicMock(),
+        run_generation=TEST_RUN_GENERATION,
+        proof_mode=proof_mode,
+        actual_unit=None,
+    )
+    assert "register-id" not in server.lode_clients
+    assert lode["active"] is False
+    assert lode["oom_scope"] == "hopper-test.scope"
+
+
 def test_spawn_claude_has_gated_and_action_successor_callers():
     hopper_dir = Path(__file__).resolve().parents[1] / "hopper"
     source = (hopper_dir / "server.py").read_text()

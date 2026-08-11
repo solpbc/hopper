@@ -2783,6 +2783,27 @@ class TestOomBoundary:
             "armed_mode": capability.value,
         }
 
+    def test_scoped_worker_reports_no_unit_when_candidate_is_absent(self, monkeypatch):
+        observed = {}
+        monkeypatch.delenv("HOPPER_OOM_SCOPE", raising=False)
+        monkeypatch.setattr(
+            oom,
+            "arm_worker",
+            lambda **_kwargs: oom.OomCapability.SUPPORTED,
+        )
+        monkeypatch.setattr(
+            "hopper.client.connect", lambda *_args, **_kwargs: {"lode": {"stage": "mill"}}
+        )
+
+        def run(runner):
+            observed["actual_unit"] = runner.actual_unit
+            return 0
+
+        monkeypatch.setattr(ProcessRunner, "run", run)
+
+        assert run_process("test-id", Path("server.sock"), expect_scope=True) == 0
+        assert observed["actual_unit"] is None
+
     def test_unscoped_worker_ignores_candidate_unit(self, monkeypatch):
         observed = {}
         monkeypatch.setenv("HOPPER_OOM_SCOPE", "hopper-test.scope")

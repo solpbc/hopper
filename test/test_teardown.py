@@ -346,14 +346,32 @@ def test_capture_scope_cgroup_rejects_root_or_unknown_control_group(tmp_path, mo
 
 
 @pytest.mark.parametrize(
-    "membership",
+    ("membership", "control_group", "observed_group"),
     [
-        "0::/user.slice/hopper.scope\n",
-        ("7:memory:/legacy/memory\n3:cpu,cpuacct:/legacy/cpu\n0::/user.slice/hopper.scope\n"),
+        (
+            "0::/user.slice/hopper.scope\n",
+            "/user.slice/hopper.scope",
+            "/user.slice/hopper.scope",
+        ),
+        (
+            "7:memory:/legacy/memory\n3:cpu,cpuacct:/legacy/cpu\n0::/user.slice/hopper.scope\n",
+            "/user.slice/hopper.scope",
+            "/user.slice/hopper.scope",
+        ),
+        (
+            "0::/user.slice/odd:name.scope\n",
+            "/user.slice/odd:name.scope",
+            "/user.slice/odd:name.scope",
+        ),
+        (
+            "0::/user.slice/hopper.scope/\n",
+            "/user.slice/hopper.scope",
+            "/user.slice/hopper.scope",
+        ),
     ],
 )
 def test_capture_worker_cgroup_membership_proves_exact_membership(
-    tmp_path, monkeypatch, membership
+    tmp_path, monkeypatch, membership, control_group, observed_group
 ):
     worker = _linux_process(102, 101, 102, 3)
 
@@ -365,12 +383,24 @@ def test_capture_worker_cgroup_membership_proves_exact_membership(
 
     monkeypatch.setattr(oom, "_read_text", read)
 
-    assert teardown.capture_worker_cgroup_membership(
-        worker, "/user.slice/hopper.scope", proc_root=tmp_path
-    ) == {
+    assert teardown.capture_worker_cgroup_membership(worker, control_group, proc_root=tmp_path) == {
         "state": "proven",
-        "control_group": "/user.slice/hopper.scope",
+        "control_group": observed_group,
         "error": None,
+    }
+
+
+def test_capture_worker_cgroup_membership_refuses_blank_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(oom, "_read_text", lambda _path: "\n \n\t\n")
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed == {
+        "state": "cannot-tell",
+        "control_group": None,
+        "error": "worker has no cgroup-v2 membership",
     }
 
 
