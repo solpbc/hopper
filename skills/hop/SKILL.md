@@ -82,33 +82,67 @@ is `$HOME/.local/bin/hop`, installed by `make install-user`.
 
 ## Waiting and monitoring
 
-Block until one or more lodes ship **(outside lode only)**:
+Supervise one or more lodes to a final outcome **(outside lode only)**:
 
 ```bash
 hop wait <lode-id>
+hop watch <lode-id>
 hop wait <id1> <id2> <id3>
 hop wait <lode-id> --timeout 300
 hop wait <lode-id> --observer-timeout 300
 ```
 
-`--timeout` limits the whole wait. `--observer-timeout` limits how long the
-latest valid authoritative status may go stale; set either to `0` to disable
-that limit. Socket events only accelerate reconciliation: durable active or
-archived status decides every outcome. Remote work is reconciled at the
-configured `--poll` interval. Do not hand-roll SSH polling loops for it.
+Top-level `hop watch` is an exact alias for `hop wait`: same options, supervisor,
+records, and exit status. `hop lode watch <id>` is different—it streams status
+events and does not provide the bounded final-record contract.
 
-Shipped lodes print once. In a multi-lode wait, the first nonzero outcome stops
-the command after any sibling terminal outcomes already known at that boundary
-are printed. Exit codes are disambiguated: `0` all shipped, `1`
-error/not-found/inactive, `2` gated, `3` stuck, and `4` overall timeout or
-observer unavailable. With `--json`, stdout is JSONL with outcomes `shipped`,
-`error`, `not_found`, `inactive`, `gated`, `stuck`, `timeout`, and
-`observer_unavailable`; diagnostics remain on stderr.
+`--timeout` limits the whole operation, including resolution and remote probes.
+It defaults to 3,600 seconds and cannot exceed 3,600; zero, negative, non-finite,
+and larger values are rejected before lookup or SSH. `--observer-timeout` limits
+how long authoritative status may remain unavailable. Setting it to `0` disables
+only that freshness failure; the overall one-hour deadline still applies. Socket
+events only accelerate reconciliation, and durable active/archive status decides
+the outcome. Do not hand-roll SSH polling loops.
 
-**Never pipe `hop wait` or `hop lode status` through `head`, `tail`, or a
-pager.** The pipeline reports the consumer's exit status, which can turn a
-failed wait or status check into false success. Run the command bare and inspect
-its full output.
+### Run the wait bare
+
+The command string must be the wait itself:
+
+```bash
+hop wait <lode-id>
+```
+
+Do not put it behind `timeout`, `nohup`, `ssh`, `sh -c`, `bash -lc`, a shell
+function, command substitution, a background `&`, `; echo $?`, `&&`, output
+redirection, a pipeline, `head`, `tail`, or a pager. Those wrappers can kill or
+detach the real waiter, hide its output, or report a different process's status.
+If the calling tool already launches commands through a shell internally, keep
+the submitted command string to exactly `hop wait ...` or `hop watch ...`.
+
+### Read the record, not only the exit code
+
+Every target emits one final human block, or one JSON object with `--json`. Read
+the complete output even when the exit code is zero. The record carries:
+
+- `outcome`, stable `reason_code`, plain-language `reason`, and `recovery`;
+- owning `server`, `route`, and bounded source `probes`;
+- exact `stage`, `state`, `status`, active/archive state, and freshness;
+- current or last-known tmux pane; and
+- exact known worktree path, provenance, and fresh existence result.
+
+The command's numeric exit is the maximum severity across target records: `0`
+shipped, `1` error/inactive/archive/resolution failure, `2` gated or durable
+action attention, `3` confirmed stuck, `4` overall timeout or status/observer
+unavailability, and `130` operator interrupt. The code alone is insufficient:
+exit `4`, for example, covers materially different recoveries. Use `outcome`,
+`reason_code`, and `recovery` to decide what happened and what to do next.
+
+With `--json`, stdout is JSONL containing final records only; the always-human
+command summary remains on stderr. In a JavaScript executor, inspect and forward
+both the returned `exit_code` and the complete `output`; never reduce the result
+to one of them. In multi-lode waits, Hopper performs a final authoritative sweep
+at a nonzero boundary so terminal siblings retain their real outcomes and
+unresolved siblings explain why supervision stopped.
 
 ### Reading the status: three traps
 

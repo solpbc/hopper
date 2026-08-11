@@ -57,11 +57,16 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop submit` | Create a lode (alias for implement) |
 | `hop list` | List lodes (alias for lode list) |
 | `hop projects` | List projects (alias for project list) |
-| `hop wait` | Wait for a lode to ship (alias for lode wait) |
+| `hop wait` | Supervise lodes to a final outcome (one-hour default and maximum) |
 | `hop show` | Show lode details (alias for lode show) |
-| `hop watch` | Watch lode status events (alias for lode watch) |
+| `hop watch` | Exact alias for `hop wait` |
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
+
+Run `hop wait ID` or `hop watch ID` as a bare command and read the complete final
+record, not only its exit code. Every record explains why supervision ended and
+includes recovery, owning server, lode status, pane context, and worktree context.
+`hop lode watch ID` is the separate streaming event view.
 
 Useful lode subcommands include `hop lode peek`, `hop lode nudge`, `hop lode
 answer`, and `hop lode path` for pane inspection, prompt recovery, and locating

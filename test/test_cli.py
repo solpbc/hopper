@@ -2565,8 +2565,7 @@ def test_lode_wait_shipped_no_title(capsys):
                 result = cmd_lode(["wait", "abc123"])
     assert result == 0
     out = capsys.readouterr().out
-    assert "✓ abc123 shipped" in out
-    assert "(" not in out
+    assert out.splitlines()[0] == "✓ abc123 shipped"
 
 
 def test_lode_wait_already_shipped(capsys):

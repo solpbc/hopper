@@ -608,11 +608,12 @@ def test_json_terminal_records_have_stable_and_additive_fields(
     assert rc == code
     payload = json.loads(capsys.readouterr().out)
     assert set(payload) == wait.FINAL_RECORD_KEYS
-    assert {"host", "source", "reason"}.isdisjoint(payload)
+    assert {"host", "source"}.isdisjoint(payload)
     assert payload["id"] == "abc123"
     assert payload["outcome"] == outcome
     assert payload["exit_code"] == code
     assert payload["reason_code"] == wait.REASON_CODES[outcome]
+    assert payload["reason"] == wait.REASON_TEXT[payload["reason_code"]]
     if outcome == "shipped":
         assert payload["recovery"] is None
     else:
@@ -625,6 +626,13 @@ def test_json_terminal_records_have_stable_and_additive_fields(
     assert payload["observed_age_s"] == 0.0
     assert payload["status_display"] == initial["status"]
     assert payload["pane_liveness"] == "not_probed"
+
+
+def test_every_final_reason_code_has_plain_language_text():
+    assert set(wait.REASON_TEXT) == set(wait.REASON_CODES.values()) | {
+        "resolution_failed",
+        "sibling_nonzero",
+    }
 
 
 @pytest.mark.parametrize(
@@ -820,10 +828,13 @@ def test_archived_before_shipping_renders_preserved_diagnostics(monkeypatch, cap
             "  stage=mill state=legacy active=True status=Preserved legacy diagnostic "
             "route=local observed_age_s=0.000"
         ),
-        (
-            "Observed outcome archived for 'abc123'. Hopper did not proceed. "
-            "Recover with: hop lode unarchive abc123."
-        ),
+        "  why: The lode was archived before it reached shipping. [archived_before_shipping]",
+        "  server: test-host (route: local)",
+        "  status: Preserved legacy diagnostic (stage=mill state=legacy active=True archived=True)",
+        "  pane: <unavailable>",
+        "  worktree: <unavailable> (basis=unavailable exists=<unavailable>)",
+        "  recovery: Observed outcome archived for 'abc123'. Hopper did not proceed. "
+        "Recover with: hop lode unarchive abc123.",
     ]
 
 
@@ -955,7 +966,7 @@ def test_local_event_is_only_a_reconciliation_hint(monkeypatch, capsys):
     assert rc == 0
     assert connection.stopped
     out = capsys.readouterr().out
-    assert out.count("shipped") == 1
+    assert out.splitlines().count("✓ abc123 shipped") == 1
     assert "Fabricated" not in out
 
 
@@ -981,7 +992,9 @@ def test_reconnect_requests_immediate_authoritative_read(monkeypatch, capsys):
 
     assert rc == 0
     assert clock.now == 1
-    assert "Recovered ship" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Before disconnect" not in out
+    assert out.count("Recovered ship") == 1
 
 
 def test_later_inactive_snapshot_has_prescriptive_recovery(monkeypatch, capsys):
@@ -1719,7 +1732,8 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
     assert len(payloads) == 1
     payload = payloads[0]
     assert set(payload) == wait.FINAL_RECORD_KEYS
-    assert {"host", "source", "reason"}.isdisjoint(payload)
+    assert {"host", "source"}.isdisjoint(payload)
+    assert payload["reason"] == wait.REASON_TEXT[payload["reason_code"]]
     assert payload["outcome"] == "stuck"
     assert payload["server"] == "fedora.local"
     assert payload["route"] == "fedora.local"
@@ -1803,10 +1817,14 @@ def test_gated_parked_gone_human_output_reports_restart_and_exits_two(monkeypatc
     assert capsys.readouterr().out.splitlines() == [
         "Lode abc123 is gated.",
         f"  stage=mill state=gated active=True status={expected} route=local observed_age_s=0.000",
-        (
-            "Observed outcome gated for 'abc123'. Hopper did not proceed. "
-            "Recover with: hop gate show abc123."
-        ),
+        "  why: The lode is gated for operator review. [gate_requires_review]",
+        "  server: test-host (route: local)",
+        f"  status: {format_park_status(reason, 'abc123')} "
+        "(stage=mill state=gated active=True archived=False)",
+        "  pane: %21",
+        "  worktree: <unavailable> (basis=unavailable exists=<unavailable>)",
+        "  recovery: Observed outcome gated for 'abc123'. Hopper did not proceed. "
+        "Recover with: hop gate show abc123.",
     ]
 
 
@@ -2062,7 +2080,7 @@ def test_remote_completed_stage_does_not_resolve_before_shipped(monkeypatch, cap
 
     assert rc == 0
     assert clock.now == 30
-    assert capsys.readouterr().out.count("shipped") == 1
+    assert capsys.readouterr().out.splitlines().count("✓ abc123 shipped") == 1
 
 
 @pytest.mark.parametrize(
@@ -2319,7 +2337,8 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
     assert len(lines) == 1
     payload = json.loads(lines[0])
     assert set(payload) == wait.FINAL_RECORD_KEYS
-    assert {"host", "source", "reason"}.isdisjoint(payload)
+    assert {"host", "source"}.isdisjoint(payload)
+    assert payload["reason"] == wait.REASON_TEXT[payload["reason_code"]]
     assert "warning:" not in captured.out
     assert "warning:" in captured.err
 
@@ -2757,6 +2776,7 @@ def test_closed_final_record_scenario_matrix(
     captured = capsys.readouterr()
     assert set(final_record) == wait.FINAL_RECORD_KEYS
     assert final_record["reason_code"] == reason_code
+    assert final_record["reason"] == wait.REASON_TEXT[reason_code]
     if outcome == "shipped":
         assert final_record["recovery"] is None
     else:
@@ -2823,7 +2843,15 @@ def test_human_renderer_uses_only_constructed_record_outcome(monkeypatch, capsys
         deadline=make_deadline(60),
     )
 
-    assert capsys.readouterr().out == "✓ case1234 shipped\n"
+    assert capsys.readouterr().out == (
+        "✓ case1234 shipped\n"
+        "  why: Shipping completed. [shipping_completed]\n"
+        "  server: test-host (route: local)\n"
+        "  status: Working (stage=shipped state=running active=False archived=False)\n"
+        "  pane: <unavailable>\n"
+        "  worktree: <unavailable> (basis=unavailable exists=<unavailable>)\n"
+        "  recovery: <none>\n"
+    )
 
 
 def test_all_query_resolution_schedules_by_utf8_and_deduplicates_aliases():

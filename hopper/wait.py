@@ -61,11 +61,51 @@ REASON_CODES = {
     "interrupted": "user_interrupted",
 }
 
+REASON_TEXT = {
+    "shipping_completed": "Shipping completed.",
+    "archived_before_shipping": "The lode was archived before it reached shipping.",
+    "lode_error": "The lode entered its terminal error state.",
+    "runner_inactive": "The runner became inactive before the lode shipped.",
+    "gate_requires_review": "The lode is gated for operator review.",
+    "progress_stalled": "The lode remained stuck after the progress grace period.",
+    "target_disappeared": "The resolved lode disappeared before the wait completed.",
+    "durable_action_blocked": "A durable completion action is blocked.",
+    "successor_adoption_stalled": (
+        "The successor runner was not adopted before its grace period expired."
+    ),
+    "startup_registration_stalled": (
+        "The initial runner did not register before its grace period expired."
+    ),
+    "ready_handoff_stalled": (
+        "The next-stage runner did not take over before the handoff grace period expired."
+    ),
+    "runner_reregistration_stalled": (
+        "The runner did not re-register after the server restart before its grace period expired."
+    ),
+    "observer_freshness_expired": (
+        "Authoritative status remained unavailable beyond the observer freshness deadline."
+    ),
+    "overall_timeout": "The configured overall wait deadline expired.",
+    "target_absent": "No lode matched the requested target.",
+    "target_ambiguous": "More than one lode matched the requested target.",
+    "initial_status_unavailable": (
+        "Authoritative status was unavailable during initial resolution."
+    ),
+    "sibling_nonzero": (
+        "A sibling target ended nonzero before this target reached a terminal outcome."
+    ),
+    "resolution_failed": (
+        "Another target failed during resolution, so this nonterminal target was not supervised."
+    ),
+    "user_interrupted": "The operator interrupted the wait.",
+}
+
 FINAL_RECORD_KEYS = {
     "id",
     "outcome",
     "exit_code",
     "reason_code",
+    "reason",
     "recovery",
     "stage",
     "state",
@@ -1224,11 +1264,13 @@ def _final_record(
     server = record.get("server")
     if isinstance(snapshot, dict):
         server = local_server if record.get("route") == "local" else record.get("route")
+    selected_reason_code = reason_code or REASON_CODES[outcome]
     final = {
         "id": record["id"],
         "outcome": outcome,
         "exit_code": exit_code,
-        "reason_code": reason_code or REASON_CODES[outcome],
+        "reason_code": selected_reason_code,
+        "reason": REASON_TEXT[selected_reason_code],
         "recovery": _recovery_for(record, outcome),
         "stage": snapshot.get("stage") if isinstance(snapshot, dict) else None,
         "state": snapshot.get("state") if isinstance(snapshot, dict) else None,
@@ -1288,6 +1330,41 @@ def _snapshot_summary(final_record: dict) -> str:
     )
 
 
+def _emit_human_final_details(final_record: dict) -> None:
+    """Render the required final context from the closed record."""
+    unavailable = "<unavailable>"
+
+    def display(value: object) -> str:
+        return unavailable if value is None else str(value)
+
+    server = final_record["server"] or unavailable
+    route = final_record["route"] or unavailable
+    status = final_record["status"] or unavailable
+    pane = final_record["tmux_pane"]
+    last_pane = final_record["last_tmux_pane"]
+    if pane is not None:
+        pane_display = pane
+    elif last_pane is not None:
+        pane_display = f"{unavailable} (last known: {last_pane})"
+    else:
+        pane_display = unavailable
+    worktree = final_record["worktree_path"] or unavailable
+    exists = final_record["worktree_exists"]
+    exists_display = unavailable if exists is None else str(exists).lower()
+    print(
+        f"  why: {final_record['reason']} [{final_record['reason_code']}]\n"
+        f"  server: {server} (route: {route})\n"
+        f"  status: {status} (stage={display(final_record['stage'])} "
+        f"state={display(final_record['state'])} active={display(final_record['active'])} "
+        f"archived={display(final_record['archived'])})\n"
+        f"  pane: {pane_display}\n"
+        f"  worktree: {worktree} (basis={final_record['worktree_path_basis']} "
+        f"exists={exists_display})"
+    )
+    recovery = final_record["recovery"]
+    print(f"  recovery: {recovery if recovery is not None else '<none>'}")
+
+
 def _emit_outcome(
     final_record: dict,
     json_output: bool,
@@ -1313,21 +1390,15 @@ def _emit_outcome(
         "interrupted",
     }:
         print(f"{STATUS_ERROR} {lid} {outcome}")
-        if final_record["recovery"]:
-            print(final_record["recovery"])
-        return
-    if outcome == "timeout":
+    elif outcome == "timeout":
         print(f"Timed out waiting for lode(s): {lid}")
         print(f"  {_snapshot_summary(final_record)}")
-        print(final_record["recovery"])
-        return
-    if outcome == "shipped":
+    elif outcome == "shipped":
         print(f"{STATUS_SHIPPED} {lid} shipped")
     elif outcome == "archived":
         status = f": {final_record['status']}" if final_record["status"] else ""
         print(f"{STATUS_ERROR} {lid} archived before shipping{status}")
         print(f"  {_snapshot_summary(final_record)}")
-        print(final_record["recovery"])
     elif outcome in {"startup_stalled", "handoff_stalled", "reconnect_stalled"}:
         label = {
             "startup_stalled": "startup registration stalled",
@@ -1336,32 +1407,25 @@ def _emit_outcome(
         }[outcome]
         print(f"{STATUS_ERROR} {lid} {label}: {final_record['status']}")
         print(f"  {_snapshot_summary(final_record)}")
-        print(final_record["recovery"])
     elif outcome in {"action_blocked", "action_stalled"}:
         label = "action blocked" if outcome == "action_blocked" else "successor adoption stalled"
         print(f"{STATUS_ERROR} {lid} {label}: {final_record['status']}")
         print(f"  {_snapshot_summary(final_record)}")
-        print(final_record["recovery"])
     elif outcome == "error":
         print(f"{STATUS_ERROR} {lid} error: {final_record['status']}")
         print(f"  {_snapshot_summary(final_record)}")
-        print(final_record["recovery"])
     elif outcome == "gated":
         print(f"Lode {lid} is gated.")
         print(f"  {_snapshot_summary(final_record)}")
-        print(final_record["recovery"])
     elif outcome == "inactive":
         print(f"Lode '{lid}' is not active ({_snapshot_summary(final_record)})")
-        print(final_record["recovery"])
     elif outcome == "stuck":
         print(_stuck_diagnostic(final_record, deadline=deadline))
-        print(final_record["recovery"])
     elif outcome == "not_found":
         print(f"Lode '{lid}' not found ({_snapshot_summary(final_record)})")
-        print(final_record["recovery"])
     elif outcome == "observer_unavailable":
         print(f"Status observer unavailable for {lid} ({_snapshot_summary(final_record)})")
-        print(final_record["recovery"])
+    _emit_human_final_details(final_record)
 
 
 def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | None:
