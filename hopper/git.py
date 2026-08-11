@@ -6,15 +6,61 @@
 import logging
 import shutil
 import subprocess
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
 UPSTREAM_REMOTE = "origin"
 DEFAULT_BRANCH_NAMES = ("main", "master")
-GIT_FETCH_TIMEOUT_SEC = 120
+UPSTREAM_FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+SHIP_CLEANLINESS_TIMEOUT_SEC = 5.0
+SHIP_REMOTE_DETECTION_TIMEOUT_SEC = 5.0
+SHIP_FETCH_TIMEOUT_SEC = 120.0
+SHIP_DEFAULT_REF_TIMEOUT_SEC = 5.0
+SHIP_ANCESTRY_TIMEOUT_SEC = 5.0
+SHIP_LANDING_TIMEOUT_SEC = 140.0
 UNPUSHED_PROBE_TIMEOUT_SEC = 2.0
+
+ShipLandingCause = Literal[
+    "worktree_unreadable",
+    "worktree_missing",
+    "cleanliness_deadline_expired",
+    "cleanliness_unavailable",
+    "cleanliness_failed",
+    "cleanliness_dirty",
+    "remote_detection_deadline_expired",
+    "remote_detection_unavailable",
+    "remote_detection_failed",
+    "remote_detection_origin_absent",
+    "fetch_deadline_expired",
+    "fetch_timed_out",
+    "fetch_unavailable",
+    "fetch_failed",
+    "default_ref_deadline_expired",
+    "default_ref_unavailable",
+    "default_ref_failed",
+    "default_ref_missing",
+    "ancestry_deadline_expired",
+    "ancestry_unavailable",
+    "ancestry_contained",
+    "ancestry_not_contained",
+    "ancestry_failed",
+]
+
+
+@dataclass(frozen=True)
+class ShipLandingVerdict:
+    """The facts Hopper proved before allowing ship completion."""
+
+    cleanliness: Literal["clean", "dirty", "indeterminate"]
+    containment: Literal["contained", "not_contained", "origin_absent", "indeterminate"]
+    base_ref: str | None
+    cause: ShipLandingCause
+    detail: str
 
 
 def _branch_exists(repo_dir: str, branch_name: str) -> bool | None:
@@ -124,15 +170,22 @@ def create_worktree(
         if UPSTREAM_REMOTE in remote_names:
             try:
                 fetch_result = subprocess.run(
-                    ["git", "fetch", UPSTREAM_REMOTE],
+                    [
+                        "git",
+                        "fetch",
+                        "--prune",
+                        UPSTREAM_REMOTE,
+                        UPSTREAM_FETCH_REFSPEC,
+                    ],
                     cwd=repo_dir,
                     capture_output=True,
                     text=True,
-                    timeout=GIT_FETCH_TIMEOUT_SEC,
+                    timeout=SHIP_FETCH_TIMEOUT_SEC,
                 )
             except subprocess.TimeoutExpired:
                 error = (
-                    f"git fetch {UPSTREAM_REMOTE} timed out after {GIT_FETCH_TIMEOUT_SEC} seconds"
+                    f"git fetch {UPSTREAM_REMOTE} timed out after "
+                    f"{SHIP_FETCH_TIMEOUT_SEC:g} seconds"
                 )
                 logger.error(error)
                 return False, error
@@ -219,6 +272,281 @@ def _git_probe(
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning(f"git {' '.join(args)} failed in {worktree_path}: {exc}")
         return None
+
+
+def _remaining_timeout(deadline: float, limit: float) -> float | None:
+    """Return this probe's share of an aggregate monotonic deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return min(limit, remaining)
+
+
+def _probe_worktree_cleanliness(
+    worktree_path: str, timeout: float
+) -> tuple[
+    Literal["clean", "dirty", "indeterminate"],
+    Literal["clean", "dirty", "unavailable", "failed"],
+    str,
+]:
+    """Return tri-state worktree cleanliness using staged and untracked state."""
+    result = _git_probe(worktree_path, ["status", "--porcelain"], timeout)
+    if result is None:
+        return (
+            "indeterminate",
+            "unavailable",
+            "worktree cleanliness is indeterminate because git status failed or timed out",
+        )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        return (
+            "indeterminate",
+            "failed",
+            f"worktree cleanliness is indeterminate because git status failed: {detail}",
+        )
+    if result.stdout:
+        return (
+            "dirty",
+            "dirty",
+            "canonical worktree has staged, unstaged, or untracked changes",
+        )
+    return "clean", "clean", "canonical worktree is clean"
+
+
+def ship_landing_verdict(worktree_dir: str | Path) -> ShipLandingVerdict:
+    """Prove a clean ship worktree is contained in a fresh upstream default ref.
+
+    The five Git stages share one 140-second monotonic budget: cleanliness (5),
+    remote detection (5), fetch (120), default-ref resolution (5), and ancestry
+    (5). A confirmed repository without ``origin`` requires cleanliness but does
+    not require containment. Every uncertainty fails closed.
+    """
+    worktree_path = str(worktree_dir)
+    deadline = time.monotonic() + SHIP_LANDING_TIMEOUT_SEC
+
+    try:
+        worktree_exists = Path(worktree_path).is_dir()
+    except OSError as exc:
+        return ShipLandingVerdict(
+            "indeterminate",
+            "indeterminate",
+            None,
+            "worktree_unreadable",
+            f"canonical worktree could not be inspected at {worktree_path}: {exc}",
+        )
+    if not worktree_exists:
+        return ShipLandingVerdict(
+            "indeterminate",
+            "indeterminate",
+            None,
+            "worktree_missing",
+            f"canonical worktree is missing or not a directory: {worktree_path}",
+        )
+
+    timeout = _remaining_timeout(deadline, SHIP_CLEANLINESS_TIMEOUT_SEC)
+    if timeout is None:
+        return ShipLandingVerdict(
+            "indeterminate",
+            "indeterminate",
+            None,
+            "cleanliness_deadline_expired",
+            "overall ship landing deadline expired before checking worktree cleanliness",
+        )
+    cleanliness, cleanliness_outcome, cleanliness_detail = _probe_worktree_cleanliness(
+        worktree_path, timeout
+    )
+    if cleanliness != "clean":
+        cleanliness_cause: ShipLandingCause = {
+            "dirty": "cleanliness_dirty",
+            "unavailable": "cleanliness_unavailable",
+            "failed": "cleanliness_failed",
+        }[cleanliness_outcome]
+        return ShipLandingVerdict(
+            cleanliness,
+            "indeterminate",
+            None,
+            cleanliness_cause,
+            cleanliness_detail,
+        )
+
+    timeout = _remaining_timeout(deadline, SHIP_REMOTE_DETECTION_TIMEOUT_SEC)
+    if timeout is None:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "remote_detection_deadline_expired",
+            "overall ship landing deadline expired before detecting Git remotes",
+        )
+    remotes = _git_probe(worktree_path, ["remote"], timeout)
+    if remotes is None:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "remote_detection_unavailable",
+            "origin detection is indeterminate because git remote failed or timed out",
+        )
+    if remotes.returncode != 0:
+        detail = remotes.stderr.strip() or f"exit code {remotes.returncode}"
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "remote_detection_failed",
+            f"origin detection is indeterminate because git remote failed: {detail}",
+        )
+    remote_names = {name.strip() for name in remotes.stdout.splitlines() if name.strip()}
+    if UPSTREAM_REMOTE not in remote_names:
+        return ShipLandingVerdict(
+            "clean",
+            "origin_absent",
+            None,
+            "remote_detection_origin_absent",
+            "canonical worktree is clean; origin is not configured, so push containment "
+            "was not verified",
+        )
+
+    timeout = _remaining_timeout(deadline, SHIP_FETCH_TIMEOUT_SEC)
+    if timeout is None:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "fetch_deadline_expired",
+            "overall ship landing deadline expired before fetching origin",
+        )
+    fetch_args = ["fetch", "--prune", UPSTREAM_REMOTE, UPSTREAM_FETCH_REFSPEC]
+    try:
+        fetch_result = subprocess.run(
+            ["git", *fetch_args],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "fetch_timed_out",
+            f"fetch from origin timed out after {timeout:g} seconds",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "fetch_unavailable",
+            f"fetch from origin failed: {exc}",
+        )
+    if fetch_result.returncode != 0:
+        detail = fetch_result.stderr.strip() or f"exit code {fetch_result.returncode}"
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "fetch_failed",
+            f"fetch from origin failed: {detail}",
+        )
+
+    resolution_deadline = min(deadline, time.monotonic() + SHIP_DEFAULT_REF_TIMEOUT_SEC)
+    base_ref = None
+    for branch_name in DEFAULT_BRANCH_NAMES:
+        candidate = f"{UPSTREAM_REMOTE}/{branch_name}"
+        timeout = _remaining_timeout(resolution_deadline, SHIP_DEFAULT_REF_TIMEOUT_SEC)
+        if timeout is None:
+            return ShipLandingVerdict(
+                "clean",
+                "indeterminate",
+                None,
+                "default_ref_deadline_expired",
+                "fresh default-branch resolution timed out",
+            )
+        result = _git_probe(
+            worktree_path,
+            ["rev-parse", "--verify", "--quiet", candidate],
+            timeout,
+        )
+        if result is None:
+            return ShipLandingVerdict(
+                "clean",
+                "indeterminate",
+                None,
+                "default_ref_unavailable",
+                f"fresh default-branch resolution is indeterminate while probing {candidate}",
+            )
+        if result.returncode == 0 and result.stdout.strip():
+            base_ref = candidate
+            break
+        if result.returncode != 1:
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            return ShipLandingVerdict(
+                "clean",
+                "indeterminate",
+                None,
+                "default_ref_failed",
+                f"fresh default-branch resolution failed while probing {candidate}: {detail}",
+            )
+    if base_ref is None:
+        attempted = ", ".join(
+            f"{UPSTREAM_REMOTE}/{branch_name}" for branch_name in DEFAULT_BRANCH_NAMES
+        )
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            None,
+            "default_ref_missing",
+            f"no fresh upstream default branch exists ({attempted})",
+        )
+
+    timeout = _remaining_timeout(deadline, SHIP_ANCESTRY_TIMEOUT_SEC)
+    if timeout is None:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            base_ref,
+            "ancestry_deadline_expired",
+            "overall ship landing deadline expired before checking ancestry",
+        )
+    ancestry = _git_probe(
+        worktree_path,
+        ["merge-base", "--is-ancestor", "HEAD", base_ref],
+        timeout,
+    )
+    if ancestry is None:
+        return ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            base_ref,
+            "ancestry_unavailable",
+            f"ancestry against {base_ref} is indeterminate because git failed or timed out",
+        )
+    if ancestry.returncode == 0:
+        return ShipLandingVerdict(
+            "clean",
+            "contained",
+            base_ref,
+            "ancestry_contained",
+            f"HEAD is contained in freshly fetched {base_ref}",
+        )
+    if ancestry.returncode == 1:
+        return ShipLandingVerdict(
+            "clean",
+            "not_contained",
+            base_ref,
+            "ancestry_not_contained",
+            f"HEAD is not contained in freshly fetched {base_ref}",
+        )
+    detail = ancestry.stderr.strip() or f"exit code {ancestry.returncode}"
+    return ShipLandingVerdict(
+        "clean",
+        "indeterminate",
+        base_ref,
+        "ancestry_failed",
+        f"ancestry against {base_ref} is indeterminate: {detail}",
+    )
 
 
 def unpushed_commits(

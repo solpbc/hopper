@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ import hopper.code as hopper_code
 from hopper import __version__, config
 from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
+from hopper.git import UPSTREAM_FETCH_REFSPEC, ShipLandingCause, ShipLandingVerdict
 from hopper.lodes import (
     current_time_ms,
     find_lode_by_prefix,
@@ -1012,6 +1014,77 @@ def cmd_screenshot(args: list[str]) -> int:
     return 0
 
 
+_SHIP_COMPLETION_CAUSES: frozenset[ShipLandingCause] = frozenset(
+    {"ancestry_contained", "remote_detection_origin_absent"}
+)
+_SHIP_RECOVERY_KIND_BY_CAUSE: dict[ShipLandingCause, str] = {
+    "worktree_unreadable": "status",
+    "worktree_missing": "status",
+    "cleanliness_deadline_expired": "status",
+    "cleanliness_unavailable": "status",
+    "cleanliness_failed": "status",
+    "cleanliness_dirty": "status",
+    "remote_detection_deadline_expired": "remote",
+    "remote_detection_unavailable": "remote",
+    "remote_detection_failed": "remote",
+    "remote_detection_origin_absent": "remote",
+    "fetch_deadline_expired": "fetch",
+    "fetch_timed_out": "fetch",
+    "fetch_unavailable": "fetch",
+    "fetch_failed": "fetch",
+    "default_ref_deadline_expired": "default_ref",
+    "default_ref_unavailable": "default_ref",
+    "default_ref_failed": "default_ref",
+    "default_ref_missing": "default_ref",
+    "ancestry_deadline_expired": "ancestry",
+    "ancestry_unavailable": "ancestry",
+    "ancestry_contained": "ancestry",
+    "ancestry_not_contained": "push",
+    "ancestry_failed": "ancestry",
+}
+
+
+def _ship_landing_recovery(verdict: ShipLandingVerdict, worktree: Path) -> str:
+    """Render the recovery action selected only from the structured cause."""
+    quoted_worktree = shlex.quote(str(worktree))
+    recovery_kind = _SHIP_RECOVERY_KIND_BY_CAUSE[verdict.cause]
+    if recovery_kind == "status":
+        return (
+            f"inspect `git -C {quoted_worktree} status --short`, commit or clean "
+            "the reported changes"
+        )
+    if recovery_kind == "remote":
+        return (
+            "inspect repository remotes using "
+            f"`git -C {quoted_worktree} remote -v` and resolve the failure"
+        )
+    if recovery_kind == "fetch":
+        return (
+            "restore upstream access and run "
+            f"`git -C {quoted_worktree} fetch --prune origin {UPSTREAM_FETCH_REFSPEC}`"
+        )
+    if recovery_kind == "default_ref":
+        return (
+            "inspect or restore the upstream default using "
+            f"`git -C {quoted_worktree} remote show origin`"
+        )
+    if verdict.base_ref is None:
+        raise ValueError(f"ship landing cause {verdict.cause} requires a base ref")
+    if recovery_kind == "push":
+        branch_name = verdict.base_ref.removeprefix("origin/")
+        return (
+            f"land the commit using `git -C {quoted_worktree} push origin "
+            f"HEAD:{shlex.quote(branch_name)}`"
+        )
+    if recovery_kind == "ancestry":
+        return (
+            "inspect containment using "
+            f"`git -C {quoted_worktree} merge-base --is-ancestor HEAD "
+            f"{shlex.quote(verdict.base_ref)}` and resolve the failure"
+        )
+    raise ValueError(f"unknown ship landing recovery kind: {recovery_kind}")
+
+
 @command("processed", "Signal stage completion with output", group="lode")
 def cmd_processed(args: list[str]) -> int:
     """Read stage output from stdin and signal stage completion."""
@@ -1059,6 +1132,26 @@ def cmd_processed(args: list[str]) -> int:
     if not output.strip():
         print("No input received. Use: hop processed <<'EOF'\\n<output>\\nEOF")
         return 1
+
+    if stage == "ship":
+        from hopper.git import ship_landing_verdict
+        from hopper.lodes import get_worktree_dir
+
+        worktree = get_worktree_dir(lode_id)
+        verdict = ship_landing_verdict(worktree)
+        if verdict.cause not in _SHIP_COMPLETION_CAUSES:
+            recovery = _ship_landing_recovery(verdict, worktree)
+            print("error: ship completion refused", file=sys.stderr)
+            print(f"observed: {verdict.detail}", file=sys.stderr)
+            print(
+                "Hopper did not write ship completion or advance the lode.",
+                file=sys.stderr,
+            )
+            print(
+                f"recover with: {recovery}, then retry `hop processed`.",
+                file=sys.stderr,
+            )
+            return 1
 
     # Write to lode directory as <stage>_out.md
     lode_dir = get_lode_dir(lode_id)

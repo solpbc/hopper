@@ -11,7 +11,13 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from hopper.git import (
-    GIT_FETCH_TIMEOUT_SEC,
+    SHIP_ANCESTRY_TIMEOUT_SEC,
+    SHIP_CLEANLINESS_TIMEOUT_SEC,
+    SHIP_DEFAULT_REF_TIMEOUT_SEC,
+    SHIP_FETCH_TIMEOUT_SEC,
+    SHIP_LANDING_TIMEOUT_SEC,
+    SHIP_REMOTE_DETECTION_TIMEOUT_SEC,
+    UPSTREAM_FETCH_REFSPEC,
     _resolve_default_branch,
     commit_all,
     create_worktree,
@@ -24,6 +30,7 @@ from hopper.git import (
     is_dirty,
     quarantine_dirty_repo,
     remove_worktree,
+    ship_landing_verdict,
     unpushed_commits,
 )
 
@@ -101,6 +108,44 @@ def stale_clone_factory(tmp_path):
     return create
 
 
+@pytest.fixture
+def upstream_clone_factory(tmp_path):
+    """Create a populated bare upstream, its publisher, and a registered clone."""
+
+    def create(branch, *, name=None):
+        prefix = name or branch
+        remote = _init_git_repo(
+            tmp_path,
+            name=f"{prefix}-upstream.git",
+            branch=branch,
+            bare=True,
+        )
+        _run_git(remote, "config", "receive.denyDeleteCurrent", "ignore")
+        publisher = tmp_path / f"{prefix}-publisher"
+        _run_git(tmp_path, "clone", str(remote), str(publisher))
+        _run_git(publisher, "config", "user.email", "test@example.com")
+        _run_git(publisher, "config", "user.name", "Test User")
+        (publisher / "README.md").write_text("initial\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "initial")
+        _run_git(publisher, "push", "-u", "origin", branch)
+
+        registered = tmp_path / f"{prefix}-registered"
+        _run_git(tmp_path, "clone", str(remote), str(registered))
+        _run_git(registered, "config", "user.email", "test@example.com")
+        _run_git(registered, "config", "user.name", "Test User")
+        return remote, publisher, registered
+
+    return create
+
+
+def _remove_or_rename_upstream_default(publisher, branch, change):
+    if change == "renamed":
+        _run_git(publisher, "branch", "-m", "trunk")
+        _run_git(publisher, "push", "-u", "origin", "trunk")
+    _run_git(publisher, "push", "origin", "--delete", branch)
+
+
 class TestCreateWorktree:
     def test_success(self, tmp_path):
         """Fetches origin and creates an untracked worktree from its first default ref."""
@@ -126,11 +171,11 @@ class TestCreateWorktree:
                 text=True,
             ),
             call(
-                ["git", "fetch", "origin"],
+                ["git", "fetch", "--prune", "origin", UPSTREAM_FETCH_REFSPEC],
                 cwd="/repo",
                 capture_output=True,
                 text=True,
-                timeout=GIT_FETCH_TIMEOUT_SEC,
+                timeout=SHIP_FETCH_TIMEOUT_SEC,
             ),
             call(
                 ["git", "rev-parse", "--verify", "origin/main"],
@@ -335,7 +380,7 @@ class TestCreateWorktree:
             "subprocess.run",
             side_effect=[
                 remote_result,
-                subprocess.TimeoutExpired(["git", "fetch", "origin"], GIT_FETCH_TIMEOUT_SEC),
+                subprocess.TimeoutExpired(["git", "fetch", "origin"], SHIP_FETCH_TIMEOUT_SEC),
             ],
         ) as mock_run:
             result = create_worktree("/repo", worktree_path, "hopper-abc12345")
@@ -437,6 +482,42 @@ class TestCreateWorktreeIntegration:
         )
         assert not worktree_path.exists()
         assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+
+    @pytest.mark.parametrize("branch", ["main", "master"])
+    @pytest.mark.parametrize("change", ["deleted", "renamed"])
+    def test_pruned_fetch_rejects_stale_upstream_default(
+        self, tmp_path, upstream_clone_factory, branch, change
+    ):
+        _remote, publisher, registered = upstream_clone_factory(
+            branch, name=f"create-{branch}-{change}"
+        )
+        stale_sha = _run_git(registered, "rev-parse", f"origin/{branch}").stdout.strip()
+        registered_branch = _run_git(registered, "branch", "--show-current").stdout
+        registered_head = _run_git(registered, "rev-parse", "HEAD").stdout
+        worktree_path = tmp_path / f"create-{branch}-{change}-worktree"
+        branch_name = f"hopper-{branch}-{change}"
+
+        _remove_or_rename_upstream_default(publisher, branch, change)
+        assert _run_git(registered, "rev-parse", f"origin/{branch}").stdout.strip() == stale_sha
+
+        created, error = create_worktree(str(registered), worktree_path, branch_name)
+
+        assert created is False
+        assert error == (
+            "upstream default branch resolution failed after git fetch origin: "
+            "no candidate exists (origin/main, origin/master)"
+        )
+        assert not worktree_path.exists()
+        assert _run_git(registered, "branch", "--list", branch_name).stdout.strip() == ""
+        assert _run_git(registered, "branch", "--show-current").stdout == registered_branch
+        assert _run_git(registered, "rev-parse", "HEAD").stdout == registered_head
+        missing = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{branch}"],
+            cwd=registered,
+            capture_output=True,
+            text=True,
+        )
+        assert missing.returncode != 0
 
     def test_partial_add_failure_removes_created_worktree_branch_and_registration(
         self, tmp_path, stale_clone_factory
@@ -548,6 +629,346 @@ class TestCreateWorktreeIntegration:
 
         assert get_diff_stat(str(worktree_path)) == ""
         assert get_diff_numstat(str(worktree_path)) == ""
+
+
+class TestShipLandingVerdictIntegration:
+    @pytest.mark.parametrize("branch", ["main", "master"])
+    @pytest.mark.parametrize("upstream_advanced", [False, True])
+    def test_accepts_head_contained_in_fresh_default(
+        self, upstream_clone_factory, branch, upstream_advanced
+    ):
+        _remote, publisher, registered = upstream_clone_factory(
+            branch, name=f"landing-{branch}-{upstream_advanced}"
+        )
+        if upstream_advanced:
+            (publisher / "upstream.txt").write_text("advanced\n")
+            _run_git(publisher, "add", ".")
+            _run_git(publisher, "commit", "-m", "advance upstream")
+            _run_git(publisher, "push", "origin", branch)
+
+        verdict = ship_landing_verdict(registered)
+
+        assert verdict.cleanliness == "clean"
+        assert verdict.containment == "contained"
+        assert verdict.base_ref == f"origin/{branch}"
+
+    def test_main_wins_when_main_and_master_exist(self, upstream_clone_factory):
+        _remote, publisher, registered = upstream_clone_factory("main", name="both-contained")
+        _run_git(publisher, "branch", "master")
+        _run_git(publisher, "push", "origin", "master")
+
+        verdict = ship_landing_verdict(registered)
+
+        assert verdict.containment == "contained"
+        assert verdict.base_ref == "origin/main"
+
+    def test_main_wins_and_refuses_head_contained_only_in_master(self, upstream_clone_factory):
+        _remote, publisher, registered = upstream_clone_factory("main", name="both-diverged")
+        _run_git(publisher, "switch", "-c", "master")
+        (publisher / "master.txt").write_text("master\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "master-only")
+        _run_git(publisher, "push", "origin", "master")
+        _run_git(publisher, "switch", "main")
+        (publisher / "main.txt").write_text("main\n")
+        _run_git(publisher, "add", ".")
+        _run_git(publisher, "commit", "-m", "main-only")
+        _run_git(publisher, "push", "origin", "main")
+        _run_git(registered, "fetch", "origin")
+        _run_git(registered, "switch", "-c", "feature", "origin/master")
+
+        verdict = ship_landing_verdict(registered)
+
+        assert verdict.cleanliness == "clean"
+        assert verdict.containment == "not_contained"
+        assert verdict.base_ref == "origin/main"
+
+    def test_feature_only_push_is_not_landed(self, upstream_clone_factory):
+        _remote, _publisher, registered = upstream_clone_factory("main", name="feature-only")
+        _run_git(registered, "switch", "-c", "feature")
+        (registered / "feature.txt").write_text("feature\n")
+        _run_git(registered, "add", ".")
+        _run_git(registered, "commit", "-m", "feature")
+        _run_git(registered, "push", "-u", "origin", "feature")
+
+        verdict = ship_landing_verdict(registered)
+
+        assert verdict.cleanliness == "clean"
+        assert verdict.containment == "not_contained"
+        assert verdict.base_ref == "origin/main"
+
+    @pytest.mark.parametrize("branch", ["main", "master"])
+    @pytest.mark.parametrize("change", ["deleted", "renamed"])
+    def test_pruned_fetch_rejects_stale_upstream_default(
+        self, upstream_clone_factory, branch, change
+    ):
+        _remote, publisher, registered = upstream_clone_factory(
+            branch, name=f"landing-{branch}-{change}"
+        )
+        stale_sha = _run_git(registered, "rev-parse", f"origin/{branch}").stdout.strip()
+        _remove_or_rename_upstream_default(publisher, branch, change)
+        assert _run_git(registered, "rev-parse", f"origin/{branch}").stdout.strip() == stale_sha
+
+        verdict = ship_landing_verdict(registered)
+
+        assert verdict.cleanliness == "clean"
+        assert verdict.containment == "indeterminate"
+        assert verdict.base_ref is None
+        assert "no fresh upstream default branch" in verdict.detail
+        missing = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{branch}"],
+            cwd=registered,
+            capture_output=True,
+            text=True,
+        )
+        assert missing.returncode != 0
+
+    def test_clean_repo_with_only_differently_named_remote_relaxes_containment(self, tmp_path):
+        repo = _init_git_repo(tmp_path, name="different-remote", branch="topic")
+        remote = _init_git_repo(tmp_path, name="different-upstream.git", branch="topic", bare=True)
+        _run_git(repo, "remote", "add", "upstream", str(remote))
+
+        verdict = ship_landing_verdict(repo)
+
+        assert verdict.cleanliness == "clean"
+        assert verdict.containment == "origin_absent"
+        assert verdict.base_ref is None
+        assert "not verified" in verdict.detail
+
+    @pytest.mark.parametrize("dirty_kind", ["staged", "unstaged", "untracked"])
+    def test_canonical_changes_are_not_hidden_by_clean_cwd(self, tmp_path, monkeypatch, dirty_kind):
+        canonical = _init_git_repo(tmp_path, name=f"canonical-{dirty_kind}")
+        clean_cwd = _init_git_repo(tmp_path, name=f"clean-cwd-{dirty_kind}")
+        if dirty_kind == "staged":
+            (canonical / "staged.txt").write_text("staged\n")
+            _run_git(canonical, "add", ".")
+        elif dirty_kind == "unstaged":
+            (canonical / "README.md").write_text("changed\n")
+        else:
+            (canonical / "untracked.txt").write_text("untracked\n")
+        monkeypatch.chdir(clean_cwd)
+
+        verdict = ship_landing_verdict(canonical)
+
+        assert verdict.cleanliness == "dirty"
+        assert verdict.containment == "indeterminate"
+
+    def test_dirty_unrelated_cwd_does_not_taint_clean_canonical_tree(self, tmp_path, monkeypatch):
+        canonical = _init_git_repo(tmp_path, name="clean-canonical", branch="topic")
+        dirty_cwd = _init_git_repo(tmp_path, name="dirty-cwd")
+        (dirty_cwd / "untracked.txt").write_text("dirty\n")
+        monkeypatch.chdir(dirty_cwd)
+
+        verdict = ship_landing_verdict(canonical)
+
+        assert verdict.cleanliness == "clean"
+        assert verdict.containment == "origin_absent"
+
+    def test_missing_worktree_is_indeterminate(self, tmp_path):
+        verdict = ship_landing_verdict(tmp_path / "missing")
+
+        assert verdict.cleanliness == "indeterminate"
+        assert verdict.containment == "indeterminate"
+        assert "missing" in verdict.detail
+
+
+class TestShipLandingVerdictDeadlines:
+    def test_each_stage_uses_its_named_deadline_and_total_is_140_seconds(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+            MagicMock(returncode=0, stdout=""),
+        ]
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch("hopper.git.subprocess.run", side_effect=results) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "contained"
+        assert [item.kwargs["timeout"] for item in run.call_args_list] == [
+            SHIP_CLEANLINESS_TIMEOUT_SEC,
+            SHIP_REMOTE_DETECTION_TIMEOUT_SEC,
+            SHIP_FETCH_TIMEOUT_SEC,
+            SHIP_DEFAULT_REF_TIMEOUT_SEC,
+            SHIP_ANCESTRY_TIMEOUT_SEC,
+        ]
+        assert (
+            SHIP_CLEANLINESS_TIMEOUT_SEC
+            + SHIP_REMOTE_DETECTION_TIMEOUT_SEC
+            + SHIP_FETCH_TIMEOUT_SEC
+            + SHIP_DEFAULT_REF_TIMEOUT_SEC
+            + SHIP_ANCESTRY_TIMEOUT_SEC
+            == SHIP_LANDING_TIMEOUT_SEC
+            == 140.0
+        )
+
+    def test_cleanliness_timeout_is_immediately_indeterminate(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(
+                    ["git", "status", "--porcelain"],
+                    SHIP_CLEANLINESS_TIMEOUT_SEC,
+                ),
+            ) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.cleanliness == "indeterminate"
+        assert verdict.containment == "indeterminate"
+        assert run.call_args.kwargs["timeout"] == SHIP_CLEANLINESS_TIMEOUT_SEC
+
+    def test_cleanliness_nonzero_is_indeterminate(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                return_value=MagicMock(returncode=128, stdout="", stderr="fatal: status"),
+            ),
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.cleanliness == "indeterminate"
+        assert "fatal: status" in verdict.detail
+
+    def test_remote_detection_timeout_fails_closed(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=0, stdout=""),
+                    subprocess.TimeoutExpired(["git", "remote"], 5),
+                ],
+            ) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert run.call_args.kwargs["timeout"] == SHIP_REMOTE_DETECTION_TIMEOUT_SEC
+
+    def test_remote_detection_nonzero_fails_closed(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=128, stdout="", stderr="fatal: remotes"),
+                ],
+            ),
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert "fatal: remotes" in verdict.detail
+
+    def test_fetch_timeout_fails_closed(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="origin\n"),
+                    subprocess.TimeoutExpired(["git", "fetch"], 120),
+                ],
+            ) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert "fetch from origin timed out" in verdict.detail
+        assert run.call_args.kwargs["timeout"] == SHIP_FETCH_TIMEOUT_SEC
+
+    def test_fetch_nonzero_fails_closed(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="origin\n"),
+                    MagicMock(returncode=128, stdout="", stderr="fatal: fetch"),
+                ],
+            ),
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert "fatal: fetch" in verdict.detail
+
+    def test_default_ref_timeout_fails_closed(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch(
+                "hopper.git.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=0, stdout=""),
+                    MagicMock(returncode=0, stdout="origin\n"),
+                    MagicMock(returncode=0, stdout=""),
+                    subprocess.TimeoutExpired(["git", "rev-parse"], 5),
+                ],
+            ) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert verdict.base_ref is None
+        assert run.call_args.kwargs["timeout"] == SHIP_DEFAULT_REF_TIMEOUT_SEC
+
+    def test_ancestry_nonzero_other_than_one_is_indeterminate(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+            MagicMock(returncode=128, stdout="", stderr="fatal: ancestry"),
+        ]
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch("hopper.git.subprocess.run", side_effect=results),
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert verdict.base_ref == "origin/main"
+        assert "fatal: ancestry" in verdict.detail
+
+    def test_ancestry_timeout_fails_closed(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="origin\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="abc123\n"),
+            subprocess.TimeoutExpired(["git", "merge-base"], 5),
+        ]
+        with (
+            patch("hopper.git.time.monotonic", return_value=0),
+            patch("hopper.git.subprocess.run", side_effect=results) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert verdict.base_ref == "origin/main"
+        assert run.call_args.kwargs["timeout"] == SHIP_ANCESTRY_TIMEOUT_SEC
+
+    def test_overall_monotonic_deadline_stops_before_next_probe(self, tmp_path):
+        with (
+            patch("hopper.git.time.monotonic", side_effect=[0, 0, 141]),
+            patch(
+                "hopper.git.subprocess.run", return_value=MagicMock(returncode=0, stdout="")
+            ) as run,
+        ):
+            verdict = ship_landing_verdict(tmp_path)
+
+        assert verdict.containment == "indeterminate"
+        assert "overall ship landing deadline" in verdict.detail
+        assert run.call_count == 1
 
 
 class TestResolveDefaultBranch:

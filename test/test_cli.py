@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import get_args
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -59,6 +60,7 @@ from hopper.cli import (
     validate_hopper_lid,
 )
 from hopper.client import RUN_GENERATION_ENV
+from hopper.git import UPSTREAM_FETCH_REFSPEC, ShipLandingCause, ShipLandingVerdict
 from hopper.lodes import (
     PARK_PANE_GONE_STATUS,
     current_time_ms,
@@ -3647,6 +3649,245 @@ def test_processed_refine_stage(temp_config, capsys):
     assert sid == lode_id
     assert state == "completed"
     assert "Refine complete" in status
+
+
+@pytest.mark.parametrize("stage", ["mill", "refine"])
+def test_processed_non_ship_stage_never_runs_landing_proof(temp_config, stage):
+    from io import StringIO
+
+    lode_id = f"test-{stage}-proof"
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch(
+            "hopper.client.get_lode",
+            return_value={"id": lode_id, "stage": stage},
+        ),
+        patch(
+            "hopper.client.set_lode_state_acknowledged",
+            return_value={"accepted": True, "reason": "accepted"},
+        ) as set_state,
+        patch("hopper.git.ship_landing_verdict") as landing_proof,
+        patch("sys.stdin", StringIO("stage output\n")),
+    ):
+        assert cmd_processed([]) == 0
+
+    landing_proof.assert_not_called()
+    set_state.assert_called_once()
+    assert (temp_config / "lodes" / lode_id / f"{stage}_out.md").read_text() == ("stage output\n")
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        ShipLandingVerdict(
+            "clean",
+            "contained",
+            "origin/main",
+            "ancestry_contained",
+            "HEAD is contained in freshly fetched origin/main",
+        ),
+        ShipLandingVerdict(
+            "clean",
+            "origin_absent",
+            None,
+            "remote_detection_origin_absent",
+            "canonical worktree is clean; origin is not configured, so push containment "
+            "was not verified",
+        ),
+    ],
+)
+def test_processed_ship_accepts_proven_landing_without_extra_claims(
+    temp_config, capsys, monkeypatch, verdict
+):
+    from io import StringIO
+
+    lode_id = "test-ship-proven"
+    canonical = temp_config / "canonical-worktree"
+    canonical.mkdir()
+    unrelated_cwd = temp_config / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch(
+            "hopper.client.get_lode",
+            return_value={"id": lode_id, "stage": "ship"},
+        ),
+        patch("hopper.lodes.get_worktree_dir", return_value=canonical),
+        patch("hopper.git.ship_landing_verdict", return_value=verdict) as landing_proof,
+        patch(
+            "hopper.client.set_lode_state_acknowledged",
+            return_value={"accepted": True, "reason": "accepted"},
+        ) as set_state,
+        patch("sys.stdin", StringIO("ship output\n")),
+    ):
+        assert cmd_processed([]) == 0
+
+    landing_proof.assert_called_once_with(canonical)
+    set_state.assert_called_once()
+    assert (temp_config / "lodes" / lode_id / "ship_out.md").read_text() == "ship output\n"
+    captured = capsys.readouterr()
+    assert "push" not in captured.out
+    assert captured.err == ""
+
+
+def test_ship_landing_recovery_mapping_covers_every_literal_cause(tmp_path):
+    worktree = tmp_path / "canonical-worktree"
+    quoted_worktree = shlex.quote(str(worktree))
+    expected_by_kind = {
+        "status": (
+            f"inspect `git -C {quoted_worktree} status --short`, commit or clean "
+            "the reported changes"
+        ),
+        "remote": (
+            "inspect repository remotes using "
+            f"`git -C {quoted_worktree} remote -v` and resolve the failure"
+        ),
+        "fetch": (
+            "restore upstream access and run "
+            f"`git -C {quoted_worktree} fetch --prune origin {UPSTREAM_FETCH_REFSPEC}`"
+        ),
+        "default_ref": (
+            "inspect or restore the upstream default using "
+            f"`git -C {quoted_worktree} remote show origin`"
+        ),
+        "push": (f"land the commit using `git -C {quoted_worktree} push origin HEAD:main`"),
+        "ancestry": (
+            "inspect containment using "
+            f"`git -C {quoted_worktree} merge-base --is-ancestor HEAD origin/main` "
+            "and resolve the failure"
+        ),
+    }
+    cause_values = get_args(ShipLandingCause)
+
+    assert len(hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE) == len(cause_values)
+    assert set(hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE) == set(cause_values)
+    for cause in cause_values:
+        if cause.startswith(("worktree_", "cleanliness_")):
+            expected_kind = "status"
+        elif cause.startswith("remote_detection_"):
+            expected_kind = "remote"
+        elif cause.startswith("fetch_"):
+            expected_kind = "fetch"
+        elif cause.startswith("default_ref_"):
+            expected_kind = "default_ref"
+        elif cause == "ancestry_not_contained":
+            expected_kind = "push"
+        elif cause.startswith("ancestry_"):
+            expected_kind = "ancestry"
+        else:
+            pytest.fail(f"unclassified ship landing cause: {cause}")
+
+        assert hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE[cause] == expected_kind
+        verdict = ShipLandingVerdict(
+            "clean",
+            "indeterminate",
+            "origin/main" if expected_kind in {"push", "ancestry"} else None,
+            cause,
+            "arbitrarily reworded presentational detail",
+        )
+        assert (
+            hopper_cli._ship_landing_recovery(verdict, worktree) == expected_by_kind[expected_kind]
+        )
+
+
+@pytest.mark.parametrize(
+    ("verdict", "recovery_fragment"),
+    [
+        (
+            ShipLandingVerdict(
+                "dirty",
+                "indeterminate",
+                None,
+                "cleanliness_dirty",
+                "canonical worktree has staged, unstaged, or untracked changes",
+            ),
+            "status --short",
+        ),
+        (
+            ShipLandingVerdict(
+                "clean",
+                "not_contained",
+                "origin/main",
+                "ancestry_not_contained",
+                "HEAD is not contained in freshly fetched origin/main",
+            ),
+            "push origin HEAD:main",
+        ),
+        (
+            ShipLandingVerdict(
+                "clean",
+                "indeterminate",
+                None,
+                "fetch_failed",
+                "fetch from origin failed: unavailable",
+            ),
+            f"fetch --prune origin {UPSTREAM_FETCH_REFSPEC}",
+        ),
+        (
+            ShipLandingVerdict(
+                "clean",
+                "indeterminate",
+                None,
+                "default_ref_missing",
+                "no fresh upstream default branch exists (origin/main, origin/master)",
+            ),
+            "remote show origin",
+        ),
+        (
+            ShipLandingVerdict(
+                "clean",
+                "indeterminate",
+                "origin/master",
+                "ancestry_failed",
+                "ancestry against origin/master is indeterminate: fatal: ancestry",
+            ),
+            "merge-base --is-ancestor HEAD origin/master",
+        ),
+    ],
+)
+def test_processed_ship_refusal_writes_nothing_and_sends_no_mutation(
+    temp_config, capsys, verdict, recovery_fragment
+):
+    from io import StringIO
+
+    lode_id = "test-ship-refused"
+    canonical = temp_config / "canonical-worktree"
+    canonical.mkdir()
+    sentinel = canonical / "sentinel.txt"
+    sentinel.write_text("keep\n")
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch(
+            "hopper.client.get_lode",
+            return_value={"id": lode_id, "stage": "ship"},
+        ),
+        patch("hopper.lodes.get_worktree_dir", return_value=canonical),
+        patch("hopper.git.ship_landing_verdict", return_value=verdict),
+        patch("hopper.client.set_lode_state_acknowledged") as set_state,
+        patch("sys.stdin", StringIO("ship output\n")),
+    ):
+        assert cmd_processed([]) == 1
+
+    set_state.assert_not_called()
+    assert not (temp_config / "lodes" / lode_id / "ship_out.md").exists()
+    assert sentinel.read_text() == "keep\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = captured.err.strip().splitlines()
+    assert len(lines) == 4
+    assert lines[0] == "error: ship completion refused"
+    assert lines[1] == f"observed: {verdict.detail}"
+    assert lines[2] == "Hopper did not write ship completion or advance the lode."
+    assert lines[3].startswith("recover with:")
+    assert recovery_fragment in lines[3]
+    assert "retry `hop processed`" in lines[3]
 
 
 def test_processed_no_ack_is_unknown_but_keeps_written_output(temp_config, capsys):
