@@ -68,6 +68,33 @@ def snapshot(lid="abc123", **overrides):
     }
 
 
+def configured_probe(
+    route="local",
+    *,
+    kind=None,
+    outcome="found",
+    candidate_id=None,
+    attempts=1,
+):
+    return {
+        "kind": kind or ("local" if route == "local" else "routed"),
+        "server": "test-host" if route == "local" else route,
+        "route": route,
+        "candidate_id": candidate_id,
+        "outcome": outcome,
+        "detail": None,
+        "attempts": attempts,
+        "observed_age_s": 0.0 if attempts else None,
+    }
+
+
+def test_record_construction_requires_configured_source_evidence():
+    with pytest.raises(ValueError, match="configured-source probe evidence"):
+        wait._new_record("abc123", snapshot(), "local", 0.0, 0, probes=[])
+    with pytest.raises(ValueError, match="configured-source probe evidence"):
+        wait._resolution_failure_record("abc123", {"outcome": "absent"}, 0, 0.0)
+
+
 def pending_action_projection(phase: str, *, recovery_command: str | None = None) -> dict:
     record = actions.new_pending_action(
         lode_id="abcd2345",
@@ -142,6 +169,7 @@ def run_local_wait(
             "lode": dict(initial),
             "host": "local",
             "canonical_id": initial["id"],
+            "probes": [configured_probe()],
             "exit_code": 0,
         },
         probe_remote=lambda *args, **kwargs: (None, "unreadable"),
@@ -156,7 +184,7 @@ def install_synchronous_remote_driver(monkeypatch, clock):
     def post_one(state, probe_remote, lid):
         record = state["records"][lid]
         one_shot = threading.Event()
-        worker_state = {**state, "stop_event": one_shot, "workers": {}}
+        worker_state = {**state, "stop_event": one_shot}
 
         def probe_once(*args, **kwargs):
             try:
@@ -164,10 +192,9 @@ def install_synchronous_remote_driver(monkeypatch, clock):
             finally:
                 one_shot.set()
 
-        wait._remote_worker(
+        wait._remote_worker_group(
             worker_state,
-            lid,
-            record["route"],
+            [(lid, record["route"])],
             state["poll_s"],
             probe_once,
         )
@@ -222,6 +249,7 @@ def run_remote_wait(
             "lode": dict(lode),
             "host": lode["host"],
             "canonical_id": lode["id"],
+            "probes": [configured_probe(lode["host"])],
             "exit_code": 0,
         }
 
@@ -280,13 +308,13 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
             "lode": snapshot(),
             "host": "local",
             "canonical_id": "abc123",
+            "probes": [configured_probe()],
             "exit_code": 0,
         }
 
     records = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
-        False,
         nearly_exhausted_resolver,
         deadline=resolution_deadline,
         child_control=remote.make_child_registry(),
@@ -328,17 +356,51 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
 
     monkeypatch.setattr(hopper_client, "read_lode_snapshot", nearly_exhausted_local)
     monkeypatch.setattr(cli, "_remote_disabled", lambda: False)
-    cache_after_expiry = MagicMock(side_effect=AssertionError("cache read after expiry"))
-    monkeypatch.setattr(remote, "load_lode_cache", cache_after_expiry)
-    resolution = cli._resolve_lode(
+    cache = {
+        lode_id: {
+            "host": host,
+            "project": "project",
+            "created_ms": remote.current_time_ms(),
+        }
+        for lode_id, host in (
+            ("first123", "first-resident"),
+            ("second123", "second-resident"),
+        )
+    }
+    cache_load = MagicMock(return_value=cache)
+    monkeypatch.setattr(remote, "load_lode_cache", cache_load)
+    monkeypatch.setattr(cli, "_remote_hosts", lambda **_kwargs: ["pool-one", "pool-two"])
+    child_control = remote.make_child_registry()
+    records = wait._resolve_targets(
         Path("server.sock"),
-        "missing",
+        ["first", "second"],
+        cli._resolve_lode,
         deadline=resolver_deadline,
-        child_control=remote.make_child_registry(),
+        child_control=child_control,
     )
-    assert resolution["outcome"] == "unavailable"
+    assert all(record["preset_outcome"] == "status_unavailable" for record in records.values())
     assert len(local_resolution_calls) == 1
-    cache_after_expiry.assert_not_called()
+    cache_load.assert_called_once()
+    first_rows = records["failure:first"]["probes"]
+    second_rows = records["failure:second"]["probes"]
+    assert [
+        (row["kind"], row["route"], row["outcome"], row["attempts"], row["observed_age_s"])
+        for row in first_rows
+    ] == [
+        ("local", "local", "absent", 1, 0.0),
+        ("resident", "first-resident", "not_attempted", 0, None),
+        ("pool", "pool-one", "not_attempted", 0, None),
+        ("pool", "pool-two", "not_attempted", 0, None),
+    ]
+    assert [
+        (row["kind"], row["route"], row["outcome"], row["attempts"], row["observed_age_s"])
+        for row in second_rows
+    ] == [
+        ("local", "local", "not_attempted", 0, None),
+        ("resident", "second-resident", "not_attempted", 0, None),
+        ("pool", "pool-one", "not_attempted", 0, None),
+        ("pool", "pool-two", "not_attempted", 0, None),
+    ]
 
     route_deadline = make_deadline(1.0, clock=clock)
     monkeypatch.setattr(remote.config, "hopper_dir", lambda: tmp_path)
@@ -353,6 +415,7 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
         "worker.example",
         clock(),
         0,
+        probes=[configured_probe("worker.example")],
     )
     route_calls = []
     monkeypatch.setattr(
@@ -437,7 +500,6 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
         "pending": {"remote1"},
         "poll_s": 30,
         "probe_timeout_s": 5,
-        "workers": {},
         "deadline": enrichment_deadline,
         "child_control": remote.make_child_registry(),
         "stop_event": threading.Event(),
@@ -488,7 +550,6 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
         for (_operation, start, budget), expires_at in zip(ledger, expirations, strict=True)
     )
     assert {
-        "wait.resolve_target",
         "client.read_lode_snapshot",
         "cli.local_resolution",
         "remote.cache_lock",
@@ -501,7 +562,7 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
     } <= {operation for operation, _start, _budget in ledger}
     assert {
         "client.read_lode_snapshot",
-        "cli.route_cache_load",
+        "cli.resident_probe_start",
         "wait.remote_probe",
         "wait.pane_liveness",
         "wait.condition_wait",
@@ -611,7 +672,7 @@ def test_validate_snapshot_rejects_malformed_or_wrong_lode(raw):
 def test_read_due_locals_uses_one_bounded_snapshot(
     monkeypatch, result, expected_kind, expected_payload, expected_detail
 ):
-    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0)
+    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0, probes=[configured_probe()])
     record["reconcile_requested"] = True
     state = {
         "condition": threading.Condition(),
@@ -676,12 +737,12 @@ def test_initial_snapshot_with_invalid_archived_is_unavailable(archived, capsys)
     result = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
-        False,
         resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": raw,
             "host": "local",
             "canonical_id": "abc123",
+            "probes": [configured_probe()],
             "exit_code": 0,
         },
         deadline=make_deadline(60),
@@ -695,7 +756,7 @@ def test_initial_snapshot_with_invalid_archived_is_unavailable(archived, capsys)
 
 
 def test_ambiguous_local_observation_never_reaches_snapshot_validation(monkeypatch):
-    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0)
+    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0, probes=[configured_probe()])
     state = {
         "condition": threading.Condition(),
         "records": {"abc123": record},
@@ -786,12 +847,12 @@ def test_initial_local_unavailable_can_resolve_remotely(monkeypatch):
     records = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
-        False,
         resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": remote_snapshot,
             "host": "fedora.local",
             "canonical_id": "abc123",
+            "probes": [configured_probe("fedora.local")],
             "exit_code": 0,
         },
         deadline=make_deadline(60),
@@ -808,10 +869,10 @@ def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
     records = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
-        False,
         resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "unavailable",
             "error": error,
+            "probes": [configured_probe(outcome="unavailable")],
             "exit_code": 2,
         },
         deadline=make_deadline(60),
@@ -825,7 +886,12 @@ def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
 
 
 def test_initial_unavailable_has_wait_only_status_outcome(monkeypatch, capsys):
-    record = wait._resolution_failure_record("abc123", {"outcome": "unavailable"}, 0, 0.0)
+    record = wait._resolution_failure_record(
+        "abc123",
+        {"outcome": "unavailable", "probes": [configured_probe(outcome="unavailable")]},
+        0,
+        0.0,
+    )
     monkeypatch.setattr(
         wait,
         "_resolve_targets",
@@ -846,10 +912,10 @@ def test_initial_unavailable_json_keeps_stdout_clean(capsys):
     result = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
-        True,
         resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "unavailable",
             "error": error,
+            "probes": [configured_probe(outcome="unavailable")],
             "exit_code": 2,
         },
         deadline=make_deadline(60),
@@ -1242,7 +1308,9 @@ def test_shared_grace_away_and_back_gets_fresh_origin(monkeypatch, capsys):
 
 
 def test_confirmed_stuck_still_beats_expired_observer_deadline():
-    record = wait._new_record("abc123", snapshot(state="stuck"), "local", 0, 0)
+    record = wait._new_record(
+        "abc123", snapshot(state="stuck"), "local", 0, 0, probes=[configured_probe()]
+    )
     record["grace"].update(recheck_pending=True, confirmed=True)
     state = {
         "pending": {"abc123"},
@@ -1292,7 +1360,7 @@ def test_every_valid_action_phase_has_one_wait_boundary(phase, category):
         active=False,
         pending_action=pending_action,
     )
-    record = wait._new_record("abcd2345", current, "local", 0, 0)
+    record = wait._new_record("abcd2345", current, "local", 0, 0, probes=[configured_probe()])
     state = {
         "pending": {"abcd2345"},
         "records": {"abcd2345": record},
@@ -1321,7 +1389,7 @@ def test_structured_startup_action_projection_is_blocked(action_type):
         active=False,
         pending_action={"phase": "blocked", "action_type": action_type, "status": "Blocked"},
     )
-    record = wait._new_record("abc123", current, "local", 0, 0)
+    record = wait._new_record("abc123", current, "local", 0, 0, probes=[configured_probe()])
     state = {
         "pending": {"abc123"},
         "records": {"abc123": record},
@@ -1446,7 +1514,7 @@ def test_storage_error_and_gate_precede_action_attention(changes, expected):
             **changes,
         }
     )
-    record = wait._new_record("abc123", current, "local", 0, 0)
+    record = wait._new_record("abc123", current, "local", 0, 0, probes=[configured_probe()])
     state = {
         "pending": {"abc123"},
         "records": {"abc123": record},
@@ -1474,7 +1542,7 @@ def test_shorter_deadline_precedes_confirmed_action_spawn_grace(
         active=False,
         pending_action=pending_action_projection("spawning"),
     )
-    record = wait._new_record("abc123", current, "local", 0, 0)
+    record = wait._new_record("abc123", current, "local", 0, 0, probes=[configured_probe()])
     record["grace"].update(recheck_pending=True, confirmed=True)
     state = {
         "pending": {"abc123"},
@@ -1751,7 +1819,7 @@ def test_gated_display_copy_does_not_mutate_wait_record(capsys):
         tmux_pane="%22",
         branch=branch,
     )
-    record = wait._new_record("abc123", snapshot_data, "local", 0.0, 0)
+    record = wait._new_record("abc123", snapshot_data, "local", 0.0, 0, probes=[configured_probe()])
     before = copy.deepcopy(record)
     expected = PARK_PANE_GONE_STATUS.format(
         reason=reason,
@@ -1771,12 +1839,9 @@ def test_gated_display_copy_does_not_mutate_wait_record(capsys):
             child_control=remote.make_child_registry(),
         )
         wait._emit_outcome(
-            record,
-            "gated",
+            final_record,
             False,
-            0.0,
             deadline=deadline,
-            final_record=final_record,
         )
 
     assert f"status={expected}" in capsys.readouterr().out
@@ -2029,10 +2094,40 @@ def test_remote_worker_converts_every_outcome_to_observation(probe_result, expec
             raise probe_result
         return probe_result
 
-    wait._remote_worker(state, "abc123", "fedora.local", 30, probe)
+    wait._remote_worker_group(state, [("abc123", "fedora.local")], 30, probe)
 
     assert len(state["observations"]) == 1
     assert state["observations"][0]["kind"] == expected_kind
+
+
+def test_remote_worker_group_cancellation_stops_mid_shard():
+    stop_event = threading.Event()
+    calls = []
+    state = {
+        "condition": threading.Condition(),
+        "pending": {"first", "second"},
+        "observations": deque(),
+        "stop_event": stop_event,
+        "shutdown": False,
+        "deadline": make_deadline(60),
+        "probe_timeout_s": 5,
+        "child_control": wait.remote.make_child_registry(),
+    }
+
+    def probe(host, lid, **_kwargs):
+        calls.append((host, lid))
+        stop_event.set()
+        return snapshot(lid=lid, host=host), "found"
+
+    wait._remote_worker_group(
+        state,
+        [("first", "one.example"), ("second", "two.example")],
+        30,
+        probe,
+    )
+
+    assert calls == [("one.example", "first")]
+    assert [item["id"] for item in state["observations"]] == ["first"]
 
 
 def test_remote_wait_workers_are_capped_and_shard_all_targets(monkeypatch):
@@ -2057,7 +2152,6 @@ def test_remote_wait_workers_are_capped_and_shard_all_targets(monkeypatch):
         "pending": set(records),
         "poll_s": 30,
         "probe_timeout_s": 5,
-        "workers": {},
         "deadline": make_deadline(60),
         "child_control": wait.remote.make_child_registry(),
     }
@@ -2070,33 +2164,17 @@ def test_remote_wait_workers_are_capped_and_shard_all_targets(monkeypatch):
     assert max(len(thread.args[1]) for thread in started) == 2
 
 
-def test_remote_worker_stop_cancels_without_join():
-    class StuckThread:
-        def __init__(self):
-            self.timeout = None
-
-        def join(self, timeout):
-            raise AssertionError(f"unexpected worker join: {timeout}")
-
-        def is_alive(self):
-            return True
-
-    thread = StuckThread()
-    state = {
-        "stop_event": threading.Event(),
-        "workers": {"abc123": thread},
-        "probe_timeout_s": 5,
-    }
+def test_remote_worker_stop_only_sets_cancellation():
+    state = {"stop_event": threading.Event()}
 
     wait._stop_remote_workers(state)
 
     assert state["stop_event"].is_set()
-    assert thread.timeout is None
 
 
 def test_keyboard_interrupt_returns_130_and_cancels_remote_workers(monkeypatch):
     initial = snapshot(host="fedora.local")
-    stopped_workers = []
+    stopped_states = []
     original_stop = wait._stop_remote_workers
 
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
@@ -2109,7 +2187,7 @@ def test_keyboard_interrupt_returns_130_and_cancels_remote_workers(monkeypatch):
 
     def stop_workers(state):
         original_stop(state)
-        stopped_workers.extend(state["workers"].values())
+        stopped_states.append(state)
 
     monkeypatch.setattr(wait, "_stop_remote_workers", stop_workers)
 
@@ -2122,13 +2200,15 @@ def test_keyboard_interrupt_returns_130_and_cancels_remote_workers(monkeypatch):
             "lode": initial,
             "host": "fedora.local",
             "canonical_id": "abc123",
+            "probes": [configured_probe("fedora.local")],
             "exit_code": 0,
         },
         probe_remote=lambda host, lid, **_kwargs: (initial, "found"),
     )
 
     assert rc == 130
-    assert len(stopped_workers) == 1
+    assert stopped_states
+    assert stopped_states[-1]["stop_event"].is_set()
 
 
 def test_interrupt_at_3599_cannot_extend_cleanup_past_original_3600_deadline():
@@ -2165,6 +2245,7 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
             "lode": initials[lid],
             "host": initials[lid]["host"],
             "canonical_id": lid,
+            "probes": [configured_probe(initials[lid]["host"])],
             "exit_code": 0,
         }
 
@@ -2187,7 +2268,6 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
     assert capsys.readouterr().out.count("ship123 shipped") == 1
     assert stopped_states
     assert stopped_states[-1]["stop_event"].is_set()
-    assert all(thread.daemon for thread in stopped_states[-1]["workers"].values())
 
 
 def test_jsonl_multi_lode_boundary_emits_independently_parseable_lines(monkeypatch, capsys):
@@ -2211,6 +2291,7 @@ def test_jsonl_multi_lode_boundary_emits_independently_parseable_lines(monkeypat
             "lode": dict(initials[lid]),
             "host": "local",
             "canonical_id": lid,
+            "probes": [configured_probe()],
             "exit_code": 0,
         },
         probe_remote=lambda *args, **kwargs: (None, "unreadable"),
@@ -2316,6 +2397,7 @@ def test_wait_summary_uses_canonical_dedup_for_requested_count(monkeypatch, caps
             "lode": dict(canonical),
             "host": "local",
             "canonical_id": "abc123",
+            "probes": [configured_probe()],
             "exit_code": 0,
         },
         probe_remote=lambda *args, **kwargs: pytest.fail("unexpected remote probe"),
@@ -2374,7 +2456,12 @@ def test_wait_summary_for_observer_unavailable(monkeypatch, capsys):
 
 
 def test_wait_summary_for_resolution_failure(monkeypatch, capsys):
-    record = wait._resolution_failure_record("abc123", {"outcome": "absent"}, 0, 0.0)
+    record = wait._resolution_failure_record(
+        "abc123",
+        {"outcome": "absent", "probes": [configured_probe(outcome="absent")]},
+        0,
+        0.0,
+    )
     monkeypatch.setattr(
         wait,
         "_resolve_targets",
@@ -2654,13 +2741,9 @@ def test_closed_final_record_scenario_matrix(
         child_control=remote.make_child_registry(),
     )
     wait._emit_outcome(
-        record,
-        outcome,
+        final_record,
         json_output,
-        0.0,
-        reason_code,
         deadline=deadline,
-        final_record=final_record,
     )
     item = {
         "record": record,
@@ -2714,27 +2797,58 @@ def test_closed_final_record_scenario_matrix(
     assert captured.err.endswith(f"hop wait: {final_record['id']} {outcome} — exited {code}\n")
 
 
+def test_human_renderer_uses_only_constructed_record_outcome(monkeypatch, capsys):
+    record = wait._new_record(
+        "case1234",
+        snapshot(lid="case1234", stage="shipped", active=False),
+        "local",
+        0.0,
+        0,
+        probes=[configured_probe()],
+    )
+    final_record = wait._final_record(
+        record,
+        "shipped",
+        0,
+        0.0,
+        None,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+    stale_boundary_item = {"outcome": "error", "final_record": final_record}
+
+    wait._emit_outcome(
+        stale_boundary_item["final_record"],
+        False,
+        deadline=make_deadline(60),
+    )
+
+    assert capsys.readouterr().out == "✓ case1234 shipped\n"
+
+
 def test_all_query_resolution_schedules_by_utf8_and_deduplicates_aliases():
     calls = []
 
     def resolver(_socket_path, query, **_kwargs):
         calls.append(query)
         if query == "aa":
-            return {"outcome": "absent", "probes": []}
+            return {"outcome": "absent", "probes": [configured_probe(outcome="absent")]}
         if query == "zz":
-            return {"outcome": "unavailable", "probes": []}
+            return {
+                "outcome": "unavailable",
+                "probes": [configured_probe(outcome="unavailable")],
+            }
         return {
             "outcome": "found",
             "lode": snapshot(lid="canonical1"),
             "host": "local",
             "canonical_id": "canonical1",
-            "probes": [],
+            "probes": [configured_probe()],
         }
 
     records = wait._resolve_targets(
         Path("server.sock"),
         ["zz", "alias-two", "aa", "alias-one"],
-        False,
         resolver,
         deadline=make_deadline(60),
         child_control=remote.make_child_registry(),
@@ -2754,7 +2868,7 @@ def test_all_query_resolution_schedules_by_utf8_and_deduplicates_aliases():
 )
 def test_resolution_failures_render_every_record_and_take_max_exit(monkeypatch, capsys, queries):
     def resolver(_socket_path, query, **_kwargs):
-        return {"outcome": query, "probes": []}
+        return {"outcome": query, "probes": [configured_probe(outcome=query)]}
 
     monkeypatch.setattr(wait, "_monotonic", lambda: 0.0)
     rc = wait.wait_for_lodes(
@@ -2777,6 +2891,40 @@ def test_resolution_failures_render_every_record_and_take_max_exit(monkeypatch, 
     assert captured.err.endswith("hop wait: 2 of 2 lodes resolved — exited 4\n")
 
 
+def test_resolution_failure_aborts_resolved_sibling_with_resolution_reason(monkeypatch, capsys):
+    monkeypatch.setattr(wait, "_monotonic", lambda: 0.0)
+
+    def resolver(_socket_path, query, **_kwargs):
+        if query == "missing":
+            return {
+                "outcome": "absent",
+                "probes": [configured_probe(outcome="absent")],
+            }
+        return {
+            "outcome": "found",
+            "lode": snapshot(lid="running1"),
+            "host": "local",
+            "canonical_id": "running1",
+            "probes": [configured_probe()],
+        }
+
+    rc = wait.wait_for_lodes(
+        Path("server.sock"),
+        ["running", "missing"],
+        deadline=make_deadline(60),
+        json_output=True,
+        resolver=resolver,
+        probe_remote=lambda *_args, **_kwargs: (None, "unreadable"),
+    )
+
+    payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert rc == 1
+    assert [(item["outcome"], item["reason_code"]) for item in payloads] == [
+        ("wait_aborted", "resolution_failed"),
+        ("target_absent", "target_absent"),
+    ]
+
+
 def _final_sweep_state(clock, records, *, observer_timeout_s=300, probe_timeout_s=5):
     return {
         "condition": threading.Condition(),
@@ -2790,7 +2938,6 @@ def _final_sweep_state(clock, records, *, observer_timeout_s=300, probe_timeout_
         "observer_timeout_s": observer_timeout_s,
         "probe_timeout_s": probe_timeout_s,
         "stop_event": threading.Event(),
-        "workers": {},
         "connection": None,
         "child_control": remote.make_child_registry(),
         "shutdown": False,
@@ -2802,10 +2949,29 @@ def test_final_sweep_is_a_barrier_with_mixed_local_remote_completion_order(monke
     clock = FakeClock()
     monkeypatch.setattr(wait, "_monotonic", clock)
     error_record = wait._new_record(
-        "error1", snapshot(lid="error1", state="error"), "local", 0.0, 0
+        "error1",
+        snapshot(lid="error1", state="error"),
+        "local",
+        0.0,
+        0,
+        probes=[configured_probe()],
     )
-    local_record = wait._new_record("local1", snapshot(lid="local1"), "local", 0.0, 1)
-    remote_record = wait._new_record("remote1", snapshot(lid="remote1"), "worker.example", 0.0, 2)
+    local_record = wait._new_record(
+        "local1",
+        snapshot(lid="local1"),
+        "local",
+        0.0,
+        1,
+        probes=[configured_probe()],
+    )
+    remote_record = wait._new_record(
+        "remote1",
+        snapshot(lid="remote1"),
+        "worker.example",
+        0.0,
+        2,
+        probes=[configured_probe("worker.example")],
+    )
     records = {record["key"]: record for record in (error_record, local_record, remote_record)}
     state = _final_sweep_state(clock, records)
     remote_completed = threading.Event()
@@ -2859,9 +3025,21 @@ def test_final_sweep_unreadable_member_classification(
     clock.now = start
     monkeypatch.setattr(wait, "_monotonic", clock)
     error_record = wait._new_record(
-        "error1", snapshot(lid="error1", state="error"), "local", 0.0, 0
+        "error1",
+        snapshot(lid="error1", state="error"),
+        "local",
+        0.0,
+        0,
+        probes=[configured_probe()],
     )
-    member = wait._new_record("member1", snapshot(lid="member1"), "worker.example", 0.0, 1)
+    member = wait._new_record(
+        "member1",
+        snapshot(lid="member1"),
+        "worker.example",
+        0.0,
+        1,
+        probes=[configured_probe("worker.example")],
+    )
     records = {record["key"]: record for record in (error_record, member)}
     state = _final_sweep_state(
         clock,
@@ -2894,6 +3072,7 @@ def test_definitive_state_at_boundary_beats_observer_and_overall_deadlines():
         "local",
         0.0,
         0,
+        probes=[configured_probe()],
     )
     clock = FakeClock()
     clock.now = 10.0
@@ -2906,7 +3085,9 @@ def test_definitive_state_at_boundary_beats_observer_and_overall_deadlines():
 
 
 def test_observer_deadline_wins_exact_tie_with_overall_deadline():
-    record = wait._new_record("run1", snapshot(lid="run1"), "local", 0.0, 0)
+    record = wait._new_record(
+        "run1", snapshot(lid="run1"), "local", 0.0, 0, probes=[configured_probe()]
+    )
     clock = FakeClock()
     clock.now = 10.0
     state = _final_sweep_state(clock, {record["key"]: record}, observer_timeout_s=10)
@@ -2924,6 +3105,7 @@ def test_final_enrichment_failures_degrade_fields_without_changing_outcome(monke
         "local",
         0.0,
         0,
+        probes=[configured_probe()],
     )
     monkeypatch.setattr(
         wait.config,
@@ -2969,6 +3151,7 @@ def test_final_local_worktree_check_is_fresh_and_recorded_when_cleaned(tmp_path)
         "local",
         0.0,
         0,
+        probes=[configured_probe()],
     )
 
     final_record = wait._final_record(
@@ -2995,6 +3178,7 @@ def test_final_remote_worktree_check_uses_frozen_path_payload(monkeypatch):
         "owner.example",
         0.0,
         0,
+        probes=[configured_probe("owner.example")],
     )
     remote_result = subprocess.CompletedProcess(
         [],
@@ -3032,7 +3216,7 @@ def test_final_remote_worktree_check_uses_frozen_path_payload(monkeypatch):
 
 
 def test_probe_rows_update_in_place_instead_of_appending():
-    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0)
+    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0, probes=[configured_probe()])
 
     wait._apply_observation(
         record,
@@ -3074,7 +3258,7 @@ def test_interrupt_during_resolution_preserves_completed_terminal_record(monkeyp
                 "lode": snapshot(lid="ship1", stage="shipped", active=False),
                 "host": "local",
                 "canonical_id": "ship1",
-                "probes": [],
+                "probes": [configured_probe()],
             }
         raise KeyboardInterrupt
 

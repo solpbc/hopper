@@ -86,14 +86,18 @@ def make_child_registry() -> dict:
 _DEFAULT_CHILD_REGISTRY = make_child_registry()
 
 
-def _register_child(registry: dict | None, process: subprocess.Popen) -> bool:
-    if registry is None:
-        return True
+def _spawn_owned_child(
+    command: list[str],
+    kwargs: dict[str, object],
+    registry: dict,
+) -> tuple[subprocess.Popen, bool]:
+    """Spawn while holding the ownership lock, then report concurrent cancellation."""
     with registry["lock"]:
         if registry["cancel_event"].is_set():
-            return False
+            raise RemoteCommandUnavailable("remote command cancelled before spawn")
+        process = subprocess.Popen(command, **kwargs)
         registry["children"].add(process)
-        return True
+        return process, registry["cancel_event"].is_set()
 
 
 def _unregister_child(registry: dict | None, process: subprocess.Popen) -> None:
@@ -112,7 +116,7 @@ def _reap_owned_children(
     processes: list[subprocess.Popen],
     deadline: dict,
     operation: str,
-) -> None:
+) -> list[subprocess.Popen]:
     """Reap as many signalled children as the common deadline permits."""
     for process in processes:
         if process.poll() is not None:
@@ -121,16 +125,18 @@ def _reap_owned_children(
             except (OSError, subprocess.TimeoutExpired):
                 pass
             continue
-        budget = deadline_utils.claim_call_budget(deadline, operation, cap_s=0.05)
-        if budget is None:
-            return
-        try:
-            process.wait(timeout=budget)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
+        while process.poll() is None:
+            budget = deadline_utils.claim_call_budget(deadline, operation, cap_s=0.05)
+            if budget is None:
+                break
+            try:
+                process.wait(timeout=budget)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+    return [process for process in processes if process.poll() is None]
 
 
-def cancel_owned_children(registry: dict, deadline: dict) -> None:
+def cancel_owned_children(registry: dict, deadline: dict) -> list[subprocess.Popen]:
     """Cancel, terminate, kill, and reap registered children under one deadline."""
     registry["cancel_event"].set()
     children = _owned_children(registry)
@@ -146,19 +152,29 @@ def cancel_owned_children(registry: dict, deadline: dict) -> None:
         deadline,
         deadline["clock"]() + min(1.0, remaining / 2.0),
     )
-    _reap_owned_children(children, terminate_deadline, "remote.child_reap_after_terminate")
+    survivors = _reap_owned_children(
+        children,
+        terminate_deadline,
+        "remote.child_reap_after_terminate",
+    )
 
-    survivors = [process for process in children if process.poll() is None]
     for process in survivors:
         try:
             process.kill()
         except OSError:
             pass
-    _reap_owned_children(survivors, deadline, "remote.child_reap_after_kill")
+    survivors = _reap_owned_children(survivors, deadline, "remote.child_reap_after_kill")
 
     for process in children:
         if process.poll() is not None:
             _unregister_child(registry, process)
+    if survivors:
+        print(
+            f"warning: {len(survivors)} owned SSH child process(es) remained alive "
+            "when the cleanup deadline expired",
+            file=sys.stderr,
+        )
+    return survivors
 
 
 def run_remote(
@@ -210,17 +226,14 @@ def run_remote(
         kwargs["stdin"] = subprocess.DEVNULL
         input_data = None
 
-    process = subprocess.Popen(command, **kwargs)
-    if not _register_child(registry, process):
-        try:
-            process.terminate()
-        except OSError:
-            pass
-        try:
-            process.kill()
-            process.wait(timeout=0)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    process, cancelled_during_spawn = _spawn_owned_child(command, kwargs, registry)
+    if cancelled_during_spawn:
+        cleanup_deadline = deadline or deadline_utils.make_deadline(0.5)
+        survivors = cancel_owned_children(registry, cleanup_deadline)
+        if process in survivors:
+            raise RemoteCommandUnavailable(
+                "remote command cancelled during spawn; owned child cleanup deadline expired"
+            )
         raise RemoteCommandUnavailable("remote command cancelled during spawn")
 
     try:
@@ -236,10 +249,18 @@ def run_remote(
                     process.kill()
                 except OSError:
                     pass
-            try:
-                process.wait(timeout=0)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            cleanup_deadline = deadline or deadline_utils.make_deadline(0.5)
+            survivors = _reap_owned_children(
+                [process],
+                cleanup_deadline,
+                "remote.child_reap_after_error",
+            )
+            if survivors:
+                print(
+                    "warning: owned SSH child remained alive when the command cleanup "
+                    "deadline expired",
+                    file=sys.stderr,
+                )
         raise
     finally:
         if process.poll() is not None:

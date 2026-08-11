@@ -19,6 +19,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import setproctitle
@@ -2471,6 +2472,89 @@ def _resolve_lode(
     resident_ids: list[str] = []
     resident_rows: dict[tuple[str, str], dict] = {}
     pool_rows: dict[str, dict] = {}
+    cache_precluded = False
+    config_precluded = False
+
+    def build_configured_source_plan() -> None:
+        nonlocal cache, cache_error, cache_precluded
+        nonlocal hosts, config_error, config_precluded
+        if not remote_enabled:
+            return
+        inventory = child_control.get("resolution_source_inventory") if wait_path else None
+        if isinstance(inventory, dict):
+            cache = dict(inventory["cache"])
+            cache_error = inventory["cache_error"]
+            cache_precluded = inventory["cache_precluded"]
+            hosts.extend(inventory["hosts"])
+            config_error = inventory["config_error"]
+            config_precluded = inventory["config_precluded"]
+        else:
+            try:
+                if wait_path:
+                    if deadline_utils.claim_call_budget(deadline, "cli.route_cache_load") is None:
+                        cache_precluded = True
+                    else:
+                        cache = prune_lode_cache(load_lode_cache(deadline=deadline))
+                else:
+                    cache = prune_lode_cache(load_lode_cache())
+            except LodeCacheError as error:
+                cache_error = error
+
+            try:
+                if wait_path:
+                    if deadline_utils.claim_call_budget(deadline, "cli.remote_hosts") is None:
+                        config_precluded = True
+                    else:
+                        hosts.extend(_remote_hosts(deadline=deadline))
+                else:
+                    hosts.extend(_remote_hosts())
+            except config.ConfigError as error:
+                config_error = error
+
+            if wait_path:
+                child_control["resolution_source_inventory"] = {
+                    "cache": dict(cache),
+                    "cache_error": cache_error,
+                    "cache_precluded": cache_precluded,
+                    "hosts": list(hosts),
+                    "config_error": config_error,
+                    "config_precluded": config_precluded,
+                }
+
+        if cache_precluded:
+            row = _probe_row("resident_cache", None)
+            row["detail"] = "deadline expired"
+            probe_rows.append(row)
+        elif cache_error is not None:
+            row = _probe_row("resident_cache", None)
+            _update_probe_row(row, "unavailable", cache_error.reason)
+            probe_rows.append(row)
+        else:
+            resident_ids.extend(
+                [prefix] if prefix in cache else [key for key in cache if key.startswith(prefix)]
+            )
+            for resident_id in resident_ids:
+                host = cache[resident_id]["host"]
+                row = _probe_row("resident", host, candidate_id=resident_id)
+                resident_rows[(resident_id, host)] = row
+                probe_rows.append(row)
+
+        if config_precluded:
+            row = _probe_row("pool_config", None)
+            row["detail"] = "deadline expired"
+            probe_rows.append(row)
+        elif config_error is not None:
+            row = _probe_row("pool_config", None)
+            _update_probe_row(row, "unavailable", config_error.reason)
+            probe_rows.append(row)
+        else:
+            for host in hosts:
+                row = _probe_row("pool", host)
+                pool_rows[host] = row
+                probe_rows.append(row)
+
+    if wait_path:
+        build_configured_source_plan()
 
     if wait_path:
         local_budget = deadline_utils.claim_call_budget(
@@ -2479,7 +2563,15 @@ def _resolve_lode(
             cap_s=2.0,
         )
         if local_budget is None:
-            probes = [_probe_summary_entry("local", "not_attempted", "deadline expired")]
+            probe_rows[0]["detail"] = "deadline expired"
+            probes = [
+                _probe_summary_entry(
+                    row.get("route") or row["kind"],
+                    row["outcome"],
+                    row["detail"],
+                )
+                for row in probe_rows
+            ]
             return _failed_resolution(
                 "unavailable",
                 prefix,
@@ -2508,46 +2600,8 @@ def _resolve_lode(
         local_matches = [("local", lode_id) for lode_id in local_payload]
         return _failed_resolution("ambiguous", prefix, probes, local_matches, probe_rows=probe_rows)
 
-    if remote_enabled:
-        try:
-            if wait_path:
-                if deadline_utils.claim_call_budget(deadline, "cli.route_cache_load") is None:
-                    raise LodeCacheError(remote_lode_cache_path(), "locked")
-                cache = prune_lode_cache(load_lode_cache(deadline=deadline))
-            else:
-                cache = prune_lode_cache(load_lode_cache())
-        except LodeCacheError as error:
-            cache_error = error
-            row = _probe_row("resident_cache", None)
-            _update_probe_row(row, "unavailable", error.reason)
-            probe_rows.append(row)
-        else:
-            resident_ids = (
-                [prefix] if prefix in cache else [key for key in cache if key.startswith(prefix)]
-            )
-            for resident_id in resident_ids:
-                host = cache[resident_id]["host"]
-                row = _probe_row("resident", host, candidate_id=resident_id)
-                resident_rows[(resident_id, host)] = row
-                probe_rows.append(row)
-
-        try:
-            if wait_path:
-                if deadline_utils.claim_call_budget(deadline, "cli.remote_hosts") is None:
-                    raise config.ConfigError(config.config_path(), "locked")
-                hosts = _remote_hosts(deadline=deadline)
-            else:
-                hosts = _remote_hosts()
-        except config.ConfigError as error:
-            config_error = error
-            row = _probe_row("pool_config", None)
-            _update_probe_row(row, "unavailable", error.reason)
-            probe_rows.append(row)
-        else:
-            for host in hosts:
-                row = _probe_row("pool", host)
-                pool_rows[host] = row
-                probe_rows.append(row)
+    if not wait_path:
+        build_configured_source_plan()
 
     if local_outcome == "found":
         if local_payload["id"] == prefix:
@@ -2586,6 +2640,27 @@ def _resolve_lode(
             probe_summary="; ".join(probes),
             probes=probe_rows,
         )
+    if cache_precluded or config_precluded:
+        unavailable_sources = []
+        if cache_precluded:
+            unavailable_sources.append("resident route cache")
+        if config_precluded:
+            unavailable_sources.append("remote config")
+        probes.extend(
+            _probe_summary_entry(
+                row.get("route") or row["kind"],
+                row["outcome"],
+                row["detail"],
+            )
+            for row in probe_rows[1:]
+        )
+        return _failed_resolution(
+            "unavailable",
+            prefix,
+            probes,
+            unreadable=unavailable_sources,
+            probe_rows=probe_rows,
+        )
 
     if len(resident_ids) > 1:
         resident_matches = [(cache[lode_id]["host"], lode_id) for lode_id in resident_ids]
@@ -2603,6 +2678,18 @@ def _resolve_lode(
         resident_id = resident_ids[0]
         resident_host = cache[resident_id]["host"]
         if wait_path:
+            if deadline_utils.claim_call_budget(deadline, "cli.resident_probe_start") is None:
+                probes.append(
+                    _probe_summary_entry(resident_host, "not_attempted", "deadline expired")
+                )
+                return _failed_resolution(
+                    "unavailable",
+                    prefix,
+                    probes,
+                    unreadable=[resident_host],
+                    probe_rows=probe_rows,
+                    host=resident_host,
+                )
             lode, state = _remote_lode_status(
                 resident_host,
                 resident_id,
@@ -3271,6 +3358,24 @@ def _wait_validation_summary(
     )
 
 
+def _wait_inside_lode_summary(
+    command_name: str,
+    lode_ids: list[str],
+    explicit_host: str | None,
+) -> str:
+    """Describe an inside-lode refusal without implying target resolution."""
+    command = ["hop"]
+    if explicit_host is not None:
+        command.extend(["-H", explicit_host])
+    command.extend(command_name.split())
+    command.extend(lode_ids)
+    return (
+        f"Observed: 'hop {command_name}' was invoked inside lode {get_hopper_lid()}. "
+        "Hopper did not proceed; no lode lookup or SSH probe was attempted. "
+        f"Recover by leaving the current lode and retrying with: {shlex.join(command)}."
+    )
+
+
 def _run_wait_command(
     args: list[str],
     *,
@@ -3299,8 +3404,13 @@ def _run_wait_command(
         return 0
 
     deadline = deadline_utils.make_deadline(parsed.timeout, clock=wait_module._monotonic)
-    if (rc := require_not_inside_lode()) is not None:
-        print(wait_module.WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
+    with redirect_stdout(sys.stderr):
+        rc = require_not_inside_lode()
+    if rc is not None:
+        print(
+            _wait_inside_lode_summary(command_name, parsed.lode_id, explicit_host),
+            file=sys.stderr,
+        )
         return rc
 
     selected_resolver = _resolve_lode
@@ -3448,10 +3558,6 @@ def cmd_lode(args: list[str]) -> int:
             create_p.print_help()
         else:
             parser.print_help()
-        if args and args[0] == "wait":
-            from hopper.wait import WAIT_SUMMARY_NO_TARGET
-
-            print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
         return 1
     except SystemExit:
         return 0
@@ -3997,9 +4103,6 @@ def cmd_lode(args: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-
-    if subcommand == "wait":
-        return _run_wait_command(args[1:], command_name="lode wait")
 
     if subcommand == "log":
         import json as json_mod

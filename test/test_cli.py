@@ -2204,6 +2204,20 @@ def test_lode_kill_missing_id(capsys):
     assert "required" in out
 
 
+def _resolution_probe(host="local", outcome="found"):
+    route_server = "test-host" if host == "local" else host
+    return {
+        "kind": "local" if host == "local" else "routed",
+        "server": route_server,
+        "route": host,
+        "candidate_id": None,
+        "outcome": outcome,
+        "detail": None,
+        "attempts": 1,
+        "observed_age_s": 0.0,
+    }
+
+
 def _watch_resolution(lode, host="local"):
     return {
         "outcome": "found",
@@ -2212,6 +2226,7 @@ def _watch_resolution(lode, host="local"):
         "canonical_id": lode["id"],
         "error": None,
         "probe_summary": f"{host}=found {lode['id']}",
+        "probes": [_resolution_probe(host)],
         "exit_code": 0,
     }
 
@@ -2982,7 +2997,7 @@ def test_wait_stuck_flap_rearms(monkeypatch, capsys):
     assert out.count("  --- last 50 lines of pane ---") == 1
 
 
-def test_wait_stuck_multi_lode_first_wins(monkeypatch, capsys):
+def test_wait_stuck_multi_lode_aborts_fresh_sibling_at_sweep(monkeypatch, capsys):
     stuck_lode = {
         "id": "aaa111",
         "active": True,
@@ -3042,6 +3057,7 @@ def test_lode_wait_not_found(capsys):
         return_value={
             "outcome": "absent",
             "error": "Lode 'bogus' not found.",
+            "probes": [_resolution_probe(outcome="absent")],
             "exit_code": 1,
         },
     ):
@@ -3302,7 +3318,7 @@ def test_lode_wait_multi_timeout(capsys):
 
 
 def test_lode_wait_multi_one_not_found(capsys):
-    """wait fails fast if any lode ID is not found."""
+    """wait renders the failed resolution and its aborted resolved sibling."""
     lode1 = {
         "id": "aaa111",
         "stage": "refine",
@@ -3315,7 +3331,23 @@ def test_lode_wait_multi_one_not_found(capsys):
     def resolve(socket_path, lode_id, **_kwargs):
         if lode_id == "aaa111":
             return _watch_resolution(lode1)
-        return {"outcome": "absent", "error": "Lode 'bogus' not found.", "exit_code": 1}
+        return {
+            "outcome": "absent",
+            "error": "Lode 'bogus' not found.",
+            "probes": [
+                {
+                    "kind": "local",
+                    "server": "test-host",
+                    "route": "local",
+                    "candidate_id": None,
+                    "outcome": "absent",
+                    "detail": None,
+                    "attempts": 1,
+                    "observed_age_s": 0.0,
+                }
+            ],
+            "exit_code": 1,
+        }
 
     with (
         patch("hopper.cli._resolve_lode", side_effect=resolve),
@@ -3365,24 +3397,55 @@ def test_lode_wait_remote_poll_json_shipped(capsys):
     assert payload["route"] == "fedora.local"
 
 
-def test_lode_wait_rejects_inside_lode(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "surface",
+    ["wait", "watch", "lode-wait", "explicit-wait", "explicit-watch"],
+)
+@pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
+def test_wait_surfaces_reject_inside_lode_without_stdout_or_lookup(
+    monkeypatch, capsys, surface, json_output
+):
     monkeypatch.setenv("HOPPER_LID", "test-lode-123")
-
-    rc = cmd_lode(["wait", "some-id"])
-    assert rc == 1
-    out = capsys.readouterr().out
-    assert "Cannot run this command inside lode test-lode-123." in out
-    assert "hop backlog add" in out
-
-
-def test_wait_summary_for_inside_lode_refusal(monkeypatch, capsys):
-    monkeypatch.setenv("HOPPER_LID", "test-lode-123")
-
-    result, _ = _run_scripted_cli_wait(monkeypatch, {}, {}, ["some-id"])
+    args = ["some-id"]
+    if json_output:
+        args.append("--json")
+    with (
+        patch("hopper.wait.wait_for_lodes") as supervise,
+        patch("hopper.cli._resolve_lode") as resolve,
+        patch("hopper.client.read_lode_snapshot") as local_snapshot,
+        patch("hopper.cli._remote_hosts") as remote_hosts,
+        patch("hopper.remote.run_remote") as run_remote,
+        patch("hopper.remote.run_remote_streaming") as stream,
+    ):
+        if surface == "wait":
+            result = cmd_wait(args)
+        elif surface == "watch":
+            result = cmd_watch(args)
+        elif surface == "lode-wait":
+            result = cmd_lode(["wait", *args])
+        else:
+            command = surface.removeprefix("explicit-")
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                ["hop", "-H", "resident.example", command, *args],
+            )
+            result = main()
 
     captured = capsys.readouterr()
     assert result == 1
-    assert captured.err == "hop wait: could not resolve target — exited 1\n"
+    assert captured.out == ""
+    assert "Cannot run this command inside lode test-lode-123." in captured.err
+    assert "Hopper did not proceed; no lode lookup or SSH probe was attempted" in captured.err
+    assert "Recover by leaving the current lode and retrying with:" in captured.err
+    assert hopper_wait.WAIT_SUMMARY_NO_TARGET not in captured.err
+    assert '"outcome"' not in captured.err
+    supervise.assert_not_called()
+    resolve.assert_not_called()
+    local_snapshot.assert_not_called()
+    remote_hosts.assert_not_called()
+    run_remote.assert_not_called()
+    stream.assert_not_called()
 
 
 def test_wait_summary_for_lode_wait_argument_error(monkeypatch, capsys):
@@ -7787,6 +7850,7 @@ def test_lode_id_surfaces_use_the_single_resolver(surface, command, args):
     unavailable = {
         "outcome": "unavailable",
         "error": "resident route unavailable",
+        "probes": [_resolution_probe(outcome="unavailable")],
         "exit_code": 2,
     }
     with patch(

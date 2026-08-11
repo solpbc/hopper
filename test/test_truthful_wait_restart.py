@@ -215,17 +215,31 @@ def restart_harness(tmp_path, monkeypatch, make_lode, release_server_lock):
             def resolver(path: Path, prefix: str, **_kwargs) -> dict:
                 status, payload = real_read_snapshot(path, prefix)
                 run["resolved"].set()
+                probes = [
+                    {
+                        "kind": "local",
+                        "server": "test-host",
+                        "route": "local",
+                        "candidate_id": None,
+                        "outcome": status,
+                        "detail": None,
+                        "attempts": 1,
+                        "observed_age_s": 0.0,
+                    }
+                ]
                 if status == "found":
                     return {
                         "outcome": "found",
                         "lode": payload,
                         "host": "local",
                         "canonical_id": payload["id"],
+                        "probes": probes,
                         "exit_code": 0,
                     }
                 return {
                     "outcome": "unavailable" if status == "unavailable" else status,
                     "error": str(payload),
+                    "probes": probes,
                     "exit_code": 2 if status == "unavailable" else 1,
                 }
 

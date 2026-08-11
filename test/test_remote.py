@@ -168,7 +168,7 @@ def test_run_remote_preserves_arbitrary_binary_stdin(monkeypatch):
 
 
 def test_run_remote_streaming_devnulls_stdin(monkeypatch):
-    """Streaming (used by `hop watch`) must not inherit real stdin either."""
+    """The `hop lode watch` streaming path must not inherit real stdin."""
 
     class FakeProcess:
         stdout = iter([])
@@ -273,6 +273,108 @@ def test_cancel_owned_children_terminates_then_kills_and_reaps_within_bound():
     assert all(child.poll() is not None for child in children)
     assert control["children"] == set()
     assert clock() <= min(original_deadline["expires_at"], 3599.0 + 5.0)
+
+
+def test_cancel_owned_children_reaps_child_that_exits_after_delayed_kill():
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+
+    class DelayedChild:
+        returncode = None
+        killed = False
+        post_kill_waits = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            clock.advance(min(timeout, 0.01))
+            if self.killed:
+                self.post_kill_waits += 1
+                if self.post_kill_waits >= 2:
+                    self.returncode = -9
+                    return self.returncode
+            raise subprocess.TimeoutExpired("delayed", timeout)
+
+    control = make_child_registry()
+    child = DelayedChild()
+    control["children"].add(child)
+
+    survivors = cancel_owned_children(control, make_deadline(1.0, clock=clock))
+
+    assert survivors == []
+    assert child.poll() == -9
+    assert child.post_kill_waits == 2
+    assert control["children"] == set()
+
+
+def test_run_remote_spawn_cancel_race_registers_and_reaps_child(monkeypatch):
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    control = make_child_registry()
+    calls = []
+
+    class RacingChild:
+        returncode = None
+        killed = False
+
+        def __init__(self, command, **kwargs):
+            self.args = command
+            self.kwargs = kwargs
+            calls.append(self)
+            control["cancel_event"].set()
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            clock.advance(min(timeout, 0.01))
+            if self.killed:
+                self.returncode = -9
+                return self.returncode
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+    monkeypatch.setattr("hopper.remote.subprocess.Popen", RacingChild)
+
+    with pytest.raises(RemoteCommandUnavailable, match="cancelled during spawn"):
+        run_remote(
+            "worker.example",
+            ["ping"],
+            deadline=make_deadline(1.0, clock=clock),
+            child_control=control,
+        )
+
+    assert len(calls) == 1
+    assert calls[0].poll() == -9
+    assert control["children"] == set()
 
 
 def test_cancelled_child_registry_refuses_remote_spawn(monkeypatch):
