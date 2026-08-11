@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 sol pbc
 
-"""Durable storage primitives for accepted lode completions."""
+"""Durable storage primitives for accepted lode actions."""
 
 import hashlib
 import json
@@ -14,14 +14,26 @@ from pathlib import Path
 
 from hopper import config
 
-PENDING_COMPLETION_FILENAME = "pending-completion.json"
+# Fleet-cutover ABI: changing this name would orphan an in-flight v1 fence.
+PENDING_ACTION_FILENAME = "pending-completion.json"
 COMPLETION_STAGING_DIRNAME = "completion-staging"
 RUN_OWNERSHIP_PREFIX = "run-ownership-"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+RUN_OWNERSHIP_SCHEMA_VERSION = 1
+SPAWN_RECEIPT_SCHEMA_VERSION = 1
+ACTION_RESULT_LIMIT = 8
 DIGEST_ALGORITHM = "sha256"
 POLL_INTERVAL_MS = 50
 
 STAGES = {"mill", "refine", "ship"}
+ACTION_TYPES = {"completion", "pause", "restart", "kill", "archive"}
+TARGET_DISPOSITIONS = {
+    "completion": {"advance_refine", "advance_ship", "shipped_archived"},
+    "pause": {"paused"},
+    "restart": {"replacement_spawned"},
+    "kill": {"killed_archived"},
+    "archive": {"archived"},
+}
 PHASES = {
     "accepted",
     "output_blocked",
@@ -34,7 +46,10 @@ PHASES = {
     "proving_ship_landing",
     "ship_blocked",
     "quarantining",
-    "publishing_next_action",
+    "checking_durability",
+    "rechecking_durability",
+    "durability_blocked",
+    "publishing_terminal",
     "spawning",
     "cleanup_blocked",
     "complete",
@@ -50,7 +65,8 @@ MARKER_NAMES = (
     "quarantine_rename",
     "worktree_repair",
     "cleanup_authorization",
-    "stage_mutation",
+    "durability_recheck",
+    "lode_mutation",
     "archive",
     "backlog",
     "spawn",
@@ -84,9 +100,9 @@ def lode_dir(lode_id: str) -> Path:
     return config.hopper_dir() / "lodes" / lode_id
 
 
-def pending_completion_path(lode_id: str) -> Path:
-    """Return the canonical pending-completion path for a lode."""
-    return lode_dir(lode_id) / PENDING_COMPLETION_FILENAME
+def pending_action_path(lode_id: str) -> Path:
+    """Return the canonical pending-action path for a lode."""
+    return lode_dir(lode_id) / PENDING_ACTION_FILENAME
 
 
 def staging_dir(lode_id: str) -> Path:
@@ -449,6 +465,7 @@ def _validate_containment(value: dict) -> None:
             "linux-degraded-bounded-empty",
             "darwin-bounded-empty",
             "other-bounded-empty-no-birth",
+            "no-owned-runner",
         },
         nullable=True,
     )
@@ -463,6 +480,7 @@ def _validate_spawn(value) -> None:
         value,
         "spawn",
         {
+            "target_lode_id",
             "target_generation",
             "receipt_relative_path",
             "pane_id",
@@ -470,6 +488,7 @@ def _validate_spawn(value) -> None:
             "worker_adopted",
         },
     )
+    _string(value["target_lode_id"], "spawn.target_lode_id", pattern=_LODE_ID)
     _string(value["target_generation"], "spawn.target_generation", pattern=_HEX32)
     _string(value["receipt_relative_path"], "spawn.receipt_relative_path", pattern=_SPAWN_PATH)
     _string(value["pane_id"], "spawn.pane_id", nullable=True)
@@ -552,14 +571,172 @@ def _validate_ship(value) -> None:
     _string(value["cleanup_failure"], "ship.cleanup_failure", nullable=True)
 
 
-def validate_pending_completion(record: dict) -> dict:
-    """Validate the complete v1 pending record and return it unchanged."""
+def _next_action(action_type: str, stage: str, target_disposition: str) -> dict:
+    expected = {
+        ("completion", "mill", "advance_refine"): {
+            "kind": "advance",
+            "target_stage": "refine",
+        },
+        ("completion", "refine", "advance_ship"): {
+            "kind": "advance",
+            "target_stage": "ship",
+        },
+        ("completion", "ship", "shipped_archived"): {
+            "kind": "ship_archive",
+            "target_stage": None,
+        },
+        ("pause", stage, "paused"): {"kind": "pause", "target_stage": None},
+        ("restart", stage, "replacement_spawned"): {
+            "kind": "restart",
+            "target_stage": stage,
+        },
+        ("kill", stage, "killed_archived"): {
+            "kind": "kill_archive",
+            "target_stage": None,
+        },
+        ("archive", stage, "archived"): {
+            "kind": "archive",
+            "target_stage": None,
+        },
+    }.get((action_type, stage, target_disposition))
+    if expected is None:
+        raise ValueError("target disposition does not match action type and stage")
+    return expected
+
+
+def action_binding(value: dict) -> tuple[str, str | None, str, str, bool]:
+    """Validate and project the immutable identity fields of an action."""
+    value = _object(
+        value,
+        "action binding",
+        {
+            "lode_id",
+            "expected_generation",
+            "action_type",
+            "target_disposition",
+            "force_consent",
+        },
+    )
+    lode_id = _string(value["lode_id"], "lode_id", pattern=_LODE_ID)
+    generation = _string(
+        value["expected_generation"],
+        "expected_generation",
+        pattern=_HEX32,
+        nullable=True,
+    )
+    action_type = _string(value["action_type"], "action_type", choices=ACTION_TYPES)
+    target = _string(
+        value["target_disposition"],
+        "target_disposition",
+        choices=TARGET_DISPOSITIONS[action_type],
+    )
+    _boolean(value["force_consent"], "force_consent")
+    return lode_id, generation, action_type, target, value["force_consent"]
+
+
+def validate_action_id(value) -> str:
+    """Validate one externally supplied action identity."""
+    return _string(value, "action_id", pattern=_HEX32)
+
+
+def record_binding(record: dict) -> tuple[str, str | None, str, str, bool]:
+    """Return the validated bound tuple from a pending record or receipt."""
+    return action_binding(
+        {
+            "lode_id": record["lode_id"],
+            "expected_generation": record["expected_generation"],
+            "action_type": record["action_type"],
+            "target_disposition": record["target_disposition"],
+            "force_consent": record["force_consent"],
+        }
+    )
+
+
+def _validate_durability_observation(value, name: str) -> None:
+    value = _object(value, name, {"outcome", "count", "basis", "error", "checked_at_ms"})
+    _string(
+        value["outcome"],
+        f"{name}.outcome",
+        choices={"safe", "unknown", "unpushed", "consent_override", "not_required"},
+    )
+    _integer(value["count"], f"{name}.count", nullable=True)
+    _string(value["basis"], f"{name}.basis", nullable=True)
+    _string(value["error"], f"{name}.error", nullable=True)
+    _integer(value["checked_at_ms"], f"{name}.checked_at_ms", nullable=True)
+
+
+def _validate_durability(value, action_type: str, force_consent: bool) -> None:
+    value = _object(value, "durability", {"required", "preflight", "final"})
+    _boolean(value["required"], "durability.required")
+    _validate_durability_observation(value["preflight"], "durability.preflight")
+    _validate_durability_observation(value["final"], "durability.final")
+    observations = (value["preflight"], value["final"])
+    if any(item["outcome"] == "consent_override" for item in observations) and not (
+        action_type == "kill" and force_consent
+    ):
+        raise ValueError("only a forced kill may override durability")
+
+
+def _validate_action_result(result: dict) -> dict:
+    result = _object(
+        result,
+        "action result",
+        {
+            "schema_version",
+            "action_id",
+            "lode_id",
+            "expected_generation",
+            "action_type",
+            "target_disposition",
+            "force_consent",
+            "terminal_disposition",
+            "completed_at_ms",
+            "containment_proof",
+            "retained",
+            "successor",
+        },
+    )
+    if type(result["schema_version"]) is not int or result["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("unsupported action result schema")
+    _string(result["action_id"], "action result action_id", pattern=_HEX32)
+    record_binding(result)
+    _string(
+        result["terminal_disposition"],
+        "action result terminal_disposition",
+        choices=TARGET_DISPOSITIONS[result["action_type"]],
+    )
+    if result["terminal_disposition"] != result["target_disposition"]:
+        raise ValueError("action result disposition does not match its binding")
+    _integer(result["completed_at_ms"], "action result completed_at_ms")
+    _string(result["containment_proof"], "action result containment_proof", nullable=True)
+    retained = _object(
+        result["retained"], "action result retained", {"worktree", "branch", "session"}
+    )
+    for name in retained:
+        _boolean(retained[name], f"action result retained.{name}")
+    if result["successor"] is not None:
+        successor = _object(
+            result["successor"],
+            "action result successor",
+            {"lode_id", "generation", "pane_id"},
+        )
+        _string(successor["lode_id"], "action result successor.lode_id", pattern=_LODE_ID)
+        _string(successor["generation"], "action result successor.generation", pattern=_HEX32)
+        _string(successor["pane_id"], "action result successor.pane_id")
+    return result
+
+
+def validate_pending_action(record: dict) -> dict:
+    """Validate the complete v2 pending action record and return it unchanged."""
     keys = {
         "schema_version",
         "action_id",
         "lode_id",
+        "action_type",
+        "target_disposition",
+        "force_consent",
         "stage",
-        "run_generation",
+        "expected_generation",
         "accepted_at_ms",
         "boot_id",
         "phase",
@@ -567,57 +744,93 @@ def validate_pending_completion(record: dict) -> dict:
         "output",
         "ownership",
         "containment",
+        "durability",
         "spawn",
         "ship",
         "markers",
         "recovery",
+        "result",
     }
-    record = _object(record, "pending completion", keys)
+    record = _object(record, "pending action", keys)
     if type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("unsupported pending completion schema")
+        raise ValueError("unsupported pending action schema")
     _string(record["action_id"], "action_id", pattern=_HEX32)
-    _string(record["lode_id"], "lode_id", pattern=_LODE_ID)
+    _, generation, action_type, target_disposition, force_consent = record_binding(record)
     stage = _string(record["stage"], "stage", choices=STAGES)
-    generation = _string(record["run_generation"], "run_generation", pattern=_HEX32)
+    if action_type == "completion" and generation is None:
+        raise ValueError("completion requires an expected generation")
     _integer(record["accepted_at_ms"], "accepted_at_ms")
-    boot_id = _string(record["boot_id"], "boot_id")
-    if not boot_id:
-        raise ValueError("boot_id must not be empty")
+    boot_id = _string(record["boot_id"], "boot_id", nullable=True)
+    if generation is None and boot_id is not None:
+        raise ValueError("boot_id requires an expected generation")
     _string(record["phase"], "phase", choices=PHASES)
     next_action = _object(record["next_action"], "next_action", {"kind", "target_stage"})
-    expected_action = {
-        "mill": ("advance", "refine"),
-        "refine": ("advance", "ship"),
-        "ship": ("ship_archive", None),
-    }[stage]
-    if (next_action["kind"], next_action["target_stage"]) != expected_action:
-        raise ValueError("next action does not match stage")
-    _validate_output(record["output"], stage)
-    _validate_ownership(record["ownership"], generation, boot_id)
+    if next_action != _next_action(action_type, stage, target_disposition):
+        raise ValueError("next action does not match action binding")
+    if action_type == "completion":
+        if record["output"] is None:
+            raise ValueError("completion requires output facts")
+        _validate_output(record["output"], stage)
+    elif record["output"] is not None:
+        raise ValueError("manual action cannot contain output facts")
+    if record["ownership"] is not None:
+        if generation is None or boot_id is None:
+            raise ValueError("ownership requires an expected generation")
+        _validate_ownership(record["ownership"], generation, boot_id)
+    elif action_type == "completion":
+        raise ValueError("completion requires ownership facts")
+    elif boot_id is not None:
+        raise ValueError("boot_id requires ownership facts")
     _validate_containment(record["containment"])
+    _validate_durability(record["durability"], action_type, force_consent)
     _validate_spawn(record["spawn"])
-    if stage == "ship":
+    if action_type == "completion" and stage == "ship":
         if record["ship"] is None:
             raise ValueError("ship completion requires ship facts")
         _validate_ship(record["ship"])
     elif record["ship"] is not None:
-        raise ValueError("non-ship completion cannot contain ship facts")
+        raise ValueError("only ship completion can contain ship facts")
     markers = _object(record["markers"], "markers", set(MARKER_NAMES))
     for name in MARKER_NAMES:
         _marker(markers[name], f"markers.{name}")
-    if stage != "ship":
-        for name in (
-            "ship_landing",
-            "quarantine_rename",
-            "worktree_repair",
-            "cleanup_authorization",
-            "archive",
-            "backlog",
-            "worktree_remove",
-            "branch_delete",
-        ):
-            if markers[name] != new_marker():
-                raise ValueError(f"non-ship marker {name} must not be started")
+    irrelevant_markers = set()
+    if action_type != "completion":
+        irrelevant_markers.update(
+            {
+                "output_publish",
+                "ship_landing",
+                "quarantine_rename",
+                "worktree_repair",
+                "cleanup_authorization",
+                "backlog",
+                "worktree_remove",
+                "branch_delete",
+            }
+        )
+    elif stage != "ship":
+        irrelevant_markers.update(
+            {
+                "ship_landing",
+                "quarantine_rename",
+                "worktree_repair",
+                "cleanup_authorization",
+                "archive",
+                "backlog",
+                "worktree_remove",
+                "branch_delete",
+            }
+        )
+    if action_type not in {"kill", "archive"}:
+        irrelevant_markers.add("durability_recheck")
+    if action_type not in {"completion", "restart"}:
+        irrelevant_markers.add("spawn")
+    if action_type in {"pause", "restart"}:
+        irrelevant_markers.add("archive")
+    if action_type in {"kill", "archive"}:
+        irrelevant_markers.add("lode_mutation")
+    for name in irrelevant_markers:
+        if markers[name] != new_marker():
+            raise ValueError(f"irrelevant marker {name} must not be started")
     recovery = _object(record["recovery"], "recovery", {"kind", "message", "command"})
     _string(
         recovery["kind"],
@@ -628,6 +841,7 @@ def validate_pending_completion(record: dict) -> dict:
             "ownership",
             "containment",
             "landing",
+            "durability",
             "spawn",
             "cleanup",
         },
@@ -635,6 +849,10 @@ def validate_pending_completion(record: dict) -> dict:
     )
     _string(recovery["message"], "recovery.message", nullable=True)
     _string(recovery["command"], "recovery.command", nullable=True)
+    if record["result"] is not None:
+        _validate_action_result(record["result"])
+        if record_binding(record["result"]) != record_binding(record):
+            raise ValueError("action result binding does not match pending action")
     return record
 
 
@@ -659,7 +877,10 @@ def validate_run_ownership(record: dict, *, require_worker: bool = False) -> dic
         "unit_name",
     }
     record = _object(record, "run ownership", keys)
-    if type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA_VERSION:
+    if (
+        type(record["schema_version"]) is not int
+        or record["schema_version"] != RUN_OWNERSHIP_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported run ownership schema")
     _string(record["lode_id"], "run ownership lode_id", pattern=_LODE_ID)
     _string(record["run_generation"], "run ownership generation", pattern=_HEX32)
@@ -761,61 +982,96 @@ def load_run_ownership(lode_id: str, run_generation: str, *, require_worker=Fals
     return record
 
 
-def new_pending_completion(
+def new_pending_action(
     *,
     lode_id: str,
     stage: str,
-    run_generation: str,
-    output_facts: dict,
-    ownership_record: dict,
-    source_record_sha256: str,
+    expected_generation: str | None,
+    action_type: str,
+    target_disposition: str,
+    force_consent: bool,
+    output_facts: dict | None = None,
+    ownership_record: dict | None = None,
+    source_record_sha256: str | None = None,
     ship: dict | None = None,
     action_id: str | None = None,
     accepted_ms: int | None = None,
+    durability: dict | None = None,
+    already_empty: bool = False,
 ) -> dict:
-    """Build a complete accepted record from verified staged and launch facts."""
-    validate_run_ownership(ownership_record, require_worker=True)
+    """Build a complete accepted record from validated action facts."""
+    binding = {
+        "lode_id": lode_id,
+        "expected_generation": expected_generation,
+        "action_type": action_type,
+        "target_disposition": target_disposition,
+        "force_consent": force_consent,
+    }
+    action_binding(binding)
+    if ownership_record is not None:
+        validate_run_ownership(ownership_record, require_worker=True)
+        if ownership_record["run_generation"] != expected_generation:
+            raise ValueError("run ownership generation does not match action binding")
+        if source_record_sha256 is None:
+            raise ValueError("run ownership digest is required")
     action_id = action_id or uuid.uuid4().hex
-    next_action = {
-        "mill": {"kind": "advance", "target_stage": "refine"},
-        "refine": {"kind": "advance", "target_stage": "ship"},
-        "ship": {"kind": "ship_archive", "target_stage": None},
-    }.get(stage)
-    if next_action is None:
-        raise ValueError("completion stage is invalid")
+    next_action = _next_action(action_type, stage, target_disposition)
     facts = ownership_record
+    accepted_ms = accepted_ms if accepted_ms is not None else int(time.time() * 1000)
+    if durability is None:
+        observation = {
+            "outcome": "not_required",
+            "count": 0,
+            "basis": action_type,
+            "error": None,
+            "checked_at_ms": accepted_ms,
+        }
+        durability = {
+            "required": False,
+            "preflight": dict(observation),
+            "final": dict(observation),
+        }
     record = {
         "schema_version": SCHEMA_VERSION,
         "action_id": action_id,
-        "lode_id": lode_id,
+        **binding,
         "stage": stage,
-        "run_generation": run_generation,
-        "accepted_at_ms": accepted_ms if accepted_ms is not None else int(time.time() * 1000),
-        "boot_id": facts["boot_id"],
+        "accepted_at_ms": accepted_ms,
+        "boot_id": facts["boot_id"] if facts is not None else None,
         "phase": "accepted",
         "next_action": next_action,
-        "output": {
-            **output_facts,
-            "canonical_name": f"{stage}_out.md",
-            "repair_token": secrets.token_urlsafe(32),
-            "published": False,
-            "failure": None,
-        },
-        "ownership": {
-            "source_record_relative_path": run_ownership_path(lode_id, run_generation).name,
-            "source_record_sha256": source_record_sha256,
-            "captured": False,
-            "captured_at_ms": None,
-            "platform": facts["platform"],
-            "proof_mode": facts["proof_mode"],
-            "pane": facts["pane"],
-            "supervisor": facts["supervisor"],
-            "worker": facts["worker"],
-            "process_group": facts["process_group"],
-            "descendants": facts["descendants"],
-            "unit": facts["unit"],
-            "cgroup": facts["cgroup"],
-        },
+        "output": (
+            {
+                **output_facts,
+                "canonical_name": f"{stage}_out.md",
+                "repair_token": secrets.token_urlsafe(32),
+                "published": False,
+                "failure": None,
+            }
+            if output_facts is not None
+            else None
+        ),
+        "ownership": (
+            {
+                "source_record_relative_path": run_ownership_path(
+                    lode_id, expected_generation
+                ).name,
+                "source_record_sha256": source_record_sha256,
+                "captured": False,
+                "captured_at_ms": None,
+                "platform": facts["platform"],
+                "proof_mode": facts["proof_mode"],
+                "pane": facts["pane"],
+                "supervisor": facts["supervisor"],
+                "worker": facts["worker"],
+                "process_group": facts["process_group"],
+                "descendants": facts["descendants"],
+                "unit": facts["unit"],
+                "cgroup": facts["cgroup"],
+            }
+            if facts is not None
+            else None
+        ),
         "containment": {
             "state": "not_started",
             "started_monotonic_ns": None,
@@ -828,35 +1084,136 @@ def new_pending_completion(
             "proof_label": None,
             "last_error": None,
         },
+        "durability": durability,
         "spawn": None,
         "ship": ship,
         "markers": new_markers(),
         "recovery": {"kind": None, "message": None, "command": None},
+        "result": None,
     }
-    validate_pending_completion(record)
+    if already_empty:
+        if ownership_record is not None:
+            raise ValueError("already-empty action cannot contain ownership facts")
+        record["containment"].update(
+            state="proven",
+            result="no-owned-runner",
+            proof_label="no active runner identity was recorded at acceptance",
+        )
+        for marker_name in ("ownership_capture", "pane_close", "containment"):
+            transition_marker(record, marker_name, "intent")
+            marker = record["markers"][marker_name]
+            transition_marker(
+                record,
+                marker_name,
+                "done",
+                attempt_id=marker["attempt_id"],
+                detail="no owned runner existed at acceptance",
+            )
+    validate_pending_action(record)
     return record
 
 
-def write_pending_completion(record: dict) -> Path:
+def write_pending_action(record: dict) -> Path:
     """Validate and durably publish the sole pending record for its lode."""
-    validate_pending_completion(record)
-    path = pending_completion_path(record["lode_id"])
+    validate_pending_action(record)
+    path = pending_action_path(record["lode_id"])
     write_durable_json(path, record)
     return path
 
 
-def load_pending_completion(lode_id: str) -> dict | None:
+class LegacyPendingActionError(ValueError):
+    """A v1 completion record was found during a clean-break upgrade."""
+
+
+def load_pending_action(lode_id: str) -> dict | None:
     """Load and validate a lode's pending record, or return None when absent."""
-    path = pending_completion_path(lode_id)
+    path = pending_action_path(lode_id)
     try:
         with open(path, encoding="utf-8") as source:
             record = json.load(source)
     except FileNotFoundError:
         return None
-    validate_pending_completion(record)
+    if isinstance(record, dict) and record.get("schema_version") == 1:
+        raise LegacyPendingActionError(
+            "schema-v1 pending action must be drained before this host is upgraded"
+        )
+    validate_pending_action(record)
     if record["lode_id"] != lode_id:
-        raise ValueError("pending completion belongs to a different lode")
+        raise ValueError("pending action belongs to a different lode")
     return record
+
+
+def new_action_result(
+    record: dict,
+    *,
+    completed_ms: int | None = None,
+    retained: dict | None = None,
+    successor: dict | None = None,
+) -> dict:
+    """Build the immutable terminal receipt for a validated pending action."""
+    validate_pending_action(record)
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "action_id": record["action_id"],
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_type": record["action_type"],
+        "target_disposition": record["target_disposition"],
+        "force_consent": record["force_consent"],
+        "terminal_disposition": record["target_disposition"],
+        "completed_at_ms": completed_ms if completed_ms is not None else accepted_at_ms(),
+        "containment_proof": record["containment"]["proof_label"],
+        "retained": retained or {"worktree": True, "branch": True, "session": False},
+        "successor": successor,
+    }
+    return _validate_action_result(result)
+
+
+def find_action_result(lode: dict, action_id: str) -> dict | None:
+    """Return one validated retained result receipt by action identity."""
+    _string(action_id, "action result lookup ID", pattern=_HEX32)
+    results = lode.get("action_results", [])
+    if not isinstance(results, list):
+        raise ValueError("lode action_results must be an array")
+    found = None
+    for result in results:
+        _validate_action_result(result)
+        if result["action_id"] == action_id:
+            if found is not None:
+                raise ValueError("lode contains duplicate action result IDs")
+            found = result
+    return found
+
+
+def append_action_result(lode: dict, result: dict) -> None:
+    """Append one receipt and retain the eight newest in publication order."""
+    _validate_action_result(result)
+    if result["lode_id"] != lode.get("id"):
+        raise ValueError("action result belongs to a different lode")
+    results = lode.setdefault("action_results", [])
+    if not isinstance(results, list):
+        raise ValueError("lode action_results must be an array")
+    for existing in results:
+        _validate_action_result(existing)
+        if existing["action_id"] == result["action_id"]:
+            if existing != result:
+                raise ValueError("action result identity already has different facts")
+            return
+    results.append(result)
+    del results[:-ACTION_RESULT_LIMIT]
+
+
+def pending_action_projection(record: dict) -> dict:
+    """Return the public, capability-free projection of a pending action."""
+    validate_pending_action(record)
+    return {
+        "action_id": record["action_id"],
+        "action_type": record["action_type"],
+        "expected_generation": record["expected_generation"],
+        "target_disposition": record["target_disposition"],
+        "phase": record["phase"],
+        "status": action_status(record),
+    }
 
 
 def _validate_spawn_receipt(receipt: dict) -> dict:
@@ -869,7 +1226,10 @@ def _validate_spawn_receipt(receipt: dict) -> dict:
         "pane_id",
     }
     receipt = _object(receipt, "spawn receipt", keys)
-    if type(receipt["schema_version"]) is not int or receipt["schema_version"] != SCHEMA_VERSION:
+    if (
+        type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != SPAWN_RECEIPT_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported spawn receipt schema")
     _string(receipt["action_id"], "spawn receipt action_id", pattern=_HEX32)
     _string(receipt["source_lode_id"], "spawn receipt source_lode_id", pattern=_LODE_ID)
@@ -901,20 +1261,22 @@ def load_spawn_receipt(lode_id: str, action_id: str) -> dict | None:
     return receipt
 
 
-def clear_pending_completion(record: dict) -> None:
+def clear_pending_action(record: dict) -> None:
     """Durably remove a completed action's staged blob and pending fence."""
-    validate_pending_completion(record)
+    validate_pending_action(record)
     if record["markers"]["pending_clear"]["state"] != "done":
-        raise ValueError("pending completion cannot clear before pending_clear is done")
+        raise ValueError("pending action cannot clear before pending_clear is done")
     directory = lode_dir(record["lode_id"])
-    staged = directory / record["output"]["staged_relative_path"]
-    try:
-        staged.unlink()
-    except FileNotFoundError:
-        pass
-    else:
-        _fsync_directory(staged.parent)
-    pending = pending_completion_path(record["lode_id"])
+    output = record["output"]
+    if record["action_type"] == "completion" and output is not None:
+        staged = directory / output["staged_relative_path"]
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            _fsync_directory(staged.parent)
+    pending = pending_action_path(record["lode_id"])
     try:
         pending.unlink()
     except FileNotFoundError:
@@ -960,7 +1322,9 @@ def stage_output(
 
 def repair_staged_output(record: dict, data: bytes) -> dict:
     """Durably replace only the staged blob with the immutable accepted bytes."""
-    validate_pending_completion(record)
+    validate_pending_action(record)
+    if record["action_type"] != "completion" or record["output"] is None:
+        raise ValueError("only a completion action has repairable output")
     if not isinstance(data, bytes):
         raise ValueError("repair output must be bytes")
     output = record["output"]
@@ -976,10 +1340,12 @@ def repair_staged_output(record: dict, data: bytes) -> dict:
 
 def pending_output_recovery(record: dict) -> dict | None:
     """Return the capability-bearing status projection only for blocked output."""
-    validate_pending_completion(record)
+    validate_pending_action(record)
     output = record["output"]
     if (
-        record["phase"] != "output_blocked"
+        record["action_type"] != "completion"
+        or output is None
+        or record["phase"] != "output_blocked"
         or output["published"]
         or record["recovery"]["kind"] != "output"
     ):
@@ -1014,7 +1380,9 @@ def verify_output_file(path: Path, length: int, digest_hex: str) -> dict:
 
 def verify_staged_output(record: dict) -> Path:
     """Verify that the server-owned staged blob still matches its accepted identity."""
-    validate_pending_completion(record)
+    validate_pending_action(record)
+    if record["action_type"] != "completion" or record["output"] is None:
+        raise ValueError("only a completion action has staged output")
     output = record["output"]
     staged = lode_dir(record["lode_id"]) / output["staged_relative_path"]
     identity = verify_output_file(staged, output["byte_length"], output["digest_hex"])
@@ -1052,12 +1420,13 @@ def publish_output(record: dict) -> Path:
 def collect_orphaned_staging(lode_id: str, record: dict | None = None) -> list[Path]:
     """Delete writer temporaries and blobs not referenced by a valid record."""
     if record is None:
-        record = load_pending_completion(lode_id)
+        record = load_pending_action(lode_id)
     elif record["lode_id"] != lode_id:
-        raise ValueError("pending completion belongs to a different lode")
+        raise ValueError("pending action belongs to a different lode")
     if record is not None:
-        validate_pending_completion(record)
-    keep = record["output"]["staged_relative_path"].split("/", 1)[1] if record else None
+        validate_pending_action(record)
+    output = record["output"] if record and record["action_type"] == "completion" else None
+    keep = output["staged_relative_path"].split("/", 1)[1] if output else None
     directory = staging_dir(lode_id)
     if not directory.is_dir():
         return []
@@ -1077,7 +1446,7 @@ def new_marker() -> dict:
 
 
 def new_markers() -> dict:
-    """Return the complete marker map for a new completion."""
+    """Return the complete marker map for a new action."""
     return {name: new_marker() for name in MARKER_NAMES}
 
 
@@ -1091,7 +1460,7 @@ def transition_marker(
 ) -> dict:
     """Apply one legal marker transition in memory and return the record."""
     if name not in MARKER_NAMES or state not in MARKER_STATES:
-        raise ValueError("unknown completion marker or state")
+        raise ValueError("unknown action marker or state")
     marker = record["markers"][name]
     if state not in MARKER_TRANSITIONS[marker["state"]]:
         raise ValueError(f"illegal marker transition {marker['state']} -> {state}")
@@ -1108,20 +1477,32 @@ def transition_marker(
 
 
 def recovery_command(record: dict, kind: str) -> str:
-    """Return the single operator command for a blocked completion phase."""
+    """Return the single operator command for a blocked action phase."""
     if kind == "output":
         return (
             f"hop lode repair-output {record['lode_id']} - "
             f"--token {record['output']['repair_token']}"
         )
-    return f"hop lode restart {record['lode_id']}"
+    if record["action_type"] == "completion":
+        return f"hop lode restart {record['lode_id']}"
+    suffix = " --force" if record["force_consent"] else ""
+    return f"hop lode {record['action_type']} {record['lode_id']}{suffix}"
 
 
-def completion_status(record: dict) -> str:
+def action_status(record: dict) -> str:
     """Project one pending record into the exact operator-facing status text."""
     phase = record["phase"]
     stage = record["stage"]
     recovery = record["recovery"]
+    if record["action_type"] != "completion":
+        label = record["action_type"].capitalize()
+        if phase.endswith("_blocked"):
+            detail = recovery["message"] or f"{record['action_type']} action is blocked"
+            command = recovery["command"] or f"hop lode status {record['lode_id']}"
+            return f"{label} blocked: {detail}. Inspect with: {command}"
+        if phase == "complete":
+            return f"{label}: {record['target_disposition'].replace('_', ' ')}"
+        return f"{label}: teardown in progress"
     if phase == "output_blocked":
         detail = recovery["message"] or "completion output publication failed"
         command = recovery["command"]
@@ -1167,7 +1548,7 @@ def completion_status(record: dict) -> str:
         if ship["archive_published"]:
             return "Teardown: cleaning quarantined worktree"
         return "Teardown: quarantining shipped worktree"
-    if phase == "publishing_next_action":
+    if phase == "publishing_terminal":
         if record["ownership"]["proof_mode"] == "linux-degraded":
             return (
                 "Teardown: bounded Linux containment observed "

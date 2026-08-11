@@ -309,14 +309,14 @@ def bootstrap_spawn_receipt(
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "tmux pane action tag could not be set")
-    from hopper import completion
+    from hopper import actions
 
-    expected_path = completion.spawn_receipt_path(source_lode_id, action_id)
+    expected_path = actions.spawn_receipt_path(source_lode_id, action_id)
     if str(expected_path) != path:
         raise ValueError("spawn receipt path does not match its action identity")
-    completion.write_spawn_receipt(
+    actions.write_spawn_receipt(
         {
-            "schema_version": completion.SCHEMA_VERSION,
+            "schema_version": actions.SPAWN_RECEIPT_SCHEMA_VERSION,
             "action_id": action_id,
             "source_lode_id": source_lode_id,
             "target_lode_id": target_lode_id,

@@ -130,10 +130,10 @@ This completes your work.
 
 ⛔ **`hop processed` is the LAST thing you do. Stop immediately after it returns.**
 Do not run another command, add a closing summary, re-read a file, or "just check"
-one more thing. Hopper dismisses your session once you signal completion, and it
-can only do that between turns — if you are still working, the dismissal lands
-mid-turn and does nothing. The stage then sits completed-but-not-advanced until a
-human notices. Signal, then stop.
+one more thing. The command durably submits your output; Hopper then closes the
+owned pane, proves the recorded runner containment is empty, and advances the
+stage. If it reports an unknown disposition, inspect `hop lode status $HOPPER_LID`
+before retrying the exact same action.
 
 Formatting requirements:
 - Be concise but complete. Use numbered lists.

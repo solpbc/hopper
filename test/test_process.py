@@ -31,7 +31,6 @@ from hopper.git import (
 from hopper.lodes import get_lode_dir, get_worktree_dir, load_lodes, save_lodes
 from hopper.process import (
     QUARANTINE_STATUS,
-    STAGES,
     ProcessRunner,
     _get_worktree_env,
     _install_setup_sigterm_handler,
@@ -178,11 +177,6 @@ def _stale_clone(tmp_path, branch="main"):
     _run_git(publisher, "push", "origin", branch)
     upstream_sha = _run_git(publisher, "rev-parse", "HEAD").stdout.strip()
     return registered, publisher, local_sha, upstream_sha
-
-
-def test_ship_next_stage_is_shipped():
-    """Ship stage should transition to shipped on completion."""
-    assert STAGES["ship"]["next_stage"] == "shipped"
 
 
 class TestRunMakeInstall:
@@ -355,7 +349,6 @@ class TestIdleParking:
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=0),
             patch("hopper.runner._descendant_pids", return_value=[]),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -1102,38 +1095,8 @@ class TestMillStage:
             for e in emitted
         )
 
-    def test_clean_exit_after_done_emits_ready_and_next_stage(self):
-        """Mill emits state=ready then stage=refine after completion."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
-        emitted = []
-
-        with (
-            patch(
-                "hopper.runner.connect",
-                return_value=_mock_response(stage="mill", state="new"),
-            ),
-            patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
-            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
-            patch("hopper.runner.get_current_pane_id", return_value=None),
-        ):
-            runner._done.set()
-            runner.run()
-
-        state_idx = next(
-            i
-            for i, e in enumerate(emitted)
-            if e[0] == "lode_set_state" and e[1]["state"] == "ready"
-        )
-        stage_idx = next(
-            i
-            for i, e in enumerate(emitted)
-            if e[0] == "lode_set_stage" and e[1]["stage"] == "refine"
-        )
-        assert state_idx < stage_idx
-        assert "Mill complete" in emitted[state_idx][1]["status"]
-
-    def test_clean_exit_without_done_no_transition(self):
-        """No ready/stage transition if done was never signalled."""
+    def test_clean_exit_does_not_publish_completion_transition(self):
+        """A worker exit cannot publish a terminal state or advance the stage."""
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         emitted = []
 
@@ -1771,42 +1734,6 @@ class TestRefineStage:
             status="Codex bootstrap timed out.",
         )
 
-    def test_clean_exit_after_done_emits_ready_and_ship(self, tmp_path):
-        """Refine emits state=ready then stage=ship after completion."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
-        emitted = []
-        session_dir, project_dir, mock_project = self._setup_refine(tmp_path)
-        (session_dir / "mill_out.md").write_text("Build it")
-
-        with (
-            patch(
-                "hopper.runner.connect",
-                return_value=_mock_response(stage="refine", state="ready", project="my-project"),
-            ),
-            patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
-            patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.create_worktree", return_value=(True, None)),
-            patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "thread-123", None)),
-            patch("hopper.process.set_codex_thread_id", return_value=True),
-            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
-            patch("hopper.runner.get_current_pane_id", return_value=None),
-        ):
-            runner._done.set()
-            runner.run()
-
-        state_idx = next(
-            i
-            for i, e in enumerate(emitted)
-            if e[0] == "lode_set_state" and e[1]["state"] == "ready"
-        )
-        stage_idx = next(
-            i for i, e in enumerate(emitted) if e[0] == "lode_set_stage" and e[1]["stage"] == "ship"
-        )
-        assert state_idx < stage_idx
-        assert "Refine complete" in emitted[state_idx][1]["status"]
-
 
 # ---------------------------------------------------------------------------
 # _get_worktree_env tests
@@ -2063,37 +1990,6 @@ class TestShipStage:
         assert mock_status.call_args[0][2].startswith(
             "Quarantined dirty project repo to branch hopper-quarantine-"
         )
-
-    def test_emits_shipped_stage_transition_on_completion(self, tmp_path):
-        """Ship emits a stage transition to shipped after completion."""
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
-        emitted = []
-        session_dir, project_dir, mock_project = self._setup_ship(tmp_path)
-        (session_dir / "refine_out.md").write_text("done")
-
-        with (
-            patch(
-                "hopper.runner.connect",
-                return_value=_mock_response(stage="ship", state="ready", project="my-project"),
-            ),
-            patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
-            patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.process.get_lode_dir", return_value=session_dir),
-            patch("hopper.process.is_dirty", return_value=False),
-            patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
-            patch("hopper.runner.get_current_pane_id", return_value=None),
-        ):
-            runner._done.set()
-            runner.run()
-
-        assert any(
-            e[0] == "lode_set_state"
-            and e[1]["state"] == "ready"
-            and "Ship complete" in e[1]["status"]
-            for e in emitted
-        )
-        assert any(e[0] == "lode_set_stage" and e[1]["stage"] == "shipped" for e in emitted)
 
     def test_ship_activates_worktree_env(self, tmp_path):
         """Ship activates worktree env when Makefile is present."""

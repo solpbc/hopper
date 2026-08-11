@@ -864,6 +864,9 @@ def _observe_strict(
         if cgroup == "empty" and supervisor == "gone" and pane_root == "gone":
             result = "linux-strict-killed-empty" if killed else "linux-strict-empty"
             return _proven(containment, result, "strict Linux containment proven")
+        if record.get("action_type") == "kill" and containment["state"] == "grace":
+            containment["state"] = "kill_pending"
+            return containment
         current = now_ns()
         if current >= deadline:
             return _blocked(containment, "strict Linux containment deadline expired")

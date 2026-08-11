@@ -22,9 +22,11 @@ from hopper.client import (
     complete_lode,
     connect,
     get_gate,
+    kill_lode,
     list_archived_lodes,
     list_lodes,
     lode_exists,
+    pause_lode,
     ping,
     probe_server,
     read_archived_lodes,
@@ -32,7 +34,7 @@ from hopper.client import (
     read_lodes,
     register_lode_supervisor,
     repair_lode_output,
-    retry_lode_completion,
+    restart_lode,
     send_gate_feedback,
     send_message,
     send_pane_input,
@@ -792,11 +794,12 @@ def test_register_lode_supervisor_propagates_server_refusal(socket_path):
 
 
 def test_complete_lode_sends_exact_bytes_metadata(socket_path):
-    response = {"type": "lode_complete_ack", "accepted": True, "action_id": "1" * 32}
+    response = {"type": "lode_action_ack", "accepted": True, "action_id": "1" * 32}
     with patch("hopper.client.send_message", return_value=response) as send:
         assert (
             complete_lode(
                 socket_path,
+                "1" * 32,
                 "test-id",
                 TEST_RUN_GENERATION,
                 "mill",
@@ -808,8 +811,12 @@ def test_complete_lode_sends_exact_bytes_metadata(socket_path):
         )
 
     request = send.call_args.args[1]
-    assert request["type"] == "lode_complete"
-    assert request["run_generation"] == TEST_RUN_GENERATION
+    assert request["type"] == "lode_action"
+    assert request["action_id"] == "1" * 32
+    assert request["expected_generation"] == TEST_RUN_GENERATION
+    assert request["action_type"] == "completion"
+    assert request["target_disposition"] == "advance_refine"
+    assert request["force_consent"] is False
     assert request["output_base64"] == "eA=="
     assert request["byte_length"] == 1
     assert request["digest_algorithm"] == "sha256"
@@ -826,7 +833,7 @@ def test_repair_lode_output_sends_raw_action_identity_and_bytes(socket_path):
                 lode_id="abcd2345",
                 action_id="1" * 32,
                 stage="mill",
-                run_generation=TEST_RUN_GENERATION,
+                expected_generation=TEST_RUN_GENERATION,
                 next_action=next_action,
                 token="T" * 43,
                 output_base64="eA==",
@@ -842,7 +849,7 @@ def test_repair_lode_output_sends_raw_action_identity_and_bytes(socket_path):
         "lode_id": "abcd2345",
         "action_id": "1" * 32,
         "stage": "mill",
-        "run_generation": TEST_RUN_GENERATION,
+        "expected_generation": TEST_RUN_GENERATION,
         "next_action": next_action,
         "token": "T" * 43,
         "output_base64": "eA==",
@@ -852,14 +859,54 @@ def test_repair_lode_output_sends_raw_action_identity_and_bytes(socket_path):
     }
 
 
-def test_retry_lode_completion_sends_dedicated_mutation(socket_path):
-    response = {"type": "lode_completion_retrying", "lode_id": "abcd2345"}
+@pytest.mark.parametrize(
+    ("operation", "action_type", "target", "force"),
+    [
+        (pause_lode, "pause", "paused", False),
+        (restart_lode, "restart", "replacement_spawned", True),
+        (kill_lode, "kill", "killed_archived", True),
+    ],
+)
+def test_manual_lode_clients_send_bound_action_and_wait_for_disposition(
+    socket_path, operation, action_type, target, force
+):
+    response = {
+        "type": "lode_action_ack",
+        "outcome": "completed",
+        "disposition": target,
+    }
+    kwargs = {
+        "action_id": "1" * 32,
+        "expected_generation": "2" * 32,
+    }
+    if action_type != "restart":
+        kwargs["stage"] = "mill"
+    if action_type in {"restart", "kill"}:
+        kwargs["force"] = force
+    args = (
+        (socket_path, "abcd2345", "mill")
+        if action_type == "restart"
+        else (
+            socket_path,
+            "abcd2345",
+        )
+    )
+
     with patch("hopper.client.send_message", return_value=response) as send:
-        assert retry_lode_completion(socket_path, "abcd2345") == response
+        assert operation(*args, **kwargs) == response
 
     send.assert_called_once_with(
         socket_path,
-        {"type": "lode_retry_completion", "lode_id": "abcd2345"},
+        {
+            "type": "lode_action",
+            "action_id": "1" * 32,
+            "lode_id": "abcd2345",
+            "expected_generation": "2" * 32,
+            "action_type": action_type,
+            "target_disposition": target,
+            "force_consent": force,
+            "stage": "mill",
+        },
         timeout=15.0,
         wait_for_response=True,
     )

@@ -22,7 +22,7 @@ import pytest
 
 import hopper.cli as hopper_cli
 import hopper.code as hopper_code
-from hopper import __version__, completion, config
+from hopper import __version__, actions, config
 from hopper.cli import (
     HELP_SKILL_REMINDER,
     _CheckProgress,
@@ -1494,12 +1494,23 @@ def test_lode_create_help_shows_epilog(capsys):
 
 def test_lode_restart_happy(capsys):
     """Restart sends correct message and prints confirmation."""
-    lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
+    generation = "1" * 32
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "new",
+        "active": False,
+        "run_generation": generation,
+    }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
-                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+                return_value={
+                    "type": "lode_action_ack",
+                    "outcome": "completed",
+                    "disposition": "replacement_spawned",
+                },
             ) as mock_restart:
                 assert cmd_lode(["restart", "test1234"]) == 0
                 mock_restart.assert_called_once()
@@ -1509,23 +1520,47 @@ def test_lode_restart_happy(capsys):
 
 
 def test_lode_restart_pending_completion_uses_retry_not_stage_reset(capsys):
-    lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": True}
-    pending_path = MagicMock()
-    pending_path.exists.return_value = True
+    action_id = "a" * 32
+    generation = "b" * 32
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "teardown",
+        "active": True,
+        "run_generation": generation,
+        "pending_action": {
+            "action_id": action_id,
+            "expected_generation": generation,
+            "action_type": "completion",
+            "target_disposition": "advance_refine",
+        },
+    }
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch("hopper.completion.pending_completion_path", return_value=pending_path),
         patch(
-            "hopper.client.retry_lode_completion",
-            return_value={"type": "lode_completion_retrying", "lode_id": "abcd2345"},
+            "hopper.client.submit_lode_action",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "completed",
+                "disposition": "advance_refine",
+            },
         ) as retry,
         patch("hopper.client.restart_lode") as restart,
     ):
         assert cmd_lode(["restart", "abcd2345"]) == 0
 
-    retry.assert_called_once_with(config.server_socket_path(), "abcd2345")
+    retry.assert_called_once_with(
+        config.server_socket_path(),
+        action_id=action_id,
+        lode_id="abcd2345",
+        expected_generation=generation,
+        action_type="completion",
+        target_disposition="advance_refine",
+        force_consent=False,
+        stage="mill",
+    )
     restart.assert_not_called()
-    assert "Retrying durable completion teardown" in capsys.readouterr().out
+    assert "Completed durable teardown" in capsys.readouterr().out
 
 
 def test_lode_repair_output_sends_exact_bytes_and_record_identity(capsys):
@@ -1533,13 +1568,13 @@ def test_lode_repair_output_sends_exact_bytes_and_record_identity(capsys):
     record = {
         "action_id": "a" * 32,
         "stage": "mill",
-        "run_generation": "b" * 32,
+        "expected_generation": "b" * 32,
         "next_action": {"kind": "advance", "target_stage": "refine"},
     }
     lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": False}
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch("hopper.completion.load_pending_completion", return_value=record),
+        patch("hopper.actions.load_pending_action", return_value=record),
         patch(
             "hopper.client.repair_lode_output",
             return_value={"type": "lode_repair_output_ack", "accepted": True},
@@ -1553,7 +1588,7 @@ def test_lode_repair_output_sends_exact_bytes_and_record_identity(capsys):
         lode_id="abcd2345",
         action_id="a" * 32,
         stage="mill",
-        run_generation="b" * 32,
+        expected_generation="b" * 32,
         next_action={"kind": "advance", "target_stage": "refine"},
         token="T" * 43,
         output_base64=base64.b64encode(data).decode("ascii"),
@@ -1595,7 +1630,7 @@ def test_lode_repair_output_refusal_is_nonzero_and_names_unchanged_canonical(cap
     lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": False}
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch("hopper.completion.load_pending_completion", return_value=None),
+        patch("hopper.actions.load_pending_action", return_value=None),
         patch(
             "hopper.client.repair_lode_output",
             return_value={
@@ -1633,60 +1668,92 @@ def test_lode_restart_not_found(capsys):
 
 
 def test_lode_restart_active(capsys):
-    """Restart of active lode prints error."""
+    """The server's active-runner refusal is rendered with its recovery command."""
     lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            assert cmd_lode(["restart", "test1234"]) == 1
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.restart_lode",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "refused",
+                "reason": "registered_runner_requires_force",
+                "detail": "Cannot restart: lode test1234 has a registered runner.",
+                "recovery_command": "hop lode restart test1234 --force",
+            },
+        ),
+    ):
+        assert cmd_lode(["restart", "test1234"]) == 1
     out = capsys.readouterr().out
     assert "registered runner" in out.lower()
     assert "--force" in out
 
 
 def test_lode_restart_unknown_ack_gives_status_next_step(capsys):
-    lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "new",
+        "active": False,
+        "run_generation": "b" * 32,
+    }
+    minted = MagicMock(hex="a" * 32)
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.cli.uuid.uuid4", return_value=minted) as mint,
         patch("hopper.client.restart_lode", return_value=None),
     ):
         assert cmd_lode(["restart", "test1234", "--force"]) == 1
 
     out = capsys.readouterr().out
+    mint.assert_called_once_with()
     assert "disposition is UNKNOWN" in out
+    assert f"Action ID: {'a' * 32}" in out
+    assert f"Expected generation: {'b' * 32}" in out
     assert "hop lode status test1234" in out
+    assert (
+        f"hop lode restart test1234 --force --action-id {'a' * 32} "
+        f"--expected-generation {'b' * 32}" in out
+    )
 
 
 @pytest.mark.parametrize(
-    ("reason", "next_steps"),
+    "reason",
     [
-        ("lode_not_found", ("hop lode list", "retry")),
-        ("invalid_stage", ("hop lode status test1234",)),
-        ("pending_runner_result", ("Wait about 60 seconds", "hop lode status test1234", "retry")),
-        ("runner_identity_unknown", ("hop lode status test1234", "runner is gone")),
-        ("runner_identity_unverified", ("hop lode status test1234", "the pane", "runner is gone")),
-        ("termination_failed", ("hop lode status test1234", "after it exits")),
-        ("already_live", ("Attach to it", "hop lode restart test1234 --force")),
-        ("tmux_unreachable", ("Verify tmux is running", "hop lode status test1234", "retry")),
-        ("spawn_failed", ("Verify tmux is running", "hop lode status test1234", "retry")),
-        ("future_refusal", ("hop lode status test1234", "retry")),
+        "lode_not_found",
+        "invalid_stage",
+        "pending_runner_result",
+        "runner_identity_unknown",
+        "runner_identity_unverified",
+        "termination_failed",
+        "already_live",
+        "tmux_unreachable",
+        "spawn_failed",
+        "future_refusal",
     ],
 )
-def test_lode_restart_refusal_names_operator_next_steps(reason, next_steps, capsys):
+def test_lode_restart_refusal_names_operator_next_steps(reason, capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
         patch(
             "hopper.client.restart_lode",
-            return_value={"type": "mutation_ack", "accepted": False, "reason": reason},
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "refused",
+                "reason": reason,
+                "recovery_command": "hop lode status test1234",
+            },
         ),
     ):
         assert cmd_lode(["restart", "test1234", "--force"]) == 1
 
     out = capsys.readouterr().out
-    for next_step in next_steps:
-        assert next_step in out
+    assert reason in out
+    assert "hop lode status test1234" in out
 
 
 def test_lode_restart_shipped(capsys):
@@ -1706,8 +1773,8 @@ def test_lode_restart_missing_id(capsys):
     assert "required" in out
 
 
-def test_lode_restart_refuses_when_started(capsys):
-    """Restart requires --force once the stage Claude session has started."""
+def test_lode_restart_renders_server_started_stage_refusal(capsys):
+    """Restart delegates the started-stage safety rule to the raw server boundary."""
     lode = {
         "id": "test1234",
         "stage": "mill",
@@ -1715,18 +1782,26 @@ def test_lode_restart_refuses_when_started(capsys):
         "active": False,
         "claude": {"mill": {"started": True}},
     }
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            with patch("hopper.client.restart_lode") as mock_restart:
-                result = cmd_lode(["restart", "test1234"])
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.restart_lode",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "refused",
+                "reason": "started_stage_requires_force",
+                "detail": "Lode test1234 has been started (claude[mill].started=True).",
+                "recovery_command": "hop lode restart test1234 --force",
+            },
+        ) as mock_restart,
+    ):
+        result = cmd_lode(["restart", "test1234"])
     assert result == 1
-    mock_restart.assert_not_called()
-    assert (
-        capsys.readouterr().out == "Lode test1234 has been started (claude[mill].started=True).\n"
-        "Restarting discards in-progress work.\n"
-        "Pass --force to override:\n"
-        "  hop lode restart test1234 --force\n"
-    )
+    mock_restart.assert_called_once()
+    output = capsys.readouterr().out
+    assert "started_stage_requires_force" in output
+    assert "hop lode restart test1234 --force" in output
 
 
 def test_lode_restart_force_proceeds_when_started(capsys):
@@ -1742,12 +1817,16 @@ def test_lode_restart_force_proceeds_when_started(capsys):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
-                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+                return_value={
+                    "type": "lode_action_ack",
+                    "outcome": "completed",
+                    "disposition": "replacement_spawned",
+                },
             ) as mock_restart:
                 result = cmd_lode(["restart", "test1234", "--force"])
     assert result == 0
     mock_restart.assert_called_once()
-    assert "Restarting mill for test1234" in capsys.readouterr().out
+    assert "Restarted mill for test1234" in capsys.readouterr().out
 
 
 def test_lode_restart_error_proceeds_when_started_without_force(capsys):
@@ -1763,12 +1842,16 @@ def test_lode_restart_error_proceeds_when_started_without_force(capsys):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
-                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+                return_value={
+                    "type": "lode_action_ack",
+                    "outcome": "completed",
+                    "disposition": "replacement_spawned",
+                },
             ) as mock_restart:
                 result = cmd_lode(["restart", "test1234"])
     assert result == 0
     mock_restart.assert_called_once()
-    assert "Restarting mill for test1234" in capsys.readouterr().out
+    assert "Restarted mill for test1234" in capsys.readouterr().out
 
 
 def test_lode_log_happy(temp_config, monkeypatch, capsys):
@@ -1882,10 +1965,23 @@ def test_lode_log_missing_id(capsys):
 
 
 def test_lode_kill_happy(capsys):
-    lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "running",
+        "active": True,
+        "run_generation": "1" * 32,
+    }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            with patch("hopper.client.kill_lode", return_value=True) as mock_kill:
+            with patch(
+                "hopper.client.kill_lode",
+                return_value={
+                    "type": "lode_action_ack",
+                    "outcome": "completed",
+                    "disposition": "killed_archived",
+                },
+            ) as mock_kill:
                 rc = cmd_lode(["kill", "test1234"])
 
     assert rc == 0
@@ -1899,35 +1995,47 @@ def test_lode_kill_reports_delivery_failure(capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-            with patch("hopper.client.kill_lode", return_value=False):
+            with patch("hopper.client.kill_lode", return_value=None):
                 rc = cmd_lode(["kill", "test1234"])
 
     assert rc == 1
-    assert "Failed to kill lode test1234" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "disposition is UNKNOWN" in output
+    assert "hop lode status test1234" in output
 
 
-@pytest.mark.parametrize(
-    ("verb", "client_name", "response_type", "output"),
-    [
-        ("pause", "pause_lode", "lode_paused", "Paused lode test1234"),
-        ("resume", "resume_lode", "lode_resumed", "Resuming lode test1234"),
-    ],
-)
-def test_lode_pause_resume(verb, client_name, response_type, output, capsys):
+def test_lode_pause_waits_for_terminal_disposition(capsys):
     lode = {"id": "test1234", "active": True, "stage": "mill", "state": "running"}
     response = {
-        "type": response_type,
+        "type": "lode_action_ack",
+        "outcome": "completed",
+        "disposition": "paused",
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.pause_lode", return_value=response) as operation,
+    ):
+        assert cmd_lode(["pause", "test1234"]) == 0
+
+    assert operation.call_args.args[:2] == (ANY, "test1234")
+    assert "Paused lode test1234" in capsys.readouterr().out
+
+
+def test_lode_resume_uses_existing_resume_protocol(capsys):
+    lode = {"id": "test1234", "active": False, "stage": "mill", "state": "gated"}
+    response = {
+        "type": "lode_resumed",
         "lode": {"id": "test1234"},
         "tmux_pane": "%2",
     }
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch(f"hopper.client.{client_name}", return_value=response) as operation,
+        patch("hopper.client.resume_lode", return_value=response) as operation,
     ):
-        assert cmd_lode([verb, "test1234"]) == 0
+        assert cmd_lode(["resume", "test1234"]) == 0
 
     operation.assert_called_once_with(ANY, "test1234")
-    assert output in capsys.readouterr().out
+    assert "Resuming lode test1234" in capsys.readouterr().out
 
 
 def test_lode_kill_shipped(capsys):
@@ -1937,10 +2045,10 @@ def test_lode_kill_shipped(capsys):
             with patch("hopper.client.kill_lode") as mock_kill:
                 rc = cmd_lode(["kill", "test1234"])
 
-    assert rc == 0
+    assert rc == 1
     mock_kill.assert_not_called()
     out = capsys.readouterr().out
-    assert "already shipped" in out
+    assert "stage is shipped" in out
 
 
 def test_lode_kill_archived(capsys):
@@ -1955,12 +2063,20 @@ def test_lode_kill_archived(capsys):
     ]
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", archived[0])):
-            with patch("hopper.client.list_archived_lodes", return_value=archived):
+            with patch(
+                "hopper.client.kill_lode",
+                return_value={
+                    "type": "lode_action_ack",
+                    "outcome": "refused",
+                    "reason": "lode_archived",
+                    "recovery_command": "hop lode status test1234",
+                },
+            ):
                 rc = cmd_lode(["kill", "test1234"])
 
-    assert rc == 0
+    assert rc == 1
     out = capsys.readouterr().out
-    assert "already archived" in out
+    assert "lode_archived" in out
 
 
 def test_lode_kill_not_found(capsys):
@@ -3931,10 +4047,11 @@ def test_processed_submits_exact_bytes_without_writing_canonical(temp_config, ca
 
     complete.assert_called_once()
     args = complete.call_args.args
-    assert args[1:4] == (lode_id, "a" * 32, "mill")
-    assert base64.b64decode(args[4]) == output
-    assert args[5] == len(output)
-    assert args[6] == hashlib.sha256(output).hexdigest()
+    assert len(args[1]) == 32
+    assert args[2:5] == (lode_id, "a" * 32, "mill")
+    assert base64.b64decode(args[5]) == output
+    assert args[6] == len(output)
+    assert args[7] == hashlib.sha256(output).hexdigest()
     assert not (temp_config / "lodes" / lode_id / "mill_out.md").exists()
     assert "Accepted mill output" in capsys.readouterr().out
 
@@ -4134,7 +4251,7 @@ def test_processed_saves_file(temp_config, capsys):
     output_path = lode_dir / "mill_out.md"
     assert not output_path.exists()
     complete.assert_called_once()
-    assert base64.b64decode(complete.call_args.args[4]) == output_text.encode()
+    assert base64.b64decode(complete.call_args.args[5]) == output_text.encode()
 
 
 def test_processed_no_stage(capsys):
@@ -4177,8 +4294,8 @@ def test_processed_refine_stage(temp_config, capsys):
     output_path = lode_dir / "refine_out.md"
     assert not output_path.exists()
     complete.assert_called_once()
-    assert complete.call_args.args[3] == "refine"
-    assert base64.b64decode(complete.call_args.args[4]) == output_text.encode()
+    assert complete.call_args.args[4] == "refine"
+    assert base64.b64decode(complete.call_args.args[5]) == output_text.encode()
 
 
 @pytest.mark.parametrize("stage", ["mill", "refine"])
@@ -4304,12 +4421,12 @@ def test_processed_no_ack_is_unknown_and_keeps_canonical_unchanged(temp_config, 
     [
         ("lode_not_found", "Lode test-session not found or archived."),
         (
-            "missing_run_generation",
+            "missing_expected_generation",
             "Completion was refused because this command has no runner generation. "
             "Run it inside the current lode runner, then retry.",
         ),
         (
-            "stale_run_generation",
+            "stale_expected_generation",
             "Completion was refused because this runner generation is stale. "
             "Check `hop lode status test-session` and use the current runner.",
         ),
@@ -4361,8 +4478,8 @@ def test_processed_acknowledges_over_real_server_socket(
     server.lode_clients[lode_id] = owner
     server.client_lodes[owner] = lode_id
     server.client_generations[owner] = generation
-    completion.write_run_ownership(_processed_ownership(lode_id, generation))
-    monkeypatch.setattr(server, "_schedule_completion_step", MagicMock())
+    actions.write_run_ownership(_processed_ownership(lode_id, generation))
+    monkeypatch.setattr(server, "_schedule_action_step", MagicMock())
     monkeypatch.setattr(config, "server_socket_path", lambda: socket_path)
     monkeypatch.setenv("HOPPER_LID", lode_id)
     monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
@@ -4371,7 +4488,7 @@ def test_processed_acknowledges_over_real_server_socket(
     assert cmd_processed([]) == 0
 
     assert server.lodes[0]["state"] == "teardown"
-    assert completion.load_pending_completion(lode_id) is not None
+    assert actions.load_pending_action(lode_id) is not None
     assert not (temp_config / "lodes" / lode_id / "mill_out.md").exists()
     captured = capsys.readouterr()
     assert "UNKNOWN" not in captured.err
@@ -5109,11 +5226,15 @@ def test_restart_delegates_to_lode_restart(capsys):
             with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
                 with patch(
                     "hopper.client.restart_lode",
-                    return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+                    return_value={
+                        "type": "lode_action_ack",
+                        "outcome": "completed",
+                        "disposition": "replacement_spawned",
+                    },
                 ):
                     assert cmd_restart(["abc123"]) == 0
     out = capsys.readouterr().out
-    assert "Restarting" in out
+    assert "Restarted" in out
     assert "abc123" in out
 
 
@@ -5200,8 +5321,8 @@ def test_lode_status_surfaces_exact_accepted_output_recovery(capsys):
     }
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch("hopper.completion.load_pending_completion", return_value={"pending": True}),
-        patch("hopper.completion.pending_output_recovery", return_value=summary),
+        patch("hopper.actions.load_pending_action", return_value={"pending": True}),
+        patch("hopper.actions.pending_output_recovery", return_value=summary),
     ):
         assert cmd_lode(["status", "abcd2345"]) == 0
 
@@ -6996,16 +7117,18 @@ def test_lode_restart_force_requests_server_side_termination(capsys):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
-                return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
+                return_value={
+                    "type": "lode_action_ack",
+                    "outcome": "completed",
+                    "disposition": "replacement_spawned",
+                },
             ) as mock_restart:
                 assert cmd_lode(["restart", "abc123", "--force"]) == 0
 
-    mock_restart.assert_called_once_with(
-        Path(config.server_socket_path()),
-        "abc123",
-        "mill",
-        force=True,
-    )
+    assert mock_restart.call_args.args == (Path(config.server_socket_path()), "abc123", "mill")
+    assert mock_restart.call_args.kwargs["force"] is True
+    assert isinstance(mock_restart.call_args.kwargs["action_id"], str)
+    assert mock_restart.call_args.kwargs["expected_generation"] is None
     assert "Terminating the registered runner" in capsys.readouterr().out
 
 
@@ -7453,6 +7576,7 @@ def test_lode_pause_resume_routes_canonical_full_id(verb):
         "active": True,
         "stage": "mill",
         "state": "running",
+        "run_generation": "a" * 32,
     }
     with (
         patch(
@@ -7463,10 +7587,135 @@ def test_lode_pause_resume_routes_canonical_full_id(verb):
     ):
         assert cmd_lode([verb, "abc"]) == 0
 
-    assert run_remote.call_args.args[:2] == (
-        "resident.example",
-        ["lode", verb, "abc12345"],
-    )
+    assert run_remote.call_args.args[0] == "resident.example"
+    remote_args = run_remote.call_args.args[1]
+    assert remote_args[:3] == ["lode", verb, "abc12345"]
+    if verb == "pause":
+        assert remote_args[3] == "--action-id"
+        assert len(remote_args[4]) == 32
+        assert remote_args[5:] == ["--expected-generation", "a" * 32]
+    else:
+        assert remote_args == ["lode", "resume", "abc12345"]
+
+
+@pytest.mark.parametrize("verb", ["pause", "restart", "kill"])
+def test_manual_action_hidden_identity_is_all_or_none_before_resolution(verb, capsys):
+    with patch("hopper.cli._resolve_lode") as resolve:
+        assert cmd_lode([verb, "abc12345", "--action-id", "a" * 32]) == 1
+
+    resolve.assert_not_called()
+    assert "must be provided together" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("verb", ["pause", "restart", "kill"])
+def test_routed_manual_action_without_identity_refuses_before_resolution(verb, monkeypatch, capsys):
+    monkeypatch.setenv("HOP_NO_ROUTE", "1")
+    with patch("hopper.cli._resolve_lode") as resolve:
+        assert cmd_lode([verb, "abc12345"]) == 1
+
+    resolve.assert_not_called()
+    assert "upgrade the calling hop CLI" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("verb", "extra"),
+    [("pause", []), ("restart", ["--force"]), ("kill", ["--force"])],
+)
+def test_remote_manual_action_forwards_existing_identity_without_regeneration(verb, extra):
+    lode = {
+        "id": "abc12345",
+        "host": "resident.example",
+        "active": False,
+        "stage": "mill",
+        "state": "running",
+        "run_generation": "c" * 32,
+    }
+    action_id = "a" * 32
+    expected_generation = "b" * 32
+    with (
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution(lode, "resident.example"),
+        ),
+        patch("hopper.cli.uuid.uuid4", side_effect=AssertionError("identity regenerated")),
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+    ):
+        assert (
+            cmd_lode(
+                [
+                    verb,
+                    "abc",
+                    *extra,
+                    "--action-id",
+                    action_id,
+                    "--expected-generation",
+                    expected_generation,
+                ]
+            )
+            == 0
+        )
+
+    remote_args = run_remote.call_args.args[1]
+    assert remote_args[:3] == ["lode", verb, "abc12345"]
+    assert "--action-id" in remote_args
+    assert remote_args[remote_args.index("--action-id") + 1] == action_id
+    assert remote_args[remote_args.index("--expected-generation") + 1] == expected_generation
+
+
+@pytest.mark.parametrize(
+    ("verb", "client_name", "disposition"),
+    [
+        ("pause", "pause_lode", "paused"),
+        ("restart", "restart_lode", "replacement_spawned"),
+        ("kill", "kill_lode", "killed_archived"),
+    ],
+)
+def test_remote_parser_preserves_forwarded_generation_over_fresh_snapshot(
+    verb, client_name, disposition, monkeypatch
+):
+    monkeypatch.setenv("HOP_NO_ROUTE", "1")
+    lode = {
+        "id": "abc12345",
+        "active": False,
+        "stage": "mill",
+        "state": "running",
+        "run_generation": "c" * 32,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            f"hopper.client.{client_name}",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "completed",
+                "disposition": disposition,
+            },
+        ) as operation,
+    ):
+        assert (
+            cmd_lode(
+                [
+                    verb,
+                    "abc12345",
+                    "--action-id",
+                    "a" * 32,
+                    "--expected-generation",
+                    "b" * 32,
+                ]
+            )
+            == 0
+        )
+
+    assert operation.call_args.kwargs["action_id"] == "a" * 32
+    assert operation.call_args.kwargs["expected_generation"] == "b" * 32
+
+
+def test_manual_action_help_hides_protocol_identity_options(capsys):
+    for verb in ("pause", "restart", "kill"):
+        assert cmd_lode([verb, "--help"]) == 0
+        output = capsys.readouterr().out
+        assert "--action-id" not in output
+        assert "--expected-generation" not in output
 
 
 def test_lode_watch_unavailable_at_start(capsys):
@@ -8630,35 +8879,27 @@ def _kill(lode_id, extra=None):
         "state": "running",
         "active": True,
         "branch": "hopper-test1234",
+        "run_generation": "a" * 32,
     }
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
-        patch("hopper.client.kill_lode", return_value=True) as mock_kill,
+        patch(
+            "hopper.client.kill_lode",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "completed",
+                "disposition": "killed_archived",
+            },
+        ) as mock_kill,
     ):
         rc = cmd_lode(["kill", lode_id, *(extra or [])])
     return rc, mock_kill
 
 
-def test_lode_kill_refuses_when_the_branch_has_unpushed_commits(lode_worktree, capsys):
+def test_lode_kill_submits_unpushed_safety_to_server(lode_worktree, capsys):
     _worktree, add_commits = lode_worktree
     add_commits(11)
-
-    rc, mock_kill = _kill("test1234")
-
-    assert rc == 1
-    mock_kill.assert_not_called()
-    err = capsys.readouterr().err
-    assert (
-        "Refusing to kill test1234: 11 commits on hopper-test1234 "
-        "exist only in this worktree." in err
-    )
-    assert "push:" in err
-    assert "hop lode kill test1234 --force" in err
-
-
-def test_lode_kill_allows_a_branch_whose_work_is_already_on_the_base(lode_worktree, capsys):
-    _worktree, _add_commits = lode_worktree
 
     rc, mock_kill = _kill("test1234")
 
@@ -8667,20 +8908,7 @@ def test_lode_kill_allows_a_branch_whose_work_is_already_on_the_base(lode_worktr
     assert "Killed lode test1234" in capsys.readouterr().out
 
 
-def test_lode_kill_allows_a_branch_that_was_pushed_but_not_merged(lode_worktree, capsys):
-    """Pushing the branch is the documented way to make a stalled lode safe."""
-    worktree, add_commits = lode_worktree
-    add_commits(4)
-    _git(worktree, "push", "-u", "origin", "hopper-test1234")
-
-    rc, mock_kill = _kill("test1234")
-
-    assert rc == 0
-    mock_kill.assert_called_once()
-    assert "Refusing to kill" not in capsys.readouterr().err
-
-
-def test_lode_kill_force_overrides_the_unpushed_guard(lode_worktree, capsys):
+def test_lode_kill_force_is_forwarded_as_durability_consent(lode_worktree, capsys):
     _worktree, add_commits = lode_worktree
     add_commits(2)
 
@@ -8688,29 +8916,8 @@ def test_lode_kill_force_overrides_the_unpushed_guard(lode_worktree, capsys):
 
     assert rc == 0
     mock_kill.assert_called_once()
-    assert "Refusing to kill" not in capsys.readouterr().err
-
-
-def test_lode_kill_refuses_when_the_count_cannot_be_proven(lode_worktree, capsys):
-    _worktree, add_commits = lode_worktree
-    add_commits(1)
-
-    with patch("hopper.git.unpushed_commits", return_value=(None, "a remote branch")):
-        rc, mock_kill = _kill("test1234")
-
-    assert rc == 1
-    mock_kill.assert_not_called()
-    assert "could not check hopper-test1234 for commits" in capsys.readouterr().err
-
-
-def test_lode_kill_singular_commit_reads_naturally(lode_worktree, capsys):
-    _worktree, add_commits = lode_worktree
-    add_commits(1)
-
-    rc, _mock_kill = _kill("test1234")
-
-    assert rc == 1
-    assert "1 commit on hopper-test1234 exists only in this worktree." in capsys.readouterr().err
+    assert mock_kill.call_args.kwargs["force"] is True
+    assert "Refusing to kill" not in capsys.readouterr().out
 
 
 # --- status surfaces that would have made the stall visible ------------------

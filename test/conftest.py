@@ -75,6 +75,8 @@ def make_lode():
             "last_pane_activity_at": None,
             "pane_title_observation": None,
             "backlog": None,
+            "pending_action": None,
+            "action_results": [],
             "runs": overrides.get("runs", {}),
             "claude": {
                 "mill": {"session_id": "00000000-0000-0000-0000-000000000001", "started": False},

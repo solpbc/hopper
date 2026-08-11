@@ -102,6 +102,7 @@ def test_lode_to_row_uses_progress_summary_when_active():
     [
         "spawn refused: tmux unreachable — verify tmux is running, then retry",
         "spawn failed: tmux could not create a runner pane — verify tmux is running, then retry",
+        "action refused: worktree durability could not be proven",
     ],
 )
 def test_lode_to_row_spawn_status_overrides_stale_progress(status):
@@ -161,20 +162,6 @@ def test_lode_to_row_refine_stage():
     }
     row = lode_to_row(session)
     assert row.stage == "refine"
-
-
-def test_lode_to_row_completed():
-    """Completed session shows running indicator (transient state)."""
-    session = {
-        "id": "abcd1234",
-        "stage": "mill",
-        "created_at": 1000,
-        "updated_at": 1000,
-        "state": "completed",
-        "active": True,
-    }
-    row = lode_to_row(session)
-    assert row.status == STATUS_RUNNING
 
 
 def test_lode_to_row_ready():
@@ -941,8 +928,10 @@ async def test_archive_with_delete(temp_config):
     async with app.run_test() as pilot:
         await pilot.press("delete")
         assert len(server.events) == 1
-        assert server.events[0]["type"] == "lode_archive"
+        assert server.events[0]["type"] == "lode_action"
         assert server.events[0]["lode_id"] == "aaaa1111"
+        assert server.events[0]["action_type"] == "archive"
+        assert server.events[0]["target_disposition"] == "archived"
 
 
 @pytest.mark.asyncio
@@ -2162,7 +2151,7 @@ async def test_queue_backlog_clear():
 
 @pytest.mark.asyncio
 async def test_delete_archives_on_session_table():
-    """Delete key should enqueue lode_archive when session table is focused."""
+    """Delete key should enqueue a durable archive action from the lode table."""
     from hopper.backlog import BacklogItem
 
     items = [
@@ -2177,7 +2166,10 @@ async def test_delete_archives_on_session_table():
         # Focus is on session table by default
         # Press Delete - should enqueue archive and leave backlog unchanged
         await pilot.press("delete")
-        assert server.events == [{"type": "lode_archive", "lode_id": "aaaa1111"}]
+        assert len(server.events) == 1
+        assert server.events[0]["type"] == "lode_action"
+        assert server.events[0]["lode_id"] == "aaaa1111"
+        assert server.events[0]["action_type"] == "archive"
         assert len(app._backlog) == 1
 
 
@@ -2199,7 +2191,43 @@ def test_action_delete_archives_lode():
     ):
         app.action_delete()
     assert len(server.events) == 1
-    assert server.events[0] == {"type": "lode_archive", "lode_id": "aaaa1111"}
+    assert server.events[0]["type"] == "lode_action"
+    assert server.events[0]["lode_id"] == "aaaa1111"
+    assert server.events[0]["action_type"] == "archive"
+    assert server.events[0]["force_consent"] is False
+
+
+def test_action_reload_enqueues_identity_bound_restart():
+    """Reload uses the same durable action path as the CLI restart verb."""
+    from hopper.tui import LodeTable
+
+    sessions = [
+        {
+            "id": "aaaa1111",
+            "stage": "refine",
+            "state": "gated",
+            "active": False,
+            "created_at": 1000,
+            "run_generation": "b" * 32,
+        }
+    ]
+    server = MockServer(sessions)
+    app = HopperApp(server=server)
+
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
+        patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
+    ):
+        app.action_reload()
+
+    assert len(server.events) == 1
+    event = server.events[0]
+    assert event["type"] == "lode_action"
+    assert event["lode_id"] == "aaaa1111"
+    assert event["expected_generation"] == "b" * 32
+    assert event["action_type"] == "restart"
+    assert event["target_disposition"] == "replacement_spawned"
+    assert event["force_consent"] is False
 
 
 def test_action_delete_shows_modal_for_unmerged_changes():
@@ -2249,7 +2277,9 @@ def test_action_delete_archives_immediately_without_worktree():
     ):
         app.action_delete()
 
-    assert server.events == [{"type": "lode_archive", "lode_id": "aaaa1111"}]
+    assert len(server.events) == 1
+    assert server.events[0]["type"] == "lode_action"
+    assert server.events[0]["action_type"] == "archive"
     mock_push.assert_not_called()
 
 
@@ -2274,7 +2304,9 @@ def test_action_delete_archives_immediately_with_empty_diff():
     ):
         app.action_delete()
 
-    assert server.events == [{"type": "lode_archive", "lode_id": "aaaa1111"}]
+    assert len(server.events) == 1
+    assert server.events[0]["type"] == "lode_action"
+    assert server.events[0]["action_type"] == "archive"
     mock_push.assert_not_called()
 
 

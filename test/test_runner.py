@@ -3,17 +3,16 @@
 
 """Tests for the base runner module."""
 
+import ast
+import inspect
 import signal
 import subprocess
-import threading
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
-import pytest
-
+import hopper.runner as runner_module
 from hopper.lodes import current_time_ms, format_park_status
 from hopper.runner import (
-    DISMISS_DEADLINE_MS,
     BaseRunner,
     _descendant_pids,
     _parse_ps_time,
@@ -462,7 +461,6 @@ class TestBaseRunnerActivityMonitor:
 
         with (
             patch("hopper.runner.capture_pane", return_value=snapshot),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.current_time_ms", return_value=100_000),
@@ -592,7 +590,6 @@ class TestBaseRunnerActivityMonitor:
                         }
                     },
                 ),
-                patch("hopper.runner.send_keys"),
                 patch("hopper.runner.get_current_pane_id", return_value="%test"),
                 patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             ):
@@ -665,7 +662,6 @@ class TestBaseRunnerActivityMonitor:
                 "hopper.runner.connect",
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -747,7 +743,6 @@ class TestBaseRunnerActivityMonitor:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", side_effect=[1000, 2000]),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -784,7 +779,6 @@ class TestBaseRunnerActivityMonitor:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=1000),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -814,7 +808,6 @@ class TestBaseRunnerActivityMonitor:
                 return_value={"lode": {"last_progress_at": None, "last_progress_summary": None}},
             ),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=2000),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -885,7 +878,6 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.connect", side_effect=heartbeat),
             patch("hopper.runner._sum_descendant_cpu_ms", return_value=0) as mock_cpu,
             patch.object(runner, "_park_idle") as mock_fail,
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -1001,7 +993,6 @@ class TestBaseRunnerActivityMonitor:
 
         with (
             patch("hopper.runner.capture_pane", return_value=None),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.connect", return_value=None),
@@ -1019,7 +1010,6 @@ class TestBaseRunnerActivityMonitor:
 
         with (
             patch("hopper.runner.capture_pane", return_value="unused"),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -1068,29 +1058,6 @@ class TestBaseRunnerActivityMonitor:
         runner = self._make_runner()
         runner._stop_monitor()  # Should not raise
 
-    def test_check_activity_skips_when_done(self):
-        """Monitor skips stuck detection once done event is set."""
-        runner = self._make_runner()
-        runner._pane_id = "%1"
-        runner._last_snapshot = "Hello World"
-        runner._done.set()
-
-        emitted = []
-        mock_conn = MagicMock()
-        mock_conn.emit = lambda msg_type, **kw: emitted.append((msg_type, kw)) or True
-        runner.connection = mock_conn
-
-        with (
-            patch("hopper.runner.capture_pane", return_value="Hello World"),
-            patch("hopper.runner.send_keys"),
-            patch("hopper.runner.get_current_pane_id", return_value="%test"),
-            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-            patch("hopper.runner.connect", return_value=None),
-        ):
-            runner._check_activity()
-
-        assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
-
     def test_check_activity_while_gated_emits_running_on_pane_change(self):
         """Once armed against the settled pane, a pane change resumes the gate."""
         runner = self._make_runner()
@@ -1131,7 +1098,6 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.capture_pane", return_value="Gate set. Review saved."),
             patch("hopper.runner.current_time_ms", return_value=12345),
             patch.object(runner, "_emit_state", return_value=True) as mock_emit,
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -1191,7 +1157,6 @@ class TestBaseRunnerActivityMonitor:
             patch("hopper.runner.connect", return_value=None),
             patch.object(runner, "_emit_state", return_value=True),
             patch.object(runner, "_park_idle") as mock_park,
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
         ):
@@ -1214,7 +1179,6 @@ class TestBaseRunnerActivityMonitor:
                 "hopper.runner.capture_pane",
                 side_effect=[None, None, None, "recovered"],
             ),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.connect", return_value=None),
@@ -1240,7 +1204,6 @@ class TestBaseRunnerActivityMonitor:
 
         with (
             patch("hopper.runner.capture_pane", side_effect=[None, "unchanged"]),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
@@ -1270,7 +1233,6 @@ class TestBaseRunnerActivityMonitor:
 
         with (
             patch("hopper.runner.capture_pane", side_effect=captures),
-            patch("hopper.runner.send_keys"),
             patch("hopper.runner.get_current_pane_id", return_value="%test"),
             patch("hopper.runner.MONITOR_INTERVAL", 0.001),
             patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
@@ -1297,30 +1259,24 @@ class TestBaseRunnerActivityMonitor:
 class TestBaseRunnerServerMessages:
     """Tests for BaseRunner server message handling."""
 
-    def test_on_server_message_sets_done(self):
-        """The retained follow-up hook still recognizes its legacy signal."""
+    def test_on_server_message_ignores_completed_state(self):
+        """Completion cannot trigger a runner-owned terminal lifecycle."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-
-        msg = {
-            "type": "lode_updated",
-            "lode": {"id": "test-session", "state": "completed"},
-        }
-        runner._on_server_message(msg)
-
-        assert runner._done.is_set()
-
-    def test_on_server_message_teardown_does_not_start_runner_dismissal(self):
-        """The server owns exact pane closure after accepted completion."""
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+        runner._gate_epoch = 7
 
         runner._on_server_message(
             {
                 "type": "lode_updated",
-                "lode": {"id": "test-session", "state": "teardown"},
+                "lode": {
+                    "id": "test-session",
+                    "state": "completed",
+                    "gate_epoch": 7,
+                },
             }
         )
 
-        assert not runner._done.is_set()
+        assert not runner._gated.is_set()
+        assert runner._gate_epoch == 7
 
     def test_on_server_message_records_gate_epoch(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
@@ -1381,7 +1337,7 @@ class TestBaseRunnerServerMessages:
         }
         runner._on_server_message(msg)
 
-        assert not runner._done.is_set()
+        assert not runner._gated.is_set()
 
     def test_on_server_message_sets_gated(self):
         """Callback sets _gated when gated state received."""
@@ -1394,7 +1350,6 @@ class TestBaseRunnerServerMessages:
         runner._on_server_message(msg)
 
         assert runner._gated.is_set()
-        assert not runner._done.is_set()
 
     def test_on_server_message_running_clears_gated(self):
         """Callback clears _gated when running state received."""
@@ -1408,7 +1363,6 @@ class TestBaseRunnerServerMessages:
         runner._on_server_message(msg)
 
         assert not runner._gated.is_set()
-        assert not runner._done.is_set()
 
     def test_on_server_message_ignores_other_states(self):
         """Callback ignores states unrelated to gate control."""
@@ -1420,7 +1374,6 @@ class TestBaseRunnerServerMessages:
         }
         runner._on_server_message(msg)
 
-        assert not runner._done.is_set()
         assert not runner._gated.is_set()
 
     def test_on_server_message_ignores_other_message_types(self):
@@ -1433,538 +1386,30 @@ class TestBaseRunnerServerMessages:
         }
         runner._on_server_message(msg)
 
-        assert not runner._done.is_set()
-
-
-class TestBaseRunnerDismiss:
-    """Tests for BaseRunner auto-dismiss behavior."""
-
-    @pytest.fixture(autouse=True)
-    def isolate_tmux(self):
-        with (
-            patch("hopper.runner.capture_pane", return_value="stable"),
-            patch("hopper.runner.send_keys", return_value=True),
-            patch("hopper.runner.get_current_pane_id", return_value="%test"),
-            patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-        ):
-            yield
-
-    def test_wait_and_dismiss_sends_ctrl_c(self):
-        """Dismiss thread sends two Ctrl-C keystrokes after screen stabilizes."""
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._done.set()
-
-        send_keys_calls = []
-
-        def on_send_keys(w, k):
-            send_keys_calls.append((w, k))
-            # Simulate process exit after the initial Ctrl-C pair.
-            if len(send_keys_calls) == 2:
-                runner._monitor_stop.set()
-            return True
-
-        snapshots = iter(["content A", "content A"])
-        with (
-            patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
-            patch("hopper.runner.send_keys", side_effect=on_send_keys),
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert send_keys_calls == [("%1", "C-c"), ("%1", "C-c")]
-
-    def test_resumed_stage_sends_no_keys_until_completed_broadcast(self):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner.is_first_run = False
-        proc = MagicMock(returncode=0, stderr=None)
-        dismissed = threading.Event()
-
-        def send_key(*_args):
-            if send.call_count == 2:
-                runner._monitor_stop.set()
-                dismissed.set()
-            return True
-
-        def wait_for_process():
-            send.assert_not_called()
-            runner._on_server_message(
-                {
-                    "type": "lode_updated",
-                    "lode": {"id": "test-session", "state": "completed"},
-                }
-            )
-            assert dismissed.wait(timeout=1)
-
-        proc.wait.side_effect = wait_for_process
-        with (
-            patch.object(runner, "_build_command", return_value=(["claude"], None)),
-            patch("hopper.runner.subprocess.Popen", return_value=proc),
-            patch.object(runner, "_emit_state"),
-            patch.object(
-                runner, "_start_monitor", side_effect=lambda: setattr(runner, "_pane_id", "%1")
-            ),
-            patch("hopper.runner.capture_pane", return_value="stable"),
-            patch("hopper.runner.send_keys", side_effect=send_key) as send,
-        ):
-            assert runner._run_claude() == (0, None)
-
-        assert [call.args[1] for call in send.call_args_list] == ["C-c", "C-c"]
-
-    def test_wait_and_dismiss_no_longer_exits_on_gate(self):
-        """Dismiss loop still waits for completion even when gated."""
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._gated.set()
-
-        wait_calls = []
-
-        def on_wait(timeout):
-            wait_calls.append(timeout)
-            raise RuntimeError("waited")
-
-        try:
-            with (
-                patch.object(runner._done, "wait", side_effect=on_wait),
-                patch("hopper.runner.capture_pane") as mock_capture,
-                patch("hopper.runner.send_keys") as mock_send_keys,
-            ):
-                runner._wait_and_dismiss_claude()
-        except RuntimeError as exc:
-            assert str(exc) == "waited"
-        else:
-            raise AssertionError("Expected wait to be called")
-
-        assert wait_calls == [1.0]
-        mock_capture.assert_not_called()
-        mock_send_keys.assert_not_called()
-
-    def test_wait_and_dismiss_retries_when_process_survives(self):
-        """Every retry re-sends the Ctrl-C pair; Ctrl-D exits Claude from no state."""
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._done.set()
-
-        send_keys_calls = []
-
-        # First attempt: stable screen, Ctrl-C sent but process survives
-        # Screen changes (Claude still outputting), then stabilizes again
-        # Second attempt: Ctrl-D sent, process exits
-        snapshots = iter(
-            [
-                "prompt v1",
-                "prompt v1",  # first stability → Ctrl-C
-                "new output",  # screen changed, not stable
-                "prompt v2",
-                "prompt v2",  # second stability → another Ctrl-C pair
-            ]
-        )
-
-        def on_send_keys(w, k):
-            send_keys_calls.append((w, k))
-            if len(send_keys_calls) == 4:
-                runner._monitor_stop.set()
-            return True
-
-        with (
-            patch("hopper.runner.capture_pane", side_effect=lambda _: next(snapshots)),
-            patch("hopper.runner.send_keys", side_effect=on_send_keys),
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert send_keys_calls == [
-            ("%1", "C-c"),
-            ("%1", "C-c"),
-            ("%1", "C-c"),
-            ("%1", "C-c"),
-        ]
-
-    def test_dismiss_never_sends_ctrl_d(self):
-        """Ctrl-D is inert against Claude Code, so it must never be a retry step.
-
-        Measured against a live pane: Ctrl-D exits from no state -- not an idle
-        prompt, not a composer holding unsubmitted text, not the exit
-        confirmation a Ctrl-C raises while a tool call is running. Sending it
-        instead of the Ctrl-C pair on attempt 2+ is what turned one mistimed
-        dismissal into a permanently stalled stage.
-        """
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._done.set()
-        sends = []
-
-        def on_send_keys(_w, k):
-            sends.append(k)
-            if len(sends) >= 12:
-                runner._monitor_stop.set()
-            return True
-
-        with (
-            patch("hopper.runner.capture_pane", return_value="stable"),
-            patch("hopper.runner.send_keys", side_effect=on_send_keys),
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert sends, "dismiss sent nothing at all"
-        assert "C-d" not in sends
-        assert set(sends) == {"C-c"}
-        assert len(sends) % 2 == 0, "Ctrl-C must always be sent as a pair"
-
-    def test_wait_and_dismiss_acts_after_capture_failure_limit(self):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._done.set()
-
-        def stop_after_pair(*_args):
-            if send.call_count == 2:
-                runner._monitor_stop.set()
-            return True
-
-        with (
-            patch("hopper.runner.capture_pane", return_value=None) as capture,
-            patch("hopper.runner.send_keys", side_effect=stop_after_pair) as send,
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert capture.call_count == 3
-        assert [call.args[1] for call in send.call_args_list] == ["C-c", "C-c"]
-
-    def test_wait_and_dismiss_acts_when_stabilization_bound_expires(self):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._done.set()
-
-        def stop_after_pair(*_args):
-            if send.call_count == 2:
-                runner._monitor_stop.set()
-            return True
-
-        with (
-            patch("hopper.runner.DISMISS_STABILIZATION_TIMEOUT_SEC", 0),
-            patch("hopper.runner.send_keys", side_effect=stop_after_pair) as send,
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert [call.args[1] for call in send.call_args_list] == ["C-c", "C-c"]
-
-    def test_wait_and_dismiss_aborts_when_monitor_stops(self):
-        """Dismiss thread aborts if monitor stop is set."""
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._monitor_stop.set()
-
-        send_keys_calls = []
-        with patch(
-            "hopper.runner.send_keys",
-            side_effect=lambda w, k: send_keys_calls.append((w, k)),
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert send_keys_calls == []
-
-    def test_wait_and_dismiss_aborts_without_pane(self):
-        """Dismiss thread aborts if no pane ID."""
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = None
-        runner._done.set()
-
-        send_keys_calls = []
-        with patch(
-            "hopper.runner.send_keys",
-            side_effect=lambda w, k: send_keys_calls.append((w, k)),
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert send_keys_calls == []
-
-    def test_wait_and_dismiss_pauses_while_parked_then_resumes(self):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._done.set()
-        runner._done_at_ms = 1_000
-        runner._dismiss_deadline_parked = True
-        runner._dismiss_attempt = 1
-        now = [2_000]
-        wait_calls = []
-
-        def on_wait(timeout):
-            wait_calls.append(timeout)
-            if len(wait_calls) > 3:
-                raise AssertionError("dismiss worker did not resume after completion re-arm")
-            if len(wait_calls) == 1:
-                send.assert_not_called()
-                runner._on_server_message(
-                    {
-                        "type": "lode_updated",
-                        "lode": {"id": "test-session", "state": "completed"},
-                    }
-                )
-            return False
-
-        def on_send_keys(*_args):
-            runner._monitor_stop.set()
-            return True
-
-        with (
-            patch.object(runner._monitor_stop, "wait", side_effect=on_wait),
-            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
-            patch("hopper.runner.time.monotonic", return_value=0),
-            patch("hopper.runner.send_keys", side_effect=on_send_keys) as send,
-        ):
-            runner._wait_and_dismiss_claude()
-
-        assert wait_calls[0] == 1.0
-        assert runner._done_at_ms == 2_000
-        assert not runner._dismiss_deadline_parked
-        assert [entry.args[1] for entry in send.call_args_list] == ["C-c", "C-c"]
-
-    def test_wait_and_dismiss_restarts_stabilization_after_rearm(self):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._dismiss_attempt = 1
-        now = [1_000]
-        wait_calls = []
-        capture_calls = [0]
-        sends = []
-        message = {
-            "type": "lode_updated",
-            "lode": {"id": "test-session", "state": "completed"},
-        }
-
-        def on_wait(_timeout):
-            wait_calls.append(_timeout)
-            if len(wait_calls) > 4:
-                raise AssertionError("dismiss worker did not finish fresh stabilization")
-            return False
-
-        def on_capture(_pane_id):
-            capture_calls[0] += 1
-            if capture_calls[0] == 2:
-                now[0] = 1_000 + DISMISS_DEADLINE_MS
-                runner._check_activity()
-                assert runner._dismiss_deadline_parked
-                now[0] = 400_000
-                runner._on_server_message(message)
-                assert not runner._dismiss_deadline_parked
-            return "stable"
-
-        def on_send_keys(_pane_id, key):
-            sends.append((capture_calls[0], key))
-            runner._monitor_stop.set()
-            return True
-
-        with (
-            patch.object(runner._monitor_stop, "wait", side_effect=on_wait),
-            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
-            patch("hopper.runner.time.monotonic", return_value=0),
-            patch.object(runner, "_park_idle") as park,
-            patch("hopper.runner.capture_pane", side_effect=on_capture),
-            patch("hopper.runner.send_keys", side_effect=on_send_keys),
-        ):
-            runner._on_server_message(message)
-            runner._wait_and_dismiss_claude()
-
-        park.assert_called_once_with(
-            "completion was signalled, but the agent did not exit within 5 min"
-        )
-        assert sends == [(4, "C-c"), (4, "C-c")]
-
-    def test_parked_completion_ignores_pane_changes_without_rearming(self):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._last_snapshot = "before park"
-        now = [1_000]
-
-        with (
-            patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
-            patch("hopper.runner.capture_pane", return_value="operator changed pane") as capture,
-            patch.object(runner, "_park_idle") as park,
-        ):
-            runner._on_server_message(
-                {
-                    "type": "lode_updated",
-                    "lode": {"id": "test-session", "state": "completed"},
-                }
-            )
-            now[0] += DISMISS_DEADLINE_MS
-            runner._check_activity()
-
-            done_at_ms = runner._done_at_ms
-            now[0] += DISMISS_DEADLINE_MS
-            runner._check_activity()
-
-        assert runner._dismiss_deadline_parked
-        assert runner._done_at_ms == done_at_ms
-        park.assert_called_once_with(
-            "completion was signalled, but the agent did not exit within 5 min"
-        )
-        capture.assert_not_called()
-
-
-def test_completion_deadline_latch_preserves_done_and_allows_advance():
-    runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-    runner._pane_id = "%1"
-    runner._done.set()
-    runner._done_at_ms = 1_000
-    runner._next_stage = "refine"
-    runner._registration_complete.set()
-    runner._registration_accepted = True
-
-    with (
-        patch("hopper.runner.capture_pane", return_value="stable"),
-        patch("hopper.runner.send_keys"),
-        patch("hopper.runner.get_current_pane_id", return_value="%test"),
-        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-        patch("hopper.runner.current_time_ms", return_value=301_000),
-        patch.object(runner, "_park_idle") as park,
-    ):
-        runner._check_activity()
-        runner._check_activity()
-
-    assert runner._dismiss_deadline_parked
-    assert runner._done.is_set()
-    park.assert_called_once_with(
-        "completion was signalled, but the agent did not exit within 5 min"
-    )
-
-    lode = {"active": False, "claude": {"": {}}, "project": ""}
-    connection = MagicMock()
-    with (
-        patch("hopper.runner.capture_pane", return_value="stable"),
-        patch("hopper.runner.send_keys"),
-        patch("hopper.runner.get_current_pane_id", return_value="%test"),
-        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-        patch("hopper.runner.signal.signal", return_value=signal.SIG_DFL),
-        patch("hopper.runner.reap_swiftpm_testing_helpers"),
-        patch("hopper.runner.connect", return_value={"lode": lode}),
-        patch("hopper.runner.HopperConnection", return_value=connection),
-        patch.object(runner, "_setup", return_value=None),
-        patch.object(runner, "_run_claude", return_value=(0, None)),
-        patch.object(runner, "_emit_state", return_value=True) as emit_state,
-        patch.object(runner, "_emit_stage") as emit_stage,
-        patch.object(runner, "_stop_monitor"),
-        patch.object(runner, "_terminate_claude_process"),
-    ):
-        assert runner.run() == 0
-
-    emit_state.assert_called_once_with("ready", "Done")
-    emit_stage.assert_called_once_with("refine")
-
-
-def test_completion_deadline_rearms_and_allows_advance():
-    now = [1_000]
-    message = {
-        "type": "lode_updated",
-        "lode": {"id": "test-session", "state": "completed"},
-    }
-
-    with (
-        patch("hopper.runner.capture_pane", return_value="stable"),
-        patch("hopper.runner.send_keys"),
-        patch("hopper.runner.get_current_pane_id", return_value="%test"),
-        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-        patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
-    ):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._pane_id = "%1"
-        runner._next_stage = "refine"
-        runner._registration_complete.set()
-        runner._registration_accepted = True
-
-        with patch.object(runner, "_park_idle") as park:
-            runner._on_server_message(message)
-            assert runner._done.is_set()
-            assert runner._done_at_ms == 1_000
-
-            now[0] = 2_000
-            runner._on_server_message(message)
-            assert runner._done_at_ms == 1_000
-
-            now[0] = 1_000 + DISMISS_DEADLINE_MS
-            runner._check_activity()
-            assert runner._dismiss_deadline_parked
-            park.assert_called_once()
-
-            second_signal_ms = 400_000
-            now[0] = second_signal_ms
-            runner._on_server_message(message)
-            assert runner._done.is_set()
-            assert runner._done_at_ms == second_signal_ms
-            assert not runner._dismiss_deadline_parked
-
-            runner._check_activity()
-            now[0] = second_signal_ms + DISMISS_DEADLINE_MS - 1
-            runner._check_activity()
-            park.assert_called_once()
-
-            now[0] = second_signal_ms + DISMISS_DEADLINE_MS
-            runner._check_activity()
-            assert runner._done.is_set()
-            assert runner._dismiss_deadline_parked
-            assert park.call_count == 2
-
-            lode = {"active": False, "claude": {"": {}}, "project": ""}
-            connection = MagicMock()
-            with (
-                patch("hopper.runner.signal.signal", return_value=signal.SIG_DFL),
-                patch("hopper.runner.reap_swiftpm_testing_helpers"),
-                patch("hopper.runner.connect", return_value={"lode": lode}),
-                patch("hopper.runner.HopperConnection", return_value=connection),
-                patch.object(runner, "_setup", return_value=None),
-                patch.object(runner, "_run_claude", return_value=(0, None)),
-                patch.object(runner, "_emit_state", return_value=True) as emit_state,
-                patch.object(runner, "_emit_stage") as emit_stage,
-                patch.object(runner, "_stop_monitor"),
-                patch.object(runner, "_terminate_claude_process"),
-            ):
-                assert runner.run() == 0
-
-        assert runner._done.is_set()
-        emit_state.assert_called_once_with("ready", "Done")
-        emit_stage.assert_called_once_with("refine")
-
-
-def test_healthy_completion_advances_without_park_stuck_or_gated():
-    now = [1_000]
-
-    with (
-        patch("hopper.runner.capture_pane", return_value="stable"),
-        patch("hopper.runner.send_keys"),
-        patch("hopper.runner.get_current_pane_id", return_value="%test"),
-        patch("hopper.runner.MONITOR_INTERVAL", 0.001),
-        patch("hopper.runner.current_time_ms", side_effect=lambda: now[0]),
-    ):
-        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
-        runner._next_stage = "refine"
-        runner._registration_complete.set()
-        runner._registration_accepted = True
-        runner._on_server_message(
-            {
-                "type": "lode_updated",
-                "lode": {"id": "test-session", "state": "completed"},
-            }
-        )
-
-        lode = {"active": False, "claude": {"": {}}, "project": ""}
-        connection = MagicMock()
-        with (
-            patch("hopper.runner.signal.signal", return_value=signal.SIG_DFL),
-            patch("hopper.runner.reap_swiftpm_testing_helpers"),
-            patch("hopper.runner.connect", return_value={"lode": lode}),
-            patch("hopper.runner.HopperConnection", return_value=connection),
-            patch.object(runner, "_setup", return_value=None),
-            patch.object(runner, "_run_claude", return_value=(0, None)),
-            patch.object(runner, "_emit_state", return_value=True) as emit_state,
-            patch.object(runner, "_emit_stage") as emit_stage,
-            patch.object(runner, "_park_idle") as park,
-            patch.object(runner, "_stop_monitor"),
-            patch.object(runner, "_terminate_claude_process"),
-        ):
-            assert runner.run() == 0
-
-    states = [entry.args[0] for entry in emit_state.call_args_list]
-    assert states == ["ready"]
-    assert "stuck" not in states
-    assert "gated" not in states
-    emit_state.assert_called_once_with("ready", "Done")
-    emit_stage.assert_called_once_with("refine")
-    park.assert_not_called()
+        assert not runner._gated.is_set()
+
+
+def test_runner_has_no_completion_owned_terminal_or_stage_path():
+    """Only activity capture remains; no runner code dismisses or advances a stage."""
+    source = inspect.getsource(runner_module)
+    tree = ast.parse(source)
+    capture_callers = set()
+    send_key_callers = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for call_node in ast.walk(node):
+            if not isinstance(call_node, ast.Call):
+                continue
+            called = call_node.func
+            name = called.id if isinstance(called, ast.Name) else None
+            if name == "capture_pane":
+                capture_callers.add(node.name)
+            elif name == "send_keys":
+                send_key_callers.add(node.name)
+
+    assert capture_callers == {"_capture_activity_pane"}
+    assert send_key_callers == set()
+    assert "_wait_and_dismiss_claude" not in source
+    assert "_emit_stage" not in source

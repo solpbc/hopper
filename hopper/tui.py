@@ -6,6 +6,7 @@
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from hopper.backlog import BacklogItem
 from hopper.claude import switch_to_pane
 from hopper.git import get_diff_stat
 from hopper.lodes import (
+    REFUSAL_STATUS_PREFIXES,
     STATUS_DISCONNECTED,
     STATUS_ERROR,
     STATUS_GATED,
@@ -119,11 +121,11 @@ def lode_to_row(lode: dict) -> Row:
     stage = lode.get("stage", "mill")
     status_text = lode.get("status", "")
     progress_text = lode.get("last_progress_summary", "")
-    spawn_status = status_text.startswith(("spawn refused: ", "spawn failed: "))
+    refusal_status = status_text.startswith(REFUSAL_STATUS_PREFIXES)
     if (
         lode.get("active")
         and progress_text
-        and not spawn_status
+        and not refusal_status
         and lode.get("state") != "teardown"
     ):
         status_text = progress_text
@@ -2082,7 +2084,7 @@ class HopperApp(App):
                     # Has unmerged changes - show confirmation modal
                     def on_confirm(result: bool | None) -> None:
                         if result and self.server:
-                            self.server.enqueue({"type": "lode_archive", "lode_id": lode_id})
+                            self._enqueue_manual_action(lode, "archive")
 
                     self.push_screen(
                         ArchiveConfirmScreen(diff_stat=diff_stat, branch=branch),
@@ -2091,7 +2093,7 @@ class HopperApp(App):
                     return
             # No worktree or no changes - archive immediately
             if self.server:
-                self.server.enqueue({"type": "lode_archive", "lode_id": lode_id})
+                self._enqueue_manual_action(lode, "archive")
         elif isinstance(self.focused, BacklogTable):
             item_id = self._get_selected_backlog_id()
             if not item_id:
@@ -2133,15 +2135,43 @@ class HopperApp(App):
             return
 
         if self.server:
-            self.server.enqueue(
-                {
-                    "type": "lode_reset_claude_stage",
-                    "lode_id": lode["id"],
-                    "claude_stage": stage,
-                    "spawn": True,
-                }
+            self._enqueue_manual_action(lode, "restart")
+
+    def _enqueue_manual_action(self, lode: dict, action_type: str) -> None:
+        """Submit a TUI action through the shared durable identity boundary."""
+        if self.server is None:
+            return
+        pending = lode.get("pending_action")
+        reuse = bool(
+            isinstance(pending, dict)
+            and (
+                pending.get("action_type") == action_type
+                or (action_type == "restart" and pending.get("action_type") == "completion")
             )
-        self.notify(f"Reloading {stage}...")
+        )
+        bound_type = pending["action_type"] if reuse else action_type
+        target = (
+            pending.get("target_disposition")
+            if reuse
+            else {
+                "archive": "archived",
+                "restart": "replacement_spawned",
+            }[action_type]
+        )
+        self.server.enqueue(
+            {
+                "type": "lode_action",
+                "action_id": pending["action_id"] if reuse else uuid.uuid4().hex,
+                "lode_id": lode["id"],
+                "expected_generation": (
+                    pending.get("expected_generation") if reuse else lode.get("run_generation")
+                ),
+                "action_type": bound_type,
+                "target_disposition": target,
+                "force_consent": False,
+                "stage": lode.get("stage"),
+            }
+        )
 
     def action_legend(self) -> None:
         """Show the symbol legend modal."""

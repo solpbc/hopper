@@ -22,7 +22,6 @@ from hopper.tmux import (
     get_current_pane_id,
     pane_needs_answer,
     rename_window,
-    send_keys,
 )
 from hopper.workspace_trust import WorkspaceTrustError, trust_claude_workspace
 
@@ -34,10 +33,7 @@ MONITOR_INTERVAL_MS = 5000
 IDLE_THRESHOLD_MS = 50_000
 STUCK_PARK_THRESHOLD_MS = 5 * 60_000
 ABSOLUTE_CAP_MS = 60 * 60_000
-DISMISS_STABILIZATION_TIMEOUT_SEC = 30.0
 PANE_CAPTURE_FAILURE_LIMIT = 3
-DISMISS_DEADLINE_MS = 5 * 60_000
-DISMISS_DEADLINE_MIN = DISMISS_DEADLINE_MS // 60_000
 PANE_ACTIVITY_EMIT_INTERVAL_MS = 30_000
 DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
@@ -208,8 +204,7 @@ class BaseRunner:
     """Base class for lode runners.
 
     Provides the full run lifecycle: signal handling, server communication,
-    subprocess management, activity monitoring, completion detection, and
-    auto-dismiss.
+    subprocess management and activity monitoring.
 
     Subclasses configure behavior via class attributes and implement:
     - _setup(): Pre-flight validation and setup. Return int to bail.
@@ -217,10 +212,7 @@ class BaseRunner:
     """
 
     # Subclasses set these to customize behavior
-    _done_label: str = "done"
     _claude_stage: str = ""  # Key into lode["claude"] dict ("mill", "refine", "ship")
-    _done_status: str = "Done"
-    _next_stage: str = ""
 
     def __init__(
         self,
@@ -259,14 +251,6 @@ class BaseRunner:
         self._activity_capture_disabled = False
         self._pane_id: str | None = None
         self._claude_proc: subprocess.Popen | None = None
-        # Completion tracking
-        self._done = threading.Event()
-        # _done_lock guards the timestamp/latch pair. Completion signalled while
-        # parked re-bases the timestamp and clears the latch to re-arm the deadline.
-        self._done_lock = threading.Lock()
-        self._done_at_ms: int | None = None
-        self._dismiss_deadline_parked = False
-        self._dismiss_attempt = 0
         self._gated = threading.Event()
         # Gate resume detector: the pane as it settled *after* the gate opened,
         # and whether we have seen it hold still long enough to trust a change.
@@ -373,12 +357,6 @@ class BaseRunner:
                     print(f"Error [{self.lode_id}]: {msg}")
                     emitted = self._emit_state("error", msg)
                     return 0 if emitted else 1
-                elif exit_code == 0 and self._done.is_set():
-                    logger.info(f"stage transition lode={self.lode_id}")
-                    self._emit_state("ready", self._done_status)
-                    if self._next_stage:
-                        self._emit_stage(self._next_stage)
-
                 return exit_code
             except Exception as exc:
                 print(f"Error [{self.lode_id}]: {exc}")
@@ -465,15 +443,6 @@ class BaseRunner:
             self._emit_state("running", "Claude running")
             self._start_monitor()
 
-            if self._pane_id:
-                # Retained with _wait_and_dismiss_claude for the sequential
-                # completion-dismissal follow-up.
-                threading.Thread(
-                    target=self._wait_and_dismiss_claude,
-                    name=f"{self._done_label.lower().replace(' ', '-')}-dismiss",
-                    daemon=True,
-                ).start()
-
             proc.wait()
 
             if proc.returncode != 0 and proc.stderr:
@@ -532,16 +501,6 @@ class BaseRunner:
             return emitted
         return False
 
-    def _emit_stage(self, stage: str) -> None:
-        """Emit stage change to server via persistent connection."""
-        if self.connection:
-            self.connection.emit(
-                "lode_set_stage",
-                lode_id=self.lode_id,
-                stage=stage,
-            )
-            logger.debug(f"Emitted stage: {stage}")
-
     def _emit_claude_started(self) -> None:
         """Mark this stage's Claude session as started on the server."""
         if self.connection:
@@ -576,20 +535,7 @@ class BaseRunner:
                 and observed_branch == self._expected_lode_branch
             ):
                 self._branch_persisted.set()
-        if lode.get("state") == "completed":
-            now = current_time_ms()
-            with self._done_lock:
-                if not self._done.is_set():
-                    self._done_at_ms = now
-                    self._done.set()
-                elif self._dismiss_deadline_parked:
-                    # Completion signalled a second time while parked proves the agent
-                    # resumed and reached a fresh terminal point. Pane activity alone
-                    # cannot distinguish resumed work from incidental terminal output.
-                    self._done_at_ms = now
-                    self._dismiss_deadline_parked = False
-            logger.debug(f"{self._done_label} signal received lode={self.lode_id}")
-        elif lode.get("state") == "gated":
+        if lode.get("state") == "gated":
             self._open_gate()
             logger.debug(f"gate signal received lode={self.lode_id}")
         elif lode.get("state") == "running":
@@ -597,98 +543,6 @@ class BaseRunner:
         # Adopt the epoch only after state handling disarms the gate detector. Until then,
         # an armed monitor must emit the old epoch so the server rejects a stale resume.
         self._gate_epoch = lode.get("gate_epoch", 0)
-
-    def _wait_and_dismiss_claude(self) -> None:
-        """Wait for completion, then dismiss Claude with bounded keystroke retries.
-
-        Retained temporarily for the sequential completion-dismissal follow-up.
-        """
-        while not self._done.is_set():
-            self._done.wait(timeout=1.0)
-            if self._monitor_stop.is_set():
-                return
-
-        if not self._pane_id:
-            return
-
-        while not self._monitor_stop.is_set():
-            with self._done_lock:
-                deadline_parked = self._dismiss_deadline_parked
-                done_at_ms = self._done_at_ms
-            while deadline_parked:
-                if self._monitor_stop.wait(timeout=1.0):
-                    return
-                with self._done_lock:
-                    deadline_parked = self._dismiss_deadline_parked
-                    done_at_ms = self._done_at_ms
-            logger.debug(f"{self._done_label}, waiting for screen to stabilize lode={self.lode_id}")
-
-            last_snapshot = None
-            capture_failures = 0
-            parked_during_stabilization = False
-            stabilization_deadline = time.monotonic() + DISMISS_STABILIZATION_TIMEOUT_SEC
-            while not self._monitor_stop.is_set():
-                with self._done_lock:
-                    if self._dismiss_deadline_parked:
-                        parked_during_stabilization = True
-                        break
-                remaining = stabilization_deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        f"screen did not stabilize before dismiss bound lode={self.lode_id}"
-                    )
-                    break
-                self._monitor_stop.wait(min(MONITOR_INTERVAL, remaining))
-                snapshot = capture_pane(self._pane_id)
-                if snapshot is None:
-                    capture_failures += 1
-                    logger.debug(
-                        "failed to capture pane while waiting to dismiss "
-                        f"lode={self.lode_id} failures={capture_failures}"
-                    )
-                    if capture_failures >= PANE_CAPTURE_FAILURE_LIMIT:
-                        break
-                    continue
-                capture_failures = 0
-                if snapshot == last_snapshot:
-                    break
-                last_snapshot = snapshot
-
-            if self._monitor_stop.is_set():
-                return
-
-            with self._done_lock:
-                # A re-arm can clear the latch after this cycle's last check, so its
-                # changed completion time keeps a pre-park snapshot from being trusted.
-                may_dismiss = (
-                    not parked_during_stabilization
-                    and not self._dismiss_deadline_parked
-                    and self._done_at_ms == done_at_ms
-                )
-            if may_dismiss:
-                if last_snapshot is None:
-                    logger.warning(f"dismissing without a stable pane capture lode={self.lode_id}")
-                # Every attempt sends the same pair, because Ctrl-D is not a
-                # stronger Ctrl-C -- it is inert. Measured against a live pane:
-                # Ctrl-D exits Claude Code from no state at all (idle prompt,
-                # composer holding unsubmitted text, or the "Exit anyway / Move
-                # to background and exit / Stay" confirmation a Ctrl-C raises
-                # while a tool call is still running). The Ctrl-C pair exits
-                # from every one of those, including that confirmation.
-                #
-                # This deliberately restores the pre-2026-08-08 unbounded retry.
-                # Escalating attempt 2+ to Ctrl-D, with an attempt counter that
-                # never reset, meant the only keystroke that works was sent at
-                # most once per runner: a single mistimed first attempt spent
-                # the rest of the stage pressing a key nothing responds to.
-                # Self-healing on a missed dismissal fell from 84% to 29%.
-                self._dismiss_attempt += 1
-                logger.debug(
-                    f"sending Ctrl-C dismiss keystrokes lode={self.lode_id} "
-                    f"attempt={self._dismiss_attempt}"
-                )
-                send_keys(self._pane_id, "C-c")
-                send_keys(self._pane_id, "C-c")
 
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""
@@ -733,27 +587,6 @@ class BaseRunner:
     def _check_activity(self) -> None:
         """Check tmux pane for activity and update state accordingly."""
         if not self._pane_id:
-            return
-
-        if self._done.is_set():
-            now = current_time_ms()
-            should_park = False
-            with self._done_lock:
-                if self._done_at_ms is None:
-                    self._done_at_ms = now
-                if (
-                    not self._dismiss_deadline_parked
-                    and now - self._done_at_ms >= DISMISS_DEADLINE_MS
-                ):
-                    self._dismiss_deadline_parked = True
-                    should_park = True
-            if should_park:
-                reason = (
-                    "completion was signalled, but the agent did not exit within "
-                    f"{DISMISS_DEADLINE_MIN} min"
-                )
-                logger.warning(f"dismiss deadline reached lode={self.lode_id}: {reason}")
-                self._park_idle(reason)
             return
 
         if self._gated.is_set():
@@ -920,8 +753,8 @@ class BaseRunner:
         stage that is merely waiting for an operator must never be executed for waiting.
 
         So a quiet stage is parked, not killed: the agent stays alive, the reason is
-        recorded, and the lode waits. For an ordinary non-completion idle park, pane
-        movement lets the existing gated branch clear the gate and carry on.
+        recorded, and the lode waits. Pane movement lets the existing gated branch
+        clear the gate and carry on.
 
         Only an explicit operator action through the hop CLI may end a stage.
         """

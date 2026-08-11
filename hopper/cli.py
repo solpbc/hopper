@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -1222,9 +1223,9 @@ def cmd_screenshot(args: list[str]) -> int:
     return 0
 
 
-@command("processed", "Signal stage completion with output", group="lode")
+@command("processed", "Durably submit stage output and wait for its disposition", group="lode")
 def cmd_processed(args: list[str]) -> int:
-    """Read stage output from stdin and signal stage completion."""
+    """Read stage output from stdin and submit the durable completion action."""
     from hopper.client import complete_lode, get_lode
 
     parser = make_parser(
@@ -1275,6 +1276,7 @@ def cmd_processed(args: list[str]) -> int:
     digest = hashlib.sha256(output).hexdigest()
     acknowledgement = complete_lode(
         _socket(),
+        uuid.uuid4().hex,
         lode_id,
         generation,
         stage,
@@ -1297,11 +1299,11 @@ def cmd_processed(args: list[str]) -> int:
         detail_suffix = f" Server detail: {detail}." if isinstance(detail, str) and detail else ""
         refusal_messages = {
             "lode_not_found": f"Lode {lode_id} not found or archived.",
-            "missing_run_generation": (
+            "missing_expected_generation": (
                 "Completion was refused because this command has no runner generation. "
                 "Run it inside the current lode runner, then retry."
             ),
-            "stale_run_generation": (
+            "stale_expected_generation": (
                 "Completion was refused because this runner generation is stale. "
                 f"Check `hop lode status {lode_id}` and use the current runner."
             ),
@@ -1848,45 +1850,6 @@ def _lode_unpushed(lode_id: str) -> dict | None:
     return {"count": count, "basis": basis, "worktree": str(worktree)}
 
 
-def _unpushed_kill_refusal(lode: dict) -> str | None:
-    """Refuse a kill that cannot be shown not to strand unpushed commits.
-
-    Kill retains the worktree and branch, but nothing downstream records that
-    the work was never pushed, and a finished-looking lode is exactly what an
-    operator reaches to clean up. An unprovable answer refuses too: only a
-    verified zero clears the guard.
-    """
-    lode_id = lode["id"]
-    probe = _lode_unpushed(lode_id)
-    if probe is None or probe["count"] == 0:
-        return None
-    count = probe["count"]
-    worktree = probe["worktree"]
-    branch = lode.get("branch", "") or f"hopper-{lode_id}"
-    if count is None:
-        headline = (
-            f"Refusing to kill {lode_id}: could not check {branch} for commits that exist "
-            "only in this worktree, so this kill cannot be shown to be safe."
-        )
-        see_them = f"  see them: git -C {worktree} log --oneline @{{u}}..HEAD"
-    else:
-        plural = "" if count == 1 else "s"
-        headline = (
-            f"Refusing to kill {lode_id}: {count} commit{plural} on {branch} "
-            f"exist{'s' if count == 1 else ''} only in this worktree."
-        )
-        see_them = f"  see them: git -C {worktree} log --oneline HEAD --not --remotes"
-    return "\n".join(
-        [
-            headline,
-            f"  worktree: {worktree}",
-            see_them,
-            f"  push:     git -C {worktree} push -u origin {branch}",
-            f"Kill anyway: hop lode kill {lode_id} --force",
-        ]
-    )
-
-
 def _age_phrase(timestamp_ms: int) -> str:
     """Render an age as a phrase. `format_age` returns "now", so "now ago" is wrong."""
     age = format_age(timestamp_ms)
@@ -2017,11 +1980,11 @@ def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) ->
 
     display_lode = dict(result["lode"])
     if result["host"] == "local":
-        from hopper import completion
+        from hopper import actions
 
         try:
-            pending = completion.load_pending_completion(result["canonical_id"])
-            pending_output = completion.pending_output_recovery(pending) if pending else None
+            pending = actions.load_pending_action(result["canonical_id"])
+            pending_output = actions.pending_output_recovery(pending) if pending else None
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logger.warning(
                 "Failed to read pending completion for %s: %s",
@@ -2670,6 +2633,153 @@ def _add_lode_list_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_action_identity_args(parser: argparse.ArgumentParser) -> None:
+    """Add argv-only identity fields used by remote manual-action forwarding."""
+    parser.add_argument("--action-id", help=argparse.SUPPRESS)
+    parser.add_argument("--expected-generation", help=argparse.SUPPRESS)
+
+
+def _manual_action_identity(parsed, lode: dict, verb: str) -> dict | None:
+    """Bind one CLI invocation without retargeting a forwarded identity."""
+    supplied_id = getattr(parsed, "action_id", None)
+    supplied_generation = getattr(parsed, "expected_generation", None)
+    if (supplied_id is None) != (supplied_generation is None):
+        print("error: --action-id and --expected-generation must be provided together")
+        return None
+    if supplied_id is None and os.environ.get("HOP_NO_ROUTE"):
+        print(
+            "error: routed manual action is missing its action identity; upgrade the "
+            "calling hop CLI and retry"
+        )
+        return None
+
+    generation = (
+        None
+        if supplied_generation == "none"
+        else supplied_generation
+        if supplied_generation is not None
+        else lode.get("run_generation")
+    )
+    action_id = supplied_id or uuid.uuid4().hex
+    pending = lode.get("pending_action")
+    receipts = lode.get("action_results", [])
+    matching = None
+    if isinstance(pending, dict) and pending.get("action_id") == action_id:
+        matching = pending
+    elif isinstance(receipts, list):
+        matching = next(
+            (
+                receipt
+                for receipt in receipts
+                if isinstance(receipt, dict) and receipt.get("action_id") == action_id
+            ),
+            None,
+        )
+    if supplied_id is None and isinstance(pending, dict):
+        pending_type = pending.get("action_type")
+        if pending_type == verb or (verb == "restart" and pending_type == "completion"):
+            action_id = pending.get("action_id")
+            generation = pending.get("expected_generation")
+            matching = pending
+
+    action_type = verb
+    target = {
+        "pause": "paused",
+        "restart": "replacement_spawned",
+        "kill": "killed_archived",
+    }[verb]
+    force_consent = bool(getattr(parsed, "force", False))
+    if (
+        verb == "restart"
+        and isinstance(matching, dict)
+        and matching.get("action_type") == "completion"
+    ):
+        action_type = "completion"
+        target = matching.get("target_disposition") or {
+            "mill": "advance_refine",
+            "refine": "advance_ship",
+            "ship": "shipped_archived",
+        }.get(lode.get("stage"))
+        force_consent = False
+    return {
+        "action_id": action_id,
+        "expected_generation": generation,
+        "action_type": action_type,
+        "target_disposition": target,
+        "force_consent": force_consent,
+    }
+
+
+def _manual_action_retry_command(verb: str, lode_id: str, identity: dict, *, force: bool) -> str:
+    generation = identity["expected_generation"] or "none"
+    parts = ["hop", "lode", verb, lode_id]
+    if force:
+        parts.append("--force")
+    parts.extend(
+        [
+            "--action-id",
+            identity["action_id"],
+            "--expected-generation",
+            generation,
+        ]
+    )
+    return shlex.join(parts)
+
+
+def _render_manual_action_disposition(
+    verb: str,
+    lode_id: str,
+    stage: str,
+    identity: dict,
+    response: dict | None,
+    *,
+    force: bool,
+) -> int:
+    """Render only terminal success; every unknown or blocked result is nonzero."""
+    retry = _manual_action_retry_command(verb, lode_id, identity, force=force)
+    generation = identity["expected_generation"] or "none"
+    terminal = bool(
+        response
+        and response.get("outcome") in {"completed", "idempotent"}
+        and isinstance(response.get("disposition"), str)
+    )
+    if terminal:
+        if identity["action_type"] == "completion":
+            print(
+                f"Completed durable teardown for {lode_id} "
+                f"({response['disposition'].replace('_', ' ')})"
+            )
+        elif verb == "pause":
+            print(f"Paused lode {lode_id}; worktree and stage session retained")
+        elif verb == "restart":
+            print(f"Restarted {stage} for {lode_id} with a replacement runner")
+        else:
+            print(f"Killed lode {lode_id}; worktree and branch retained for recovery")
+        return 0
+
+    if response and response.get("outcome") in {"blocked", "refused"}:
+        outcome = response["outcome"]
+        reason = response.get("reason", outcome)
+        detail = response.get("detail")
+        print(f"{verb.capitalize()} {outcome} ({reason}).")
+        if detail:
+            print(f"Server detail: {detail}")
+        recovery = response.get("recovery_command")
+        if recovery:
+            print(f"Recover with: {recovery}")
+        else:
+            print(f"Inspect with: hop lode status {lode_id}")
+            print(f"Retry the same action with: {retry}")
+        return 1
+
+    print(f"{verb.capitalize()} disposition is UNKNOWN; no success was reported.")
+    print(f"Action ID: {identity['action_id']}")
+    print(f"Expected generation: {generation}")
+    print(f"Inspect with: hop lode status {lode_id}")
+    print(f"Retry the same action with: {retry}")
+    return 1
+
+
 @command("lode", "Manage lodes")
 def cmd_lode(args: list[str]) -> int:
     """Manage lodes — list, create, restart, watch, wait."""
@@ -2689,14 +2799,15 @@ def cmd_lode(args: list[str]) -> int:
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
     _add_create_args(create_p)
 
-    restart_p = subs.add_parser("restart", help="Restart an inactive lode", exit_on_error=False)
+    restart_p = subs.add_parser("restart", help="Safely restart a lode stage", exit_on_error=False)
     restart_p.add_argument("lode_id", help="Lode ID to restart")
     restart_p.add_argument(
         "-f",
         "--force",
         action="store_true",
-        help="Restart even if Claude has already started for this stage",
+        help="Consent to discarding an active or already-started stage",
     )
+    _add_action_identity_args(restart_p)
     repair_p = subs.add_parser(
         "repair-output",
         help="Restore missing bytes for an accepted completion",
@@ -2716,6 +2827,7 @@ def cmd_lode(args: list[str]) -> int:
     )
     pause_p = subs.add_parser("pause", help="Pause a lode and retain its worktree")
     pause_p.add_argument("lode_id", help="Lode ID to pause")
+    _add_action_identity_args(pause_p)
     resume_p = subs.add_parser("resume", help="Resume a paused or dead-pane lode")
     resume_p.add_argument("lode_id", help="Lode ID to resume")
 
@@ -2747,14 +2859,15 @@ def cmd_lode(args: list[str]) -> int:
     log_p.add_argument("lode_id", help="Lode ID (or prefix)")
     log_p.add_argument("-n", "--tail", type=int, default=0, help="Show last N entries")
     log_p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
-    kill_p = subs.add_parser("kill", help="Kill a running lode", exit_on_error=False)
+    kill_p = subs.add_parser("kill", help="Safely kill and archive a lode", exit_on_error=False)
     kill_p.add_argument("lode_id", help="Lode ID to kill")
     kill_p.add_argument(
         "-f",
         "--force",
         action="store_true",
-        help="Kill even when commits exist only in this lode's worktree",
+        help="Override only unknown or unpushed commit durability refusal",
     )
+    _add_action_identity_args(kill_p)
     peek_p = subs.add_parser("peek", help="Show plain text from a lode pane", exit_on_error=False)
     peek_p.add_argument("lode_id", help="Lode ID to inspect")
     peek_p.add_argument("-n", "--lines", type=int, default=40, help="Number of lines to show")
@@ -2783,6 +2896,18 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     subcommand = parsed.subcommand or "list"
+    if subcommand in {"pause", "restart", "kill"}:
+        supplied_id = getattr(parsed, "action_id", None)
+        supplied_generation = getattr(parsed, "expected_generation", None)
+        if (supplied_id is None) != (supplied_generation is None):
+            print("error: --action-id and --expected-generation must be provided together")
+            return 1
+        if supplied_id is None and os.environ.get("HOP_NO_ROUTE"):
+            print(
+                "error: routed manual action is missing its action identity; upgrade the "
+                "calling hop CLI and retry"
+            )
+            return 1
     if subcommand == "nudge" and parsed.text is not None and parsed.text_option is not None:
         print("error: positional text and --text cannot be used together")
         nudge_p.print_usage()
@@ -2983,7 +3108,49 @@ def cmd_lode(args: list[str]) -> int:
             print(f"Created lode for {project_name}")
         return 0
 
-    if subcommand in ("pause", "resume"):
+    if subcommand == "pause":
+        if (rc := require_not_inside_lode()) is not None:
+            return rc
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        lode = resolved["lode"]
+        identity = _manual_action_identity(parsed, lode, "pause")
+        if identity is None:
+            return 1
+        if resolved["host"] != "local":
+            return _run_remote_cli(
+                resolved["host"],
+                [
+                    "lode",
+                    "pause",
+                    lode_id,
+                    "--action-id",
+                    identity["action_id"],
+                    "--expected-generation",
+                    identity["expected_generation"] or "none",
+                ],
+                reason=f"lode {lode_id}",
+            )
+        response = client.pause_lode(
+            socket_path,
+            lode_id,
+            action_id=identity["action_id"],
+            expected_generation=identity["expected_generation"],
+            stage=lode.get("stage", ""),
+        )
+        return _render_manual_action_disposition(
+            "pause",
+            lode_id,
+            lode.get("stage", ""),
+            identity,
+            response,
+            force=False,
+        )
+
+    if subcommand == "resume":
         if (rc := require_not_inside_lode()) is not None:
             return rc
         resolved = _resolve_lode(socket_path, parsed.lode_id)
@@ -2994,24 +3161,19 @@ def cmd_lode(args: list[str]) -> int:
         if resolved["host"] != "local":
             return _run_remote_cli(
                 resolved["host"],
-                ["lode", subcommand, lode_id],
+                ["lode", "resume", lode_id],
                 reason=f"lode {lode_id}",
             )
-        operation = client.pause_lode if subcommand == "pause" else client.resume_lode
-        response = operation(socket_path, lode_id)
-        expected = "lode_paused" if subcommand == "pause" else "lode_resumed"
-        if not response or response.get("type") != expected:
+        response = client.resume_lode(socket_path, lode_id)
+        if not response or response.get("type") != "lode_resumed":
             error = (
-                response.get("error", f"failed to {subcommand} lode")
+                response.get("error", "failed to resume lode")
                 if response
-                else (f"failed to {subcommand} lode")
+                else ("failed to resume lode")
             )
-            print(f"Cannot {subcommand}: {error}")
+            print(f"Cannot resume: {error}")
             return 1
-        if subcommand == "pause":
-            print(f"Paused lode {response['lode']['id']}; worktree and stage session retained")
-        else:
-            print(f"Resuming lode {response['lode']['id']} (pane {response.get('tmux_pane', '')})")
+        print(f"Resuming lode {response['lode']['id']} (pane {response.get('tmux_pane', '')})")
         return 0
 
     if subcommand == "path":
@@ -3154,10 +3316,10 @@ def cmd_lode(args: list[str]) -> int:
                 stdin_bytes=data,
             )
 
-        from hopper import completion
+        from hopper import actions
 
         try:
-            record = completion.load_pending_completion(lode_id)
+            record = actions.load_pending_action(lode_id)
         except (OSError, ValueError, json.JSONDecodeError):
             record = None
         identity = record or {}
@@ -3166,7 +3328,7 @@ def cmd_lode(args: list[str]) -> int:
             lode_id=lode_id,
             action_id=identity.get("action_id"),
             stage=identity.get("stage"),
-            run_generation=identity.get("run_generation"),
+            expected_generation=identity.get("expected_generation"),
             next_action=identity.get("next_action"),
             token=parsed.token,
             output_base64=base64.b64encode(data).decode("ascii"),
@@ -3197,114 +3359,62 @@ def cmd_lode(args: list[str]) -> int:
             print(resolved["error"])
             return resolved["exit_code"]
         lode_id = resolved["canonical_id"]
-        if resolved["host"] != "local":
-            return _run_remote_cli(
-                resolved["host"],
-                ["lode", "restart", lode_id, *(["--force"] if parsed.force else [])],
-                reason=f"lode {lode_id}",
-            )
-        from hopper import completion
-
-        if is_canonical_lode_id(lode_id) and completion.pending_completion_path(lode_id).exists():
-            response = client.retry_lode_completion(socket_path, lode_id)
-            if response is None:
-                print(
-                    "Completion retry disposition is UNKNOWN. "
-                    f"Check `hop lode status {lode_id}` before retrying."
-                )
-                return 1
-            if response.get("type") != "lode_completion_retrying":
-                print(
-                    f"Cannot retry completion: {response.get('error', 'server refused retry')}. "
-                    f"Check `hop lode status {lode_id}`."
-                )
-                return 1
-            print(f"Retrying durable completion teardown for {lode_id}")
-            return 0
         lode = resolved["lode"]
-        if lode.get("active") and not parsed.force:
-            print(f"Cannot restart: lode {lode_id} has a registered runner.")
-            print(f"Attach to it, or retry with: hop lode restart {lode_id} --force")
-            return 1
-        if lode.get("active") and parsed.force:
-            print(f"Terminating the registered runner for lode {lode_id} before restart.")
         stage = lode.get("stage", "")
         if stage not in ("mill", "refine", "ship"):
             print(f"Cannot restart: lode {lode_id} stage is {stage}.")
             print(f"Check its current state with: hop lode status {lode_id}")
             return 1
-        started = bool(lode.get("claude", {}).get(stage, {}).get("started"))
-        if started and not parsed.force and lode.get("state") != "error":
-            print(f"Lode {lode_id} has been started (claude[{stage}].started=True).")
-            print("Restarting discards in-progress work.")
-            print("Pass --force to override:")
-            print(f"  hop lode restart {lode_id} --force")
+        identity = _manual_action_identity(parsed, lode, "restart")
+        if identity is None:
             return 1
-        acknowledgement = client.restart_lode(
-            socket_path,
+        if resolved["host"] != "local":
+            remote_args = ["lode", "restart", lode_id]
+            if parsed.force:
+                remote_args.append("--force")
+            remote_args.extend(
+                [
+                    "--action-id",
+                    identity["action_id"],
+                    "--expected-generation",
+                    identity["expected_generation"] or "none",
+                ]
+            )
+            return _run_remote_cli(
+                resolved["host"],
+                remote_args,
+                reason=f"lode {lode_id}",
+            )
+        if lode.get("active") and parsed.force:
+            print(f"Terminating the registered runner for lode {lode_id} before restart.")
+        if identity["action_type"] == "completion":
+            acknowledgement = client.submit_lode_action(
+                socket_path,
+                action_id=identity["action_id"],
+                lode_id=lode_id,
+                expected_generation=identity["expected_generation"],
+                action_type="completion",
+                target_disposition=identity["target_disposition"],
+                force_consent=False,
+                stage=stage,
+            )
+        else:
+            acknowledgement = client.restart_lode(
+                socket_path,
+                lode_id,
+                stage,
+                action_id=identity["action_id"],
+                expected_generation=identity["expected_generation"],
+                force=parsed.force,
+            )
+        return _render_manual_action_disposition(
+            "restart",
             lode_id,
             stage,
+            identity,
+            acknowledgement,
             force=parsed.force,
         )
-        if acknowledgement is None:
-            print(
-                "Restart disposition is UNKNOWN because the server did not acknowledge it. "
-                f"Check `hop lode status {lode_id}` before retrying."
-            )
-            return 1
-        if acknowledgement.get("accepted") is not True:
-            reason = acknowledgement.get("reason")
-            messages = {
-                "lode_not_found": (
-                    f"Restart refused: lode {lode_id} was not found. Check the ID with "
-                    "`hop lode list`, then retry."
-                ),
-                "invalid_stage": (
-                    f"Restart refused: stage {stage} is not restartable. Check "
-                    f"`hop lode status {lode_id}`."
-                ),
-                "pending_runner_result": (
-                    "Restart refused while the prior guarded runner result is pending. "
-                    "Wait about 60 seconds, check "
-                    f"`hop lode status {lode_id}`, then retry."
-                ),
-                "runner_identity_unknown": (
-                    "Restart refused because the existing runner identity could not be "
-                    f"verified. Inspect `hop lode status {lode_id}`, then retry after the "
-                    "runner is gone."
-                ),
-                "runner_identity_unverified": (
-                    "Restart refused because the registered runner could not be matched to "
-                    f"its live tmux pane. Inspect `hop lode status {lode_id}` and the pane, "
-                    "then retry after the runner is gone."
-                ),
-                "termination_failed": (
-                    "Restart refused because the existing runner did not exit. Inspect "
-                    f"`hop lode status {lode_id}`, then retry after it exits."
-                ),
-                "already_live": (
-                    "Restart refused because a runner is still live. Attach to it, or retry "
-                    f"with `hop lode restart {lode_id} --force`."
-                ),
-                "tmux_unreachable": (
-                    "Restart refused because tmux liveness is unknown. Verify tmux is "
-                    f"running, check `hop lode status {lode_id}`, then retry."
-                ),
-                "spawn_failed": (
-                    "Restart failed while creating the replacement pane. Verify tmux is "
-                    f"running, check `hop lode status {lode_id}`, then retry."
-                ),
-            }
-            print(
-                messages.get(
-                    reason,
-                    "Restart was refused by the server. "
-                    f"Check `hop lode status {lode_id}`, then retry.",
-                )
-            )
-            return 1
-        print(f"Restarting {stage} for {lode_id}")
-        return 0
 
     if subcommand == "watch":
         if (rc := require_not_inside_lode()) is not None:
@@ -3417,29 +3527,48 @@ def cmd_lode(args: list[str]) -> int:
             print(resolved["error"])
             return resolved["exit_code"]
         lode_id = resolved["canonical_id"]
+        lode = resolved["lode"]
+        stage = lode.get("stage", "")
+        if stage not in ("mill", "refine", "ship"):
+            print(f"Cannot kill: lode {lode_id} stage is {stage}.")
+            print(f"Check its current state with: hop lode status {lode_id}")
+            return 1
+        identity = _manual_action_identity(parsed, lode, "kill")
+        if identity is None:
+            return 1
         if resolved["host"] != "local":
+            remote_args = ["lode", "kill", lode_id]
+            if parsed.force:
+                remote_args.append("--force")
+            remote_args.extend(
+                [
+                    "--action-id",
+                    identity["action_id"],
+                    "--expected-generation",
+                    identity["expected_generation"] or "none",
+                ]
+            )
             return _run_remote_cli(
                 resolved["host"],
-                ["lode", "kill", lode_id, *(["--force"] if parsed.force else [])],
+                remote_args,
                 reason=f"lode {lode_id}",
             )
-        lode = resolved["lode"]
-        if isinstance(lode.get("archived_at"), int):
-            print(f"Lode {lode_id} is already archived.")
-            return 0
-        if lode.get("stage") == "shipped":
-            print(f"Lode {lode['id']} has already shipped.")
-            return 0
-        if not parsed.force:
-            refusal = _unpushed_kill_refusal(lode)
-            if refusal:
-                print(refusal, file=sys.stderr)
-                return 1
-        if not client.kill_lode(socket_path, lode["id"]):
-            print(f"Failed to kill lode {lode['id']}")
-            return 1
-        print(f"Killed lode {lode['id']}; worktree and branch retained for recovery")
-        return 0
+        response = client.kill_lode(
+            socket_path,
+            lode_id,
+            action_id=identity["action_id"],
+            expected_generation=identity["expected_generation"],
+            stage=stage,
+            force=parsed.force,
+        )
+        return _render_manual_action_disposition(
+            "kill",
+            lode_id,
+            stage,
+            identity,
+            response,
+            force=parsed.force,
+        )
 
     if subcommand in ("peek", "nudge", "answer"):
         resolved = _resolve_lode(socket_path, parsed.lode_id)
@@ -3624,17 +3753,17 @@ def cmd_watch(args: list[str]) -> int:
     return cmd_lode(["watch"] + args)
 
 
-@command("restart", "Restart an inactive lode (alias for lode restart)", group="aliases")
+@command("restart", "Safely restart a lode stage (alias for lode restart)", group="aliases")
 def cmd_restart(args: list[str]) -> int:
     """Alias for hop lode restart."""
     if "-h" in args or "--help" in args:
-        p = make_parser("restart", "Restart an inactive lode (alias for lode restart)")
+        p = make_parser("restart", "Safely restart a lode stage (alias for lode restart)")
         p.add_argument("lode_id", help="Lode ID to restart")
         p.add_argument(
             "-f",
             "--force",
             action="store_true",
-            help="Restart even if Claude has already started for this stage",
+            help="Consent to discarding an active or already-started stage",
         )
         try:
             parse_args(p, args)

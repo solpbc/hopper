@@ -24,7 +24,7 @@ from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
-from hopper import completion, config, git, oom, teardown
+from hopper import actions, config, git, oom, teardown
 from hopper.backlog import (
     BacklogItem,
     add_backlog_item,
@@ -45,6 +45,7 @@ from hopper.client import (
 )
 from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
+    REFUSAL_STATUS_PREFIXES,
     archive_lode,
     archive_lode_for_action,
     create_lode,
@@ -77,7 +78,6 @@ from hopper.tmux import (
     capture_pane,
     classify_pane_phase,
     completion_action_panes,
-    get_pane_pid,
     pane_identity,
     pane_liveness,
     pane_needs_answer,
@@ -90,8 +90,8 @@ from hopper.tmux import (
 logger = logging.getLogger(__name__)
 
 PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "completed", "teardown", "error"})
-PENDING_ACTION_FENCED_MUTATIONS = frozenset(
-    {"lode_pause", "lode_resume", "lode_kill", "lode_archive", "lode_spawn"}
+SUPPORTED_LODE_STATES = frozenset(
+    {"new", "running", "stuck", "error", "gated", "ready", "mill", "refine", "ship", "teardown"}
 )
 LISTEN_BACKLOG = 64
 PAUSE_TERM_GRACE_SEC = 0.75
@@ -116,10 +116,10 @@ def _is_verified_ordinary_exit(unit_result: str | None, worker_returncode: int |
     return unit_result in (None, "success") and worker_returncode == 0
 
 
-def _pending_completion_exists(lode_id: str) -> bool:
+def _pending_action_file_exists(lode_id: str) -> bool:
     """Return whether a schema-addressable lode has a durable completion fence."""
     try:
-        return completion.pending_completion_path(lode_id).exists()
+        return actions.pending_action_path(lode_id).exists()
     except ValueError:
         # Legacy/corrupt lode IDs cannot name a valid pending-completion record.
         return False
@@ -224,10 +224,10 @@ def _capture_supervisor_registration(lode: dict, message: dict) -> dict:
         boot_id=process_boot_id,
     )
     return {
-        "schema_version": completion.SCHEMA_VERSION,
+        "schema_version": actions.RUN_OWNERSHIP_SCHEMA_VERSION,
         "lode_id": lode["id"],
         "run_generation": lode["run_generation"],
-        "registered_at_ms": completion.accepted_at_ms(),
+        "registered_at_ms": actions.accepted_at_ms(),
         "boot_id": boot_id,
         "platform": platform,
         "proof_mode": proof_mode,
@@ -304,7 +304,7 @@ def _capture_worker_registration(source: dict, message: dict) -> dict:
         "unit": ownership["unit"],
         "cgroup": ownership["cgroup"],
     }
-    completion.validate_run_ownership(record, require_worker=True)
+    actions.validate_run_ownership(record, require_worker=True)
     pidfd = None
     if proof_mode == "linux-strict":
         pidfd_interface = teardown.resolve_pidfd_interface()
@@ -506,9 +506,6 @@ class SpawnOutcome(Enum):
     FAILED = "failed"
 
 
-SPAWN_STATUS_PREFIXES = ("spawn refused: ", "spawn failed: ")
-
-
 def _process_group_has_live_members(process_group: int) -> bool | None:
     """Return whether a process group has non-zombie members, or None if unknown."""
     try:
@@ -631,7 +628,7 @@ def _set_spawn_refusal(lode: dict, message: str) -> bool:
 def _clear_spawn_refusal(lode: dict) -> bool:
     """Clear a refusal or failure after live runner evidence supersedes it."""
     status = lode.get("status", "")
-    if not status.startswith(SPAWN_STATUS_PREFIXES):
+    if not status.startswith(REFUSAL_STATUS_PREFIXES[:2]):
         return False
     lode["status"] = ""
     return True
@@ -927,11 +924,19 @@ class Server:
         self.client_generations: dict[socket.socket, str] = {}
         self.pending_disconnects: dict[tuple[str, str], dict] = {}
         self.runner_results: dict[tuple[str, str], tuple[str | None, int]] = {}
-        self.completion_threads: dict[tuple[str, str], threading.Thread] = {}
+        self.action_threads: dict[tuple[str, str], threading.Thread] = {}
         self.registration_threads: dict[str, threading.Thread] = {}
-        self.completion_acceptances: dict[str, str] = {}
+        self.action_acceptances: dict[
+            str,
+            tuple[
+                str,
+                tuple[str, str | None, str, str, bool],
+                list[socket.socket],
+            ],
+        ] = {}
+        self.action_waiters: dict[str, list[socket.socket]] = {}
         self.supervisor_pidfds: dict[tuple[str, str], int] = {}
-        self._startup_completion_actions: list[str] = []
+        self._startup_actions: list[str] = []
         self._log_handler: logging.FileHandler | None = None
         self._lock_file = None
         self._socket_bound = False
@@ -942,15 +947,15 @@ class Server:
         """Find a lode by ID."""
         return next((lode for lode in self.lodes if lode["id"] == lode_id), None)
 
-    def _find_completion_lode(self, lode_id: str) -> dict | None:
+    def _find_action_lode(self, lode_id: str) -> dict | None:
         """Find the active or archived object owned by a pending action."""
         return self._find_lode(lode_id) or next(
             (lode for lode in self.archived_lodes if lode["id"] == lode_id), None
         )
 
     @staticmethod
-    def _completion_spawn_target_id(record: dict) -> str | None:
-        if record["stage"] != "ship":
+    def _action_spawn_target_id(record: dict) -> str | None:
+        if record["action_type"] == "restart" or record["stage"] != "ship":
             return record["lode_id"]
         return record["ship"]["backlog"]["promoted_lode_id"]
 
@@ -960,24 +965,24 @@ class Server:
         seen = set()
         for source in [*self.lodes, *self.archived_lodes]:
             source_id = source["id"]
-            if source_id in seen or not _pending_completion_exists(source_id):
+            if source_id in seen or not _pending_action_file_exists(source_id):
                 continue
             seen.add(source_id)
             try:
-                record = self._load_pending(source_id)
+                record = self._load_action_slot(source_id)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if (
                 record
                 and record["spawn"] is not None
                 and record["markers"]["spawn"]["state"] == "intent"
-                and self._completion_spawn_target_id(record) == lode_id
+                and self._action_spawn_target_id(record) == lode_id
                 and record["spawn"]["target_generation"] == generation
             ):
                 matches.append(record)
         return matches[0] if len(matches) == 1 else None
 
-    def _adopt_completion_spawn_receipt(self, lode: dict, message: dict) -> bool:
+    def _adopt_action_spawn_receipt(self, lode: dict, message: dict) -> bool:
         """Adopt only the pane named by the action's fsynced bootstrap receipt."""
         generation = message.get("run_generation")
         if not isinstance(generation, str):
@@ -986,7 +991,7 @@ class Server:
         if record is None:
             return True
         try:
-            receipt = completion.load_spawn_receipt(record["lode_id"], record["action_id"])
+            receipt = actions.load_spawn_receipt(record["lode_id"], record["action_id"])
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logger.error("Spawn receipt is invalid lode=%s: %s", record["lode_id"], error)
             return False
@@ -1015,7 +1020,7 @@ class Server:
             lode.get("status", ""),
             "completion_spawn_receipt_adoption",
         )
-        self._persist_completion(record, via="completion_spawn:receipt_adopted")
+        self._persist_action(record, via="completion_spawn:receipt_adopted")
         return True
 
     def _runner_generation_matches(self, lode: dict | None, message: dict) -> bool:
@@ -1035,22 +1040,26 @@ class Server:
             )
         return matched
 
-    def _load_pending(self, lode_id: str) -> dict | None:
+    def _load_action_slot(self, lode_id: str) -> dict | None:
         """Load the canonical teardown fence, propagating malformed records."""
-        return completion.load_pending_completion(lode_id)
+        return actions.load_pending_action(lode_id)
 
-    def _generation_is_fenced(self, lode_id: str, run_generation: str | None) -> bool:
-        """Fail closed when a pending record exists for a generation."""
-        if not _pending_completion_exists(lode_id):
+    def _lode_has_pending_action(self, lode_id: str) -> bool:
+        """Fence every ordinary spawn while the lode owns a durable action."""
+        return _pending_action_file_exists(lode_id)
+
+    def _generation_has_teardown_intent(self, lode_id: str, run_generation: str | None) -> bool:
+        """Classify only the pending action's source generation as teardown."""
+        if not _pending_action_file_exists(lode_id):
             return False
         try:
-            record = self._load_pending(lode_id)
+            record = self._load_action_slot(lode_id)
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            logger.error("Invalid completion fence lode=%s: %s", lode_id, error)
+            logger.error("Invalid action fence lode=%s: %s", lode_id, error)
             return True
-        return bool(record and record["run_generation"] == run_generation)
+        return bool(record and record["expected_generation"] == run_generation)
 
-    def _project_completion(
+    def _project_action(
         self,
         record: dict,
         *,
@@ -1058,11 +1067,12 @@ class Server:
         active: bool | None = None,
     ) -> None:
         """Persist the sole pending record's display projection."""
-        lode = self._find_completion_lode(record["lode_id"])
+        lode = self._find_action_lode(record["lode_id"])
         if not lode:
             return
         lode["state"] = "teardown"
-        lode["status"] = completion.completion_status(record)
+        lode["status"] = actions.action_status(record)
+        lode["pending_action"] = actions.pending_action_projection(record)
         if active is not None:
             lode["active"] = active
         touch(lode)
@@ -1107,7 +1117,7 @@ class Server:
                 if kind == "supervisor":
                     result = {"record": _capture_supervisor_registration(snapshot, request)}
                 else:
-                    source = completion.load_run_ownership(
+                    source = actions.load_run_ownership(
                         snapshot["id"], generation, require_worker=False
                     )
                     if source is None:
@@ -1155,7 +1165,7 @@ class Server:
         if (
             not lode
             or lode.get("run_generation") != generation
-            or self._generation_is_fenced(lode_id, generation)
+            or self._generation_has_teardown_intent(lode_id, generation)
             or not connection_live
             or result.get("ok") is not True
         ):
@@ -1171,7 +1181,7 @@ class Server:
                 )
             return
         try:
-            completion.write_run_ownership(result["record"])
+            actions.write_run_ownership(result["record"])
         except Exception as error:
             fd = result.get("pidfd")
             if isinstance(fd, int):
@@ -1227,7 +1237,7 @@ class Server:
             _log_state_change(lode_id, lode.get("state", ""), status, "supervisor_capture_degraded")
             self.broadcast({"type": "lode_updated", "lode": lode})
 
-        self._record_completion_spawn_adoption(lode_id, generation, kind)
+        self._record_action_spawn_adoption(lode_id, generation, kind)
 
         if conn:
             self._send_response(
@@ -1235,7 +1245,7 @@ class Server:
                 {"type": response_type, "lode_id": lode_id, "accepted": True},
             )
 
-    def _record_completion_spawn_adoption(self, lode_id: str, generation: str, kind: str) -> None:
+    def _record_action_spawn_adoption(self, lode_id: str, generation: str, kind: str) -> None:
         """Persist supervisor/worker adoption for an action-scoped spawn."""
         record = self._pending_spawn_for(lode_id, generation)
         if record is None:
@@ -1244,80 +1254,485 @@ class Server:
         record["spawn"][field] = True
         marker = record["markers"]["spawn"]
         if record["spawn"]["supervisor_adopted"] and record["spawn"]["worker_adopted"]:
-            completion.transition_marker(
+            actions.transition_marker(
                 record, "spawn", "done", attempt_id=marker["attempt_id"], detail="runner adopted"
             )
-            self._persist_completion(record, via="completion_result:spawn_adopted")
-            self._continue_completion(record)
+            self._persist_action(record, via="completion_result:spawn_adopted")
+            self._continue_action(record)
         else:
-            self._persist_completion(record, via=f"completion_spawn:{kind}_adopted")
+            self._persist_action(record, via=f"completion_spawn:{kind}_adopted")
 
-    def _send_completion_ack(
+    def _send_action_ack(
         self,
         conn: socket.socket | None,
         *,
-        accepted: bool,
+        outcome: str,
         reason: str,
         action_id: str | None = None,
+        action_type: str | None = None,
+        disposition: str | None = None,
         detail: str | None = None,
+        recovery_command: str | None = None,
     ) -> None:
-        if conn:
-            response = {"type": "lode_complete_ack", "accepted": accepted, "reason": reason}
-            if action_id is not None:
-                response["action_id"] = action_id
-            if detail is not None:
-                response["detail"] = detail
-            self._send_response(conn, response)
+        response = {
+            "type": "lode_action_ack",
+            "accepted": outcome != "refused",
+            "outcome": outcome,
+            "reason": reason,
+        }
+        if action_id is not None:
+            response["action_id"] = action_id
+        if action_type is not None:
+            response["action_type"] = action_type
+        if disposition is not None:
+            response["disposition"] = disposition
+        if detail is not None:
+            response["detail"] = detail
+        if recovery_command is not None:
+            response["recovery_command"] = recovery_command
+        waiters = (
+            self.action_waiters.pop(action_id, []) if conn is None and action_id is not None else []
+        )
+        targets = waiters or ([conn] if conn is not None else [])
+        for target in targets:
+            self._send_response(target, response)
 
-    def _handle_lode_complete(self, message: dict, conn: socket.socket | None) -> None:
+    def _send_action_open_result(
+        self,
+        conn: socket.socket | None,
+        action_type: str,
+        opened: dict,
+    ) -> None:
+        self._send_action_ack(
+            conn,
+            outcome=opened["outcome"],
+            reason=opened["reason"],
+            action_id=opened.get("action_id"),
+            action_type=action_type,
+            disposition=opened.get("disposition"),
+            detail=opened.get("detail"),
+            recovery_command=opened.get("recovery_command"),
+        )
+
+    def _set_action_refusal(self, lode_id: str, reason: str, detail: str | None = None) -> None:
+        """Publish a pre-accept manual refusal without clobbering an action owner."""
+        visible_reasons = {
+            "terminal_failure",
+            "runner_result_pending",
+            "registered_runner_requires_force",
+            "started_stage_requires_force",
+            "ownership_unavailable",
+            "pidfd_unavailable",
+            "durability_unknown",
+            "durability_unpushed",
+            "action_persistence_unavailable",
+            "action_raced",
+            "protocol_upgrade_required",
+        }
+        if reason not in visible_reasons or _pending_action_file_exists(lode_id):
+            return
+        lode = self._find_action_lode(lode_id)
+        if lode is None or lode.get("pending_action") is not None:
+            return
+        message = detail or reason.replace("_", " ")
+        status = f"action refused: {message}"
+        if lode.get("status") == status:
+            return
+        lode["status"] = status
+        touch(lode)
+        if any(item is lode for item in self.lodes):
+            save_lodes(self.lodes)
+        else:
+            save_archived_lodes(self.archived_lodes)
+        self.broadcast({"type": "lode_updated", "lode": lode})
+
+    @staticmethod
+    def _completion_target(stage: str) -> str | None:
+        return {
+            "mill": "advance_refine",
+            "refine": "advance_ship",
+            "ship": "shipped_archived",
+        }.get(stage)
+
+    def _open_lode_action(
+        self,
+        *,
+        action_type: str,
+        message: dict,
+        prepared: dict,
+    ) -> dict:
+        """Validate and durably accept one action without pre-fsync side effects."""
+        action_id = message.get("action_id")
+        try:
+            actions.validate_action_id(action_id)
+            binding = actions.action_binding(
+                {
+                    "lode_id": message.get("lode_id"),
+                    "expected_generation": message.get("expected_generation"),
+                    "action_type": message.get("action_type"),
+                    "target_disposition": message.get("target_disposition"),
+                    "force_consent": message.get("force_consent"),
+                }
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            return {
+                "outcome": "refused",
+                "reason": "invalid_action",
+                "action_id": action_id if isinstance(action_id, str) else None,
+                "detail": str(error),
+            }
+        if action_type != message["action_type"]:
+            return {
+                "outcome": "refused",
+                "reason": "action_type_mismatch",
+                "action_id": action_id,
+            }
+
+        lode_id, expected_generation, _, target_disposition, force_consent = binding
+        lode = self._find_action_lode(lode_id)
+        if lode is None:
+            return {"outcome": "refused", "reason": "lode_not_found", "action_id": action_id}
+
+        try:
+            receipt = actions.find_action_result(lode, action_id)
+        except ValueError as error:
+            return {
+                "outcome": "refused",
+                "reason": "action_result_invalid",
+                "action_id": action_id,
+                "detail": str(error),
+                "recovery_command": f"hop lode status {lode_id}",
+            }
+        if receipt is not None:
+            if actions.record_binding(receipt) != binding:
+                return {
+                    "outcome": "refused",
+                    "reason": "action_identity_mismatch",
+                    "action_id": action_id,
+                }
+            return {
+                "outcome": "idempotent",
+                "reason": "already_completed",
+                "action_id": action_id,
+                "disposition": receipt["terminal_disposition"],
+            }
+
+        if _pending_action_file_exists(lode_id):
+            try:
+                pending = self._load_action_slot(lode_id)
+            except actions.LegacyPendingActionError as error:
+                return {
+                    "outcome": "refused",
+                    "reason": "legacy_pending_action",
+                    "action_id": action_id,
+                    "detail": str(error),
+                    "recovery_command": f"hop lode status {lode_id}",
+                }
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                return {
+                    "outcome": "refused",
+                    "reason": "invalid_pending_action",
+                    "action_id": action_id,
+                    "detail": f"pending action must be repaired or drained before upgrade: {error}",
+                    "recovery_command": f"hop lode status {lode_id}",
+                }
+            if pending is not None:
+                if pending["action_id"] != action_id:
+                    return {
+                        "outcome": "refused",
+                        "reason": "action_conflict",
+                        "action_id": action_id,
+                        "detail": (
+                            f"action {pending['action_id']} ({pending['action_type']}) owns "
+                            f"generation {pending['expected_generation']}"
+                        ),
+                        "recovery_command": f"hop lode status {lode_id}",
+                    }
+                if actions.record_binding(pending) != binding:
+                    return {
+                        "outcome": "refused",
+                        "reason": "action_identity_mismatch",
+                        "action_id": action_id,
+                    }
+                return {
+                    "outcome": "idempotent",
+                    "reason": "already_accepted",
+                    "action_id": action_id,
+                    "record": pending,
+                }
+
+        if expected_generation != lode.get("run_generation"):
+            return {
+                "outcome": "refused",
+                "reason": "stale_expected_generation",
+                "action_id": action_id,
+                "recovery_command": f"hop lode status {lode_id}",
+            }
+        stage = message.get("stage")
+        if stage != lode.get("stage") or stage not in STAGES:
+            return {"outcome": "refused", "reason": "stage_mismatch", "action_id": action_id}
+        if action_type != "completion" and not any(item is lode for item in self.lodes):
+            return {"outcome": "refused", "reason": "lode_archived", "action_id": action_id}
+        if action_type == "completion" and (
+            target_disposition != self._completion_target(stage) or force_consent
+        ):
+            return {"outcome": "refused", "reason": "invalid_action", "action_id": action_id}
+        if action_type in {"pause", "archive"} and force_consent:
+            return {
+                "outcome": "refused",
+                "reason": "invalid_action",
+                "action_id": action_id,
+            }
+
+        key = (lode_id, expected_generation)
+        if is_terminal_failure_kind(lode.get("failure_kind")):
+            return {"outcome": "refused", "reason": "terminal_failure", "action_id": action_id}
+        if key in self.runner_results or key in self.pending_disconnects:
+            return {
+                "outcome": "refused",
+                "reason": "runner_result_pending",
+                "action_id": action_id,
+            }
+        if action_type == "completion" and (
+            not lode.get("active") or lode_id not in self.lode_clients
+        ):
+            return {"outcome": "refused", "reason": "inactive_runner", "action_id": action_id}
+        if action_type == "restart" and not force_consent:
+            if lode.get("active") and lode_id in self.lode_clients:
+                return {
+                    "outcome": "refused",
+                    "reason": "registered_runner_requires_force",
+                    "action_id": action_id,
+                    "detail": f"Cannot restart: lode {lode_id} has a registered runner.",
+                    "recovery_command": f"hop lode restart {lode_id} --force",
+                }
+            if (
+                lode.get("claude", {}).get(stage, {}).get("started")
+                and lode.get("state") != "error"
+            ):
+                return {
+                    "outcome": "refused",
+                    "reason": "started_stage_requires_force",
+                    "action_id": action_id,
+                    "detail": (
+                        f"Lode {lode_id} has been started "
+                        f"(claude[{stage}].started=True). Restarting discards in-progress work."
+                    ),
+                    "recovery_command": f"hop lode restart {lode_id} --force",
+                }
+        if prepared.get("ok") is not True:
+            return {
+                "outcome": "refused",
+                "reason": prepared.get("reason", "ownership_unavailable"),
+                "action_id": action_id,
+                "detail": prepared.get("error"),
+            }
+        ownership = prepared.get("ownership")
+        already_empty = prepared.get("already_empty") is True
+        if not already_empty and (
+            not isinstance(ownership, dict)
+            or ownership.get("run_generation") != expected_generation
+        ):
+            return {
+                "outcome": "refused",
+                "reason": "ownership_unavailable",
+                "action_id": action_id,
+            }
+        if (
+            ownership
+            and ownership.get("proof_mode") == "linux-strict"
+            and (teardown.resolve_pidfd_interface() is None)
+        ):
+            return {"outcome": "refused", "reason": "pidfd_unavailable", "action_id": action_id}
+        if already_empty and action_type != "archive":
+            return {"outcome": "refused", "reason": "ownership_unavailable", "action_id": action_id}
+        durability = prepared.get("durability")
+        if action_type in {"kill", "archive"}:
+            if not isinstance(durability, dict):
+                return {
+                    "outcome": "refused",
+                    "reason": "durability_unknown",
+                    "action_id": action_id,
+                }
+            outcome = durability["preflight"]["outcome"]
+            if outcome not in {"safe", "consent_override", "not_required"}:
+                detail = durability["preflight"].get("error") or (
+                    "worktree contains commits that are not durably published"
+                    if outcome == "unpushed"
+                    else "worktree durability could not be proven"
+                )
+                return {
+                    "outcome": "refused",
+                    "reason": f"durability_{outcome}",
+                    "action_id": action_id,
+                    "detail": detail,
+                    "recovery_command": f"hop lode status {lode_id}",
+                }
+
+        # This final in-loop pass follows all off-loop preparation and precedes the
+        # sole accepting mutation: the fsynced pending-action replace below.
+        if self._find_action_lode(lode_id) is not lode:
+            return {"outcome": "refused", "reason": "lode_not_found", "action_id": action_id}
+        if (
+            lode.get("run_generation") != expected_generation
+            or lode.get("stage") != stage
+            or is_terminal_failure_kind(lode.get("failure_kind"))
+            or _pending_action_file_exists(lode_id)
+            or (
+                prepared.get("safety_snapshot") is not None
+                and prepared["safety_snapshot"]
+                != {
+                    field: lode.get(field)
+                    for field in (
+                        "stage",
+                        "run_generation",
+                        "active",
+                        "tmux_pane",
+                        "pid",
+                        "oom_scope",
+                        "failure_kind",
+                    )
+                }
+            )
+        ):
+            return {
+                "outcome": "refused",
+                "reason": "action_raced",
+                "action_id": action_id,
+                "recovery_command": f"hop lode status {lode_id}",
+            }
+        try:
+            record = actions.new_pending_action(
+                lode_id=lode_id,
+                stage=stage,
+                expected_generation=expected_generation,
+                action_type=action_type,
+                target_disposition=target_disposition,
+                force_consent=force_consent,
+                output_facts=prepared.get("output"),
+                ownership_record=ownership,
+                source_record_sha256=prepared.get("source_digest"),
+                ship=prepared.get("ship"),
+                action_id=action_id,
+                durability=durability,
+                already_empty=already_empty,
+            )
+            actions.write_pending_action(record)
+        except Exception as error:
+            logger.error("Action record persistence failed lode=%s: %s", lode_id, error)
+            return {
+                "outcome": "refused",
+                "reason": (
+                    "completion_persistence_unavailable"
+                    if action_type == "completion"
+                    else "action_persistence_unavailable"
+                ),
+                "action_id": action_id,
+                "detail": str(error),
+            }
+
+        self._cancel_generation_guard(lode_id, expected_generation)
+        self._project_action(record, via="action_acceptance")
+        return {
+            "outcome": "accepted",
+            "reason": "accepted",
+            "action_id": action_id,
+            "record": record,
+        }
+
+    def _handle_lode_action(self, message: dict, conn: socket.socket | None) -> None:
         """Validate completion and prepare server-owned bytes off-loop."""
         lode_id = message.get("lode_id")
-        generation = message.get("run_generation")
+        generation = message.get("expected_generation")
+        action_id = message.get("action_id")
+        action_type = message.get("action_type")
+        try:
+            actions.validate_action_id(action_id)
+            binding = actions.action_binding(
+                {
+                    "lode_id": lode_id,
+                    "expected_generation": generation,
+                    "action_type": action_type,
+                    "target_disposition": message.get("target_disposition"),
+                    "force_consent": message.get("force_consent"),
+                }
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            self._send_action_ack(
+                conn, outcome="refused", reason="invalid_action", detail=str(error)
+            )
+            return
+        if action_type != "completion":
+            self._handle_manual_lode_action(message, conn, binding)
+            return
+        if (
+            message.get("stage") not in STAGES
+            or binding[3] != self._completion_target(message["stage"])
+            or binding[4]
+        ):
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="invalid_action",
+                action_id=action_id,
+                action_type=action_type,
+            )
+            return
         lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
         if not lode:
-            self._send_completion_ack(conn, accepted=False, reason="lode_not_found")
+            result = self._open_lode_action(
+                action_type=action_type, message=message, prepared={"ok": False}
+            )
+            self._send_action_open_result(conn, action_type, result)
             return
         if not generation:
-            self._send_completion_ack(conn, accepted=False, reason="missing_run_generation")
+            self._send_action_ack(
+                conn, outcome="refused", reason="missing_expected_generation", action_id=action_id
+            )
             return
         if generation != lode.get("run_generation"):
-            self._send_completion_ack(conn, accepted=False, reason="stale_run_generation")
+            result = self._open_lode_action(
+                action_type=action_type, message=message, prepared={"ok": False}
+            )
+            self._send_action_open_result(conn, action_type, result)
             return
         if message.get("stage") != lode.get("stage") or lode.get("stage") not in STAGES:
-            self._send_completion_ack(conn, accepted=False, reason="stage_mismatch")
+            self._send_action_ack(
+                conn, outcome="refused", reason="stage_mismatch", action_id=action_id
+            )
             return
 
-        if _pending_completion_exists(lode_id):
-            try:
-                pending = self._load_pending(lode_id)
-            except (OSError, ValueError, json.JSONDecodeError):
-                self._send_completion_ack(conn, accepted=False, reason="completion_pending")
-                return
-            same_submission = bool(
-                pending
-                and pending["run_generation"] == generation
-                and pending["stage"] == message.get("stage")
-                and pending["output"]["digest_hex"] == message.get("digest_hex")
-                and pending["output"]["byte_length"] == message.get("byte_length")
+        if _pending_action_file_exists(lode_id):
+            result = self._open_lode_action(
+                action_type=action_type, message=message, prepared={"ok": False}
             )
-            self._send_completion_ack(
-                conn,
-                accepted=same_submission,
-                reason="already_accepted" if same_submission else "completion_pending",
-                action_id=pending["action_id"] if same_submission else None,
-            )
+            self._send_action_open_result(conn, action_type, result)
+            if result["outcome"] == "idempotent" and result.get("record") is not None:
+                self._continue_action(result["record"])
             return
         if is_terminal_failure_kind(lode.get("failure_kind")):
-            self._send_completion_ack(conn, accepted=False, reason="terminal_failure")
+            self._send_action_ack(
+                conn, outcome="refused", reason="terminal_failure", action_id=action_id
+            )
             return
         if not lode.get("active") or lode_id not in self.lode_clients:
-            self._send_completion_ack(conn, accepted=False, reason="inactive_runner")
+            self._send_action_ack(
+                conn, outcome="refused", reason="inactive_runner", action_id=action_id
+            )
             return
-        if lode_id in self.completion_acceptances:
-            self._send_completion_ack(conn, accepted=False, reason="completion_pending")
+        if lode_id in self.action_acceptances:
+            owner_id, owner_binding, preparation_waiters = self.action_acceptances[lode_id]
+            if owner_id == action_id and owner_binding == binding:
+                if conn is not None:
+                    preparation_waiters.append(conn)
+                return
+            reason = "action_identity_mismatch" if owner_id == action_id else "action_conflict"
+            self._send_action_ack(conn, outcome="refused", reason=reason, action_id=action_id)
             return
-        if message.get("digest_algorithm") != completion.DIGEST_ALGORITHM:
-            self._send_completion_ack(conn, accepted=False, reason="invalid_output")
+        if message.get("digest_algorithm") != actions.DIGEST_ALGORITHM:
+            self._send_action_ack(
+                conn, outcome="refused", reason="invalid_output", action_id=action_id
+            )
             return
         length = message.get("byte_length")
         digest_hex = message.get("digest_hex")
@@ -1330,57 +1745,83 @@ class Server:
             or len(digest_hex) != 64
             or not isinstance(encoded, str)
         ):
-            self._send_completion_ack(conn, accepted=False, reason="invalid_output")
+            self._send_action_ack(
+                conn, outcome="refused", reason="invalid_output", action_id=action_id
+            )
             return
         try:
             data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
-            self._send_completion_ack(conn, accepted=False, reason="invalid_output")
+            self._send_action_ack(
+                conn, outcome="refused", reason="invalid_output", action_id=action_id
+            )
             return
         if (
             len(data) != length
             or hashlib.sha256(data).hexdigest() != digest_hex
             or not data.strip()
         ):
-            self._send_completion_ack(conn, accepted=False, reason="invalid_output")
+            self._send_action_ack(
+                conn, outcome="refused", reason="invalid_output", action_id=action_id
+            )
             return
         try:
-            ownership = completion.load_run_ownership(lode_id, generation, require_worker=True)
+            ownership = actions.load_run_ownership(lode_id, generation, require_worker=True)
         except (OSError, ValueError, json.JSONDecodeError):
             ownership = None
         if ownership is None:
-            self._send_completion_ack(conn, accepted=False, reason="ownership_unavailable")
+            self._send_action_ack(
+                conn, outcome="refused", reason="ownership_unavailable", action_id=action_id
+            )
             return
         if ownership["proof_mode"] == "linux-strict" and teardown.resolve_pidfd_interface() is None:
-            self._send_completion_ack(conn, accepted=False, reason="pidfd_unavailable")
+            self._send_action_ack(
+                conn, outcome="refused", reason="pidfd_unavailable", action_id=action_id
+            )
             return
         project = find_project(lode.get("project", "")) if lode["stage"] == "ship" else None
         if lode["stage"] == "ship" and not project:
-            self._send_completion_ack(conn, accepted=False, reason="ship_provenance_unavailable")
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="ship_provenance_unavailable",
+                action_id=action_id,
+            )
             return
 
-        action_id = uuid.uuid4().hex
-        self.completion_acceptances[lode_id] = action_id
+        self.action_acceptances[lode_id] = (
+            action_id,
+            binding,
+            [conn] if conn is not None else [],
+        )
         snapshot = copy.deepcopy(lode)
 
         def prepare() -> None:
             def finish(result: dict) -> None:
                 self._enqueue_event(
                     {
-                        "type": "_completion_acceptance_result",
+                        "type": "_action_acceptance_result",
                         "exchange_id": message.get("exchange_id"),
-                        "lode_id": lode_id,
-                        "run_generation": generation,
-                        "stage": snapshot["stage"],
-                        "action_id": action_id,
+                        "request": {
+                            "action_id": action_id,
+                            "lode_id": lode_id,
+                            "expected_generation": generation,
+                            "action_type": action_type,
+                            "target_disposition": message.get("target_disposition"),
+                            "force_consent": message.get("force_consent"),
+                            "stage": snapshot["stage"],
+                            "digest_algorithm": message.get("digest_algorithm"),
+                            "digest_hex": digest_hex,
+                            "byte_length": length,
+                        },
                         "result": result,
                     },
-                    conn,
+                    None,
                 )
 
             try:
-                completion.collect_orphaned_staging(lode_id, None)
-                output = completion.stage_output(
+                actions.collect_orphaned_staging(lode_id, None)
+                output = actions.stage_output(
                     lode_id,
                     data,
                     expected_length=length,
@@ -1390,9 +1831,9 @@ class Server:
                 finish({"ok": False, "reason": "output_staging_unavailable", "error": str(error)})
                 return
             try:
-                source_path = completion.run_ownership_path(lode_id, generation)
-                source_digest = completion.durable_json_sha256(source_path)
-                source = completion.load_run_ownership(lode_id, generation, require_worker=True)
+                source_path = actions.run_ownership_path(lode_id, generation)
+                source_digest = actions.durable_json_sha256(source_path)
+                source = actions.load_run_ownership(lode_id, generation, require_worker=True)
                 if source is None:
                     raise RuntimeError("generation ownership disappeared")
             except Exception as error:
@@ -1421,116 +1862,299 @@ class Server:
                 }
             )
 
-        thread = threading.Thread(target=prepare, name="hopper-completion-accept", daemon=True)
+        thread = threading.Thread(target=prepare, name="hopper-action-accept", daemon=True)
         self.registration_threads[f"accept:{lode_id}:{generation}"] = thread
         thread.start()
 
-    def _handle_completion_acceptance_result(
-        self, message: dict, conn: socket.socket | None
+    @staticmethod
+    def _durability_observation(lode_id: str, *, override: bool = False) -> dict:
+        checked_at_ms = current_time_ms()
+        if override:
+            return {
+                "outcome": "consent_override",
+                "count": None,
+                "basis": "kill --force",
+                "error": None,
+                "checked_at_ms": checked_at_ms,
+            }
+        worktree = get_worktree_dir(lode_id)
+        count, basis = git.unpushed_commits(str(worktree))
+        if count is None:
+            return {
+                "outcome": "unknown",
+                "count": None,
+                "basis": basis,
+                "error": f"could not prove worktree durability at {worktree}",
+                "checked_at_ms": checked_at_ms,
+            }
+        if count:
+            return {
+                "outcome": "unpushed",
+                "count": count,
+                "basis": basis,
+                "error": f"{count} commit(s) exist only in worktree {worktree}",
+                "checked_at_ms": checked_at_ms,
+            }
+        return {
+            "outcome": "safe",
+            "count": 0,
+            "basis": basis,
+            "error": None,
+            "checked_at_ms": checked_at_ms,
+        }
+
+    def _handle_manual_lode_action(
+        self,
+        message: dict,
+        conn: socket.socket | None,
+        binding: tuple[str, str | None, str, str, bool],
     ) -> None:
+        """Prepare one manual action without changing lode or containment state."""
+        lode_id, generation, action_type, _, force_consent = binding
+        action_id = message["action_id"]
+        stage = message.get("stage")
+        if stage not in STAGES:
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="stage_mismatch",
+                action_id=action_id,
+                action_type=action_type,
+            )
+            return
+        lode = self._find_action_lode(lode_id)
+        has_receipt_identity = bool(
+            lode
+            and isinstance(lode.get("action_results", []), list)
+            and any(
+                isinstance(result, dict) and result.get("action_id") == action_id
+                for result in lode.get("action_results", [])
+            )
+        )
+        if (
+            lode is None
+            or generation != lode.get("run_generation")
+            or stage != lode.get("stage")
+            or _pending_action_file_exists(lode_id)
+            or has_receipt_identity
+        ):
+            opened = self._open_lode_action(
+                action_type=action_type, message=message, prepared={"ok": False}
+            )
+            record = opened.get("record")
+            if opened["outcome"] == "idempotent" and record is not None:
+                if conn is not None:
+                    self.action_waiters.setdefault(action_id, []).append(conn)
+                if record["phase"].endswith("_blocked"):
+                    self._retry_action(lode_id, None)
+                else:
+                    self._resume_action(lode_id)
+            else:
+                if conn is None:
+                    self._set_action_refusal(
+                        lode_id,
+                        opened.get("reason", "refused"),
+                        opened.get("detail"),
+                    )
+                self._send_action_open_result(conn, action_type, opened)
+            return
+        if lode_id in self.action_acceptances:
+            owner_id, owner_binding, waiters = self.action_acceptances[lode_id]
+            if owner_id == action_id and owner_binding == binding:
+                if conn is not None:
+                    waiters.append(conn)
+                return
+            reason = "action_identity_mismatch" if owner_id == action_id else "action_conflict"
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason=reason,
+                action_id=action_id,
+                action_type=action_type,
+            )
+            return
+
+        already_empty = bool(
+            action_type == "archive"
+            and not lode.get("active")
+            and lode_id not in self.lode_clients
+            and all(lode.get(field) is None for field in ("tmux_pane", "pid", "oom_scope"))
+        )
+        self.action_acceptances[lode_id] = (
+            action_id,
+            binding,
+            [conn] if conn is not None else [],
+        )
+        snapshot = copy.deepcopy(lode)
+
+        def prepare() -> None:
+            try:
+                ownership = None
+                source_digest = None
+                if not already_empty:
+                    if generation is None:
+                        raise RuntimeError("active action has no run generation")
+                    source_path = actions.run_ownership_path(lode_id, generation)
+                    source_digest = actions.durable_json_sha256(source_path)
+                    ownership = actions.load_run_ownership(lode_id, generation, require_worker=True)
+                    if ownership is None:
+                        raise RuntimeError("generation ownership is absent")
+                durability = None
+                if action_type in {"kill", "archive"}:
+                    required = not already_empty
+                    if required:
+                        preflight = self._durability_observation(
+                            lode_id,
+                            override=action_type == "kill" and force_consent,
+                        )
+                        final = {
+                            "outcome": "not_required",
+                            "count": 0,
+                            "basis": "pending post-containment recheck",
+                            "error": None,
+                            "checked_at_ms": None,
+                        }
+                    else:
+                        preflight = final = {
+                            "outcome": "not_required",
+                            "count": 0,
+                            "basis": "already-empty archive",
+                            "error": None,
+                            "checked_at_ms": current_time_ms(),
+                        }
+                    durability = {
+                        "required": required,
+                        "preflight": dict(preflight),
+                        "final": dict(final),
+                    }
+            except Exception as error:
+                result = {"ok": False, "reason": "ownership_unavailable", "error": str(error)}
+            else:
+                result = {
+                    "ok": True,
+                    "ownership": ownership,
+                    "source_digest": source_digest,
+                    "durability": durability,
+                    "already_empty": already_empty,
+                    "safety_snapshot": {
+                        field: snapshot.get(field)
+                        for field in (
+                            "stage",
+                            "run_generation",
+                            "active",
+                            "tmux_pane",
+                            "pid",
+                            "oom_scope",
+                            "failure_kind",
+                        )
+                    },
+                }
+            self._enqueue_event(
+                {
+                    "type": "_action_acceptance_result",
+                    "request": copy.deepcopy(message),
+                    "result": result,
+                }
+            )
+
+        thread = threading.Thread(target=prepare, name="hopper-action-accept", daemon=True)
+        self.registration_threads[f"accept:{lode_id}:{generation}"] = thread
+        thread.start()
+
+    def _handle_action_acceptance_result(self, message: dict, conn: socket.socket | None) -> None:
         """Commit the durable record and install its generation fence."""
-        lode_id = message.get("lode_id")
-        generation = message.get("run_generation")
-        action_id = message.get("action_id")
+        request = message.get("request", {})
+        lode_id = request.get("lode_id")
+        generation = request.get("expected_generation")
+        action_id = request.get("action_id")
+        action_type = request.get("action_type")
         self.registration_threads.pop(f"accept:{lode_id}:{generation}", None)
-        if self.completion_acceptances.get(lode_id) != action_id:
+        try:
+            binding = actions.action_binding(
+                {
+                    "lode_id": request.get("lode_id"),
+                    "expected_generation": request.get("expected_generation"),
+                    "action_type": request.get("action_type"),
+                    "target_disposition": request.get("target_disposition"),
+                    "force_consent": request.get("force_consent"),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            binding = None
+        acceptance = self.action_acceptances.get(lode_id)
+        if acceptance is None or acceptance[:2] != (action_id, binding):
             logger.info(
                 "Discarding stale completion acceptance lode=%s action=%s", lode_id, action_id
             )
             return
-        self.completion_acceptances.pop(lode_id, None)
-        lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
-        result = message.get("result", {})
-        if not lode:
-            self._send_completion_ack(conn, accepted=False, reason="lode_not_found")
-            return
-        if lode.get("run_generation") != generation:
-            self._send_completion_ack(conn, accepted=False, reason="stale_run_generation")
-            return
-        if lode.get("stage") != message.get("stage"):
-            self._send_completion_ack(conn, accepted=False, reason="stage_mismatch")
-            return
-        if is_terminal_failure_kind(lode.get("failure_kind")):
-            self._send_completion_ack(conn, accepted=False, reason="terminal_failure")
-            return
-        if not lode.get("active") or lode_id not in self.lode_clients:
-            self._send_completion_ack(conn, accepted=False, reason="inactive_runner")
-            return
-        if _pending_completion_exists(lode_id):
-            self._send_completion_ack(conn, accepted=False, reason="completion_pending")
-            return
-        if result.get("ok") is not True:
-            reason = result.get("reason", "ownership_unavailable")
-            logger.error("Completion preparation failed lode=%s: %s", lode_id, result.get("error"))
-            self._send_completion_ack(
-                conn, accepted=False, reason=reason, detail=result.get("error")
-            )
-            return
-        try:
-            record = completion.new_pending_completion(
-                lode_id=lode_id,
-                stage=message["stage"],
-                run_generation=generation,
-                output_facts=result["output"],
-                ownership_record=result["ownership"],
-                source_record_sha256=result["source_digest"],
-                ship=result["ship"],
-                action_id=action_id,
-            )
-            completion.write_pending_completion(record)
-        except Exception as error:
-            logger.error("Completion record persistence failed lode=%s: %s", lode_id, error)
-            self._send_completion_ack(
-                conn,
-                accepted=False,
-                reason="completion_persistence_unavailable",
-                detail=str(error),
-            )
-            return
-
-        # The fsynced record above is the acceptance linearization point.
-        self._cancel_generation_guard(lode_id, generation)
-        self._project_completion(record, via="completion_acceptance")
-        self._send_completion_ack(
-            conn,
-            accepted=True,
-            reason="accepted",
-            action_id=record["action_id"],
+        self.action_acceptances.pop(lode_id, None)
+        preparation_waiters = acceptance[2]
+        opened = self._open_lode_action(
+            action_type=action_type,
+            message=request,
+            prepared=message.get("result", {}),
         )
-        self._schedule_completion_step(record, "output_publish", "publishing_output")
+        if opened["outcome"] in {"accepted", "idempotent"}:
+            self.action_waiters[action_id] = preparation_waiters
+            if action_type == "completion":
+                self._send_action_open_result(None, action_type, opened)
+        else:
+            if action_type != "completion" and isinstance(lode_id, str) and not preparation_waiters:
+                self._set_action_refusal(
+                    lode_id,
+                    opened.get("reason", "refused"),
+                    opened.get("detail"),
+                )
+            for waiter in preparation_waiters:
+                self._send_action_open_result(waiter, action_type, opened)
+        record = opened.get("record")
+        if opened["outcome"] == "accepted":
+            if action_type == "completion":
+                self._schedule_action_step(record, "output_publish", "publishing_output")
+            elif record["markers"]["containment"]["state"] == "done":
+                self._continue_action(record)
+            else:
+                self._schedule_action_step(record, "ownership_capture", "capturing_ownership")
+        elif opened["outcome"] == "idempotent" and record is not None:
+            if record["phase"].endswith("_blocked"):
+                self._retry_action(record["lode_id"], None)
+            else:
+                self._resume_action(record["lode_id"])
 
-    def _persist_completion(self, record: dict, *, via: str) -> None:
-        completion.write_pending_completion(record)
-        self._project_completion(record, via=via)
+    def _persist_action(self, record: dict, *, via: str) -> None:
+        actions.write_pending_action(record)
+        self._project_action(record, via=via)
 
-    def _schedule_completion_step(self, record: dict, marker_name: str, phase: str) -> None:
+    def _schedule_action_step(self, record: dict, marker_name: str, phase: str) -> None:
         """Persist an intent and start exactly one daemon worker for it."""
         marker = record["markers"][marker_name]
         if marker["state"] in {"not_started", "blocked"}:
-            completion.transition_marker(record, marker_name, "intent")
+            actions.transition_marker(record, marker_name, "intent")
         elif marker["state"] != "intent":
             return
         record["phase"] = phase
         record["recovery"] = {"kind": None, "message": None, "command": None}
-        self._persist_completion(record, via=f"completion_intent:{marker_name}")
+        self._persist_action(record, via=f"completion_intent:{marker_name}")
         key = (record["action_id"], phase)
-        existing = self.completion_threads.get(key)
+        existing = self.action_threads.get(key)
         if existing is not None and existing.is_alive():
             return
         snapshot = copy.deepcopy(record)
         attempt_id = marker["attempt_id"]
-        retained_pidfd = self.supervisor_pidfds.get((record["lode_id"], record["run_generation"]))
-        context = self._completion_step_context(record, marker_name)
+        retained_pidfd = self.supervisor_pidfds.get(
+            (record["lode_id"], record["expected_generation"])
+        )
+        context = self._action_step_context(record, marker_name)
         thread = threading.Thread(
-            target=self._run_completion_step,
+            target=self._run_action_step,
             args=(snapshot, marker_name, phase, attempt_id, retained_pidfd, context),
             name=f"hopper-completion-{phase}",
             daemon=True,
         )
-        self.completion_threads[key] = thread
+        self.action_threads[key] = thread
         thread.start()
 
-    def _run_completion_step(
+    def _run_action_step(
         self,
         record: dict,
         marker_name: str,
@@ -1543,10 +2167,10 @@ class Server:
         try:
             if phase == "publishing_output":
                 try:
-                    completion.publish_output(record)
+                    actions.publish_output(record)
                 except Exception as publish_error:
                     try:
-                        completion.verify_staged_output(record)
+                        actions.verify_staged_output(record)
                     except Exception as staged_error:
                         result = {
                             "ok": False,
@@ -1565,27 +2189,37 @@ class Server:
                 else:
                     result = {"ok": True}
             elif phase == "capturing_ownership":
-                result = self._recapture_completion_ownership(record, retained_pidfd)
+                result = self._recapture_action_ownership(record, retained_pidfd)
             elif phase == "closing_pane":
                 closed = teardown.close_owned_pane(record["ownership"])
                 result = {"ok": closed["state"] == "gone", "error": closed["error"]}
             elif phase in {"observing_containment", "force_killing"}:
-                result = self._observe_completion_containment(record, retained_pidfd)
+                result = self._observe_action_containment(record, retained_pidfd)
             elif phase == "proving_ship_landing":
                 result = self._prove_ship_landing(record)
             elif phase == "quarantining":
                 result = self._run_ship_cleanup_step(record, marker_name)
+            elif phase == "rechecking_durability":
+                observation = self._durability_observation(
+                    record["lode_id"],
+                    override=(record["action_type"] == "kill" and record["force_consent"]),
+                )
+                result = {
+                    "ok": observation["outcome"] in {"safe", "consent_override"},
+                    "observation": observation,
+                    "error": observation["error"],
+                }
             elif phase == "spawning":
-                result = self._spawn_completion_pane(record, context or {})
+                result = self._spawn_action_successor(record, context or {})
             else:
                 result = {"ok": False, "error": f"unsupported completion phase {phase}"}
         except Exception as error:
             result = {"ok": False, "error": str(error)}
         self._enqueue_event(
             {
-                "type": "_completion_step_result",
+                "type": "_action_step_result",
                 "lode_id": record["lode_id"],
-                "run_generation": record["run_generation"],
+                "expected_generation": record["expected_generation"],
                 "action_id": record["action_id"],
                 "marker_name": marker_name,
                 "phase": phase,
@@ -1594,11 +2228,11 @@ class Server:
             }
         )
 
-    def _completion_step_context(self, record: dict, marker_name: str) -> dict | None:
+    def _action_step_context(self, record: dict, marker_name: str) -> dict | None:
         """Snapshot serialized state needed by a completion worker."""
         if marker_name != "spawn":
             return None
-        target_id = self._completion_spawn_target_id(record)
+        target_id = self._action_spawn_target_id(record)
         target = self._find_lode(target_id) if target_id else None
         if target is None:
             return {"error": "completion spawn target is absent"}
@@ -1680,13 +2314,22 @@ class Server:
         return {"ok": False, "error": f"unsupported ship cleanup marker {marker_name}"}
 
     @staticmethod
-    def _spawn_completion_pane(record: dict, context: dict) -> dict:
+    def _spawn_action_successor(record: dict, context: dict) -> dict:
         if context.get("error"):
             return {"ok": False, "error": context["error"]}
+        if (
+            record["action_type"] not in {"completion", "restart"}
+            or record["containment"]["state"] != "proven"
+            or record["markers"]["containment"]["state"] != "done"
+            or record["markers"]["lode_mutation"]["state"] != "done"
+            or record["markers"]["spawn"]["state"] != "intent"
+            or record["spawn"] is None
+        ):
+            return {"ok": False, "error": "action successor prerequisites are incomplete"}
         target = context["target"]
         spawn = record["spawn"]
         try:
-            receipt = completion.load_spawn_receipt(record["lode_id"], record["action_id"])
+            receipt = actions.load_spawn_receipt(record["lode_id"], record["action_id"])
         except (OSError, ValueError, json.JSONDecodeError) as error:
             return {"ok": False, "error": f"spawn receipt is invalid: {error}"}
         if receipt is not None:
@@ -1714,7 +2357,7 @@ class Server:
         if target.get("oom_scope"):
             pane_env[OOM_SCOPE_ENV] = target["oom_scope"]
         receipt_facts = {
-            "path": str(completion.spawn_receipt_path(record["lode_id"], record["action_id"])),
+            "path": str(actions.spawn_receipt_path(record["lode_id"], record["action_id"])),
             "action_id": record["action_id"],
             "source_lode_id": record["lode_id"],
             "target_lode_id": target["id"],
@@ -1730,23 +2373,21 @@ class Server:
         if not pane_id:
             return {"ok": False, "error": "tmux could not create the completion runner pane"}
         try:
-            receipt = completion.load_spawn_receipt(record["lode_id"], record["action_id"])
+            receipt = actions.load_spawn_receipt(record["lode_id"], record["action_id"])
         except (OSError, ValueError, json.JSONDecodeError) as error:
             return {"ok": False, "error": f"spawn receipt is invalid: {error}"}
         if receipt is None or receipt.get("pane_id") != pane_id:
             return {"ok": False, "error": "pane bootstrap did not publish its exact receipt"}
         return {"ok": True, "pane_id": pane_id, "adopted": False}
 
-    def _recapture_completion_ownership(self, record: dict, retained_pidfd: int | None) -> dict:
+    def _recapture_action_ownership(self, record: dict, retained_pidfd: int | None) -> dict:
         """Reverify generation ownership immediately before pane closure."""
         ownership = record["ownership"]
-        source_path = (
-            completion.lode_dir(record["lode_id"]) / ownership["source_record_relative_path"]
-        )
-        if completion.durable_json_sha256(source_path) != ownership["source_record_sha256"]:
+        source_path = actions.lode_dir(record["lode_id"]) / ownership["source_record_relative_path"]
+        if actions.durable_json_sha256(source_path) != ownership["source_record_sha256"]:
             raise RuntimeError("generation ownership record digest changed")
-        source = completion.load_run_ownership(
-            record["lode_id"], record["run_generation"], require_worker=True
+        source = actions.load_run_ownership(
+            record["lode_id"], record["expected_generation"], require_worker=True
         )
         if source is None:
             raise RuntimeError("generation ownership record is absent")
@@ -1770,7 +2411,7 @@ class Server:
             **ownership,
             **current,
             "captured": True,
-            "captured_at_ms": completion.accepted_at_ms(),
+            "captured_at_ms": actions.accepted_at_ms(),
         }
         pidfd = retained_pidfd
         pidfd_owned = False
@@ -1792,7 +2433,7 @@ class Server:
             "pidfd_owned": pidfd_owned,
         }
 
-    def _observe_completion_containment(self, record: dict, retained_pidfd: int | None) -> dict:
+    def _observe_action_containment(self, record: dict, retained_pidfd: int | None) -> dict:
         """Build identity-bound observers and run the bounded state machine."""
         ownership = record["ownership"]
         mode = ownership["proof_mode"]
@@ -1915,7 +2556,7 @@ class Server:
             "pidfd_owned": pidfd_owned,
         }
 
-    def _block_completion(
+    def _block_action(
         self,
         record: dict,
         marker_name: str,
@@ -1924,7 +2565,7 @@ class Server:
     ) -> None:
         marker = record["markers"][marker_name]
         if marker["state"] == "intent":
-            completion.transition_marker(
+            actions.transition_marker(
                 record,
                 marker_name,
                 "blocked",
@@ -1935,7 +2576,7 @@ class Server:
             for kill_marker in ("scope_kill", "supervisor_kill"):
                 current = record["markers"][kill_marker]
                 if current["state"] == "intent":
-                    completion.transition_marker(
+                    actions.transition_marker(
                         record,
                         kill_marker,
                         "blocked",
@@ -1948,25 +2589,38 @@ class Server:
             record["phase"] = "containment_blocked"
         elif marker_name == "ship_landing":
             record["phase"] = "ship_blocked"
+        elif marker_name == "durability_recheck":
+            record["phase"] = "durability_blocked"
         else:
             record["phase"] = "cleanup_blocked"
         record["recovery"] = {
             "kind": recovery_kind,
             "message": error or "completion phase failed",
-            "command": completion.recovery_command(record, recovery_kind),
+            "command": actions.recovery_command(record, recovery_kind),
         }
         if marker_name == "output_publish":
             record["output"]["failure"] = error or "completion output publication failed"
-        self._persist_completion(record, via=f"completion_blocked:{marker_name}")
+        self._persist_action(record, via=f"completion_blocked:{marker_name}")
+        if record["action_type"] != "completion":
+            self._send_action_ack(
+                None,
+                outcome="blocked",
+                reason=f"{recovery_kind}_blocked",
+                action_id=record["action_id"],
+                action_type=record["action_type"],
+                disposition=record["target_disposition"],
+                detail=record["recovery"]["message"],
+                recovery_command=record["recovery"]["command"],
+            )
 
-    def _handle_completion_step_result(self, message: dict) -> None:
+    def _handle_action_step_result(self, message: dict) -> None:
         """Accept one worker result only for its persisted action/phase/attempt."""
         action_id = message.get("action_id")
         phase = message.get("phase")
-        self.completion_threads.pop((action_id, phase), None)
+        self.action_threads.pop((action_id, phase), None)
         lode_id = message.get("lode_id")
         try:
-            record = self._load_pending(lode_id)
+            record = self._load_action_slot(lode_id)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logger.error("Cannot apply completion result lode=%s: %s", lode_id, error)
             result = message.get("result", {})
@@ -1980,6 +2634,7 @@ class Server:
             "observing_containment": "containment",
             "force_killing": "containment",
             "proving_ship_landing": "ship_landing",
+            "rechecking_durability": "durability_recheck",
             "spawning": "spawn",
         }
         marker_name = message.get("marker_name") or marker_by_phase.get(phase)
@@ -1990,6 +2645,7 @@ class Server:
             "observing_containment": {"containment"},
             "force_killing": {"containment"},
             "proving_ship_landing": {"ship_landing"},
+            "rechecking_durability": {"durability_recheck"},
             "quarantining": {
                 "quarantine_rename",
                 "worktree_repair",
@@ -2005,7 +2661,7 @@ class Server:
             or marker_name is None
             or marker_name not in allowed_markers.get(phase, set())
             or record["action_id"] != action_id
-            or record["run_generation"] != message.get("run_generation")
+            or record["expected_generation"] != message.get("expected_generation")
             or record["phase"] != phase
             or record["markers"][marker_name]["state"] != "intent"
             or record["markers"][marker_name]["attempt_id"] != message.get("attempt_id")
@@ -2022,7 +2678,7 @@ class Server:
 
         pidfd = result.get("pidfd")
         if isinstance(pidfd, int):
-            key = (record["lode_id"], record["run_generation"])
+            key = (record["lode_id"], record["expected_generation"])
             prior = self.supervisor_pidfds.get(key)
             if result.get("pidfd_owned") and prior is not None and prior != pidfd:
                 os.close(prior)
@@ -2031,6 +2687,8 @@ class Server:
         if result.get("ok") is not True:
             if "containment" in result:
                 record["containment"] = result["containment"]
+            if phase == "rechecking_durability" and "observation" in result:
+                record["durability"]["final"] = result["observation"]
             recovery_kind = {
                 "publishing_output": (
                     "publication" if result.get("staged_bytes") == "verified" else "output"
@@ -2040,6 +2698,7 @@ class Server:
                 "observing_containment": "containment",
                 "force_killing": "containment",
                 "proving_ship_landing": "landing",
+                "rechecking_durability": "durability",
                 "quarantining": "cleanup",
                 "spawning": "spawn",
             }[phase]
@@ -2053,50 +2712,57 @@ class Server:
                     quarantine["branch_outcome"] = "retained"
                 elif marker_name == "branch_delete":
                     quarantine["branch_outcome"] = "retained"
-            self._block_completion(record, marker_name, recovery_kind, result.get("error"))
+            self._block_action(record, marker_name, recovery_kind, result.get("error"))
             return
 
         marker = record["markers"][marker_name]
         if phase == "publishing_output":
-            completion.transition_marker(
-                record, marker_name, "done", attempt_id=marker["attempt_id"]
-            )
+            actions.transition_marker(record, marker_name, "done", attempt_id=marker["attempt_id"])
             record["output"]["published"] = True
             record["output"]["failure"] = None
-            self._persist_completion(record, via="completion_result:output_publish")
-            self._schedule_completion_step(record, "ownership_capture", "capturing_ownership")
+            self._persist_action(record, via="completion_result:output_publish")
+            self._schedule_action_step(record, "ownership_capture", "capturing_ownership")
             return
 
         if phase == "capturing_ownership":
             record["ownership"] = result["ownership"]
-            completion.transition_marker(
-                record, marker_name, "done", attempt_id=marker["attempt_id"]
-            )
+            actions.transition_marker(record, marker_name, "done", attempt_id=marker["attempt_id"])
             record["containment"]["state"] = "pane_close_pending"
-            self._persist_completion(record, via="completion_result:ownership_capture")
-            self._schedule_completion_step(record, "pane_close", "closing_pane")
+            self._persist_action(record, via="completion_result:ownership_capture")
+            self._schedule_action_step(record, "pane_close", "closing_pane")
             return
 
         if phase == "closing_pane":
-            completion.transition_marker(
-                record, marker_name, "done", attempt_id=marker["attempt_id"]
-            )
+            actions.transition_marker(record, marker_name, "done", attempt_id=marker["attempt_id"])
             record["containment"] = teardown.start_containment(record)
-            self._persist_completion(record, via="completion_result:pane_close")
-            self._schedule_completion_step(record, "containment", "observing_containment")
+            self._persist_action(record, via="completion_result:pane_close")
+            self._schedule_action_step(record, "containment", "observing_containment")
             return
 
         if phase == "proving_ship_landing":
             record["ship"]["landing"] = result["landing"]
-            completion.transition_marker(
+            actions.transition_marker(
                 record,
                 marker_name,
                 "done",
                 attempt_id=marker["attempt_id"],
                 detail=result["landing"]["cause"],
             )
-            self._persist_completion(record, via="completion_result:ship_landing")
-            self._continue_completion(record)
+            self._persist_action(record, via="completion_result:ship_landing")
+            self._continue_action(record)
+            return
+
+        if phase == "rechecking_durability":
+            record["durability"]["final"] = result["observation"]
+            actions.transition_marker(
+                record,
+                marker_name,
+                "done",
+                attempt_id=marker["attempt_id"],
+                detail=result["observation"]["outcome"],
+            )
+            self._persist_action(record, via="action_result:durability_recheck")
+            self._continue_action(record)
             return
 
         if phase == "quarantining":
@@ -2110,20 +2776,20 @@ class Server:
                     "already_absent" if fact["state"] == "already-absent" else "deleted"
                 )
             record["ship"]["cleanup_failure"] = None
-            completion.transition_marker(
+            actions.transition_marker(
                 record,
                 marker_name,
                 "done",
                 attempt_id=marker["attempt_id"],
                 detail=fact.get("state") or "authorized",
             )
-            self._persist_completion(record, via=f"completion_result:{marker_name}")
-            self._continue_completion(record)
+            self._persist_action(record, via=f"completion_result:{marker_name}")
+            self._continue_action(record)
             return
 
         if phase == "spawning":
             record["spawn"]["pane_id"] = result["pane_id"]
-            self._persist_completion(record, via="completion_result:spawn_pane")
+            self._persist_action(record, via="completion_result:spawn_pane")
             self._reconcile_spawn_adoption(record)
             return
 
@@ -2132,41 +2798,46 @@ class Server:
         if containment["state"] == "kill_pending":
             attempt = uuid.uuid4().hex
             if containment["last_cgroup_observation"] == "populated":
-                completion.transition_marker(record, "scope_kill", "intent", attempt_id=attempt)
+                actions.transition_marker(record, "scope_kill", "intent", attempt_id=attempt)
             if containment["last_supervisor_observation"] == "alive":
-                completion.transition_marker(
-                    record, "supervisor_kill", "intent", attempt_id=attempt
-                )
+                actions.transition_marker(record, "supervisor_kill", "intent", attempt_id=attempt)
             record["phase"] = "force_killing"
-            self._persist_completion(record, via="completion_intent:force_killing")
-            self._schedule_completion_step(record, "containment", "force_killing")
+            self._persist_action(record, via="completion_intent:force_killing")
+            self._schedule_action_step(record, "containment", "force_killing")
             return
         if containment["state"] != "proven":
-            self._block_completion(
+            self._block_action(
                 record,
                 marker_name,
                 "containment",
                 containment.get("last_error") or "containment proof is incomplete",
             )
             return
-        completion.transition_marker(record, marker_name, "done", attempt_id=marker["attempt_id"])
+        actions.transition_marker(record, marker_name, "done", attempt_id=marker["attempt_id"])
         for kill_marker in ("scope_kill", "supervisor_kill"):
             current = record["markers"][kill_marker]
             if current["state"] == "intent":
-                completion.transition_marker(
+                actions.transition_marker(
                     record, kill_marker, "done", attempt_id=current["attempt_id"]
                 )
-        record["phase"] = "publishing_next_action"
-        self._persist_completion(record, via="completion_result:containment_proven")
-        fd = self.supervisor_pidfds.pop((record["lode_id"], record["run_generation"]), None)
+        record["phase"] = "publishing_terminal"
+        self._persist_action(record, via="completion_result:containment_proven")
+        fd = self.supervisor_pidfds.pop((record["lode_id"], record["expected_generation"]), None)
         if fd is not None:
             os.close(fd)
-        self._continue_completion(record)
+        self._continue_action(record)
 
-    def _continue_completion(self, record: dict) -> None:
+    def _continue_action(self, record: dict) -> None:
         """Dispatch the first unfinished post-containment action."""
         if record["markers"]["containment"]["state"] != "done":
             return
+        if record["action_type"] != "completion":
+            self._continue_manual_action(record)
+            return
+        self._continue_completion_action(record)
+
+    def _continue_completion_action(self, record: dict) -> None:
+        """Dispatch completion-only terminal, ship, spawn, and cleanup work."""
         if record["stage"] == "ship":
             for marker_name in (
                 "ship_landing",
@@ -2178,9 +2849,9 @@ class Server:
                     phase = (
                         "proving_ship_landing" if marker_name == "ship_landing" else "quarantining"
                     )
-                    self._schedule_completion_step(record, marker_name, phase)
+                    self._schedule_action_step(record, marker_name, phase)
                     return
-        if record["markers"]["stage_mutation"]["state"] != "done":
+        if record["markers"]["lode_mutation"]["state"] != "done":
             if not self._apply_completion_stage(record):
                 return
         if record["stage"] == "ship":
@@ -2194,28 +2865,149 @@ class Server:
             record["ship"]["backlog"]["promoted_lode_id"]
         )
         if needs_spawn and record["markers"]["spawn"]["state"] != "done":
-            if not self._prepare_completion_spawn(record):
+            if not self._prepare_action_spawn(record):
                 return
             self._reconcile_spawn_adoption(record)
             return
         if record["stage"] == "ship":
             for marker_name in ("worktree_remove", "branch_delete"):
                 if record["markers"][marker_name]["state"] != "done":
-                    self._schedule_completion_step(record, marker_name, "quarantining")
+                    self._schedule_action_step(record, marker_name, "quarantining")
                     return
         self._clear_completed_action(record)
 
-    def _apply_completion_stage(self, record: dict) -> bool:
-        marker = record["markers"]["stage_mutation"]
+    def _continue_manual_action(self, record: dict) -> None:
+        """Dispatch the accepted manual action after containment is proven empty."""
+        if (
+            record["durability"]["required"]
+            and record["markers"]["durability_recheck"]["state"] != "done"
+        ):
+            self._schedule_action_step(record, "durability_recheck", "rechecking_durability")
+            return
+        if record["action_type"] in {"pause", "restart"}:
+            if record["markers"]["lode_mutation"]["state"] != "done":
+                if not self._apply_manual_lode_mutation(record):
+                    return
+        else:
+            if record["markers"]["archive"]["state"] != "done":
+                if not self._apply_manual_archive(record):
+                    return
+        if record["action_type"] == "restart" and record["markers"]["spawn"]["state"] != "done":
+            if not self._prepare_action_spawn(record):
+                return
+            self._reconcile_spawn_adoption(record)
+            return
+        self._clear_completed_action(record)
+
+    def _apply_manual_lode_mutation(self, record: dict) -> bool:
+        marker = record["markers"]["lode_mutation"]
         if marker["state"] in {"not_started", "blocked"}:
-            completion.transition_marker(record, "stage_mutation", "intent")
-            record["phase"] = "publishing_next_action"
-            self._persist_completion(record, via="completion_intent:stage_mutation")
-            marker = record["markers"]["stage_mutation"]
-        lode = self._find_completion_lode(record["lode_id"])
+            target_session = str(uuid.uuid4()) if record["action_type"] == "restart" else None
+            actions.transition_marker(record, "lode_mutation", "intent", detail=target_session)
+            record["phase"] = "publishing_terminal"
+            self._persist_action(record, via="action_intent:lode_mutation")
+            marker = record["markers"]["lode_mutation"]
+        lode = self._find_lode(record["lode_id"])
+        if lode is None or lode.get("stage") != record["stage"]:
+            self._block_action(
+                record, "lode_mutation", "cleanup", "accepted lode identity is absent"
+            )
+            return False
+        if record["action_type"] == "pause":
+            lode["state"] = "paused"
+            lode["status"] = "Paused by user; worktree retained"
+        else:
+            if (
+                reset_lode_claude_stage(
+                    self.lodes,
+                    lode["id"],
+                    record["stage"],
+                    persist=False,
+                    session_id=marker["detail"],
+                )
+                is None
+            ):
+                self._block_action(
+                    record, "lode_mutation", "cleanup", "accepted Claude stage is absent"
+                )
+                return False
+            lode["state"] = "teardown"
+            lode["status"] = actions.action_status(record)
+        lode["failure_kind"] = None
+        lode["active"] = False
+        lode["tmux_pane"] = None
+        lode["pid"] = None
+        lode["oom_scope"] = None
+        touch(lode)
+        save_lodes(self.lodes)
+        actions.transition_marker(
+            record,
+            "lode_mutation",
+            "done",
+            attempt_id=marker["attempt_id"],
+            detail=record["target_disposition"],
+        )
+        self._persist_action(record, via="action_result:lode_mutation")
+        self.broadcast({"type": "lode_updated", "lode": lode})
+        return True
+
+    def _apply_manual_archive(self, record: dict) -> bool:
+        marker = record["markers"]["archive"]
+        if marker["state"] in {"not_started", "blocked"}:
+            actions.transition_marker(record, "archive", "intent")
+            record["phase"] = "publishing_terminal"
+            self._persist_action(record, via="action_intent:archive")
+            marker = record["markers"]["archive"]
+        lode = self._find_action_lode(record["lode_id"])
+        if lode is None:
+            self._block_action(record, "archive", "cleanup", "accepted lode is absent")
+            return False
+        if any(item is lode for item in self.lodes):
+            if record["action_type"] == "kill":
+                lode["state"] = "error"
+                lode["status"] = "Killed by user; worktree retained"
+            else:
+                lode["status"] = "Archived by user; worktree retained"
+            lode["failure_kind"] = None
+            lode["active"] = False
+            lode["tmux_pane"] = None
+            lode["pid"] = None
+            lode["oom_scope"] = None
+            lode["pending_action"] = actions.pending_action_projection(record)
+            touch(lode)
+            save_lodes(self.lodes)
+        try:
+            archived = archive_lode_for_action(
+                self.lodes,
+                self.archived_lodes,
+                record["lode_id"],
+                record["action_id"],
+            )
+        except (OSError, ValueError) as error:
+            self._block_action(record, "archive", "cleanup", str(error))
+            return False
+        actions.transition_marker(
+            record,
+            "archive",
+            "done",
+            attempt_id=marker["attempt_id"],
+            detail="archive_action_id matched",
+        )
+        self._persist_action(record, via="action_result:archive")
+        self.broadcast({"type": "lode_archived", "lode": archived})
+        return True
+
+    def _apply_completion_stage(self, record: dict) -> bool:
+        marker = record["markers"]["lode_mutation"]
+        if marker["state"] in {"not_started", "blocked"}:
+            actions.transition_marker(record, "lode_mutation", "intent")
+            record["phase"] = "publishing_terminal"
+            self._persist_action(record, via="completion_intent:stage_mutation")
+            marker = record["markers"]["lode_mutation"]
+        lode = self._find_action_lode(record["lode_id"])
         target = record["next_action"]["target_stage"] or "shipped"
         if lode is None:
-            self._block_completion(record, "stage_mutation", "cleanup", "completion lode is absent")
+            self._block_action(record, "lode_mutation", "cleanup", "completion lode is absent")
             return False
         if lode.get("stage") == record["stage"]:
             lode["stage"] = target
@@ -2231,28 +3023,28 @@ class Server:
                 "completion_stage_mutation",
             )
         elif lode.get("stage") != target:
-            self._block_completion(
+            self._block_action(
                 record,
-                "stage_mutation",
+                "lode_mutation",
                 "cleanup",
                 "lode stage conflicts with the accepted completion action",
             )
             return False
-        completion.transition_marker(
+        actions.transition_marker(
             record,
-            "stage_mutation",
+            "lode_mutation",
             "done",
             attempt_id=marker["attempt_id"],
             detail=f"stage {target}",
         )
-        self._persist_completion(record, via="completion_result:stage_mutation")
+        self._persist_action(record, via="completion_result:stage_mutation")
         return True
 
     def _apply_completion_archive(self, record: dict) -> bool:
         marker = record["markers"]["archive"]
         if marker["state"] in {"not_started", "blocked"}:
-            completion.transition_marker(record, "archive", "intent")
-            self._persist_completion(record, via="completion_intent:archive")
+            actions.transition_marker(record, "archive", "intent")
+            self._persist_action(record, via="completion_intent:archive")
             marker = record["markers"]["archive"]
         try:
             archived = archive_lode_for_action(
@@ -2262,10 +3054,10 @@ class Server:
                 record["action_id"],
             )
         except (OSError, ValueError) as error:
-            self._block_completion(record, "archive", "cleanup", str(error))
+            self._block_action(record, "archive", "cleanup", str(error))
             return False
         record["ship"]["archive_published"] = True
-        completion.transition_marker(
+        actions.transition_marker(
             record,
             "archive",
             "done",
@@ -2278,20 +3070,20 @@ class Server:
             archived.get("status", ""),
             "completion_archive",
         )
-        self._persist_completion(record, via="completion_result:archive")
+        self._persist_action(record, via="completion_result:archive")
         self.broadcast({"type": "lode_archived", "lode": archived})
         return True
 
     def _apply_completion_backlog(self, record: dict) -> bool:
         marker = record["markers"]["backlog"]
         if marker["state"] in {"not_started", "blocked"}:
-            completion.transition_marker(record, "backlog", "intent")
-            self._persist_completion(record, via="completion_intent:backlog")
+            actions.transition_marker(record, "backlog", "intent")
+            self._persist_action(record, via="completion_intent:backlog")
             marker = record["markers"]["backlog"]
         plan = record["ship"]["backlog"]
-        source = self._find_completion_lode(record["lode_id"])
+        source = self._find_action_lode(record["lode_id"])
         if source is None:
-            self._block_completion(record, "backlog", "cleanup", "archived lode is absent")
+            self._block_action(record, "backlog", "cleanup", "archived lode is absent")
             return False
         if not plan["planned"]:
             project = find_project(source.get("project", ""))
@@ -2312,7 +3104,7 @@ class Server:
                     else [item.id for item in queued]
                 ),
             )
-            self._persist_completion(record, via="completion_backlog:plan")
+            self._persist_action(record, via="completion_backlog:plan")
         planned_item_ids = set(plan["remaining_item_ids"])
         if plan["selected_item_id"] is not None:
             planned_item_ids.add(plan["selected_item_id"])
@@ -2323,7 +3115,7 @@ class Server:
         ]
         if newly_queued:
             plan["remaining_item_ids"].extend(newly_queued)
-            self._persist_completion(record, via="completion_backlog:extend_plan")
+            self._persist_action(record, via="completion_backlog:extend_plan")
         selected_id = plan["selected_item_id"]
         promoted_id = plan["promoted_lode_id"]
         if selected_id is not None and promoted_id is not None:
@@ -2340,7 +3132,7 @@ class Server:
                     len(promoted_matches) != 1
                     or promoted.get("backlog", {}).get("id") != selected_id
                 ):
-                    self._block_completion(
+                    self._block_action(
                         record, "backlog", "cleanup", "promoted lode identity conflicts"
                     )
                     return False
@@ -2353,7 +3145,7 @@ class Server:
                         lode_id=promoted_id,
                     )
                 except (OSError, RuntimeError, ValueError) as error:
-                    self._block_completion(record, "backlog", "cleanup", str(error))
+                    self._block_action(record, "backlog", "cleanup", str(error))
                     return False
                 promoted["backlog"] = selected.to_dict()
                 save_lodes(self.lodes)
@@ -2365,7 +3157,7 @@ class Server:
                 )
                 self.broadcast({"type": "lode_created", "lode": promoted})
             else:
-                self._block_completion(
+                self._block_action(
                     record,
                     "backlog",
                     "cleanup",
@@ -2384,10 +3176,10 @@ class Server:
                 remaining_item_ids=plan["remaining_item_ids"],
             )
         except (OSError, ValueError) as error:
-            self._block_completion(record, "backlog", "cleanup", str(error))
+            self._block_action(record, "backlog", "cleanup", str(error))
             return False
         if any(item.queued == record["lode_id"] for item in self.backlog):
-            self._block_completion(
+            self._block_action(
                 record,
                 "backlog",
                 "cleanup",
@@ -2400,26 +3192,27 @@ class Server:
             if item.id in plan["remaining_item_ids"]:
                 self.broadcast({"type": "backlog_updated", "item": item.to_dict()})
         plan["applied"] = True
-        completion.transition_marker(
+        actions.transition_marker(
             record,
             "backlog",
             "done",
             attempt_id=marker["attempt_id"],
             detail="recorded backlog disposition applied",
         )
-        self._persist_completion(record, via="completion_result:backlog")
+        self._persist_action(record, via="completion_result:backlog")
         return True
 
-    def _prepare_completion_spawn(self, record: dict) -> bool:
+    def _prepare_action_spawn(self, record: dict) -> bool:
         marker = record["markers"]["spawn"]
-        target_id = self._completion_spawn_target_id(record)
+        target_id = self._action_spawn_target_id(record)
         target = self._find_lode(target_id) if target_id else None
         if target is None:
-            self._block_completion(record, "spawn", "spawn", "completion spawn target is absent")
+            self._block_action(record, "spawn", "spawn", "completion spawn target is absent")
             return False
         if record["spawn"] is None:
             generation = uuid.uuid4().hex
             record["spawn"] = {
+                "target_lode_id": target["id"],
                 "target_generation": generation,
                 "receipt_relative_path": f"spawn-{record['action_id']}.json",
                 "pane_id": None,
@@ -2428,26 +3221,26 @@ class Server:
             }
         generation = record["spawn"]["target_generation"]
         if marker["state"] in {"not_started", "blocked"}:
-            completion.transition_marker(record, "spawn", "intent")
+            actions.transition_marker(record, "spawn", "intent")
             record["phase"] = "spawning"
-            self._persist_completion(record, via="completion_intent:spawn")
+            self._persist_action(record, via="completion_intent:spawn")
             marker = record["markers"]["spawn"]
         current_generation = target.get("run_generation")
-        allowed_prior = {None, record["run_generation"], generation}
+        allowed_prior = {None, record["expected_generation"], generation}
         if current_generation not in allowed_prior:
-            self._block_completion(
+            self._block_action(
                 record, "spawn", "spawn", "spawn target generation conflicts with this action"
             )
             return False
         try:
-            receipt = completion.load_spawn_receipt(record["lode_id"], record["action_id"])
+            receipt = actions.load_spawn_receipt(record["lode_id"], record["action_id"])
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            self._block_completion(record, "spawn", "spawn", f"spawn receipt is invalid: {error}")
+            self._block_action(record, "spawn", "spawn", f"spawn receipt is invalid: {error}")
             return False
         if receipt is not None and (
             receipt["target_lode_id"] != target["id"] or receipt["target_generation"] != generation
         ):
-            self._block_completion(
+            self._block_action(
                 record, "spawn", "spawn", "spawn receipt belongs to another action target"
             )
             return False
@@ -2456,11 +3249,11 @@ class Server:
         retained_source_pane = bool(
             receipt is None
             and target["id"] == record["lode_id"]
-            and current_generation == record["run_generation"]
+            and current_generation == record["expected_generation"]
             and current_pane == record["ownership"]["pane"]["pane_id"]
         )
         if current_pane not in {None, pane_id} and not retained_source_pane:
-            self._block_completion(
+            self._block_action(
                 record, "spawn", "spawn", "spawn target pane conflicts with this action"
             )
             return False
@@ -2479,22 +3272,22 @@ class Server:
             target.get("status", ""),
             "completion_spawn_prepare",
         )
-        self._schedule_completion_step(record, "spawn", "spawning")
+        self._schedule_action_step(record, "spawn", "spawning")
         return True
 
     def _reconcile_spawn_adoption(self, record: dict) -> None:
         if record["spawn"] is None or record["markers"]["spawn"]["state"] != "intent":
             return
-        target_id = self._completion_spawn_target_id(record)
+        target_id = self._action_spawn_target_id(record)
         target = self._find_lode(target_id) if target_id else None
         if target is None or target.get("run_generation") != record["spawn"]["target_generation"]:
             return
         try:
-            receipt = completion.load_spawn_receipt(record["lode_id"], record["action_id"])
-            ownership = completion.load_run_ownership(
+            receipt = actions.load_spawn_receipt(record["lode_id"], record["action_id"])
+            ownership = actions.load_run_ownership(
                 target["id"], record["spawn"]["target_generation"], require_worker=False
             )
-            final_ownership = completion.load_run_ownership(
+            final_ownership = actions.load_run_ownership(
                 target["id"], record["spawn"]["target_generation"], require_worker=True
             )
         except (OSError, ValueError, json.JSONDecodeError):
@@ -2509,23 +3302,26 @@ class Server:
         record["spawn"]["supervisor_adopted"] = ownership is not None
         record["spawn"]["worker_adopted"] = final_ownership is not None
         if not (record["spawn"]["supervisor_adopted"] and record["spawn"]["worker_adopted"]):
-            self._persist_completion(record, via="completion_spawn:reconcile")
+            self._persist_action(record, via="completion_spawn:reconcile")
             return
         marker = record["markers"]["spawn"]
-        completion.transition_marker(
+        actions.transition_marker(
             record, "spawn", "done", attempt_id=marker["attempt_id"], detail="runner adopted"
         )
-        self._persist_completion(record, via="completion_result:spawn_reconcile")
-        self._continue_completion(record)
+        self._persist_action(record, via="completion_result:spawn_reconcile")
+        self._continue_action(record)
 
     def _clear_completed_action(self, record: dict) -> None:
+        if record["action_type"] != "completion":
+            self._clear_completed_manual_action(record)
+            return
         marker = record["markers"]["pending_clear"]
         if marker["state"] == "not_started":
-            completion.transition_marker(record, "pending_clear", "intent")
-            self._persist_completion(record, via="completion_intent:pending_clear")
+            actions.transition_marker(record, "pending_clear", "intent")
+            self._persist_action(record, via="completion_intent:pending_clear")
             marker = record["markers"]["pending_clear"]
         if marker["state"] == "intent":
-            completion.transition_marker(
+            actions.transition_marker(
                 record,
                 "pending_clear",
                 "done",
@@ -2533,12 +3329,31 @@ class Server:
                 detail="all durable side effects complete",
             )
         record["phase"] = "complete"
+        if record["result"] is None:
+            successor = None
+            if record["spawn"] is not None:
+                successor = {
+                    "lode_id": record["spawn"]["target_lode_id"],
+                    "generation": record["spawn"]["target_generation"],
+                    "pane_id": record["spawn"]["pane_id"],
+                }
+            record["result"] = actions.new_action_result(
+                record,
+                retained={
+                    "worktree": True,
+                    "branch": True,
+                    "session": record["stage"] != "ship",
+                },
+                successor=successor,
+            )
         if record["stage"] == "ship":
-            self._persist_completion(record, via="completion_result:complete")
-            lode = self._find_completion_lode(record["lode_id"])
+            self._persist_action(record, via="completion_result:complete")
+            lode = self._find_action_lode(record["lode_id"])
             if lode is not None:
+                actions.append_action_result(lode, record["result"])
+                lode["pending_action"] = None
                 lode["state"] = "ready"
-                lode["status"] = completion.completion_status(record)
+                lode["status"] = actions.action_status(record)
                 lode["active"] = False
                 lode["pid"] = None
                 lode["tmux_pane"] = None
@@ -2548,21 +3363,106 @@ class Server:
                 _log_state_change(lode["id"], lode["state"], lode["status"], "completion_clear")
                 self.broadcast({"type": "lode_updated", "lode": lode})
         else:
-            completion.write_pending_completion(record)
+            actions.write_pending_action(record)
             lode = self._find_lode(record["lode_id"])
             if lode is not None:
+                actions.append_action_result(lode, record["result"])
+                lode["pending_action"] = None
                 lode["state"] = "running"
                 lode["status"] = f"Starting {lode['stage']}"
                 touch(lode)
                 save_lodes(self.lodes)
                 _log_state_change(lode["id"], lode["state"], lode["status"], "completion_clear")
                 self.broadcast({"type": "lode_updated", "lode": lode})
-        completion.clear_pending_completion(record)
+        actions.clear_pending_action(record)
 
-    def _retry_completion(self, lode_id: str, conn: socket.socket | None) -> None:
+    def _clear_completed_manual_action(self, record: dict) -> None:
+        if record["result"] is None:
+            successor = None
+            if record["spawn"] is not None:
+                successor = {
+                    "lode_id": record["spawn"]["target_lode_id"],
+                    "generation": record["spawn"]["target_generation"],
+                    "pane_id": record["spawn"]["pane_id"],
+                }
+            record["result"] = actions.new_action_result(
+                record,
+                retained={
+                    "worktree": True,
+                    "branch": True,
+                    "session": record["action_type"] != "restart",
+                },
+                successor=successor,
+            )
+        # Persist the terminal receipt before acknowledging it.  The pending
+        # record remains the recovery source until the response boundary has
+        # passed and pending-clear intent is itself durable.
+        actions.write_pending_action(record)
+        lode = self._find_action_lode(record["lode_id"])
+        if lode is None:
+            self._block_action(record, "pending_clear", "cleanup", "action lode is absent")
+            return
+        actions.append_action_result(lode, record["result"])
+        self._set_manual_terminal_status(lode, record["action_type"])
+        touch(lode)
+        if any(item is lode for item in self.lodes):
+            save_lodes(self.lodes)
+        else:
+            save_archived_lodes(self.archived_lodes)
+        self.broadcast({"type": "lode_updated", "lode": lode})
+        self._send_action_ack(
+            None,
+            outcome="completed",
+            reason="completed",
+            action_id=record["action_id"],
+            action_type=record["action_type"],
+            disposition=record["target_disposition"],
+        )
+
+        marker = record["markers"]["pending_clear"]
+        if marker["state"] == "not_started":
+            actions.transition_marker(record, "pending_clear", "intent")
+            actions.write_pending_action(record)
+            marker = record["markers"]["pending_clear"]
+        if marker["state"] == "intent":
+            actions.transition_marker(
+                record,
+                "pending_clear",
+                "done",
+                attempt_id=marker["attempt_id"],
+                detail="all durable side effects complete",
+            )
+        record["phase"] = "complete"
+        actions.write_pending_action(record)
+        actions.clear_pending_action(record)
+        lode["pending_action"] = None
+        touch(lode)
+        if any(item is lode for item in self.lodes):
+            save_lodes(self.lodes)
+        else:
+            save_archived_lodes(self.archived_lodes)
+        self.broadcast({"type": "lode_updated", "lode": lode})
+
+    @staticmethod
+    def _set_manual_terminal_status(lode: dict, action_type: str) -> None:
+        """Apply the receipt-backed terminal presentation for a manual action."""
+        if action_type == "pause":
+            lode["state"] = "paused"
+            lode["status"] = "Paused by user; worktree retained"
+        elif action_type == "restart":
+            lode["state"] = "running"
+            lode["status"] = f"Starting {lode['stage']}"
+        elif action_type == "kill":
+            lode["state"] = "error"
+            lode["status"] = "Killed by user; worktree retained"
+        else:
+            lode["state"] = "ready"
+            lode["status"] = "Archived by user; worktree retained"
+
+    def _retry_action(self, lode_id: str, conn: socket.socket | None) -> None:
         """Retry only the identity-bound phase named by a blocked record."""
         try:
-            record = self._load_pending(lode_id)
+            record = self._load_action_slot(lode_id)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             if conn:
                 self._send_response(conn, {"type": "error", "error": str(error)})
@@ -2573,7 +3473,7 @@ class Server:
             return
         if record["phase"] == "output_blocked":
             if record["recovery"]["kind"] == "publication":
-                self._schedule_completion_step(record, "output_publish", "publishing_output")
+                self._schedule_action_step(record, "output_publish", "publishing_output")
                 if conn:
                     self._send_response(
                         conn, {"type": "lode_completion_retrying", "lode_id": lode_id}
@@ -2586,7 +3486,12 @@ class Server:
                 )
             return
         recovery_kind = record["recovery"]["kind"]
-        if record["phase"] not in {"containment_blocked", "ship_blocked", "cleanup_blocked"}:
+        if record["phase"] not in {
+            "containment_blocked",
+            "ship_blocked",
+            "durability_blocked",
+            "cleanup_blocked",
+        }:
             if conn:
                 self._send_response(conn, {"type": "error", "error": "completion is not retryable"})
             return
@@ -2594,11 +3499,12 @@ class Server:
             "ownership": ("ownership_capture", "capturing_ownership"),
             "containment": ("containment", "observing_containment"),
             "landing": ("ship_landing", "proving_ship_landing"),
+            "durability": ("durability_recheck", "rechecking_durability"),
         }
         selected = mapping.get(recovery_kind)
         if recovery_kind in {"spawn", "cleanup"}:
             record["recovery"] = {"kind": None, "message": None, "command": None}
-            self._continue_completion(record)
+            self._continue_action(record)
             selected = None
         if selected is None:
             if recovery_kind not in {"spawn", "cleanup"} and conn:
@@ -2610,16 +3516,16 @@ class Server:
         if recovery_kind == "ownership" and record["markers"]["pane_close"]["state"] == "blocked":
             marker_name, phase = "pane_close", "closing_pane"
         if recovery_kind == "containment":
-            completion.transition_marker(record, "containment", "intent")
+            actions.transition_marker(record, "containment", "intent")
             retrying_kill = False
             for kill_marker in ("scope_kill", "supervisor_kill"):
                 if record["markers"][kill_marker]["state"] == "blocked":
-                    completion.transition_marker(record, kill_marker, "intent")
+                    actions.transition_marker(record, kill_marker, "intent")
                     retrying_kill = True
             record["containment"]["state"] = "kill_pending" if retrying_kill else "grace"
             record["containment"]["last_error"] = None
             phase = "force_killing" if retrying_kill else "observing_containment"
-        self._schedule_completion_step(record, marker_name, phase)
+        self._schedule_action_step(record, marker_name, phase)
         if conn:
             self._send_response(
                 conn,
@@ -2645,11 +3551,11 @@ class Server:
             acknowledge(False, "no_pending_output_failure")
             return
         try:
-            record = self._load_pending(lode_id)
+            record = self._load_action_slot(lode_id)
         except (OSError, ValueError, json.JSONDecodeError):
             acknowledge(False, "no_pending_output_failure")
             return
-        if record is None:
+        if record is None or record["action_type"] != "completion" or record["output"] is None:
             acknowledge(False, "no_pending_output_failure")
             return
 
@@ -2664,19 +3570,19 @@ class Server:
             "lode_id": record["lode_id"],
             "action_id": record["action_id"],
             "stage": record["stage"],
-            "run_generation": record["run_generation"],
+            "expected_generation": record["expected_generation"],
             "next_action": record["next_action"],
         }
         if any(message.get(key) != value for key, value in expected_identity.items()):
             acknowledge(False, "action_mismatch")
             return
 
-        lode = self._find_completion_lode(lode_id)
+        lode = self._find_action_lode(lode_id)
         active_identity = bool(
             lode
             and any(item is lode for item in self.lodes)
             and lode.get("stage") == record["stage"]
-            and lode.get("run_generation") == record["run_generation"]
+            and lode.get("run_generation") == record["expected_generation"]
         )
         archived_identity = bool(
             lode
@@ -2720,7 +3626,7 @@ class Server:
             return
         digest_hex = message.get("digest_hex")
         if (
-            message.get("digest_algorithm") != completion.DIGEST_ALGORITHM
+            message.get("digest_algorithm") != actions.DIGEST_ALGORITHM
             or not isinstance(digest_hex, str)
             or not secrets.compare_digest(digest_hex, output["digest_hex"])
             or not secrets.compare_digest(hashlib.sha256(data).hexdigest(), output["digest_hex"])
@@ -2729,34 +3635,67 @@ class Server:
             return
 
         try:
-            output["staged_identity"] = completion.repair_staged_output(record, data)
+            output["staged_identity"] = actions.repair_staged_output(record, data)
             output["failure"] = None
-            self._schedule_completion_step(record, "output_publish", "publishing_output")
+            self._schedule_action_step(record, "output_publish", "publishing_output")
         except Exception as error:
             logger.error("Completion output repair failed lode=%s: %s", lode_id, error)
             acknowledge(False, "repair_failed")
             return
         acknowledge(True, "accepted")
 
-    def _reconcile_completion_records(self) -> None:
+    def _reconcile_action_records(self) -> None:
         """Load durable fences before ordinary startup reconciliation."""
-        self._startup_completion_actions = []
+        self._startup_actions = []
         seen = set()
         for lode in [*self.lodes, *self.archived_lodes]:
             if lode["id"] in seen:
                 continue
             seen.add(lode["id"])
-            if not _pending_completion_exists(lode["id"]):
+            if not _pending_action_file_exists(lode["id"]):
+                projection = lode.get("pending_action")
+                action_id = projection.get("action_id") if isinstance(projection, dict) else None
+                if isinstance(action_id, str):
+                    try:
+                        receipt = actions.find_action_result(lode, action_id)
+                    except ValueError:
+                        receipt = None
+                    if receipt is not None and receipt["action_type"] != "completion":
+                        lode["pending_action"] = None
+                        self._set_manual_terminal_status(lode, receipt["action_type"])
+                        touch(lode)
                 try:
-                    completion.collect_orphaned_staging(lode["id"], None)
+                    actions.collect_orphaned_staging(lode["id"], None)
                 except ValueError:
                     pass
                 continue
             try:
-                record = self._load_pending(lode["id"])
+                record = self._load_action_slot(lode["id"])
+            except actions.LegacyPendingActionError as error:
+                lode["state"] = "teardown"
+                lode["status"] = f"Teardown blocked: {error}"
+                lode["pending_action"] = {
+                    "action_type": "legacy-v1",
+                    "phase": "blocked",
+                    "status": lode["status"],
+                }
+                lode["active"] = False
+                touch(lode)
+                _log_state_change(
+                    lode["id"], lode["state"], lode["status"], "action_startup_legacy"
+                )
+                continue
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 lode["state"] = "teardown"
-                lode["status"] = f"Teardown blocked: invalid durable completion record: {error}"
+                lode["status"] = (
+                    "Teardown blocked: malformed pending action must be repaired or drained "
+                    f"before upgrade: {error}"
+                )
+                lode["pending_action"] = {
+                    "action_type": "invalid",
+                    "phase": "blocked",
+                    "status": lode["status"],
+                }
                 lode["active"] = False
                 touch(lode)
                 _log_state_change(
@@ -2765,36 +3704,60 @@ class Server:
                 continue
             if record is None:
                 continue
-            self._cancel_generation_guard(lode["id"], record["run_generation"])
+            self._cancel_generation_guard(lode["id"], record["expected_generation"])
             if record["markers"]["pending_clear"]["state"] == "done":
                 self._clear_completed_action(record)
                 continue
             lode["state"] = "teardown"
-            lode["status"] = completion.completion_status(record)
+            lode["status"] = actions.action_status(record)
             lode["active"] = False
             touch(lode)
             _log_state_change(
                 lode["id"], lode["state"], lode["status"], "completion_startup_reconcile"
             )
-            completion.collect_orphaned_staging(lode["id"], record)
-            self._startup_completion_actions.append(lode["id"])
+            actions.collect_orphaned_staging(lode["id"], record)
+            self._startup_actions.append(lode["id"])
         save_lodes(self.lodes)
         save_archived_lodes(self.archived_lodes)
 
-    def _resume_completion(self, lode_id: str) -> None:
+    def _resume_action(self, lode_id: str, *, startup: bool = False) -> None:
         try:
-            record = self._load_pending(lode_id)
+            record = self._load_action_slot(lode_id)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logger.error("Completion startup reconciliation blocked lode=%s: %s", lode_id, error)
             return
-        if record is None or record["phase"] in {
+        if record is None:
+            return
+        if (
+            startup
+            and record["action_type"] in {"kill", "archive"}
+            and record["durability"]["required"]
+            and record["markers"]["durability_recheck"]["state"] == "done"
+            and record["markers"]["archive"]["state"] != "done"
+            and self._find_lode(lode_id) is not None
+        ):
+            record["markers"]["durability_recheck"] = actions.new_marker()
+            record["durability"]["final"] = {
+                "outcome": "not_required",
+                "count": 0,
+                "basis": "pending post-containment recheck",
+                "error": None,
+                "checked_at_ms": None,
+            }
+            record["phase"] = "publishing_terminal"
+            self._persist_action(record, via="action_startup:durability_recheck")
+        if record["phase"] in {
             "output_blocked",
             "containment_blocked",
             "ship_blocked",
+            "durability_blocked",
             "cleanup_blocked",
         }:
             return
-        if record["markers"]["output_publish"]["state"] != "done":
+        if (
+            record["action_type"] == "completion"
+            and record["markers"]["output_publish"]["state"] != "done"
+        ):
             selected = ("output_publish", "publishing_output")
         elif record["markers"]["ownership_capture"]["state"] != "done":
             selected = ("ownership_capture", "capturing_ownership")
@@ -2811,10 +3774,10 @@ class Server:
             if record["markers"]["pending_clear"]["state"] == "done":
                 self._clear_completed_action(record)
                 return
-            self._continue_completion(record)
+            self._continue_action(record)
             return
         if record["markers"][selected[0]]["state"] != "blocked":
-            self._schedule_completion_step(record, *selected)
+            self._schedule_action_step(record, *selected)
 
     def _acquire_server_lock(self) -> None:
         """Acquire and retain the singleton lock colocated with the server socket."""
@@ -2870,7 +3833,7 @@ class Server:
         changed = False
         for lode in self.lodes:
             generation = lode.get("run_generation")
-            if _pending_completion_exists(lode["id"]):
+            if _pending_action_file_exists(lode["id"]):
                 continue
             if generation and (lode["id"], generation) in self.pending_disconnects:
                 continue
@@ -2922,7 +3885,7 @@ class Server:
         systemctl = oom.find_systemctl()
         if not systemctl:
             for lode in self.lodes:
-                if _pending_completion_exists(lode["id"]):
+                if self._generation_has_teardown_intent(lode["id"], lode.get("run_generation")):
                     continue
                 if lode.get("oom_scope") and not is_terminal_failure_kind(lode.get("failure_kind")):
                     self._set_terminal_failure(
@@ -2933,7 +3896,7 @@ class Server:
                     )
             return
         for lode in self.lodes:
-            if _pending_completion_exists(lode["id"]):
+            if self._generation_has_teardown_intent(lode["id"], lode.get("run_generation")):
                 continue
             unit_name = lode.get("oom_scope")
             run_generation = lode.get("run_generation")
@@ -2977,8 +3940,8 @@ class Server:
     ) -> tuple[SpawnOutcome, str | None]:
         """Spawn a runner only when its recorded pane is absent or gone."""
         generation = lode.get("run_generation")
-        if generation and self._generation_is_fenced(lode["id"], generation):
-            logger.warning("lode %s: spawn suppressed by accepted completion", lode["id"])
+        if self._lode_has_pending_action(lode["id"]):
+            logger.warning("lode %s: spawn suppressed by accepted action", lode["id"])
             return SpawnOutcome.FAILED, None
         if generation and (lode["id"], generation) in self.pending_disconnects:
             logger.warning("lode %s: spawn suppressed while scope result is pending", lode["id"])
@@ -3101,7 +4064,7 @@ class Server:
         self.backlog = load_backlog()
         self.projects = get_active_projects()
 
-        self._reconcile_completion_records()
+        self._reconcile_action_records()
         self._consume_failed_oom_units()
         self._reconcile_startup_lodes()
 
@@ -3110,7 +4073,7 @@ class Server:
             lode
             for lode in self.lodes
             if lode.get("stage") == "shipped"
-            and not _pending_completion_exists(lode["id"])
+            and not _pending_action_file_exists(lode["id"])
             and not is_terminal_failure_kind(lode.get("failure_kind"))
             and (
                 not lode.get("run_generation")
@@ -3148,8 +4111,8 @@ class Server:
             )
             self.event_thread.start()
 
-            for lode_id in self._startup_completion_actions:
-                self._enqueue_event({"type": "_completion_reconcile", "lode_id": lode_id})
+            for lode_id in self._startup_actions:
+                self._enqueue_event({"type": "_action_reconcile", "lode_id": lode_id})
 
             logger.info(f"Server listening on {self.socket_path}")
 
@@ -3241,7 +4204,7 @@ class Server:
             return
 
         key = (lode_id, run_generation)
-        if self._generation_is_fenced(lode_id, run_generation):
+        if self._generation_has_teardown_intent(lode_id, run_generation):
             self._cancel_generation_guard(lode_id, run_generation)
             lode["active"] = False
             touch(lode)
@@ -3253,7 +4216,7 @@ class Server:
                 "expected_teardown_disconnect",
             )
             self.broadcast({"type": "lode_updated", "lode": lode})
-            self._enqueue_event({"type": "_completion_reconcile", "lode_id": lode_id})
+            self._enqueue_event({"type": "_action_reconcile", "lode_id": lode_id})
             return
         observed_result = self.runner_results.pop(key, None)
         if is_terminal_failure_kind(lode.get("failure_kind")):
@@ -3300,7 +4263,7 @@ class Server:
         broadcast: bool = True,
     ) -> bool:
         """Persist one canonical terminal runner failure."""
-        if self._generation_is_fenced(lode["id"], run_generation):
+        if self._generation_has_teardown_intent(lode["id"], run_generation):
             logger.info(
                 "Ignoring terminal failure for expected teardown lode=%s generation=%s",
                 lode["id"],
@@ -3344,7 +4307,7 @@ class Server:
             if pending is None:
                 continue
             lode_id, run_generation = key
-            if self._generation_is_fenced(lode_id, run_generation):
+            if self._generation_has_teardown_intent(lode_id, run_generation):
                 self.runner_results.pop(key, None)
                 continue
             lode = self._find_lode(lode_id)
@@ -3550,7 +4513,7 @@ class Server:
             acknowledge(False, False, "unit-mismatch")
             return
 
-        if self._generation_is_fenced(lode_id, run_generation):
+        if self._generation_has_teardown_intent(lode_id, run_generation):
             self._cancel_generation_guard(lode_id, run_generation)
             acknowledge(True, False, "expected-teardown")
             return
@@ -3626,43 +4589,14 @@ class Server:
         if (
             msg_type == "lode_set_state"
             and message.get("state") == "teardown"
-            and (not isinstance(lode_id, str) or not _pending_completion_exists(lode_id))
+            and (not isinstance(lode_id, str) or not _pending_action_file_exists(lode_id))
         ):
             logger.warning(
                 "Refusing teardown projection without pending completion lode=%s", lode_id
             )
             acknowledge_mutation(False, "teardown_requires_pending_completion")
             return
-        if (
-            msg_type in PENDING_ACTION_FENCED_MUTATIONS
-            and isinstance(lode_id, str)
-            and _pending_completion_exists(lode_id)
-        ):
-            logger.info(
-                "Refusing manual mutation during pending completion type=%s lode=%s",
-                msg_type,
-                lode_id,
-            )
-            if conn:
-                self._send_response(
-                    conn,
-                    {
-                        "type": "error",
-                        "error": "completion teardown is pending; use hop lode restart "
-                        f"{lode_id} to retry its blocked phase",
-                    },
-                )
-            return
-
-        if (
-            msg_type == "lode_reset_claude_stage"
-            and isinstance(lode_id, str)
-            and _pending_completion_exists(lode_id)
-        ):
-            acknowledge_mutation(False, "completion_pending")
-            return
-
-        if msg_type in RUNNER_MUTATION_TYPES and msg_type != "lode_complete":
+        if msg_type in RUNNER_MUTATION_TYPES and msg_type != "lode_action":
             lode = self._find_lode(lode_id) if lode_id else None
             if not self._runner_generation_matches(lode, message):
                 if msg_type in {"lode_register", "lode_supervisor_register"} and conn and lode_id:
@@ -3683,7 +4617,7 @@ class Server:
                     reason = "stale_run_generation"
                 acknowledge_mutation(False, reason)
                 return
-            if self._generation_is_fenced(lode_id, message.get("run_generation")):
+            if self._generation_has_teardown_intent(lode_id, message.get("run_generation")):
                 logger.info(
                     "Dropping runner mutation for expected teardown type=%s lode=%s",
                     msg_type,
@@ -3726,16 +4660,16 @@ class Server:
         elif msg_type == "_registration_capture_result":
             self._handle_registration_capture_result(message, conn)
 
-        elif msg_type == "_completion_acceptance_result":
-            self._handle_completion_acceptance_result(message, conn)
+        elif msg_type == "_action_acceptance_result":
+            self._handle_action_acceptance_result(message, conn)
 
-        elif msg_type == "_completion_step_result":
-            self._handle_completion_step_result(message)
+        elif msg_type == "_action_step_result":
+            self._handle_action_step_result(message)
 
-        elif msg_type == "_completion_reconcile":
+        elif msg_type == "_action_reconcile":
             lode_id = message.get("lode_id")
             if isinstance(lode_id, str):
-                self._resume_completion(lode_id)
+                self._resume_action(lode_id, startup=True)
 
         elif msg_type == "lode_snapshot":
             prefix = message.get("prefix")
@@ -3771,7 +4705,7 @@ class Server:
         elif msg_type == "lode_supervisor_register":
             lode_id = message.get("lode_id")
             lode = self._find_lode(lode_id) if lode_id else None
-            if lode and self._adopt_completion_spawn_receipt(lode, message):
+            if lode and self._adopt_action_spawn_receipt(lode, message):
                 self._start_registration_capture("supervisor", lode, message, conn)
             elif lode and conn:
                 self._send_response(
@@ -3788,7 +4722,7 @@ class Server:
             lode_id = message.get("lode_id")
             if lode_id:
                 lode = self._find_lode(lode_id)
-                if lode and self._adopt_completion_spawn_receipt(lode, message):
+                if lode and self._adopt_action_spawn_receipt(lode, message):
                     self._start_registration_capture("worker", lode, message, conn)
                 elif lode and conn:
                     self._send_response(
@@ -3801,16 +4735,24 @@ class Server:
                         },
                     )
 
+        elif msg_type == "lode_action":
+            self._handle_lode_action(message, conn)
+
         elif msg_type == "lode_complete":
-            self._handle_lode_complete(message, conn)
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="protocol_upgrade_required",
+                detail="lode_complete is no longer accepted; use a v2 lode_action request",
+            )
 
         elif msg_type == "lode_run_result":
             self._handle_lode_run_result(message, conn)
 
-        elif msg_type == "lode_retry_completion":
+        elif msg_type == "lode_retry_action":
             lode_id = message.get("lode_id")
             if isinstance(lode_id, str):
-                self._retry_completion(lode_id, conn)
+                self._retry_action(lode_id, conn)
 
         elif msg_type == "lode_repair_output":
             self._repair_completion_output(message, conn)
@@ -3851,66 +4793,20 @@ class Server:
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_archive":
-            lode_id = message.get("lode_id")
-            if lode_id:
-                lode = archive_lode(self.lodes, lode_id)
-                if lode:
-                    self.archived_lodes.append(lode)
-                    logger.info(f"Lode {lode_id} archived")
-                    self.broadcast({"type": "lode_archived", "lode": lode})
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="protocol_upgrade_required",
+                detail="lode_archive is no longer accepted; use a v2 lode_action request",
+            )
 
         elif msg_type == "lode_pause":
-            lode_id = message.get("lode_id")
-            lode = self._find_lode(lode_id) if lode_id else None
-            if not lode:
-                if conn:
-                    self._send_response(
-                        conn, {"type": "error", "error": f"lode {lode_id} not found"}
-                    )
-                return
-            pid = lode.get("pid")
-            pane = lode.get("tmux_pane")
-            runner_pid = pid or (get_pane_pid(pane) if pane else None)
-            if pane and runner_pid is None and pane_liveness(pane) is not Liveness.GONE:
-                error = (
-                    f"lode {lode_id} runner identity is unknown; pause refused because "
-                    "tmux cannot prove the existing pane is gone"
-                )
-                logger.error(error)
-                if conn:
-                    self._send_response(conn, {"type": "error", "error": error})
-                return
-            lode["oom_scope"] = None
-            generation = lode.get("run_generation")
-            if generation:
-                self.pending_disconnects.pop((lode_id, generation), None)
-                self.runner_results.pop((lode_id, generation), None)
-            save_lodes(self.lodes)
-            if runner_pid and not _terminate_runner_process_group(runner_pid):
-                error = (
-                    f"lode {lode_id} runner did not exit; pause refused so resume cannot "
-                    "collide with the existing stage session"
-                )
-                logger.error(error)
-                if conn:
-                    self._send_response(conn, {"type": "error", "error": error})
-                return
-            if pane:
-                from hopper.tmux import kill_pane
-
-                kill_pane(pane)
-            lode["state"] = "paused"
-            lode["status"] = "Paused by user; worktree retained"
-            _log_state_change(lode_id, "paused", lode["status"], "pause")
-            lode["failure_kind"] = None
-            lode["active"] = False
-            lode["tmux_pane"] = None
-            lode["pid"] = None
-            touch(lode)
-            save_lodes(self.lodes)
-            self.broadcast({"type": "lode_updated", "lode": lode})
-            if conn:
-                self._send_response(conn, {"type": "lode_paused", "lode": lode})
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="protocol_upgrade_required",
+                detail="lode_pause is no longer accepted; use a v2 lode_action request",
+            )
 
         elif msg_type == "lode_resume":
             lode_id = message.get("lode_id")
@@ -3971,46 +4867,26 @@ class Server:
                 )
 
         elif msg_type == "lode_kill":
-            lode_id = message.get("lode_id")
-            if lode_id:
-                lode = self._find_lode(lode_id)
-                if lode:
-                    lode["oom_scope"] = None
-                    generation = lode.get("run_generation")
-                    if generation:
-                        self.pending_disconnects.pop((lode_id, generation), None)
-                        self.runner_results.pop((lode_id, generation), None)
-                    pid = lode.get("pid")
-                    if pid:
-                        try:
-                            os.kill(pid, signal.SIGTERM)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                    tmux_pane = lode.get("tmux_pane")
-                    if tmux_pane:
-                        from hopper.tmux import kill_pane
-
-                        kill_pane(tmux_pane)
-                    lode["state"] = "error"
-                    lode["status"] = "Killed by user"
-                    _log_state_change(lode_id, "error", "Killed by user", "kill")
-                    lode["failure_kind"] = None
-                    lode["active"] = False
-                    lode["tmux_pane"] = None
-                    lode["pid"] = None
-                    touch(lode)
-                    save_lodes(self.lodes)
-                    logger.info(f"Lode {lode_id} killed by user")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
-                    archived = archive_lode(self.lodes, lode_id)
-                    if archived:
-                        self.archived_lodes.append(archived)
-                        logger.info(f"Lode {lode_id} archived after kill")
-                        self.broadcast({"type": "lode_archived", "lode": archived})
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="protocol_upgrade_required",
+                detail="lode_kill is no longer accepted; use a v2 lode_action request",
+            )
 
         elif msg_type == "lode_unarchive":
             lode_id = message.get("lode_id")
             if lode_id:
+                if message.get("spawn") and self._lode_has_pending_action(lode_id):
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": "pending action must finish before unarchive spawn",
+                            },
+                        )
+                    return
                 lode = unarchive_lode(self.archived_lodes, self.lodes, lode_id)
                 if lode:
                     logger.info(f"Lode {lode_id} unarchived")
@@ -4040,6 +4916,10 @@ class Server:
             lode_id = message.get("lode_id")
             state = message.get("state")
             status = message.get("status", "")
+            if state not in SUPPORTED_LODE_STATES:
+                logger.warning("Refusing unsupported lode state lode=%s state=%r", lode_id, state)
+                acknowledge_mutation(False, "unsupported_state")
+                return
             if lode_id and state:
                 lode = self._find_lode(lode_id)
                 message_epoch = message.get("gate_epoch")
@@ -4139,96 +5019,17 @@ class Server:
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_reset_claude_stage":
-            lode_id = message.get("lode_id")
-            claude_stage = message.get("claude_stage")
-            if lode_id and claude_stage:
-                lode = self._find_lode(lode_id)
-                if not lode or claude_stage not in lode.get("claude", {}):
-                    acknowledge_mutation(
-                        False,
-                        "lode_not_found" if not lode else "invalid_stage",
-                    )
-                    return
-                if message.get("spawn"):
-                    force = message.get("force") is True
-                    generation = lode.get("run_generation")
-                    if force and generation and (lode_id, generation) in self.pending_disconnects:
-                        acknowledge_mutation(False, "pending_runner_result")
-                        return
-                    if force:
-                        pane = lode.get("tmux_pane")
-                        runner_pid = lode.get("pid")
-                        process_group = None
-                        if pane:
-                            liveness = pane_liveness(pane)
-                            if liveness is Liveness.ALIVE:
-                                pane_pid = get_pane_pid(pane)
-                                if runner_pid is None or pane_pid is None:
-                                    acknowledge_mutation(False, "runner_identity_unverified")
-                                    return
-                                process_group = _corroborated_runner_process_group(
-                                    runner_pid, pane_pid
-                                )
-                                if process_group is None:
-                                    acknowledge_mutation(False, "runner_identity_unverified")
-                                    return
-                            elif (
-                                liveness is Liveness.UNKNOWN
-                                or runner_pid is not None
-                                or lode.get("active")
-                            ):
-                                acknowledge_mutation(False, "runner_identity_unverified")
-                                return
-                        elif runner_pid is not None or lode.get("active"):
-                            acknowledge_mutation(False, "runner_identity_unverified")
-                            return
-                        if runner_pid and not _terminate_runner_process_group(
-                            runner_pid, process_group=process_group
-                        ):
-                            acknowledge_mutation(False, "termination_failed")
-                            return
-                        if runner_pid:
-                            runner_exited = _runner_process_exited(runner_pid)
-                            pane_gone = not pane or pane_liveness(pane) is Liveness.GONE
-                            if not runner_exited or not pane_gone:
-                                acknowledge_mutation(False, "termination_failed")
-                                return
-                        if generation:
-                            self.runner_results.pop((lode_id, generation), None)
-                        lode["active"] = False
-                        lode["tmux_pane"] = None
-                        lode["pid"] = None
-                    proj = find_project(lode.get("project", ""))
-                    project_path = proj.path if proj else None
-
-                    def reset_before_spawn() -> None:
-                        reset_lode_claude_stage(
-                            self.lodes,
-                            lode_id,
-                            claude_stage,
-                            persist=False,
-                        )
-
-                    outcome, _ = self._gated_spawn(
-                        lode,
-                        project_path,
-                        pre_spawn=reset_before_spawn,
-                        allow_terminal_recovery=True,
-                    )
-                    if outcome is SpawnOutcome.SPAWNED:
-                        logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
-                        acknowledge_mutation(True, "spawned")
-                    elif outcome is SpawnOutcome.ALREADY_LIVE:
-                        acknowledge_mutation(False, "already_live")
-                    elif outcome is SpawnOutcome.REFUSED_UNKNOWN:
-                        acknowledge_mutation(False, "tmux_unreachable")
-                    else:
-                        acknowledge_mutation(False, "spawn_failed")
-                else:
-                    reset_lode_claude_stage(self.lodes, lode_id, claude_stage)
-                    logger.info(f"Lode {lode_id} claude_reset stage={claude_stage}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
-                    acknowledge_mutation(True, "reset")
+            acknowledge_mutation(False, "protocol_upgrade_required")
+            if conn and not ack_requested:
+                self._send_action_ack(
+                    conn,
+                    outcome="refused",
+                    reason="protocol_upgrade_required",
+                    detail=(
+                        "lode_reset_claude_stage is no longer accepted; use a v2 restart "
+                        "lode_action request"
+                    ),
+                )
 
         elif msg_type == "lode_resume_refine":
             # Compound: apply refine state only when the gated spawn is allowed.

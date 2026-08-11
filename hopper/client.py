@@ -25,7 +25,7 @@ RUNNER_MUTATION_TYPES = frozenset(
     {
         "lode_register",
         "lode_supervisor_register",
-        "lode_complete",
+        "lode_action",
         "lode_set_state",
         "lode_set_stage",
         "lode_set_progress",
@@ -568,49 +568,109 @@ def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
     return {"lode": lode, "gate": gate_text}
 
 
+def submit_lode_action(
+    socket_path: Path,
+    *,
+    action_id: str,
+    lode_id: str,
+    expected_generation: str | None,
+    action_type: str,
+    target_disposition: str,
+    force_consent: bool,
+    stage: str,
+    payload: dict | None = None,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Submit one identity-bound lode action and await its final server response."""
+    response = send_message(
+        socket_path,
+        {
+            "type": "lode_action",
+            "action_id": action_id,
+            "lode_id": lode_id,
+            "expected_generation": expected_generation,
+            "action_type": action_type,
+            "target_disposition": target_disposition,
+            "force_consent": force_consent,
+            "stage": stage,
+            **(payload or {}),
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if response and response.get("type") == "lode_action_ack":
+        return response
+    return None
+
+
 def restart_lode(
     socket_path: Path,
     lode_id: str,
     stage: str,
     *,
+    action_id: str,
+    expected_generation: str | None,
     force: bool = False,
     timeout: float = MUTATION_ACK_TIMEOUT_SEC,
 ) -> dict | None:
     """Restart a lode's current stage session and await its disposition."""
-    response = send_message(
+    return submit_lode_action(
         socket_path,
-        {
-            "type": "lode_reset_claude_stage",
-            "lode_id": lode_id,
-            "claude_stage": stage,
-            "spawn": True,
-            "force": force,
-            "ack_requested": True,
-        },
-        timeout=timeout,
-        wait_for_response=True,
-    )
-    if response and response.get("type") == "mutation_ack":
-        return response
-    return None
-
-
-def kill_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> bool:
-    """Kill a running lode. Fire-and-forget."""
-    return _fire_and_forget(
-        socket_path,
-        {"type": "lode_kill", "lode_id": lode_id},
+        action_id=action_id,
+        lode_id=lode_id,
+        expected_generation=expected_generation,
+        action_type="restart",
+        target_disposition="replacement_spawned",
+        force_consent=force,
+        stage=stage,
         timeout=timeout,
     )
 
 
-def pause_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
-    """Pause a lode without archiving or removing its worktree."""
-    return send_message(
+def kill_lode(
+    socket_path: Path,
+    lode_id: str,
+    *,
+    action_id: str,
+    expected_generation: str | None,
+    stage: str,
+    force: bool = False,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Kill and archive a lode after its terminal disposition is durable."""
+    return submit_lode_action(
         socket_path,
-        {"type": "lode_pause", "lode_id": lode_id},
+        action_id=action_id,
+        lode_id=lode_id,
+        expected_generation=expected_generation,
+        action_type="kill",
+        target_disposition="killed_archived",
+        force_consent=force,
+        stage=stage,
         timeout=timeout,
-        wait_for_response=True,
+    )
+
+
+def pause_lode(
+    socket_path: Path,
+    lode_id: str,
+    *,
+    action_id: str,
+    expected_generation: str | None,
+    stage: str,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Pause a lode after its retained terminal disposition is durable."""
+    return submit_lode_action(
+        socket_path,
+        action_id=action_id,
+        lode_id=lode_id,
+        expected_generation=expected_generation,
+        action_type="pause",
+        target_disposition="paused",
+        force_consent=False,
+        stage=stage,
+        timeout=timeout,
     )
 
 
@@ -707,6 +767,7 @@ def register_lode_supervisor(
 
 def complete_lode(
     socket_path: Path,
+    action_id: str,
     lode_id: str,
     run_generation: str,
     stage: str,
@@ -716,24 +777,27 @@ def complete_lode(
     timeout: float = MUTATION_ACK_TIMEOUT_SEC,
 ) -> dict | None:
     """Submit exact stage bytes and await the durable completion disposition."""
-    response = send_message(
+    return submit_lode_action(
         socket_path,
-        {
-            "type": "lode_complete",
-            "lode_id": lode_id,
-            "run_generation": run_generation,
-            "stage": stage,
+        action_id=action_id,
+        lode_id=lode_id,
+        expected_generation=run_generation,
+        action_type="completion",
+        target_disposition={
+            "mill": "advance_refine",
+            "refine": "advance_ship",
+            "ship": "shipped_archived",
+        }.get(stage),
+        force_consent=False,
+        stage=stage,
+        payload={
             "output_base64": output_base64,
             "byte_length": byte_length,
             "digest_algorithm": "sha256",
             "digest_hex": digest_hex,
         },
         timeout=timeout,
-        wait_for_response=True,
     )
-    if response and response.get("type") == "lode_complete_ack":
-        return response
-    return None
 
 
 def repair_lode_output(
@@ -742,7 +806,7 @@ def repair_lode_output(
     lode_id: str,
     action_id: str | None,
     stage: str | None,
-    run_generation: str | None,
+    expected_generation: str | None,
     next_action: dict | None,
     token: str,
     output_base64: str,
@@ -758,7 +822,7 @@ def repair_lode_output(
             "lode_id": lode_id,
             "action_id": action_id,
             "stage": stage,
-            "run_generation": run_generation,
+            "expected_generation": expected_generation,
             "next_action": next_action,
             "token": token,
             "output_base64": output_base64,
@@ -774,30 +838,15 @@ def repair_lode_output(
     return None
 
 
-def retry_lode_completion(
-    socket_path: Path,
-    lode_id: str,
-    *,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
-) -> dict | None:
-    """Retry the identity-bound blocked phase of a pending completion."""
-    return send_message(
-        socket_path,
-        {"type": "lode_retry_completion", "lode_id": lode_id},
-        timeout=timeout,
-        wait_for_response=True,
-    )
-
-
 def set_lode_state(
     socket_path: Path, lode_id: str, state: str, status: str, timeout: float = 2.0
 ) -> bool:
-    """Set a lode's state and status (fire-and-forget).
+    """Set a lode's supported runner state and status (fire-and-forget).
 
     Args:
         socket_path: Path to the Unix socket
         lode_id: The lode ID to update
-        state: New state (freeform string, e.g. "new", "running", "error", task names, etc.)
+        state: Supported runner state such as "running", "gated", or "error"
         status: Human-readable status text
         timeout: Connection timeout in seconds
 

@@ -10,7 +10,7 @@ Lodes are plain dicts with these fields:
 - project: str - project name (default "")
 - scope: str - user's task scope description (default "")
 - updated_at: int - milliseconds since epoch (default 0, meaning use created_at)
-- state: str - "new", "running", "stuck", "error", etc. (default "new")
+- state: str - server-validated lifecycle state (default "new")
 - status: str - human-readable status text (default "")
 - title: str - short human-readable label (default "")
 - branch: str - git branch name for this lode's worktree (default "")
@@ -20,7 +20,7 @@ Lodes are plain dicts with these fields:
 - run_generation: str | None - generation owning runner mutations (default None)
 - oom_scope: str | None - guarded systemd scope unit name (default None)
 - failure_kind: str | None - durable terminal runner failure discriminator (default None)
-- archive_action_id: str | None - completion action that published this archive (default None)
+- archive_action_id: str | None - action that published this archive (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
@@ -48,6 +48,7 @@ from hopper.tmux import Liveness, pane_liveness
 
 ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
+REFUSAL_STATUS_PREFIXES = ("spawn refused: ", "spawn failed: ", "action refused: ")
 
 
 def is_canonical_lode_id(value: object) -> bool:
@@ -395,6 +396,8 @@ def create_lode(
         "last_pane_activity_at": None,
         "pane_title_observation": None,
         "backlog": None,
+        "pending_action": None,
+        "action_results": [],
         "runs": {},
         "claude": _make_claude_sessions(),
     }
@@ -451,7 +454,7 @@ def archive_lode(lodes: list[dict], lode_id: str) -> dict | None:
 def archive_lode_for_action(
     active_lodes: list[dict], archived_lodes: list[dict], lode_id: str, action_id: str
 ) -> dict:
-    """Publish exactly one archive record for a durable completion action.
+    """Publish exactly one archive record for a durable lode action.
 
     The archive snapshot is persisted before the active twin is removed. A
     retry therefore converges after a crash on either side of the active-file
@@ -459,14 +462,14 @@ def archive_lode_for_action(
     """
     archived_matches = [lode for lode in archived_lodes if lode.get("id") == lode_id]
     if any(lode.get("archive_action_id") != action_id for lode in archived_matches):
-        raise ValueError("lode is archived by a different completion action")
+        raise ValueError("lode is archived by a different action")
     active_matches = [lode for lode in active_lodes if lode.get("id") == lode_id]
     if len(active_matches) > 1:
         raise ValueError("active lode identity is duplicated")
     if active_matches and active_matches[0].get("archive_action_id") not in {None, action_id}:
         raise ValueError("active lode belongs to a different archive action")
     if not archived_matches and not active_matches:
-        raise ValueError("completion lode is absent from active and archived storage")
+        raise ValueError("action lode is absent from active and archived storage")
 
     if archived_matches:
         archived = archived_matches[0]
@@ -577,13 +580,14 @@ def reset_lode_claude_stage(
     claude_stage: str,
     *,
     persist: bool = True,
+    session_id: str | None = None,
 ) -> dict | None:
     """Reset a claude stage (new session_id, started=False)."""
     for lode in lodes:
         if lode["id"] == lode_id:
             if claude_stage not in lode.get("claude", {}):
                 return None
-            lode["claude"][claude_stage]["session_id"] = str(uuid.uuid4())
+            lode["claude"][claude_stage]["session_id"] = session_id or str(uuid.uuid4())
             lode["claude"][claude_stage]["started"] = False
             lode["last_progress_at"] = None
             lode["last_progress_summary"] = ""
@@ -715,7 +719,7 @@ STATUS_NEW = "○"  # empty circle
 STATUS_ERROR = "✗"  # x mark
 STATUS_SHIPPED = "✓"
 STATUS_GATED = "◇"  # open diamond — paused at gate, awaiting user review
-STATUS_TEARDOWN = "◌"  # dotted circle — accepted completion is being torn down
+STATUS_TEARDOWN = "◌"  # dotted circle — accepted action is proving containment
 STATUS_DISCONNECTED = "⊘"  # circled division slash — runner not connected
 
 

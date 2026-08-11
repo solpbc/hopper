@@ -300,20 +300,14 @@ def _get_worktree_env(worktree_path: Path, base_env: dict | None = None) -> dict
 STAGES = {
     "mill": {
         "prompt": "mill",
-        "done_status": "Mill complete",
-        "next_stage": "refine",
         "input_from": None,
     },
     "refine": {
         "prompt": "refine",
-        "done_status": "Refine complete",
-        "next_stage": "ship",
         "input_from": "mill",
     },
     "ship": {
         "prompt": "ship",
-        "done_status": "Ship complete",
-        "next_stage": "shipped",
         "input_from": "refine",
     },
 }
@@ -343,9 +337,6 @@ class ProcessRunner(BaseRunner):
             raise ValueError(f"Unknown stage: {stage}")
         cfg = STAGES[stage]
         self._claude_stage = stage
-        self._done_label = f"{stage.capitalize()} done"
-        self._done_status = cfg["done_status"]
-        self._next_stage = cfg["next_stage"]
         self._prompt_name: str = cfg["prompt"]
         self._input_from: str | None = cfg["input_from"]
         # Set by _setup

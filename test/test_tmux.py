@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hopper import completion
+from hopper import actions
 from hopper.tmux import (
     Liveness,
     PanePhase,
@@ -34,11 +34,11 @@ from hopper.tmux import (
 
 
 def test_spawn_bootstrap_tags_exact_pane_before_durable_receipt(tmp_path, monkeypatch):
-    monkeypatch.setattr("hopper.completion.config.hopper_dir", lambda: tmp_path)
+    monkeypatch.setattr("hopper.actions.config.hopper_dir", lambda: tmp_path)
     monkeypatch.setenv("TMUX_PANE", "%17")
     action_id = "a" * 32
     generation = "b" * 32
-    path = completion.spawn_receipt_path("abcd2345", action_id)
+    path = actions.spawn_receipt_path("abcd2345", action_id)
 
     with patch("hopper.tmux.subprocess.run") as run:
         run.return_value.returncode = 0
@@ -57,7 +57,7 @@ def test_spawn_bootstrap_tags_exact_pane_before_durable_receipt(tmp_path, monkey
         capture_output=True,
         text=True,
     )
-    assert completion.load_spawn_receipt("abcd2345", action_id)["pane_id"] == "%17"
+    assert actions.load_spawn_receipt("abcd2345", action_id)["pane_id"] == "%17"
 
 
 def test_completion_action_panes_fails_closed_on_ambiguous_rows():

@@ -114,7 +114,7 @@ its full output.
 
 `hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `teardown`, `error`, `gated`).
 
-1. **`state: teardown` is not terminal.** Hopper has accepted the stage output and is durably stopping that runner before the next action. **The only terminal success signal is `stage: shipped`.** Key your loop on that, never on a teardown status line.
+1. **`state: teardown` is not terminal.** Hopper has accepted an action and is durably closing and proving runner containment before the terminal disposition. For the final workflow stage, key status loops on `stage: shipped`, never on a teardown status line.
 2. **Debounce `stuck`: one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` waits ~2 min before treating stuck as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
 3. **Use the complete exit-code table above; do not reconstruct it from this
    example.** In particular, `hop wait` timeout is exit `4`, not gate; gate is
@@ -182,7 +182,9 @@ worktree. It is the number of commits that exist **only** in that worktree, reac
 from no remote-tracking ref. Read it before you believe a finished-looking lode
 is finished: only `stage: shipped` merges and pushes, so a lode that stalled
 earlier can be complete, committed, clean, and entirely absent from the remote.
-`UNKNOWN` means the check could not be made; it never means zero.
+`UNKNOWN` means the check could not be made; it never means zero. Kill and
+archive enforce this durability proof at the server boundary, including a
+second check after containment is empty and before archive publication.
 
 Restart an inactive lode (error, stuck, or failed ship):
 
@@ -205,8 +207,7 @@ worktree is not evidence the work is safe. Commits fast-forwarded onto a
 *local* main but never pushed still count. Pushing the branch clears the guard
 even without merging, which is the fast way to make a stalled lode safe. The
 refusal prints the worktree path, the commands to inspect and push, and the
-`--force` escape. The real-repository refusal and indeterminate paths are pinned
-in `test/test_cli.py`. Push first, then kill.
+`--force` escape. Push first, then kill.
 
 Runner spawn problems remain visible in lode status. `spawn refused:` means
 hopper did not launch a duplicate: attach when the recorded pane is live, or
@@ -296,7 +297,7 @@ truthy), so reading it directly has the same problem. Use `--allow-capture`.
 These commands only work when `HOPPER_LID` is set (i.e., inside a running lode):
 
 ```bash
-hop processed <<'EOF'                 # signal stage completion with output
+hop processed <<'EOF'                 # durably submit stage output
 <stage output>
 EOF
 
@@ -307,15 +308,17 @@ EOF
 hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
 
-`hop processed` submits exact bytes to the server. Acceptance durably stages
-those bytes before teardown begins; the CLI does not write the canonical output
-file. In ship, the server later re-proves landing against the canonical session
+`hop processed` submits exact bytes to the server and waits for a terminal or
+blocked disposition. Acceptance durably stages those bytes before teardown
+begins; the CLI does not write the canonical output file. The server closes the
+owned pane and proves the recorded runner containment is empty before advancing.
+In ship, the server later re-proves landing against the canonical session
 worktree: it must be clean, and one stable HEAD must be contained in freshly
 fetched upstream `main`, falling back to upstream `master` only when `main` is
 absent. Without `origin`, that same stable, clean HEAD must be contained in local
 `main`, or local `master` only when `main` is absent. Hopper verifies only: it
-never merges, rebases, commits, or pushes. If initial completion is refused,
-follow the printed recovery command and retry `hop processed` only after the
+never merges, rebases, commits, or pushes. If submission is blocked or refused,
+follow the printed recovery command and retry the same action only after the
 stated condition is satisfied.
 
 ## Responding to a gate
@@ -385,14 +388,14 @@ human approval.
     hop lode kill <lode-id>          # add --force if commits live only in its worktree
     # 2. resubmit the corrected scope
 
-**Warning:** `hop lode restart --force` will not do this. Its `--force` means
-*"restart even if Claude has already started for this stage"*. It applies to the
-**stage**, not to a parked or wrong-premise lode, and it refuses a parked lode.
-Restart re-runs the lode you already have, which is exactly what you do not want
-when the premise was wrong. `hop lode kill` retains **both** the worktree and the
-branch, so "killed" is not "cleaned up": push the branch, verify the SHA from a
-**second** clone, kill, run `git worktree remove --force`, then confirm with
-`ls ~/.hopper/worktrees/`.
+**Warning:** `hop lode restart --force` will not clean up retained work. Its
+`--force` consents only to discarding an active or already-started stage. The
+server still closes the owned pane and proves containment is empty before it
+spawns a replacement. Restart re-runs the lode you already have, which is not
+appropriate when the premise was wrong. `hop lode kill` retains **both** the
+worktree and the branch, so "killed" is not "cleaned up": push the branch,
+verify the SHA from a **second** clone, kill, run
+`git worktree remove --force`, then confirm with `ls ~/.hopper/worktrees/`.
 
 **Workspace trust is Hopper-managed.** Before opening Claude, Hopper attempts to
 record trust in the Claude profile inherited by that lode. Registered project
@@ -420,13 +423,10 @@ the real foreground signals; descendant CPU can keep a lode `running` while
 background work is active. Heartbeat or CPU activity can carry a quiet stage,
 but neither bypasses the 60-minute pane-silence cap.
 
-If a senior Claude stage stays stuck past the runner timeout, Hopper terminates
-it, marks the lode `error`, and releases `active` so `hop restart <id>` can
-retry. Every stuck-kill writes `recovery.json` under the lode directory with a
-snapshot outcome (committed SHA, clean, no worktree, or failed with the git
-error); `hop lode status <id>` surfaces the record. Worktree cleanup also
-refuses to destroy a dirty worktree; it retains the path and logs a warning
-instead.
+If a stage remains quiet or stuck, Hopper parks it at a gate and keeps the agent
+alive for operator inspection. Use `hop lode peek <id>` to inspect it, then
+choose an explicit pause, restart, or kill action. These actions retain the
+worktree; none treats terminal silence as permission to clean it up.
 
 On a fresh Make-based worktree, refine setup prefers `make hopper-install` when
 the project declares that target and otherwise falls back to `make install`.

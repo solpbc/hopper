@@ -756,6 +756,28 @@ def test_strict_containment_proves_clean_exit_without_kill():
     assert kills == []
 
 
+def test_kill_action_requests_identity_bound_kill_without_grace_sleep():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict")
+    record["action_type"] = "kill"
+
+    result = teardown.observe_containment(
+        record,
+        {
+            "observe_cgroup": lambda: "populated",
+            "observe_supervisor": lambda: "alive",
+            "observe_pane_root": lambda: "gone",
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "kill_pending"
+    assert result["last_cgroup_observation"] == "populated"
+    assert result["last_supervisor_observation"] == "alive"
+    assert clock["polls"] == []
+
+
 def test_containment_deadline_is_materialized_before_worker_polling():
     _clock, now_ns, _poll = _fake_clock(start=5_000_000_000)
     record = _containment_record("linux-strict", state="pane_close_pending")

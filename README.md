@@ -47,7 +47,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | Command | Description |
 |---------|-------------|
 | `hop status` | Show or update lode status |
-| `hop processed` | Signal stage completion with output |
+| `hop processed` | Durably submit stage output and wait for its disposition |
 | `hop gate` | Pause lode at a review gate |
 | `hop code` | Run a stage prompt via Codex |
 
@@ -65,10 +65,11 @@ Run `hop <command> -h` for detailed usage.
 
 Useful lode subcommands include `hop lode peek`, `hop lode nudge`, `hop lode
 answer`, and `hop lode path` for pane inspection, prompt recovery, and locating
-the exact worktree. `hop lode pause ID` stops the pane while retaining the
-active lode, worktree, branch, and stage session; `hop lode resume ID` continues
-it. Watch, pause, and resume route to the lode's resident host. `hop lode kill`
-archives the lode but retains its worktree and branch for recovery.
+the exact worktree. `hop lode pause ID` closes the owned pane, proves containment
+is empty, and retains the active lode, worktree, branch, and stage session;
+`hop lode resume ID` continues it. Watch, pause, and resume route to the lode's
+resident host. `hop lode kill` proves containment and durability before
+archiving the lode while retaining its worktree and branch for recovery.
 
 Use `hop remote` plus the global `-H/--host` flag for remote hopper hosts.
 Quote remote-home paths (`hop -H host project add '~/src/repo'`): an unquoted
@@ -126,7 +127,8 @@ or local `master` only when `main` is absent; missing or unlanded local defaults
 fail closed. `hop processed` performs this proof only; it never merges, rebases,
 commits, or pushes. A refusal keeps the session and its worktree intact and
 prints recovery guidance for inspecting, cleaning, fetching, or landing before
-retrying.
+retrying. Once accepted, the server closes the owned pane, proves the recorded
+runner containment is empty, and publishes the terminal stage disposition.
 
 ## Key concepts
 **Lode** -- a Claude Code session with a unique ID, workflow stage, status, and associated tmux window.
