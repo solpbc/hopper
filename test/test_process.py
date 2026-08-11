@@ -2359,6 +2359,13 @@ class TestProcessingLog:
 
 
 class TestOomBoundary:
+    @pytest.fixture(autouse=True)
+    def _accept_supervisor_registration(self, monkeypatch):
+        monkeypatch.setattr(
+            "hopper.process.register_lode_supervisor",
+            lambda *_args, **_kwargs: {"accepted": True},
+        )
+
     class _ScopeResultClock:
         def __init__(self, reads):
             self.now = 0.0
@@ -2486,6 +2493,68 @@ class TestOomBoundary:
         assert run_process_supervisor("test-id", Path("server.sock")) == 0
         assert [event[0] for event in events] == ["launch", "read", "report", "release"]
         assert events[0][1] == oom.build_scope_argv("systemd-run", "hop", unit, "test-id")
+
+    def test_supervisor_registration_precedes_strict_scope_launch(self, monkeypatch):
+        generation = "9" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        events = []
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setenv("TMUX_PANE", "%7")
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(
+            "hopper.process.register_lode_supervisor",
+            lambda *args, **kwargs: events.append(("register", args, kwargs)) or {"accepted": True},
+        )
+        monkeypatch.setattr(oom, "launch_scope", lambda _argv: events.append(("launch",)) or 0)
+        monkeypatch.setattr(oom, "read_scope_result", lambda *_args: "success")
+        monkeypatch.setattr(
+            "hopper.process.report_lode_run_result",
+            lambda *_args: {"durable": False},
+        )
+
+        assert run_process_supervisor("test-id", Path("server.sock")) == 0
+        assert [event[0] for event in events] == ["register", "launch"]
+        assert events[0][2]["tmux_pane"] == "%7"
+        assert events[0][2]["proof_mode"] == "linux-strict"
+        assert events[0][2]["unit_name"] == unit
+
+    def test_missing_stdlib_pidfd_does_not_degrade_supported_scope(self, monkeypatch, caplog):
+        generation = "8" * 32
+        unit = oom.scope_unit_name("test-id", generation)
+        registrations = []
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", unit)
+        monkeypatch.setattr(oom, "is_linux", lambda: True)
+        monkeypatch.delattr(os, "pidfd_open", raising=False)
+        monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+        monkeypatch.setattr(oom, "find_scope_tools", lambda: ("systemd-run", "systemctl"))
+        monkeypatch.setattr(oom, "find_hop_executable", lambda: "hop")
+        monkeypatch.setattr(
+            "hopper.process.register_lode_supervisor",
+            lambda *_args, **kwargs: registrations.append(kwargs) or {"accepted": True},
+        )
+        inline = MagicMock(return_value=7)
+        monkeypatch.setattr("hopper.process.run_process", inline)
+        launch = MagicMock(return_value=0)
+        monkeypatch.setattr(oom, "launch_scope", launch)
+        monkeypatch.setattr(oom, "read_scope_result", lambda *_args: "success")
+        monkeypatch.setattr(
+            "hopper.process.report_lode_run_result", lambda *_args: {"durable": True}
+        )
+        monkeypatch.setattr(oom, "release_scope", lambda *_args: True)
+
+        with caplog.at_level(logging.WARNING, logger="hopper.process"):
+            assert run_process_supervisor("test-id", Path("server.sock")) == 0
+
+        assert registrations[0]["proof_mode"] == "linux-strict"
+        assert registrations[0]["unit_name"] == unit
+        assert registrations[0]["degraded_reason"] is None
+        assert "pidfd bindings unavailable" not in caplog.text
+        launch.assert_called_once()
+        inline.assert_not_called()
 
     def test_failed_ack_retains_failed_unit_evidence(self, monkeypatch):
         generation = "b" * 32
@@ -2737,6 +2806,7 @@ class TestOomBoundary:
         release.assert_not_called()
 
     def test_non_linux_supervisor_uses_inline_worker_without_probes(self, monkeypatch):
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", "7" * 32)
         monkeypatch.setattr(oom, "is_linux", lambda: False)
         monkeypatch.setattr(oom, "find_scope_tools", MagicMock(side_effect=AssertionError))
         monkeypatch.setattr(oom, "find_hop_executable", MagicMock(side_effect=AssertionError))
@@ -2784,6 +2854,65 @@ class TestOomBoundary:
             text=True,
             timeout=oom.SYSTEMCTL_TIMEOUT_SEC,
         )
+
+    def test_read_scope_control_group_returns_loaded_non_root_path(self):
+        unit = oom.scope_unit_name("test-id", "f" * 32)
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="LoadState=loaded\nControlGroup=/user.slice/example.scope\n",
+            stderr="",
+        )
+
+        with patch("hopper.oom.subprocess.run", return_value=result) as mock_run:
+            assert oom.read_scope_control_group("systemctl", unit) == {
+                "state": "present",
+                "load_state": "loaded",
+                "control_group": "/user.slice/example.scope",
+                "error": None,
+            }
+
+        mock_run.assert_called_once_with(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=ControlGroup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=oom.SYSTEMCTL_TIMEOUT_SEC,
+        )
+
+    def test_read_scope_control_group_proves_explicit_absence(self):
+        result = subprocess.CompletedProcess(
+            [], 0, stdout="LoadState=not-found\nControlGroup=\n", stderr=""
+        )
+        with patch("hopper.oom.subprocess.run", return_value=result):
+            assert oom.read_scope_control_group("systemctl", "gone.scope") == {
+                "state": "absent",
+                "load_state": "not-found",
+                "control_group": None,
+                "error": None,
+            }
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="denied"),
+            subprocess.CompletedProcess([], 0, stdout="LoadState=loaded\n", stderr=""),
+            subprocess.CompletedProcess(
+                [], 0, stdout="LoadState=loaded\nControlGroup=/\n", stderr=""
+            ),
+        ],
+    )
+    def test_read_scope_control_group_ambiguity_is_explicit(self, result):
+        with patch("hopper.oom.subprocess.run", return_value=result):
+            assert oom.read_scope_control_group("systemctl", "bad.scope")["state"] == (
+                "cannot-tell"
+            )
 
     def test_release_scope_passes_bounded_timeout(self):
         """The systemctl reset-failed probe uses the shared bounded timeout."""
@@ -2868,6 +2997,9 @@ class TestArmedRegistration:
         assert [event[0] for event in events[:3]] == ["lode_register", "setup", "model"]
         assert events[0][1]["armed_mode"] == "supported"
         assert events[0][1]["actual_unit"] == "hopper.scope"
+        assert events[0][1]["pid"] == os.getpid()
+        assert events[0][1]["ppid"] == os.getppid()
+        assert events[0][1]["pgid"] == os.getpgid(0)
 
     def test_registration_refusal_launches_no_setup_or_model(self):
         generation = "d" * 32

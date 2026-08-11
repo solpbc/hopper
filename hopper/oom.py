@@ -131,6 +131,78 @@ def read_scope_result(
     return value or None
 
 
+def read_scope_control_group(
+    systemctl: str,
+    unit_name: str,
+    *,
+    timeout: float = SYSTEMCTL_TIMEOUT_SEC,
+) -> dict:
+    """Read one unit's LoadState and ControlGroup without guessing on failure."""
+    try:
+        result = subprocess.run(
+            [
+                systemctl,
+                "--user",
+                "show",
+                unit_name,
+                "--property=LoadState",
+                "--property=ControlGroup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return {
+            "state": "cannot-tell",
+            "load_state": None,
+            "control_group": None,
+            "error": str(error),
+        }
+    if result.returncode != 0:
+        return {
+            "state": "cannot-tell",
+            "load_state": None,
+            "control_group": None,
+            "error": result.stderr.strip() or f"systemctl exited {result.returncode}",
+        }
+    properties: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in properties:
+            return {
+                "state": "cannot-tell",
+                "load_state": None,
+                "control_group": None,
+                "error": "malformed systemctl properties",
+            }
+        properties[key] = value
+    if set(properties) != {"LoadState", "ControlGroup"}:
+        return {
+            "state": "cannot-tell",
+            "load_state": None,
+            "control_group": None,
+            "error": "incomplete systemctl properties",
+        }
+    load_state = properties["LoadState"]
+    control_group = properties["ControlGroup"]
+    if load_state == "not-found" and not control_group:
+        return {"state": "absent", "load_state": load_state, "control_group": None, "error": None}
+    if load_state != "loaded" or not control_group.startswith("/") or control_group == "/":
+        return {
+            "state": "cannot-tell",
+            "load_state": load_state or None,
+            "control_group": control_group or None,
+            "error": "unit does not have one loaded non-root control group",
+        }
+    return {
+        "state": "present",
+        "load_state": load_state,
+        "control_group": control_group,
+        "error": None,
+    }
+
+
 def settle_scope_result(systemctl: str, unit_name: str) -> str | None:
     """Wait briefly for a failed scope's authoritative Result property to settle.
 

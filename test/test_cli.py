@@ -3,7 +3,9 @@
 
 """Tests for the hopper CLI."""
 
+import base64
 import copy
+import hashlib
 import json
 import os
 import shlex
@@ -14,14 +16,13 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import get_args
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 import hopper.cli as hopper_cli
 import hopper.code as hopper_code
-from hopper import __version__, config
+from hopper import __version__, completion, config
 from hopper.cli import (
     HELP_SKILL_REMINDER,
     _CheckProgress,
@@ -61,7 +62,6 @@ from hopper.cli import (
     validate_hopper_lid,
 )
 from hopper.client import RUN_GENERATION_ENV
-from hopper.git import UPSTREAM_FETCH_REFSPEC, ShipLandingCause, ShipLandingVerdict
 from hopper.lodes import (
     PARK_PANE_GONE_STATUS,
     current_time_ms,
@@ -1506,6 +1506,83 @@ def test_lode_restart_happy(capsys):
     out = capsys.readouterr().out
     assert "test1234" in out
     assert "mill" in out
+
+
+def test_lode_restart_pending_completion_uses_retry_not_stage_reset(capsys):
+    lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": True}
+    pending_path = MagicMock()
+    pending_path.exists.return_value = True
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.completion.pending_completion_path", return_value=pending_path),
+        patch(
+            "hopper.client.retry_lode_completion",
+            return_value={"type": "lode_completion_retrying", "lode_id": "abcd2345"},
+        ) as retry,
+        patch("hopper.client.restart_lode") as restart,
+    ):
+        assert cmd_lode(["restart", "abcd2345"]) == 0
+
+    retry.assert_called_once_with(config.server_socket_path(), "abcd2345")
+    restart.assert_not_called()
+    assert "Retrying durable completion teardown" in capsys.readouterr().out
+
+
+def test_lode_repair_output_sends_exact_bytes_and_record_identity(capsys):
+    data = b"accepted bytes\n"
+    record = {
+        "action_id": "a" * 32,
+        "stage": "mill",
+        "run_generation": "b" * 32,
+        "next_action": {"kind": "advance", "target_stage": "refine"},
+    }
+    lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": False}
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.completion.load_pending_completion", return_value=record),
+        patch(
+            "hopper.client.repair_lode_output",
+            return_value={"type": "lode_repair_output_ack", "accepted": True},
+        ) as repair,
+        patch("sys.stdin", _processed_stdin(data.decode())),
+    ):
+        assert cmd_lode(["repair-output", "abcd2345", "-", "--token", "T" * 43]) == 0
+
+    repair.assert_called_once_with(
+        config.server_socket_path(),
+        lode_id="abcd2345",
+        action_id="a" * 32,
+        stage="mill",
+        run_generation="b" * 32,
+        next_action={"kind": "advance", "target_stage": "refine"},
+        token="T" * 43,
+        output_base64=base64.b64encode(data).decode("ascii"),
+        byte_length=len(data),
+        digest_hex=hashlib.sha256(data).hexdigest(),
+    )
+    assert "Accepted exact replacement bytes" in capsys.readouterr().out
+
+
+def test_lode_repair_output_refusal_is_nonzero_and_names_unchanged_canonical(capsys):
+    lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": False}
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.completion.load_pending_completion", return_value=None),
+        patch(
+            "hopper.client.repair_lode_output",
+            return_value={
+                "type": "lode_repair_output_ack",
+                "accepted": False,
+                "reason": "unauthenticated",
+            },
+        ),
+        patch("sys.stdin", _processed_stdin("candidate\n")),
+    ):
+        assert cmd_lode(["repair-output", "abcd2345", "-", "--token", "wrong"]) == 1
+
+    output = capsys.readouterr().out
+    assert "unauthenticated" in output
+    assert "Canonical output is unchanged" in output
 
 
 def test_lode_restart_rejects_inside_lode(monkeypatch, capsys):
@@ -3759,6 +3836,148 @@ def test_screenshot_success(capsys):
 # Tests for processed command
 
 
+def _processed_stdin(value: str):
+    import io
+
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(value.encode())
+    return stdin
+
+
+def _processed_ownership(lode_id: str, generation: str) -> dict:
+    process = {
+        "pid": 101,
+        "ppid": 100,
+        "pgid": 100,
+        "birth": {
+            "kind": "linux-proc-starttime",
+            "boot_id": "boot-one",
+            "value": "1010",
+        },
+    }
+    return {
+        "schema_version": 1,
+        "lode_id": lode_id,
+        "run_generation": generation,
+        "registered_at_ms": 1_000,
+        "boot_id": "boot-one",
+        "platform": "linux",
+        "proof_mode": "linux-degraded",
+        "degraded_reason": "systemd scope unavailable",
+        "pane": {"pane_id": "%1", "window_id": "@1", "root_process": process},
+        "supervisor": process,
+        "worker": process,
+        "process_group": 100,
+        "descendants": [],
+        "unit": None,
+        "cgroup": None,
+        "unit_name": None,
+    }
+
+
+def test_processed_submits_exact_bytes_without_writing_canonical(temp_config, capsys):
+    import io
+
+    lode_id = "abcd2345"
+    output = b"# Mill output\n\nExact bytes.\n"
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(output)
+    with (
+        patch.dict(
+            os.environ,
+            {"HOPPER_LID": lode_id, "HOPPER_RUN_GENERATION": "a" * 32},
+        ),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch(
+            "hopper.client.get_lode",
+            return_value={"id": lode_id, "stage": "mill"},
+        ),
+        patch(
+            "hopper.client.complete_lode",
+            return_value={"accepted": True, "reason": "accepted", "action_id": "b" * 32},
+        ) as complete,
+        patch("sys.stdin", stdin),
+    ):
+        assert cmd_processed([]) == 0
+
+    complete.assert_called_once()
+    args = complete.call_args.args
+    assert args[1:4] == (lode_id, "a" * 32, "mill")
+    assert base64.b64decode(args[4]) == output
+    assert args[5] == len(output)
+    assert args[6] == hashlib.sha256(output).hexdigest()
+    assert not (temp_config / "lodes" / lode_id / "mill_out.md").exists()
+    assert "Accepted mill output" in capsys.readouterr().out
+
+
+def test_processed_server_refusal_leaves_existing_canonical_unchanged(temp_config, capsys):
+    import io
+
+    lode_id = "test-session"
+    canonical = temp_config / "lodes" / lode_id / "mill_out.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"known good\n")
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(b"new output\n")
+    with (
+        patch.dict(
+            os.environ,
+            {"HOPPER_LID": lode_id, "HOPPER_RUN_GENERATION": "a" * 32},
+        ),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch(
+            "hopper.client.get_lode",
+            return_value={"id": lode_id, "stage": "mill"},
+        ),
+        patch(
+            "hopper.client.complete_lode",
+            return_value={"accepted": False, "reason": "ownership_unavailable"},
+        ),
+        patch("sys.stdin", stdin),
+    ):
+        assert cmd_processed([]) == 1
+
+    assert canonical.read_bytes() == b"known good\n"
+    assert "hop lode restart" in capsys.readouterr().err
+
+
+def test_processed_pidfd_capability_refusal_is_prescriptive(temp_config, capsys):
+    import io
+
+    lode_id = "test-session"
+    canonical = temp_config / "lodes" / lode_id / "mill_out.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"known good\n")
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(b"new output\n")
+    with (
+        patch.dict(
+            os.environ,
+            {"HOPPER_LID": lode_id, "HOPPER_RUN_GENERATION": "a" * 32},
+        ),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch(
+            "hopper.client.get_lode",
+            return_value={"id": lode_id, "stage": "mill"},
+        ),
+        patch(
+            "hopper.client.complete_lode",
+            return_value={"accepted": False, "reason": "pidfd_unavailable"},
+        ),
+        patch("sys.stdin", stdin),
+    ):
+        assert cmd_processed([]) == 1
+
+    assert canonical.read_bytes() == b"known good\n"
+    error = capsys.readouterr().err
+    assert "pidfd_open and pidfd_send_signal" in error
+    assert "libc" in error
+    assert "retry `hop processed`" in error
+
+
 def test_processed_help(capsys):
     """processed --help shows help and returns 0."""
     result = cmd_processed(["--help"])
@@ -3766,9 +3985,9 @@ def test_processed_help(capsys):
     captured = capsys.readouterr()
     assert "usage: hop processed" in captured.out
     help_text = " ".join(captured.out.split())
-    assert "canonical worktree is clean" in help_text
-    assert "freshly fetched when origin exists" in help_text
-    assert "never merges, rebases, commits, or pushes" in help_text
+    assert "durable server acceptance" in help_text
+    assert "owns staged bytes before acknowledging" in help_text
+    assert "re-proved by the server after containment" in help_text
 
 
 def test_processed_no_server(capsys):
@@ -3806,14 +4025,12 @@ def test_processed_invalid_session(capsys):
 
 def test_processed_empty_stdin(capsys):
     """processed returns 1 on empty stdin."""
-    from io import StringIO
-
     lode_data = {"id": "test-session", "stage": "mill"}
     with patch.dict(os.environ, {"HOPPER_LID": "test-session"}):
         with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
-                    with patch("sys.stdin", StringIO("")):
+                    with patch("sys.stdin", _processed_stdin("")):
                         result = cmd_processed([])
     assert result == 1
     captured = capsys.readouterr()
@@ -3821,9 +4038,7 @@ def test_processed_empty_stdin(capsys):
 
 
 def test_processed_saves_file(temp_config, capsys):
-    """processed saves output to lode directory and updates state."""
-    from io import StringIO
-
+    """The moved contract submits bytes without writing canonical output."""
     lode_id = "test-session-1234"
     lode_dir = temp_config / "lodes" / lode_id
     output_text = "# Mill output\n\nDo the thing.\n"
@@ -3834,27 +4049,23 @@ def test_processed_saves_file(temp_config, capsys):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch(
-                        "hopper.client.set_lode_state_acknowledged",
-                        return_value={"accepted": True, "reason": "accepted"},
-                    ) as mock_set:
-                        with patch("sys.stdin", StringIO(output_text)):
+                        "hopper.client.complete_lode",
+                        return_value={
+                            "accepted": True,
+                            "reason": "accepted",
+                            "action_id": "b" * 32,
+                        },
+                    ) as complete:
+                        with patch("sys.stdin", _processed_stdin(output_text)):
                             result = cmd_processed([])
 
     assert result == 0
     captured = capsys.readouterr()
-    assert "Saved to" in captured.out
-
-    # Verify file was written as <stage>_out.md
+    assert "Accepted mill output for durable teardown" in captured.out
     output_path = lode_dir / "mill_out.md"
-    assert output_path.exists()
-    assert output_path.read_text() == output_text
-
-    # Verify state was updated: set_lode_state(socket_path, lode_id, state, status)
-    mock_set.assert_called_once()
-    _, sid, state, status = mock_set.call_args[0]
-    assert sid == lode_id
-    assert state == "completed"
-    assert "complete" in status.lower()
+    assert not output_path.exists()
+    complete.assert_called_once()
+    assert base64.b64decode(complete.call_args.args[4]) == output_text.encode()
 
 
 def test_processed_no_stage(capsys):
@@ -3871,9 +4082,7 @@ def test_processed_no_stage(capsys):
 
 
 def test_processed_refine_stage(temp_config, capsys):
-    """processed saves refine_out.md for refine stage."""
-    from io import StringIO
-
+    """Refine output also crosses the durable completion boundary."""
     lode_id = "test-refine-1234"
     lode_dir = temp_config / "lodes" / lode_id
     output_text = "# Refine summary\n\nFeature implemented.\n"
@@ -3884,31 +4093,27 @@ def test_processed_refine_stage(temp_config, capsys):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
                     with patch(
-                        "hopper.client.set_lode_state_acknowledged",
-                        return_value={"accepted": True, "reason": "accepted"},
-                    ) as mock_set:
-                        with patch("sys.stdin", StringIO(output_text)):
+                        "hopper.client.complete_lode",
+                        return_value={
+                            "accepted": True,
+                            "reason": "accepted",
+                            "action_id": "b" * 32,
+                        },
+                    ) as complete:
+                        with patch("sys.stdin", _processed_stdin(output_text)):
                             result = cmd_processed([])
 
     assert result == 0
 
-    # Verify file was written as refine_out.md
     output_path = lode_dir / "refine_out.md"
-    assert output_path.exists()
-    assert output_path.read_text() == output_text
-
-    # Verify state: "Refine complete"
-    mock_set.assert_called_once()
-    _, sid, state, status = mock_set.call_args[0]
-    assert sid == lode_id
-    assert state == "completed"
-    assert "Refine complete" in status
+    assert not output_path.exists()
+    complete.assert_called_once()
+    assert complete.call_args.args[3] == "refine"
+    assert base64.b64decode(complete.call_args.args[4]) == output_text.encode()
 
 
 @pytest.mark.parametrize("stage", ["mill", "refine"])
 def test_processed_non_ship_stage_never_runs_landing_proof(temp_config, stage):
-    from io import StringIO
-
     lode_id = f"test-{stage}-proof"
     with (
         patch.dict(os.environ, {"HOPPER_LID": lode_id}),
@@ -3919,36 +4124,29 @@ def test_processed_non_ship_stage_never_runs_landing_proof(temp_config, stage):
             return_value={"id": lode_id, "stage": stage},
         ),
         patch(
-            "hopper.client.set_lode_state_acknowledged",
-            return_value={"accepted": True, "reason": "accepted"},
-        ) as set_state,
+            "hopper.client.complete_lode",
+            return_value={"accepted": True, "reason": "accepted", "action_id": "b" * 32},
+        ) as complete,
         patch("hopper.git.ship_landing_verdict") as landing_proof,
-        patch("sys.stdin", StringIO("stage output\n")),
+        patch("sys.stdin", _processed_stdin("stage output\n")),
     ):
         assert cmd_processed([]) == 0
 
     landing_proof.assert_not_called()
-    set_state.assert_called_once()
-    assert (temp_config / "lodes" / lode_id / f"{stage}_out.md").read_text() == ("stage output\n")
+    complete.assert_called_once()
+    assert not (temp_config / "lodes" / lode_id / f"{stage}_out.md").exists()
 
 
 @pytest.mark.parametrize(
-    "verdict",
+    "server_ack",
     [
-        ShipLandingVerdict(
-            "clean",
-            "contained",
-            "origin/main",
-            "ancestry_contained",
-            "HEAD is contained in freshly fetched origin/main",
-        ),
+        {"accepted": True, "reason": "accepted", "action_id": "b" * 32},
+        {"accepted": True, "reason": "already_accepted", "action_id": "b" * 32},
     ],
 )
 def test_processed_ship_accepts_proven_landing_without_extra_claims(
-    temp_config, capsys, monkeypatch, verdict
+    temp_config, capsys, monkeypatch, server_ack
 ):
-    from io import StringIO
-
     lode_id = "test-ship-proven"
     canonical = temp_config / "canonical-worktree"
     canonical.mkdir()
@@ -3963,144 +4161,25 @@ def test_processed_ship_accepts_proven_landing_without_extra_claims(
             "hopper.client.get_lode",
             return_value={"id": lode_id, "stage": "ship"},
         ),
-        patch("hopper.lodes.get_worktree_dir", return_value=canonical),
-        patch("hopper.git.ship_landing_verdict", return_value=verdict) as landing_proof,
+        patch("hopper.git.ship_landing_verdict") as landing_proof,
         patch(
-            "hopper.client.set_lode_state_acknowledged",
-            return_value={"accepted": True, "reason": "accepted"},
-        ) as set_state,
-        patch("sys.stdin", StringIO("ship output\n")),
+            "hopper.client.complete_lode",
+            return_value=server_ack,
+        ) as complete,
+        patch("sys.stdin", _processed_stdin("ship output\n")),
     ):
         assert cmd_processed([]) == 0
 
-    landing_proof.assert_called_once_with(canonical)
-    set_state.assert_called_once()
-    assert (temp_config / "lodes" / lode_id / "ship_out.md").read_text() == "ship output\n"
+    landing_proof.assert_not_called()
+    complete.assert_called_once()
+    assert not (temp_config / "lodes" / lode_id / "ship_out.md").exists()
     captured = capsys.readouterr()
     assert "push" not in captured.out
     assert captured.err == ""
 
 
-def test_ship_landing_recovery_mapping_covers_every_literal_cause(tmp_path):
-    worktree = tmp_path / "canonical-worktree"
-    quoted_worktree = shlex.quote(str(worktree))
-    expected_by_kind = {
-        "status": (
-            f"inspect `git -C {quoted_worktree} status --short`, commit or clean "
-            "the reported changes"
-        ),
-        "remote": (
-            "inspect repository remotes using "
-            f"`git -C {quoted_worktree} remote -v` and resolve the failure"
-        ),
-        "fetch": (
-            "restore upstream access and run "
-            f"`git -C {quoted_worktree} fetch --prune origin {UPSTREAM_FETCH_REFSPEC}`"
-        ),
-        "default_ref": (
-            "inspect or restore the upstream default using "
-            f"`git -C {quoted_worktree} remote show origin`"
-        ),
-        "push": (f"land the commit using `git -C {quoted_worktree} push origin HEAD:main`"),
-        "ancestry": (
-            "inspect containment using "
-            f"`git -C {quoted_worktree} merge-base --is-ancestor HEAD origin/main` "
-            "and resolve the failure"
-        ),
-    }
-    cause_values = get_args(ShipLandingCause)
-
-    assert len(hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE) == len(cause_values)
-    assert set(hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE) == set(cause_values)
-    for cause in cause_values:
-        if cause.startswith(("worktree_", "cleanliness_", "head_")):
-            expected_kind = "status"
-        elif cause.startswith("remote_detection_"):
-            expected_kind = "remote"
-        elif cause.startswith("fetch_"):
-            expected_kind = "fetch"
-        elif cause.startswith("default_ref_"):
-            expected_kind = "default_ref"
-        elif cause == "ancestry_not_contained":
-            expected_kind = "push"
-        elif cause.startswith("ancestry_"):
-            expected_kind = "ancestry"
-        else:
-            pytest.fail(f"unclassified ship landing cause: {cause}")
-
-        assert hopper_cli._SHIP_RECOVERY_KIND_BY_CAUSE[cause] == expected_kind
-        verdict = ShipLandingVerdict(
-            "clean",
-            "indeterminate",
-            "origin/main" if expected_kind in {"push", "ancestry"} else None,
-            cause,
-            "arbitrarily reworded presentational detail",
-        )
-        assert (
-            hopper_cli._ship_landing_recovery(verdict, worktree) == expected_by_kind[expected_kind]
-        )
-
-
-@pytest.mark.parametrize(
-    ("verdict", "recovery_fragment"),
-    [
-        (
-            ShipLandingVerdict(
-                "dirty",
-                "indeterminate",
-                None,
-                "cleanliness_dirty",
-                "canonical worktree has staged, unstaged, or untracked changes",
-            ),
-            "status --short",
-        ),
-        (
-            ShipLandingVerdict(
-                "clean",
-                "not_contained",
-                "origin/main",
-                "ancestry_not_contained",
-                "HEAD is not contained in freshly fetched origin/main",
-            ),
-            "push origin HEAD:main",
-        ),
-        (
-            ShipLandingVerdict(
-                "clean",
-                "indeterminate",
-                None,
-                "fetch_failed",
-                "fetch from origin failed: unavailable",
-            ),
-            f"fetch --prune origin {UPSTREAM_FETCH_REFSPEC}",
-        ),
-        (
-            ShipLandingVerdict(
-                "clean",
-                "indeterminate",
-                None,
-                "default_ref_missing",
-                "no fresh upstream default branch exists (origin/main, origin/master)",
-            ),
-            "remote show origin",
-        ),
-        (
-            ShipLandingVerdict(
-                "clean",
-                "indeterminate",
-                "origin/master",
-                "ancestry_failed",
-                "ancestry against origin/master is indeterminate: fatal: ancestry",
-            ),
-            "merge-base --is-ancestor HEAD origin/master",
-        ),
-    ],
-)
-def test_processed_ship_refusal_writes_nothing_and_sends_no_mutation(
-    temp_config, capsys, verdict, recovery_fragment
-):
-    from io import StringIO
-
+def test_processed_ship_refusal_writes_nothing_and_sends_no_mutation(temp_config, capsys):
+    """A server refusal is authoritative; the CLI never writes accepted bytes."""
     lode_id = "test-ship-refused"
     canonical = temp_config / "canonical-worktree"
     canonical.mkdir()
@@ -4114,31 +4193,25 @@ def test_processed_ship_refusal_writes_nothing_and_sends_no_mutation(
             "hopper.client.get_lode",
             return_value={"id": lode_id, "stage": "ship"},
         ),
-        patch("hopper.lodes.get_worktree_dir", return_value=canonical),
-        patch("hopper.git.ship_landing_verdict", return_value=verdict),
-        patch("hopper.client.set_lode_state_acknowledged") as set_state,
-        patch("sys.stdin", StringIO("ship output\n")),
+        patch("hopper.git.ship_landing_verdict") as landing_proof,
+        patch(
+            "hopper.client.complete_lode",
+            return_value={"accepted": False, "reason": "ship_provenance_unavailable"},
+        ) as complete,
+        patch("sys.stdin", _processed_stdin("ship output\n")),
     ):
         assert cmd_processed([]) == 1
 
-    set_state.assert_not_called()
+    landing_proof.assert_not_called()
+    complete.assert_called_once()
     assert not (temp_config / "lodes" / lode_id / "ship_out.md").exists()
     assert sentinel.read_text() == "keep\n"
     captured = capsys.readouterr()
     assert captured.out == ""
-    lines = captured.err.strip().splitlines()
-    assert len(lines) == 4
-    assert lines[0] == "error: ship completion refused"
-    assert lines[1] == f"observed: {verdict.detail}"
-    assert lines[2] == "Hopper did not write ship completion or advance the lode."
-    assert lines[3].startswith("recover with:")
-    assert recovery_fragment in lines[3]
-    assert "retry `hop processed`" in lines[3]
+    assert "could not capture the ship repository identity" in captured.err
 
 
-def test_processed_no_ack_is_unknown_but_keeps_written_output(temp_config, capsys):
-    from io import StringIO
-
+def test_processed_no_ack_is_unknown_and_keeps_canonical_unchanged(temp_config, capsys):
     lode_id = "test-session"
     output = "completed output\n"
     with (
@@ -4146,12 +4219,12 @@ def test_processed_no_ack_is_unknown_but_keeps_written_output(temp_config, capsy
         patch("hopper.client.probe_server", return_value="up"),
         patch("hopper.client.lode_exists", return_value=True),
         patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
-        patch("hopper.client.set_lode_state_acknowledged", return_value=None),
-        patch("sys.stdin", StringIO(output)),
+        patch("hopper.client.complete_lode", return_value=None),
+        patch("sys.stdin", _processed_stdin(output)),
     ):
-        assert cmd_processed([]) == 0
+        assert cmd_processed([]) == 1
 
-    assert (temp_config / "lodes" / lode_id / "mill_out.md").read_text() == output
+    assert not (temp_config / "lodes" / lode_id / "mill_out.md").exists()
     captured = capsys.readouterr()
     assert "disposition is UNKNOWN" in captured.err
     assert f"hop lode status {lode_id}" in captured.err
@@ -4181,8 +4254,6 @@ def test_processed_no_ack_is_unknown_but_keeps_written_output(temp_config, capsy
 def test_processed_each_explicit_refusal_is_distinct_and_nonzero(
     temp_config, capsys, reason, message
 ):
-    from io import StringIO
-
     lode_id = "test-session"
     output = "completed output\n"
     with (
@@ -4191,35 +4262,48 @@ def test_processed_each_explicit_refusal_is_distinct_and_nonzero(
         patch("hopper.client.lode_exists", return_value=True),
         patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
         patch(
-            "hopper.client.set_lode_state_acknowledged",
+            "hopper.client.complete_lode",
             return_value={"accepted": False, "reason": reason},
         ),
-        patch("sys.stdin", StringIO(output)),
+        patch("sys.stdin", _processed_stdin(output)),
     ):
         assert cmd_processed([]) == 1
 
-    assert (temp_config / "lodes" / lode_id / "mill_out.md").read_text() == output
+    assert not (temp_config / "lodes" / lode_id / "mill_out.md").exists()
     assert capsys.readouterr().err.strip() == message
 
 
 def test_processed_acknowledges_over_real_server_socket(
     check_server, make_lode, temp_config, monkeypatch, capsys
 ):
-    from io import StringIO
-
     server, socket_path = check_server
     generation = "a" * 32
-    lode_id = "test-session"
-    server.lodes = [make_lode(id=lode_id, state="running", run_generation=generation)]
+    lode_id = "abcd2345"
+    lode = make_lode(
+        id=lode_id,
+        state="running",
+        active=True,
+        tmux_pane="%1",
+        pid=101,
+        run_generation=generation,
+    )
+    server.lodes = [lode]
+    owner = MagicMock()
+    server.lode_clients[lode_id] = owner
+    server.client_lodes[owner] = lode_id
+    server.client_generations[owner] = generation
+    completion.write_run_ownership(_processed_ownership(lode_id, generation))
+    monkeypatch.setattr(server, "_schedule_completion_step", MagicMock())
     monkeypatch.setattr(config, "server_socket_path", lambda: socket_path)
     monkeypatch.setenv("HOPPER_LID", lode_id)
     monkeypatch.setenv("HOPPER_RUN_GENERATION", generation)
-    monkeypatch.setattr(sys, "stdin", StringIO("real boundary output\n"))
+    monkeypatch.setattr(sys, "stdin", _processed_stdin("real boundary output\n"))
 
     assert cmd_processed([]) == 0
 
-    assert server.lodes[0]["state"] == "completed"
-    assert (temp_config / "lodes" / lode_id / "mill_out.md").exists()
+    assert server.lodes[0]["state"] == "teardown"
+    assert completion.load_pending_completion(lode_id) is not None
+    assert not (temp_config / "lodes" / lode_id / "mill_out.md").exists()
     captured = capsys.readouterr()
     assert "UNKNOWN" not in captured.err
 
@@ -5023,6 +5107,46 @@ def test_lode_status_subcommand(capsys):
     out = capsys.readouterr().out
     assert "abc12345" in out
     assert "stage:    mill" in out
+
+
+def test_lode_status_surfaces_exact_accepted_output_recovery(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "project": "proj",
+        "status": "Teardown blocked",
+        "state": "teardown",
+        "active": False,
+        "created_at": 1000,
+        "updated_at": 2000,
+    }
+    summary = {
+        "stage": "mill",
+        "action_id": "a" * 32,
+        "sha256": "b" * 64,
+        "byte_length": 17,
+        "repair_token": "T" * 43,
+        "failure": "staged blob missing",
+        "command": f"hop lode repair-output abcd2345 - --token {'T' * 43}",
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.completion.load_pending_completion", return_value={"pending": True}),
+        patch("hopper.completion.pending_output_recovery", return_value=summary),
+    ):
+        assert cmd_lode(["status", "abcd2345"]) == 0
+
+    output = capsys.readouterr().out
+    for expected in (
+        "stage:   mill",
+        "action:  " + "a" * 32,
+        "sha256:  " + "b" * 64,
+        "bytes:   17",
+        "token:   " + "T" * 43,
+        "failure: staged blob missing",
+        summary["command"],
+    ):
+        assert expected in output
 
 
 def test_lode_status_uses_one_snapshot_exchange(capsys, make_lode):

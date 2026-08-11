@@ -24,6 +24,8 @@ MUTATION_ACK_TIMEOUT_SEC = 15.0
 RUNNER_MUTATION_TYPES = frozenset(
     {
         "lode_register",
+        "lode_supervisor_register",
+        "lode_complete",
         "lode_set_state",
         "lode_set_stage",
         "lode_set_progress",
@@ -663,6 +665,127 @@ def report_lode_run_result(
     return None
 
 
+def register_lode_supervisor(
+    socket_path: Path,
+    lode_id: str,
+    run_generation: str,
+    *,
+    tmux_pane: str | None,
+    pid: int,
+    ppid: int,
+    pgid: int,
+    proof_mode: str,
+    degraded_reason: str | None,
+    unit_name: str | None,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Register and durably bind the outside supervisor before worker launch."""
+    response = send_message(
+        socket_path,
+        {
+            "type": "lode_supervisor_register",
+            "lode_id": lode_id,
+            "run_generation": run_generation,
+            "tmux_pane": tmux_pane,
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "proof_mode": proof_mode,
+            "degraded_reason": degraded_reason,
+            "unit_name": unit_name,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if response and response.get("type") == "lode_supervisor_registered":
+        return response
+    return None
+
+
+def complete_lode(
+    socket_path: Path,
+    lode_id: str,
+    run_generation: str,
+    stage: str,
+    output_base64: str,
+    byte_length: int,
+    digest_hex: str,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Submit exact stage bytes and await the durable completion disposition."""
+    response = send_message(
+        socket_path,
+        {
+            "type": "lode_complete",
+            "lode_id": lode_id,
+            "run_generation": run_generation,
+            "stage": stage,
+            "output_base64": output_base64,
+            "byte_length": byte_length,
+            "digest_algorithm": "sha256",
+            "digest_hex": digest_hex,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if response and response.get("type") == "lode_complete_ack":
+        return response
+    return None
+
+
+def repair_lode_output(
+    socket_path: Path,
+    *,
+    lode_id: str,
+    action_id: str | None,
+    stage: str | None,
+    run_generation: str | None,
+    next_action: dict | None,
+    token: str,
+    output_base64: str,
+    byte_length: int,
+    digest_hex: str,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Submit replacement bytes to the server's raw accepted-output repair boundary."""
+    response = send_message(
+        socket_path,
+        {
+            "type": "lode_repair_output",
+            "lode_id": lode_id,
+            "action_id": action_id,
+            "stage": stage,
+            "run_generation": run_generation,
+            "next_action": next_action,
+            "token": token,
+            "output_base64": output_base64,
+            "byte_length": byte_length,
+            "digest_algorithm": "sha256",
+            "digest_hex": digest_hex,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if response and response.get("type") == "lode_repair_output_ack":
+        return response
+    return None
+
+
+def retry_lode_completion(
+    socket_path: Path,
+    lode_id: str,
+    *,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Retry the identity-bound blocked phase of a pending completion."""
+    return send_message(
+        socket_path,
+        {"type": "lode_retry_completion", "lode_id": lode_id},
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
 def set_lode_state(
     socket_path: Path, lode_id: str, state: str, status: str, timeout: float = 2.0
 ) -> bool:
@@ -686,36 +809,6 @@ def set_lode_state(
         "ts": current_time_ms(),
     }
     return _fire_and_forget(socket_path, msg, timeout)
-
-
-def set_lode_state_acknowledged(
-    socket_path: Path,
-    lode_id: str,
-    state: str,
-    status: str,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
-) -> dict | None:
-    """Set lode state and await the server's fenced-mutation disposition."""
-    msg = {
-        "type": "lode_set_state",
-        "lode_id": lode_id,
-        "state": state,
-        "status": status,
-        "ts": current_time_ms(),
-        "ack_requested": True,
-    }
-    run_generation = os.environ.get(RUN_GENERATION_ENV)
-    if run_generation:
-        msg["run_generation"] = run_generation
-    response = send_message(
-        socket_path,
-        msg,
-        timeout=timeout,
-        wait_for_response=True,
-    )
-    if response and response.get("type") == "mutation_ack":
-        return response
-    return None
 
 
 def set_lode_status(socket_path: Path, lode_id: str, status: str, timeout: float = 2.0) -> bool:

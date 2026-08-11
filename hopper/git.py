@@ -3,14 +3,21 @@
 
 """Git utilities for hopper."""
 
+import fcntl
+import hashlib
+import json
 import logging
+import os
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+
+from hopper import config
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +148,59 @@ def _resolve_default_branch(
     return None, candidates
 
 
+def git_common_dir_identity(repo_dir: str | Path) -> dict:
+    """Resolve the shared Git directory and bind it to its filesystem identity."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr.strip() or "git common directory is unavailable")
+    path = Path(result.stdout.strip()).resolve(strict=True)
+    stat = path.stat()
+    return {
+        "realpath": str(path),
+        "identity": {"st_dev": stat.st_dev, "st_ino": stat.st_ino},
+    }
+
+
+@contextmanager
+def repository_fetch_lock(repo_dir: str | Path):
+    """Serialize shared-ref fetch workflows by exact Git common directory."""
+    identity = git_common_dir_identity(repo_dir)
+    key_bytes = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    key = hashlib.sha256(key_bytes).hexdigest()
+    lock_dir = config.hopper_dir() / "git-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{key}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        # The path can be replaced while waiting; never share a lock across
+        # different repositories merely because a pathname was reused.
+        if git_common_dir_identity(repo_dir) != identity:
+            raise RuntimeError("Git common directory identity changed while acquiring fetch lock")
+        yield identity
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def create_worktree(
+    repo_dir: str, worktree_path: Path, branch_name: str
+) -> tuple[bool, str | None]:
+    """Create a worktree while serializing shared remote-ref mutation."""
+    try:
+        with repository_fetch_lock(repo_dir):
+            return _create_worktree_locked(repo_dir, worktree_path, branch_name)
+    except (OSError, RuntimeError) as exc:
+        error = f"Git fetch lock unavailable: {exc}"
+        logger.error(error)
+        return False, error
+
+
+def _create_worktree_locked(
     repo_dir: str, worktree_path: Path, branch_name: str
 ) -> tuple[bool, str | None]:
     """Create an untracked branch worktree from the current upstream base.
@@ -319,6 +378,39 @@ def _probe_worktree_cleanliness(
 
 
 def ship_landing_verdict(worktree_dir: str | Path) -> ShipLandingVerdict:
+    """Prove landing while serializing every shared-ref-dependent probe."""
+    worktree_path = str(worktree_dir)
+    try:
+        if not Path(worktree_path).is_dir():
+            return ShipLandingVerdict(
+                "indeterminate",
+                "indeterminate",
+                None,
+                "worktree_missing",
+                f"canonical worktree is missing or not a directory: {worktree_path}",
+            )
+    except OSError as exc:
+        return ShipLandingVerdict(
+            "indeterminate",
+            "indeterminate",
+            None,
+            "worktree_unreadable",
+            f"canonical worktree could not be inspected at {worktree_path}: {exc}",
+        )
+    try:
+        with repository_fetch_lock(worktree_path):
+            return _ship_landing_verdict_locked(worktree_path)
+    except (OSError, RuntimeError) as exc:
+        return ShipLandingVerdict(
+            "indeterminate",
+            "indeterminate",
+            None,
+            "fetch_unavailable",
+            f"Git fetch lock is unavailable: {exc}",
+        )
+
+
+def _ship_landing_verdict_locked(worktree_dir: str | Path) -> ShipLandingVerdict:
     """Prove one stable, clean HEAD is contained in the repository's default ref.
 
     Repositories with ``origin`` are checked against a freshly fetched upstream
@@ -703,6 +795,328 @@ def unpushed_commits(
     except ValueError:
         logger.warning(f"unpushed count returned no number in {worktree_path}")
         return None, basis
+
+
+def _required_git(cwd: str | Path, *args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def _path_identity(path: str | Path) -> dict:
+    resolved = Path(path).resolve(strict=True)
+    stat = resolved.stat()
+    return {
+        "realpath": str(resolved),
+        "identity": {"st_dev": stat.st_dev, "st_ino": stat.st_ino},
+    }
+
+
+def _path_matches(path: str | Path, expected: dict) -> bool | None:
+    try:
+        return _path_identity(path) == expected
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+
+
+def worktree_registrations(repo_dir: str | Path) -> list[dict]:
+    """Return strict records from ``git worktree list --porcelain -z``."""
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain", "-z"],
+        cwd=str(repo_dir),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(detail or "git worktree list failed")
+    records: list[dict] = []
+    current: dict[str, str | bool] = {}
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        text = raw.decode("utf-8")
+        key, separator, value = text.partition(" ")
+        if key in current:
+            raise ValueError(f"duplicate {key} in git worktree record")
+        current[key] = value if separator else True
+    if current:
+        records.append(current)
+    for record in records:
+        if not isinstance(record.get("worktree"), str) or not isinstance(record.get("HEAD"), str):
+            raise ValueError("git worktree record is missing worktree or HEAD")
+    return records
+
+
+def _matching_registration(records: list[dict], path: str, branch_ref: str, head_oid: str) -> str:
+    matches = [record for record in records if record.get("worktree") == path]
+    if not matches:
+        return "absent"
+    if len(matches) != 1:
+        return "mismatch"
+    record = matches[0]
+    if record.get("HEAD") != head_oid or record.get("branch") != branch_ref:
+        return "mismatch"
+    return "match"
+
+
+def capture_worktree_provenance(project_dir: str | Path, worktree_path: str | Path) -> dict:
+    """Capture the immutable repository/worktree facts used by ship cleanup."""
+    project = _path_identity(project_dir)
+    worktree = _path_identity(worktree_path)
+    common = git_common_dir_identity(worktree["realpath"])
+    private_git_dir = _path_identity(
+        _required_git(
+            worktree["realpath"],
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+        )
+    )
+    branch_ref = _required_git(worktree["realpath"], "symbolic-ref", "-q", "HEAD")
+    head_oid = _required_git(worktree["realpath"], "rev-parse", "HEAD")
+    branch_oid = _required_git(worktree["realpath"], "rev-parse", branch_ref)
+    records = worktree_registrations(project["realpath"])
+    if _matching_registration(records, worktree["realpath"], branch_ref, head_oid) != "match":
+        raise RuntimeError("accepted worktree registration is absent or ambiguous")
+    return {
+        "project": project,
+        "git_common_dir": common,
+        "worktree": worktree,
+        "worktree_git_dir": private_git_dir,
+        "branch_ref": branch_ref,
+        "branch_oid": branch_oid,
+        "head_oid": head_oid,
+    }
+
+
+def revalidate_worktree_provenance(provenance: dict, *, worktree_path: str | None = None) -> dict:
+    """Revalidate every destructive ship identity and exact registration."""
+    target = worktree_path or provenance["worktree"]["realpath"]
+    for name in ("project", "git_common_dir", "worktree_git_dir"):
+        matched = _path_matches(provenance[name]["realpath"], provenance[name])
+        if matched is None:
+            return {"state": "unknown", "error": f"{name} identity cannot be read"}
+        if not matched:
+            return {"state": "mismatch", "error": f"{name} identity changed"}
+    target_expected = {
+        "realpath": str(Path(target).resolve(strict=False)),
+        "identity": provenance["worktree"]["identity"],
+    }
+    matched = _path_matches(target, target_expected)
+    if matched is None:
+        return {"state": "unknown", "error": "worktree identity cannot be read"}
+    if not matched:
+        return {"state": "mismatch", "error": "worktree identity changed or is absent"}
+    try:
+        branch_oid = _required_git(
+            provenance["project"]["realpath"], "rev-parse", provenance["branch_ref"]
+        )
+        head_oid = _required_git(target, "rev-parse", "HEAD")
+        records = worktree_registrations(provenance["project"]["realpath"])
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        return {"state": "unknown", "error": str(exc)}
+    if branch_oid != provenance["branch_oid"] or head_oid != provenance["head_oid"]:
+        return {"state": "mismatch", "error": "branch or HEAD identity changed"}
+    registration = _matching_registration(
+        records, target_expected["realpath"], provenance["branch_ref"], provenance["head_oid"]
+    )
+    if registration != "match":
+        return {
+            "state": "mismatch" if registration == "mismatch" else "unknown",
+            "error": "exact worktree registration is absent or changed",
+        }
+    return {"state": "match", "error": None}
+
+
+def quarantine_worktree(provenance: dict, quarantine: dict) -> dict:
+    """Rename the exact accepted worktree to its deterministic sibling."""
+    original = quarantine["original_path"]
+    target = quarantine["quarantine_path"]
+    expected_identity = quarantine["expected_identity"]
+    original_expected = {"realpath": original, "identity": expected_identity}
+    target_expected = {"realpath": target, "identity": expected_identity}
+    original_match = _path_matches(original, original_expected)
+    target_match = _path_matches(target, target_expected)
+    if original_match is None or target_match is None:
+        return {"state": "unknown", "error": "quarantine paths cannot be inspected"}
+    if target_match and not original_match:
+        return {"state": "renamed", "error": None}
+    if not original_match or target_match or Path(target).exists():
+        return {"state": "retained", "error": "quarantine path identities are ambiguous"}
+    validation = revalidate_worktree_provenance(provenance)
+    if validation["state"] != "match":
+        return {"state": "retained", "error": validation["error"]}
+    try:
+        os.rename(original, target)
+    except OSError as exc:
+        return {"state": "retained", "error": f"quarantine rename failed: {exc}"}
+    if _path_matches(target, target_expected) is not True or Path(original).exists():
+        return {"state": "unknown", "error": "quarantine rename could not be verified"}
+    return {"state": "renamed", "error": None}
+
+
+def repair_quarantined_worktree(provenance: dict, quarantine: dict) -> dict:
+    """Repair and verify the exact Git registration after quarantine rename."""
+    original = quarantine["original_path"]
+    target = quarantine["quarantine_path"]
+    target_expected = {"realpath": target, "identity": quarantine["expected_identity"]}
+    if _path_matches(target, target_expected) is not True or Path(original).exists():
+        return {"state": "retained", "error": "quarantine rename identity is not exact"}
+    for name in ("project", "git_common_dir", "worktree_git_dir"):
+        if _path_matches(provenance[name]["realpath"], provenance[name]) is not True:
+            return {"state": "retained", "error": f"{name} identity changed"}
+    try:
+        records = worktree_registrations(provenance["project"]["realpath"])
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        return {"state": "unknown", "error": str(exc)}
+    target_state = _matching_registration(
+        records, target, provenance["branch_ref"], provenance["head_oid"]
+    )
+    if target_state == "match":
+        return {"state": "repaired", "error": None}
+    original_state = _matching_registration(
+        records, original, provenance["branch_ref"], provenance["head_oid"]
+    )
+    if target_state != "absent" or original_state != "match":
+        return {"state": "retained", "error": "worktree registration is ambiguous"}
+    try:
+        result = subprocess.run(
+            ["git", "-C", provenance["project"]["realpath"], "worktree", "repair", target],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return {"state": "unknown", "error": f"git worktree repair failed: {exc}"}
+    if result.returncode != 0:
+        return {
+            "state": "retained",
+            "error": result.stderr.strip() or "git worktree repair failed",
+        }
+    validation = revalidate_worktree_provenance(provenance, worktree_path=target)
+    if validation["state"] != "match":
+        return {"state": "retained", "error": validation["error"]}
+    return {"state": "repaired", "error": None}
+
+
+def authorize_quarantine_cleanup(
+    provenance: dict, quarantine: dict, *, base_ref: str | None
+) -> dict:
+    """Re-probe every work-loss guard on the repaired quarantine."""
+    target = quarantine["quarantine_path"]
+    validation = revalidate_worktree_provenance(provenance, worktree_path=target)
+    if validation["state"] != "match":
+        return {"authorized": False, "error": validation["error"]}
+    if is_dirty(target):
+        return {"authorized": False, "error": "quarantined worktree is dirty or unreadable"}
+    count, basis = unpushed_commits(target)
+    if count is None:
+        return {"authorized": False, "error": "unpushed commit count is unknown"}
+    if count:
+        return {
+            "authorized": False,
+            "error": f"quarantined worktree has {count} unpushed commit(s) against {basis}",
+        }
+    if base_ref is not None:
+        result = _git_probe(target, ["merge-base", "--is-ancestor", "HEAD", base_ref], None)
+        if result is None or result.returncode != 0:
+            return {
+                "authorized": False,
+                "error": f"HEAD ancestry against {base_ref} is no longer proven",
+            }
+    return {"authorized": True, "error": None}
+
+
+def remove_quarantined_worktree(repo_identity: dict, quarantine: dict) -> dict:
+    """Remove only an exact quarantine via non-forcing Git worktree removal."""
+    target = quarantine["quarantine_path"]
+    project = repo_identity["project"]["realpath"]
+    target_expected = {"realpath": target, "identity": quarantine["expected_identity"]}
+    target_match = _path_matches(target, target_expected)
+    try:
+        records = worktree_registrations(project)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        return {"state": "unknown", "error": str(exc)}
+    registration = _matching_registration(
+        records, target, repo_identity["branch_ref"], repo_identity["head_oid"]
+    )
+    if target_match is False and registration == "absent":
+        return {"state": "already-absent", "error": None}
+    if target_match is not True or registration != "match":
+        return {"state": "retained", "error": "quarantine path or registration is ambiguous"}
+    for name in ("project", "git_common_dir", "worktree_git_dir"):
+        if _path_matches(repo_identity[name]["realpath"], repo_identity[name]) is not True:
+            return {"state": "retained", "error": f"{name} identity changed"}
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", target],
+            cwd=project,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return {"state": "unknown", "error": f"git worktree remove failed: {exc}"}
+    try:
+        post_records = worktree_registrations(project)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        return {"state": "unknown", "error": str(exc)}
+    post_registration = _matching_registration(
+        post_records, target, repo_identity["branch_ref"], repo_identity["head_oid"]
+    )
+    if not Path(target).exists() and post_registration == "absent":
+        return {"state": "removed", "error": None}
+    detail = result.stderr.strip() or "non-forcing git worktree removal did not complete"
+    return {"state": "retained", "error": detail}
+
+
+def delete_branch_if_unchanged(provenance: dict) -> dict:
+    """Safely delete the accepted branch only if its exact OID still exists."""
+    project = provenance["project"]["realpath"]
+    for name in ("project", "git_common_dir"):
+        if _path_matches(provenance[name]["realpath"], provenance[name]) is not True:
+            return {"state": "retained", "error": f"{name} identity changed"}
+    try:
+        records = worktree_registrations(project)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        return {"state": "unknown", "error": str(exc)}
+    if any(record.get("branch") == provenance["branch_ref"] for record in records):
+        return {"state": "retained", "error": "accepted branch is still checked out"}
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", provenance["branch_ref"]],
+        cwd=project,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 1:
+        return {"state": "already-absent", "error": None}
+    if result.returncode != 0 or result.stdout.strip() != provenance["branch_oid"]:
+        return {"state": "retained", "error": "accepted branch ref is unknown or changed"}
+    branch = provenance["branch_ref"].removeprefix("refs/heads/")
+    deleted = subprocess.run(
+        ["git", "branch", "-d", "--", branch],
+        cwd=project,
+        capture_output=True,
+        text=True,
+    )
+    if deleted.returncode != 0:
+        return {
+            "state": "retained",
+            "error": deleted.stderr.strip() or "safe branch deletion failed",
+        }
+    verify = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", provenance["branch_ref"]],
+        cwd=project,
+        capture_output=True,
+        text=True,
+    )
+    if verify.returncode == 1:
+        return {"state": "deleted", "error": None}
+    return {"state": "unknown", "error": "branch deletion could not be verified"}
 
 
 def is_dirty(repo_dir: str) -> bool:

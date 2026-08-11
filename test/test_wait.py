@@ -425,6 +425,17 @@ def test_initial_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
     assert "✓ abc123 shipped" in out
 
 
+def test_inactive_teardown_waits_without_reporting_failure():
+    assert (
+        wait.classify(
+            snapshot(
+                state="teardown", status="Teardown: waiting for Linux containment", active=False
+            )
+        )
+        is None
+    )
+
+
 def test_later_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
     handoff = snapshot(stage="ship", state="ready", status="Refine complete", active=False)
     shipped = snapshot(stage="shipped", state="ready", status="Ship complete", active=False)

@@ -19,6 +19,7 @@ from hopper.client import (
     HopperConnection,
     InvalidServerResponse,
     _exchange_message,
+    complete_lode,
     connect,
     get_gate,
     list_archived_lodes,
@@ -29,12 +30,14 @@ from hopper.client import (
     read_archived_lodes,
     read_lode_snapshot,
     read_lodes,
+    register_lode_supervisor,
+    repair_lode_output,
+    retry_lode_completion,
     send_gate_feedback,
     send_message,
     send_pane_input,
     set_lode_progress,
     set_lode_state,
-    set_lode_state_acknowledged,
     set_lode_title,
 )
 from hopper.server import Server
@@ -730,6 +733,115 @@ def test_send_pane_input_is_not_a_runner_mutation():
     assert "lode_send_pane_input" not in RUNNER_MUTATION_TYPES
 
 
+def test_register_lode_supervisor_sends_complete_identity(socket_path):
+    response = {"type": "lode_supervisor_registered", "accepted": True}
+    with patch("hopper.client.send_message", return_value=response) as send:
+        assert (
+            register_lode_supervisor(
+                socket_path,
+                "test-id",
+                TEST_RUN_GENERATION,
+                tmux_pane="%1",
+                pid=10,
+                ppid=9,
+                pgid=10,
+                proof_mode="linux-degraded",
+                degraded_reason="pidfd unavailable",
+                unit_name=None,
+            )
+            == response
+        )
+
+    request = send.call_args.args[1]
+    assert request == {
+        "type": "lode_supervisor_register",
+        "lode_id": "test-id",
+        "run_generation": TEST_RUN_GENERATION,
+        "tmux_pane": "%1",
+        "pid": 10,
+        "ppid": 9,
+        "pgid": 10,
+        "proof_mode": "linux-degraded",
+        "degraded_reason": "pidfd unavailable",
+        "unit_name": None,
+    }
+    assert send.call_args.kwargs == {"timeout": 15.0, "wait_for_response": True}
+
+
+def test_complete_lode_sends_exact_bytes_metadata(socket_path):
+    response = {"type": "lode_complete_ack", "accepted": True, "action_id": "1" * 32}
+    with patch("hopper.client.send_message", return_value=response) as send:
+        assert (
+            complete_lode(
+                socket_path,
+                "test-id",
+                TEST_RUN_GENERATION,
+                "mill",
+                "eA==",
+                1,
+                "2" * 64,
+            )
+            == response
+        )
+
+    request = send.call_args.args[1]
+    assert request["type"] == "lode_complete"
+    assert request["run_generation"] == TEST_RUN_GENERATION
+    assert request["output_base64"] == "eA=="
+    assert request["byte_length"] == 1
+    assert request["digest_algorithm"] == "sha256"
+    assert request["digest_hex"] == "2" * 64
+
+
+def test_repair_lode_output_sends_raw_action_identity_and_bytes(socket_path):
+    response = {"type": "lode_repair_output_ack", "accepted": True}
+    next_action = {"kind": "advance", "target_stage": "refine"}
+    with patch("hopper.client.send_message", return_value=response) as send:
+        assert (
+            repair_lode_output(
+                socket_path,
+                lode_id="abcd2345",
+                action_id="1" * 32,
+                stage="mill",
+                run_generation=TEST_RUN_GENERATION,
+                next_action=next_action,
+                token="T" * 43,
+                output_base64="eA==",
+                byte_length=1,
+                digest_hex="2" * 64,
+            )
+            == response
+        )
+
+    request = send.call_args.args[1]
+    assert request == {
+        "type": "lode_repair_output",
+        "lode_id": "abcd2345",
+        "action_id": "1" * 32,
+        "stage": "mill",
+        "run_generation": TEST_RUN_GENERATION,
+        "next_action": next_action,
+        "token": "T" * 43,
+        "output_base64": "eA==",
+        "byte_length": 1,
+        "digest_algorithm": "sha256",
+        "digest_hex": "2" * 64,
+    }
+
+
+def test_retry_lode_completion_sends_dedicated_mutation(socket_path):
+    response = {"type": "lode_completion_retrying", "lode_id": "abcd2345"}
+    with patch("hopper.client.send_message", return_value=response) as send:
+        assert retry_lode_completion(socket_path, "abcd2345") == response
+
+    send.assert_called_once_with(
+        socket_path,
+        {"type": "lode_retry_completion", "lode_id": "abcd2345"},
+        timeout=15.0,
+        wait_for_response=True,
+    )
+
+
 def test_get_gate_returns_lode_and_doc(socket_path, temp_config):
     """get_gate returns the lode plus the current gate.md text."""
     from hopper.lodes import get_lode_dir
@@ -794,53 +906,6 @@ def test_fire_and_forget_attaches_runner_generation(socket_path):
     message = send.call_args.args[1]
     assert message["run_generation"] == TEST_RUN_GENERATION
     assert send.call_args.kwargs["wait_for_response"] is False
-
-
-def test_set_lode_state_acknowledged_round_trips_real_socket(server, socket_path):
-    server.lodes = [
-        {
-            "id": "test-id",
-            "stage": "mill",
-            "state": "running",
-            "status": "Working",
-            "failure_kind": None,
-            "run_generation": TEST_RUN_GENERATION,
-        }
-    ]
-
-    response = set_lode_state_acknowledged(
-        socket_path,
-        "test-id",
-        "completed",
-        "Mill complete",
-    )
-
-    assert response is not None
-    assert response["accepted"] is True
-    assert response["reason"] == "accepted"
-    assert server.lodes[0]["state"] == "completed"
-
-
-def test_set_lode_state_acknowledged_old_server_returns_unknown(socket_path):
-    def responder(_conn, _request):
-        return None
-
-    response, request = _exchange_with_responder(
-        socket_path,
-        responder,
-        timeout=0.1,
-        invoke=lambda path: set_lode_state_acknowledged(
-            path,
-            "test-id",
-            "completed",
-            "Mill complete",
-            timeout=0.1,
-        ),
-    )
-
-    assert response is None
-    assert request["ack_requested"] is True
-    assert request["exchange_id"]
 
 
 def test_persistent_connection_attaches_runner_generation(socket_path):

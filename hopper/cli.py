@@ -2,6 +2,8 @@
 # Copyright (c) 2026 sol pbc
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -23,7 +25,6 @@ import hopper.code as hopper_code
 from hopper import __version__, config
 from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
-from hopper.git import UPSTREAM_FETCH_REFSPEC, ShipLandingCause, ShipLandingVerdict
 from hopper.lodes import (
     current_time_ms,
     format_age,
@@ -1217,101 +1218,16 @@ def cmd_screenshot(args: list[str]) -> int:
     return 0
 
 
-_SHIP_COMPLETION_CAUSES: frozenset[ShipLandingCause] = frozenset({"ancestry_contained"})
-_SHIP_RECOVERY_KIND_BY_CAUSE: dict[ShipLandingCause, str] = {
-    "worktree_unreadable": "status",
-    "worktree_missing": "status",
-    "cleanliness_deadline_expired": "status",
-    "cleanliness_unavailable": "status",
-    "cleanliness_failed": "status",
-    "cleanliness_dirty": "status",
-    "head_deadline_expired": "status",
-    "head_unavailable": "status",
-    "head_failed": "status",
-    "head_changed": "status",
-    "remote_detection_deadline_expired": "remote",
-    "remote_detection_unavailable": "remote",
-    "remote_detection_failed": "remote",
-    "fetch_deadline_expired": "fetch",
-    "fetch_timed_out": "fetch",
-    "fetch_unavailable": "fetch",
-    "fetch_failed": "fetch",
-    "default_ref_deadline_expired": "default_ref",
-    "default_ref_unavailable": "default_ref",
-    "default_ref_failed": "default_ref",
-    "default_ref_missing": "default_ref",
-    "ancestry_deadline_expired": "ancestry",
-    "ancestry_unavailable": "ancestry",
-    "ancestry_contained": "ancestry",
-    "ancestry_not_contained": "push",
-    "ancestry_failed": "ancestry",
-}
-
-
-def _ship_landing_recovery(verdict: ShipLandingVerdict, worktree: Path) -> str:
-    """Render the recovery action selected only from the structured cause."""
-    quoted_worktree = shlex.quote(str(worktree))
-    recovery_kind = _SHIP_RECOVERY_KIND_BY_CAUSE[verdict.cause]
-    if recovery_kind == "status":
-        return (
-            f"inspect `git -C {quoted_worktree} status --short`, commit or clean "
-            "the reported changes"
-        )
-    if recovery_kind == "remote":
-        return (
-            "inspect repository remotes using "
-            f"`git -C {quoted_worktree} remote -v` and resolve the failure"
-        )
-    if recovery_kind == "fetch":
-        return (
-            "restore upstream access and run "
-            f"`git -C {quoted_worktree} fetch --prune origin {UPSTREAM_FETCH_REFSPEC}`"
-        )
-    if recovery_kind == "default_ref":
-        if verdict.base_ref is None and verdict.detail.startswith("no local default branch"):
-            return (
-                "create or restore local `main` or `master`, then land the commit into it "
-                f"inside `{quoted_worktree}`"
-            )
-        return (
-            "inspect or restore the upstream default using "
-            f"`git -C {quoted_worktree} remote show origin`"
-        )
-    if verdict.base_ref is None:
-        raise ValueError(f"ship landing cause {verdict.cause} requires a base ref")
-    if recovery_kind == "push":
-        if not verdict.base_ref.startswith("origin/"):
-            return (
-                f"land the commit into local {shlex.quote(verdict.base_ref)} inside "
-                f"`{quoted_worktree}`"
-            )
-        branch_name = verdict.base_ref.removeprefix("origin/")
-        return (
-            f"land the commit using `git -C {quoted_worktree} push origin "
-            f"HEAD:{shlex.quote(branch_name)}`"
-        )
-    if recovery_kind == "ancestry":
-        return (
-            "inspect containment using "
-            f"`git -C {quoted_worktree} merge-base --is-ancestor HEAD "
-            f"{shlex.quote(verdict.base_ref)}` and resolve the failure"
-        )
-    raise ValueError(f"unknown ship landing recovery kind: {recovery_kind}")
-
-
 @command("processed", "Signal stage completion with output", group="lode")
 def cmd_processed(args: list[str]) -> int:
     """Read stage output from stdin and signal stage completion."""
-    from hopper.client import get_lode, set_lode_state_acknowledged
-    from hopper.lodes import get_lode_dir
+    from hopper.client import complete_lode, get_lode
 
     parser = make_parser(
         "processed",
-        "Read stage output from stdin, save it, and signal completion. "
-        "During ship, completion is refused unless the canonical worktree is clean, stays "
-        "clean, and "
-        "one stable HEAD is contained in main or master (freshly fetched when origin exists). "
-        "The CLI verifies the landing; it never merges, rebases, commits, or pushes. "
+        "Submit exact stage output from stdin for durable server acceptance. "
+        "The server owns staged bytes before acknowledging and publishes canonical output "
+        "during teardown. Ship landing is re-proved by the server after containment. "
         "Usage: hop processed <<'EOF'\n<output>\nEOF",
     )
     try:
@@ -1346,52 +1262,31 @@ def cmd_processed(args: list[str]) -> int:
         return 1
 
     # Read output from stdin
-    output = sys.stdin.read()
+    output = sys.stdin.buffer.read()
     if not output.strip():
         print("No input received. Use: hop processed <<'EOF'\\n<output>\\nEOF")
         return 1
 
-    if stage == "ship":
-        from hopper.git import ship_landing_verdict
-        from hopper.lodes import get_worktree_dir
-
-        worktree = get_worktree_dir(lode_id)
-        verdict = ship_landing_verdict(worktree)
-        if verdict.cause not in _SHIP_COMPLETION_CAUSES:
-            recovery = _ship_landing_recovery(verdict, worktree)
-            print("error: ship completion refused", file=sys.stderr)
-            print(f"observed: {verdict.detail}", file=sys.stderr)
-            print(
-                "Hopper did not write ship completion or advance the lode.",
-                file=sys.stderr,
-            )
-            print(
-                f"recover with: {recovery}, then retry `hop processed`.",
-                file=sys.stderr,
-            )
-            return 1
-
-    # Write to lode directory as <stage>_out.md
-    lode_dir = get_lode_dir(lode_id)
-    lode_dir.mkdir(parents=True, exist_ok=True)
-    output_path = lode_dir / f"{stage}_out.md"
-    tmp_path = output_path.with_suffix(".md.tmp")
-    tmp_path.write_text(output)
-    os.replace(tmp_path, output_path)
-    print(f"Saved to {output_path}")
-
-    # Signal completion
-    status = f"{stage.capitalize()} complete"
-    acknowledgement = set_lode_state_acknowledged(_socket(), lode_id, "completed", status)
+    generation = os.environ.get("HOPPER_RUN_GENERATION", "")
+    digest = hashlib.sha256(output).hexdigest()
+    acknowledgement = complete_lode(
+        _socket(),
+        lode_id,
+        generation,
+        stage,
+        base64.b64encode(output).decode("ascii"),
+        len(output),
+        digest,
+    )
     if acknowledgement is None or (
         acknowledgement.get("accepted") is not True and acknowledgement.get("accepted") is not False
     ):
         print(
-            "warning: completion disposition is UNKNOWN because the server did not "
+            "error: completion disposition is UNKNOWN because the server did not "
             f"acknowledge it. Check with `hop lode status {lode_id}`.",
             file=sys.stderr,
         )
-        return 0
+        return 1
     if acknowledgement["accepted"] is False:
         reason = acknowledgement.get("reason")
         refusal_messages = {
@@ -1408,6 +1303,37 @@ def cmd_processed(args: list[str]) -> int:
                 "Completion was refused because this lode has a terminal failure. "
                 f"Check `hop lode status {lode_id}` before recovering it."
             ),
+            "inactive_runner": (
+                "Completion was refused because this runner is not registered as active. "
+                f"Check `hop lode status {lode_id}` and retry from its current runner."
+            ),
+            "stage_mismatch": (
+                "Completion was refused because the submitted stage is stale. "
+                f"Check `hop lode status {lode_id}` and retry from its current runner."
+            ),
+            "completion_pending": (
+                "Completion was already accepted for this lode. "
+                f"Check `hop lode status {lode_id}` for teardown progress."
+            ),
+            "ownership_unavailable": (
+                "Completion was refused because Hopper could not verify this runner's "
+                "launch ownership. Restart the runner with `hop lode restart "
+                f"{lode_id}`, then retry."
+            ),
+            "pidfd_unavailable": (
+                "Completion was refused because strict Linux teardown requires "
+                "pidfd_open and pidfd_send_signal, but neither the Python stdlib nor "
+                "libc provides the complete interface. Install a libc or Python build "
+                "with both calls, restart Hopper, then retry `hop processed`."
+            ),
+            "invalid_output": (
+                "Completion was refused because the submitted bytes failed validation. "
+                "Retry `hop processed` with the intended nonempty output."
+            ),
+            "ship_provenance_unavailable": (
+                "Completion was refused because Hopper could not capture the ship "
+                f"repository identity. Check `hop lode status {lode_id}` and retry."
+            ),
         }
         print(
             refusal_messages.get(
@@ -1419,6 +1345,10 @@ def cmd_processed(args: list[str]) -> int:
         )
         return 1
 
+    print(
+        f"Accepted {stage} output for durable teardown "
+        f"(action {acknowledgement.get('action_id', 'unknown')})."
+    )
     return 0
 
 
@@ -1997,6 +1927,22 @@ def format_lode_detail(lode: dict) -> str:
     if isinstance(unpushed, dict):
         lines.append(_format_unpushed_line(unpushed))
 
+    pending_output = lode.get("pending_output_recovery")
+    if isinstance(pending_output, dict):
+        lines.extend(
+            [
+                "",
+                "  accepted output recovery:",
+                f"    stage:   {pending_output['stage']}",
+                f"    action:  {pending_output['action_id']}",
+                f"    sha256:  {pending_output['sha256']}",
+                f"    bytes:   {pending_output['byte_length']}",
+                f"    token:   {pending_output['repair_token']}",
+                f"    failure: {pending_output['failure']}",
+                f"    repair:  {pending_output['command']}",
+            ]
+        )
+
     created_age = format_age(lode.get("created_at", 0))
     updated_at = lode.get("updated_at", 0) or lode.get("created_at", 0)
     updated_age = format_age(updated_at)
@@ -2052,6 +1998,20 @@ def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) ->
 
     display_lode = dict(result["lode"])
     if result["host"] == "local":
+        from hopper import completion
+
+        try:
+            pending = completion.load_pending_completion(result["canonical_id"])
+            pending_output = completion.pending_output_recovery(pending) if pending else None
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            logger.warning(
+                "Failed to read pending completion for %s: %s",
+                result["canonical_id"],
+                error,
+            )
+            pending_output = None
+        if pending_output is not None:
+            display_lode["pending_output_recovery"] = pending_output
         recovery = _load_lode_recovery(result["canonical_id"])
         if recovery is not None:
             display_lode["recovery"] = recovery
@@ -2718,6 +2678,23 @@ def cmd_lode(args: list[str]) -> int:
         action="store_true",
         help="Restart even if Claude has already started for this stage",
     )
+    repair_p = subs.add_parser(
+        "repair-output",
+        help="Restore missing bytes for an accepted completion",
+        description=(
+            "Restore server-owned staged bytes only for an already accepted completion. "
+            "The stdin bytes must exactly match its recorded SHA-256 and byte length; "
+            "this is not normal output submission or a general output editor."
+        ),
+        exit_on_error=False,
+    )
+    repair_p.add_argument("lode_id", help="Lode ID whose accepted output is blocked")
+    repair_p.add_argument("source", help="Literal - to read the exact replacement bytes from stdin")
+    repair_p.add_argument(
+        "--token",
+        required=True,
+        help="Capability token printed by hop lode status for this accepted output",
+    )
     pause_p = subs.add_parser("pause", help="Pause a lode and retain its worktree")
     pause_p.add_argument("lode_id", help="Lode ID to pause")
     resume_p = subs.add_parser("resume", help="Resume a paused or dead-pane lode")
@@ -3139,6 +3116,65 @@ def cmd_lode(args: list[str]) -> int:
             print(f"{host}:{payload['path']}")
         return 0
 
+    if subcommand == "repair-output":
+        if parsed.source != "-":
+            print("error: repair-output reads exact accepted bytes only from literal - stdin")
+            repair_p.print_usage()
+            return 1
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        data = sys.stdin.buffer.read()
+        if resolved["host"] != "local":
+            try:
+                stdin_text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                print("Accepted output repair cannot route non-UTF-8 bytes to a remote host.")
+                return 1
+            return _run_remote_cli(
+                resolved["host"],
+                ["lode", "repair-output", lode_id, "-", "--token", parsed.token],
+                reason=f"lode {lode_id}",
+                stdin_text=stdin_text,
+            )
+
+        from hopper import completion
+
+        try:
+            record = completion.load_pending_completion(lode_id)
+        except (OSError, ValueError, json.JSONDecodeError):
+            record = None
+        identity = record or {}
+        response = client.repair_lode_output(
+            socket_path,
+            lode_id=lode_id,
+            action_id=identity.get("action_id"),
+            stage=identity.get("stage"),
+            run_generation=identity.get("run_generation"),
+            next_action=identity.get("next_action"),
+            token=parsed.token,
+            output_base64=base64.b64encode(data).decode("ascii"),
+            byte_length=len(data),
+            digest_hex=hashlib.sha256(data).hexdigest(),
+        )
+        if response is None:
+            print(
+                "Output repair disposition is UNKNOWN. Check `hop lode status "
+                f"{lode_id}` before retrying."
+            )
+            return 1
+        if response.get("accepted") is not True:
+            reason = response.get("reason", "refused")
+            print(
+                f"Accepted-output repair refused ({reason}). Canonical output is unchanged. "
+                f"Check `hop lode status {lode_id}`."
+            )
+            return 1
+        print(f"Accepted exact replacement bytes for {lode_id}; output publication is retrying.")
+        return 0
+
     if subcommand == "restart":
         if (rc := require_not_inside_lode()) is not None:
             return rc
@@ -3153,6 +3189,24 @@ def cmd_lode(args: list[str]) -> int:
                 ["lode", "restart", lode_id, *(["--force"] if parsed.force else [])],
                 reason=f"lode {lode_id}",
             )
+        from hopper import completion
+
+        if is_canonical_lode_id(lode_id) and completion.pending_completion_path(lode_id).exists():
+            response = client.retry_lode_completion(socket_path, lode_id)
+            if response is None:
+                print(
+                    "Completion retry disposition is UNKNOWN. "
+                    f"Check `hop lode status {lode_id}` before retrying."
+                )
+                return 1
+            if response.get("type") != "lode_completion_retrying":
+                print(
+                    f"Cannot retry completion: {response.get('error', 'server refused retry')}. "
+                    f"Check `hop lode status {lode_id}`."
+                )
+                return 1
+            print(f"Retrying durable completion teardown for {lode_id}")
+            return 0
         lode = resolved["lode"]
         if lode.get("active") and not parsed.force:
             print(f"Cannot restart: lode {lode_id} has a registered runner.")

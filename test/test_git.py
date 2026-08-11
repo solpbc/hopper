@@ -6,6 +6,7 @@
 import os
 import shutil
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -22,17 +23,24 @@ from hopper.git import (
     SHIP_REVALIDATION_TIMEOUT_SEC,
     UPSTREAM_FETCH_REFSPEC,
     _resolve_default_branch,
+    authorize_quarantine_cleanup,
+    capture_worktree_provenance,
     commit_all,
     create_worktree,
     current_branch,
     delete_branch,
+    delete_branch_if_unchanged,
     dirty_status,
     get_diff_numstat,
     get_diff_stat,
     head_sha,
     is_dirty,
     quarantine_dirty_repo,
+    quarantine_worktree,
+    remove_quarantined_worktree,
     remove_worktree,
+    repair_quarantined_worktree,
+    repository_fetch_lock,
     ship_landing_verdict,
     unpushed_commits,
 )
@@ -150,6 +158,10 @@ def _remove_or_rename_upstream_default(publisher, branch, change):
 
 
 class TestCreateWorktree:
+    @pytest.fixture(autouse=True)
+    def _mock_fetch_lock(self, monkeypatch):
+        monkeypatch.setattr("hopper.git.repository_fetch_lock", lambda _repo: nullcontext())
+
     def test_success(self, tmp_path):
         """Fetches origin and creates an untracked worktree from its first default ref."""
         worktree_path = tmp_path / "worktree"
@@ -807,6 +819,10 @@ class TestShipLandingVerdictIntegration:
 
 
 class TestShipLandingVerdictDeadlines:
+    @pytest.fixture(autouse=True)
+    def _mock_fetch_lock(self, monkeypatch):
+        monkeypatch.setattr("hopper.git.repository_fetch_lock", lambda _repo: nullcontext())
+
     def test_each_stage_uses_its_named_deadline_and_total_budget(self, tmp_path):
         results = [
             MagicMock(returncode=0, stdout=""),
@@ -1562,6 +1578,80 @@ class TestRemoveWorktree:
         assert result is True
         mock_run.assert_not_called()
         assert caplog.records == []
+
+
+class TestDurableShipQuarantine:
+    @pytest.mark.parametrize(
+        ("dirty", "unpushed", "expected"),
+        [
+            (True, (0, "a remote branch"), "dirty or unreadable"),
+            (False, (None, None), "unknown"),
+            (False, (2, "a remote branch"), "2 unpushed"),
+        ],
+    )
+    def test_cleanup_authorization_retains_dirty_unpushed_or_unknown(
+        self, dirty, unpushed, expected
+    ):
+        provenance = {"worktree": {"realpath": "/old"}}
+        quarantine = {"quarantine_path": "/quarantine"}
+        with (
+            patch(
+                "hopper.git.revalidate_worktree_provenance",
+                return_value={"state": "match", "error": None},
+            ),
+            patch("hopper.git.is_dirty", return_value=dirty),
+            patch("hopper.git.unpushed_commits", return_value=unpushed),
+        ):
+            result = authorize_quarantine_cleanup(provenance, quarantine, base_ref=None)
+
+        assert result["authorized"] is False
+        assert expected in result["error"]
+
+    def test_quarantine_repairs_authorizes_and_removes_without_force_or_rmtree(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="quarantine-project")
+        worktree = tmp_path / "quarantine-worktree"
+        branch = "hopper-abcd2345"
+        _run_git(project, "worktree", "add", "-b", branch, str(worktree), "main")
+        provenance = capture_worktree_provenance(project, worktree)
+        quarantine_path = tmp_path / f".abcd2345-quarantine-{'a' * 32}"
+        quarantine = {
+            "original_path": str(worktree),
+            "quarantine_path": str(quarantine_path),
+            "expected_identity": provenance["worktree"]["identity"],
+        }
+
+        assert quarantine_worktree(provenance, quarantine)["state"] == "renamed"
+        assert repair_quarantined_worktree(provenance, quarantine)["state"] == "repaired"
+        assert authorize_quarantine_cleanup(provenance, quarantine, base_ref="main") == {
+            "authorized": True,
+            "error": None,
+        }
+
+        real_run = subprocess.run
+        with (
+            patch("hopper.git.subprocess.run", side_effect=real_run) as run,
+            patch("hopper.git.shutil.rmtree") as rmtree,
+        ):
+            result = remove_quarantined_worktree(provenance, quarantine)
+
+        assert result == {"state": "removed", "error": None}
+        rmtree.assert_not_called()
+        commands = [item.args[0] for item in run.call_args_list]
+        assert not any("--force" in command for command in commands)
+        assert not any(
+            command[:2] == ["git", "worktree"] and "prune" in command for command in commands
+        )
+        assert delete_branch_if_unchanged(provenance)["state"] == "deleted"
+
+    def test_fetch_lock_identity_is_shared_by_linked_worktrees(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="lock-project")
+        worktree = tmp_path / "lock-worktree"
+        _run_git(project, "worktree", "add", "-b", "lock-branch", str(worktree), "main")
+
+        with repository_fetch_lock(project) as project_identity:
+            common = project_identity
+        with repository_fetch_lock(worktree) as worktree_identity:
+            assert worktree_identity == common
 
     def test_git_fails_but_path_gone_returns_true_with_prune(self, caplog):
         """Returns True and prunes stale metadata when git removed the path anyway."""

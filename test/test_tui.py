@@ -18,6 +18,7 @@ from hopper.lodes import (
     STATUS_RUNNING,
     STATUS_SHIPPED,
     STATUS_STUCK,
+    STATUS_TEARDOWN,
     format_age,
     parse_diff_numstat,
     parse_diff_numstat_totals,
@@ -319,6 +320,25 @@ def test_lode_to_row_disconnected():
     }
     row = lode_to_row(lode)
     assert row.status == STATUS_DISCONNECTED
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_lode_to_row_teardown_keeps_status_and_icon(active):
+    lode = {
+        "id": "abcd1234",
+        "stage": "refine",
+        "created_at": 1000,
+        "updated_at": 1000,
+        "state": "teardown",
+        "status": "Teardown: waiting for Linux containment",
+        "last_progress_summary": "stale progress",
+        "active": active,
+    }
+
+    row = lode_to_row(lode)
+
+    assert row.status == STATUS_TEARDOWN
+    assert row.status_text == "Teardown: waiting for Linux containment"
 
 
 def test_lode_to_row_shipped_inactive():
@@ -1100,6 +1120,16 @@ def test_ready_lode_does_not_trigger_jam():
     app._lodes = [{"active": False, "stage": "refine", "state": "ready"}]
     app._update_window_title()
     assert app._window_title == "hopper"
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_teardown_lode_is_hopping_not_jammed(active):
+    app = HopperApp()
+    app._lodes = [{"active": active, "stage": "refine", "state": "teardown"}]
+
+    app._update_window_title()
+
+    assert app._window_title == "hopping"
 
 
 def test_gated_lode_does_not_trigger_jam():

@@ -68,6 +68,7 @@ def make_lode():
             "run_generation": None,
             "oom_scope": None,
             "failure_kind": None,
+            "archive_action_id": None,
             "codex_thread_id": None,
             "last_progress_at": None,
             "last_progress_summary": "",

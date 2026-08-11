@@ -6,10 +6,14 @@
 import logging
 import os
 import re
+import shlex
 import subprocess
+import sys
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+COMPLETION_ACTION_OPTION = "@hopper_completion_action"
 
 
 class Liveness(Enum):
@@ -87,6 +91,40 @@ def get_pane_pid(target: str) -> int | None:
         return int(result.stdout.strip())
     except ValueError:
         return None
+
+
+def pane_identity(target: str) -> dict | None:
+    """Return the exact pane, window, and pane-root PID, or None on ambiguity."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{pane_id}\t#{window_id}\t#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    rows = [line for line in result.stdout.splitlines() if line]
+    if len(rows) != 1:
+        return None
+    fields = rows[0].split("\t")
+    if len(fields) != 3 or fields[0] != target or not fields[1]:
+        return None
+    try:
+        pane_pid = int(fields[2])
+    except ValueError:
+        return None
+    if pane_pid < 1:
+        return None
+    return {"pane_id": fields[0], "window_id": fields[1], "pane_pid": pane_pid}
 
 
 def pane_title(target: str) -> str | None:
@@ -170,6 +208,7 @@ def new_window(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     background: bool = False,
+    spawn_receipt: dict | None = None,
 ) -> str | None:
     """Create a new tmux window and return its pane ID.
 
@@ -178,10 +217,32 @@ def new_window(
         cwd: Working directory for the new window.
         env: Environment variables to set in the new window.
         background: If True, don't switch to the new window.
+        spawn_receipt: Durable completion action facts to publish before command start.
 
     Returns:
         The tmux pane ID (e.g., "%1") on success, None on failure.
     """
+    if spawn_receipt is not None:
+        fields = (
+            spawn_receipt["path"],
+            spawn_receipt["action_id"],
+            spawn_receipt["source_lode_id"],
+            spawn_receipt["target_lode_id"],
+            spawn_receipt["target_generation"],
+        )
+        code = (
+            "from hopper.tmux import bootstrap_spawn_receipt; "
+            f"bootstrap_spawn_receipt({', '.join(repr(value) for value in fields)})"
+        )
+        wait_channel = f"hopper-spawn-{spawn_receipt['action_id']}"
+        command = (
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}; "
+            "receipt_status=$?; "
+            f"tmux wait-for -U {shlex.quote(wait_channel)}; "
+            '[ "$receipt_status" -eq 0 ] || exit "$receipt_status"; '
+            f"exec {command}"
+        )
+
     cmd = ["tmux", "new-window", "-P", "-F", "#{pane_id}"]
     if background:
         cmd.append("-d")
@@ -192,15 +253,105 @@ def new_window(
             cmd.extend(["-e", f"{key}={value}"])
     cmd.append(command)
 
+    channel_locked = False
     try:
+        if spawn_receipt is not None:
+            acquired = subprocess.run(
+                ["tmux", "wait-for", "-L", wait_channel], capture_output=True, text=True
+            )
+            if acquired.returncode != 0:
+                logger.error(f"tmux spawn receipt lock failed: {acquired.stderr.strip()}")
+                return None
+            channel_locked = True
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.error(f"tmux new-window failed: {result.stderr.strip()}")
             return None
-        return result.stdout.strip()
+        pane_id = result.stdout.strip()
+        if spawn_receipt is not None:
+            waited = subprocess.run(
+                ["tmux", "wait-for", "-L", wait_channel], capture_output=True, text=True
+            )
+            if waited.returncode != 0:
+                logger.error(f"tmux spawn receipt wait failed: {waited.stderr.strip()}")
+                return None
+        return pane_id
     except FileNotFoundError:
         logger.error("tmux command not found")
         return None
+    finally:
+        if channel_locked:
+            try:
+                subprocess.run(
+                    ["tmux", "wait-for", "-U", wait_channel],
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError:
+                pass
+
+
+def bootstrap_spawn_receipt(
+    path: str,
+    action_id: str,
+    source_lode_id: str,
+    target_lode_id: str,
+    target_generation: str,
+) -> None:
+    """Tag the pane and fsync its action receipt before supervisor launch."""
+    pane_id = os.environ.get("TMUX_PANE")
+    if not pane_id:
+        raise RuntimeError("tmux did not provide an exact pane identity")
+    result = subprocess.run(
+        ["tmux", "set-option", "-p", "-t", pane_id, COMPLETION_ACTION_OPTION, action_id],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "tmux pane action tag could not be set")
+    from hopper import completion
+
+    expected_path = completion.spawn_receipt_path(source_lode_id, action_id)
+    if str(expected_path) != path:
+        raise ValueError("spawn receipt path does not match its action identity")
+    completion.write_spawn_receipt(
+        {
+            "schema_version": completion.SCHEMA_VERSION,
+            "action_id": action_id,
+            "source_lode_id": source_lode_id,
+            "target_lode_id": target_lode_id,
+            "target_generation": target_generation,
+            "pane_id": pane_id,
+        }
+    )
+
+
+def completion_action_panes(action_id: str) -> list[str] | None:
+    """Return panes tagged for an action, or None when tmux is unknowable."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                f"#{{pane_id}}\t#{{{COMPLETION_ACTION_OPTION}}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    panes = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2:
+            return None
+        if fields[1] == action_id:
+            panes.append(fields[0])
+    return panes
 
 
 def rename_window(target: str, name: str) -> bool:

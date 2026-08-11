@@ -20,6 +20,7 @@ Lodes are plain dicts with these fields:
 - run_generation: str | None - generation owning runner mutations (default None)
 - oom_scope: str | None - guarded systemd scope unit name (default None)
 - failure_kind: str | None - durable terminal runner failure discriminator (default None)
+- archive_action_id: str | None - completion action that published this archive (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
@@ -273,7 +274,13 @@ def _write_jsonl_atomic(path: Path, items: list[dict]) -> None:
             for item in items:
                 f.write(json.dumps(item) + "\n")
             f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -338,7 +345,9 @@ def _make_claude_sessions() -> dict:
     }
 
 
-def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
+def create_lode(
+    lodes: list[dict], project: str, scope: str = "", *, lode_id: str | None = None
+) -> dict:
     """Create a new lode, add to list, and create its directory.
 
     Args:
@@ -349,9 +358,21 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
     Returns:
         The newly created lode dict.
     """
+    if lode_id is not None:
+        if len(lode_id) != ID_LEN or any(character not in ID_ALPHABET for character in lode_id):
+            raise ValueError("reserved lode ID has an invalid format")
+        if any(existing.get("id") == lode_id for existing in lodes):
+            raise ValueError("reserved lode ID is already active")
+        if get_lode_dir(lode_id).exists():
+            raise ValueError("reserved lode ID directory already exists")
+        archived_path = config.hopper_dir() / "archived.jsonl"
+        if archived_path.exists():
+            with open(archived_path) as source:
+                if any(json.loads(line).get("id") == lode_id for line in source if line.strip()):
+                    raise ValueError("reserved lode ID is already archived")
     now = current_time_ms()
     lode = {
-        "id": _generate_lode_id(lodes),
+        "id": lode_id or _generate_lode_id(lodes),
         "stage": "mill",
         "created_at": now,
         "project": project,
@@ -367,6 +388,7 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
         "run_generation": None,
         "oom_scope": None,
         "failure_kind": None,
+        "archive_action_id": None,
         "codex_thread_id": None,
         "last_progress_at": None,
         "last_progress_summary": "",
@@ -380,6 +402,11 @@ def create_lode(lodes: list[dict], project: str, scope: str = "") -> dict:
     get_lode_dir(lode["id"]).mkdir(parents=True, exist_ok=True)
     save_lodes(lodes)
     return lode
+
+
+def reserve_lode_id(lodes: list[dict]) -> str:
+    """Return a collision-checked lode ID without publishing a lode."""
+    return _generate_lode_id(lodes)
 
 
 def _update_lode_field(lodes: list[dict], lode_id: str, field: str, value) -> dict | None:
@@ -419,6 +446,51 @@ def archive_lode(lodes: list[dict], lode_id: str) -> dict | None:
             save_lodes(lodes)
             return archived
     return None
+
+
+def archive_lode_for_action(
+    active_lodes: list[dict], archived_lodes: list[dict], lode_id: str, action_id: str
+) -> dict:
+    """Publish exactly one archive record for a durable completion action.
+
+    The archive snapshot is persisted before the active twin is removed. A
+    retry therefore converges after a crash on either side of the active-file
+    rewrite.
+    """
+    archived_matches = [lode for lode in archived_lodes if lode.get("id") == lode_id]
+    if any(lode.get("archive_action_id") != action_id for lode in archived_matches):
+        raise ValueError("lode is archived by a different completion action")
+    active_matches = [lode for lode in active_lodes if lode.get("id") == lode_id]
+    if len(active_matches) > 1:
+        raise ValueError("active lode identity is duplicated")
+    if active_matches and active_matches[0].get("archive_action_id") not in {None, action_id}:
+        raise ValueError("active lode belongs to a different archive action")
+    if not archived_matches and not active_matches:
+        raise ValueError("completion lode is absent from active and archived storage")
+
+    if archived_matches:
+        archived = archived_matches[0]
+    else:
+        archived = dict(active_matches[0])
+        archived["archive_action_id"] = action_id
+        archived["archived_at"] = current_time_ms()
+
+    prior_archived = list(archived_lodes)
+    archived_lodes[:] = [lode for lode in archived_lodes if lode.get("id") != lode_id] + [archived]
+    try:
+        save_archived_lodes(archived_lodes)
+    except Exception:
+        archived_lodes[:] = prior_archived
+        raise
+
+    prior_active = list(active_lodes)
+    active_lodes[:] = [lode for lode in active_lodes if lode.get("id") != lode_id]
+    try:
+        save_lodes(active_lodes)
+    except Exception:
+        active_lodes[:] = prior_active
+        raise
+    return archived
 
 
 def unarchive_lode(
@@ -643,6 +715,7 @@ STATUS_NEW = "○"  # empty circle
 STATUS_ERROR = "✗"  # x mark
 STATUS_SHIPPED = "✓"
 STATUS_GATED = "◇"  # open diamond — paused at gate, awaiting user review
+STATUS_TEARDOWN = "◌"  # dotted circle — accepted completion is being torn down
 STATUS_DISCONNECTED = "⊘"  # circled division slash — runner not connected
 
 
@@ -658,10 +731,12 @@ def lode_icon(lode: dict) -> str:
         icon = STATUS_ERROR
     elif state == "gated":
         icon = STATUS_GATED
+    elif state == "teardown":
+        icon = STATUS_TEARDOWN
     elif state == "stuck":
         icon = STATUS_STUCK
     else:
         icon = STATUS_RUNNING
-    if not lode.get("active", False) and stage != "shipped" and state != "gated":
+    if not lode.get("active", False) and stage != "shipped" and state not in {"gated", "teardown"}:
         icon = STATUS_DISCONNECTED
     return icon

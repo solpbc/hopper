@@ -42,6 +42,7 @@ from hopper.lodes import (
     STATUS_RUNNING,
     STATUS_SHIPPED,
     STATUS_STUCK,
+    STATUS_TEARDOWN,
     compute_runtime_ms,
     current_time_ms,
     format_age,
@@ -87,6 +88,7 @@ STATUS_COLORS = {
     STATUS_STUCK: "bright_yellow",
     STATUS_ERROR: "bright_red",
     STATUS_GATED: "bright_cyan",
+    STATUS_TEARDOWN: "bright_cyan",
     STATUS_NEW: "bright_black",
     STATUS_SHIPPED: "bright_green",
     STATUS_DISCONNECTED: "bright_red",
@@ -104,7 +106,7 @@ class Row:
     age: str  # formatted age string
     run: str  # formatted cumulative runtime
     # STATUS_RUNNING, STATUS_STUCK, STATUS_NEW, STATUS_ERROR, STATUS_GATED,
-    # STATUS_SHIPPED, STATUS_DISCONNECTED
+    # STATUS_SHIPPED, STATUS_TEARDOWN, STATUS_DISCONNECTED
     status: str
     project: str = ""  # Project name
     title: str = ""  # Short human-readable lode title
@@ -118,7 +120,12 @@ def lode_to_row(lode: dict) -> Row:
     status_text = lode.get("status", "")
     progress_text = lode.get("last_progress_summary", "")
     spawn_status = status_text.startswith(("spawn refused: ", "spawn failed: "))
-    if lode.get("active") and progress_text and not spawn_status:
+    if (
+        lode.get("active")
+        and progress_text
+        and not spawn_status
+        and lode.get("state") != "teardown"
+    ):
         status_text = progress_text
 
     return Row(
@@ -1070,6 +1077,8 @@ class LegendScreen(ModalScreen):
         t.append("  new\n", style="bright_black")
         t.append(f"  {STATUS_GATED}", style="bright_cyan")
         t.append("  gated\n", style="bright_black")
+        t.append(f"  {STATUS_TEARDOWN}", style="bright_cyan")
+        t.append("  teardown\n", style="bright_black")
         t.append(f"  {STATUS_SHIPPED}", style="bright_green")
         t.append("  shipped\n", style="bright_black")
         t.append(f"  {STATUS_DISCONNECTED}", style="bright_red")
@@ -1488,14 +1497,15 @@ class HopperApp(App):
             or (
                 not lode.get("active", False)
                 and lode.get("stage", "mill") != "shipped"
-                and lode.get("state", "new") not in ("new", "ready", "gated")
+                and lode.get("state", "new") not in ("new", "ready", "gated", "teardown")
             )
             for lode in self._lodes
         )
         if needs_attention:
             target = "hopJAM"
         elif any(
-            lode.get("active", False) and lode.get("stage", "mill") != "shipped"
+            (lode.get("active", False) or lode.get("state") == "teardown")
+            and lode.get("stage", "mill") != "shipped"
             for lode in self._lodes
         ):
             target = "hopping"

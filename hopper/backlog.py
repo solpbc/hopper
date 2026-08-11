@@ -70,8 +70,15 @@ def save_backlog(items: list[BacklogItem]) -> None:
     with open(tmp_path, "w") as f:
         for item in items:
             f.write(json.dumps(item.to_dict()) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
     os.replace(tmp_path, backlog_file)
+    directory_fd = os.open(backlog_file.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def add_backlog_item(
@@ -134,6 +141,38 @@ def set_backlog_queued(
             save_backlog(items)
             return item
     return None
+
+
+def apply_completion_disposition(
+    items: list[BacklogItem],
+    *,
+    source_lode_id: str,
+    selected_item_id: str,
+    promoted_lode_id: str,
+    remaining_item_ids: list[str],
+) -> None:
+    """Apply one previously persisted ship backlog plan idempotently."""
+    by_id: dict[str, BacklogItem] = {}
+    for item in items:
+        if item.id in by_id:
+            raise ValueError(f"backlog item {item.id} is duplicated")
+        by_id[item.id] = item
+
+    selected = by_id.get(selected_item_id)
+    if selected is not None and selected.queued != source_lode_id:
+        raise ValueError("selected backlog item no longer belongs to the completed lode")
+    for item_id in remaining_item_ids:
+        item = by_id.get(item_id)
+        if item is None:
+            raise ValueError(f"planned backlog item {item_id} is absent")
+        if item.queued not in {source_lode_id, promoted_lode_id}:
+            raise ValueError(f"planned backlog item {item_id} has conflicting queue ownership")
+
+    if selected is not None:
+        items.remove(selected)
+    for item_id in remaining_item_ids:
+        by_id[item_id].queued = promoted_lode_id
+    save_backlog(items)
 
 
 def find_by_prefix(items: list[BacklogItem], prefix: str) -> BacklogItem | None:

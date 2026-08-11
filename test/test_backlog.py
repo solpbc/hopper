@@ -3,9 +3,14 @@
 
 """Tests for backlog management."""
 
+from unittest.mock import patch
+
+import pytest
+
 from hopper.backlog import (
     BacklogItem,
     add_backlog_item,
+    apply_completion_disposition,
     find_by_prefix,
     load_backlog,
     remove_backlog_item,
@@ -78,6 +83,50 @@ def test_backlog_item_from_dict_missing_queued():
     }
     item = BacklogItem.from_dict(data)
     assert item.queued is None
+
+
+def test_completion_disposition_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr("hopper.backlog.config.hopper_dir", lambda: tmp_path)
+    selected = BacklogItem("select01", "proj", "first", 1, queued="source01")
+    remaining = BacklogItem("remain01", "proj", "second", 2, queued="source01")
+    items = [selected, remaining]
+
+    kwargs = {
+        "source_lode_id": "source01",
+        "selected_item_id": selected.id,
+        "promoted_lode_id": "promote1",
+        "remaining_item_ids": [remaining.id],
+    }
+    apply_completion_disposition(items, **kwargs)
+    apply_completion_disposition(items, **kwargs)
+
+    assert [item.id for item in items] == [remaining.id]
+    assert remaining.queued == "promote1"
+
+
+def test_completion_disposition_reconciles_persistence_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr("hopper.backlog.config.hopper_dir", lambda: tmp_path)
+    items = [
+        BacklogItem("select01", "proj", "first", 1, queued="source01"),
+        BacklogItem("remain01", "proj", "second", 2, queued="source01"),
+    ]
+    kwargs = {
+        "source_lode_id": "source01",
+        "selected_item_id": "select01",
+        "promoted_lode_id": "promote1",
+        "remaining_item_ids": ["remain01"],
+    }
+
+    with (
+        patch("hopper.backlog.save_backlog", side_effect=OSError("persistence crash")),
+        pytest.raises(OSError, match="persistence crash"),
+    ):
+        apply_completion_disposition(items, **kwargs)
+    apply_completion_disposition(items, **kwargs)
+
+    loaded = load_backlog()
+    assert [item.id for item in loaded] == ["remain01"]
+    assert loaded[0].queued == "promote1"
 
 
 def test_set_backlog_queued_not_found(tmp_path, monkeypatch):

@@ -112,9 +112,9 @@ its full output.
 
 ### Reading the status: three traps
 
-`hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `completed`, `error`, `gated`).
+`hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `teardown`, `error`, `gated`).
 
-1. **`state: completed` is a STAGE boundary, not the finish.** State flips to `completed` at the end of *each* stage (mill done, refine done, ship done), then the next stage begins. **The only terminal success signal is `stage: shipped`.** Key your loop on that, never on `state: completed`.
+1. **`state: teardown` is not terminal.** Hopper has accepted the stage output and is durably stopping that runner before the next action. **The only terminal success signal is `stage: shipped`.** Key your loop on that, never on a teardown status line.
 2. **Debounce `stuck`: one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` waits ~2 min before treating stuck as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
 3. **Use the complete exit-code table above; do not reconstruct it from this
    example.** In particular, `hop wait` timeout is exit `4`, not gate; gate is
@@ -307,14 +307,16 @@ EOF
 hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
 
-In the ship stage, `hop processed` runs an independent landing proof against the
-canonical session worktree. The worktree must be clean, and HEAD must be
-contained in freshly fetched upstream `main`, falling back to upstream `master`
-only when `main` is absent. Without `origin`, the same stable, clean HEAD must be
-contained in local `main`, or local `master` only when `main` is absent.
-`hop processed` verifies only: it never merges, rebases, commits, or pushes. If
-completion is refused, follow the printed recovery guidance and retry
-`hop processed` only after the repository satisfies the proof.
+`hop processed` submits exact bytes to the server. Acceptance durably stages
+those bytes before teardown begins; the CLI does not write the canonical output
+file. In ship, the server later re-proves landing against the canonical session
+worktree: it must be clean, and one stable HEAD must be contained in freshly
+fetched upstream `main`, falling back to upstream `master` only when `main` is
+absent. Without `origin`, that same stable, clean HEAD must be contained in local
+`main`, or local `master` only when `main` is absent. Hopper verifies only: it
+never merges, rebases, commits, or pushes. If initial completion is refused,
+follow the printed recovery command and retry `hop processed` only after the
+stated condition is satisfied.
 
 ## Responding to a gate
 
@@ -350,6 +352,18 @@ hop lode nudge <lode-id> --text "..."
 hop lode nudge <lode-id> -- -leading-dash-text
 hop lode answer <lode-id> 1         # answer numbered prompts
 ```
+
+If `hop lode status <lode-id>` reports that an already accepted output cannot
+be published, restore only those missing server-owned staged bytes with the
+printed capability token:
+
+```bash
+hop lode repair-output <lode-id> - --token <token> < exact-output.md
+```
+
+This is accepted-output recovery, not normal submission or a general output
+editor. The stdin bytes must match the accepted SHA-256 and byte length exactly;
+otherwise the server refuses without changing canonical output.
 
 When JavaScript exec runs a command, inspect `r.exit_code` directly. When forwarding the
 shell result to the model, emit both fields with

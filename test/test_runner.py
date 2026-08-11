@@ -1298,7 +1298,7 @@ class TestBaseRunnerServerMessages:
     """Tests for BaseRunner server message handling."""
 
     def test_on_server_message_sets_done(self):
-        """Callback sets _done when completed state received."""
+        """The retained follow-up hook still recognizes its legacy signal."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
 
         msg = {
@@ -1308,6 +1308,19 @@ class TestBaseRunnerServerMessages:
         runner._on_server_message(msg)
 
         assert runner._done.is_set()
+
+    def test_on_server_message_teardown_does_not_start_runner_dismissal(self):
+        """The server owns exact pane closure after accepted completion."""
+        runner = BaseRunner("test-session", Path("/tmp/test.sock"))
+
+        runner._on_server_message(
+            {
+                "type": "lode_updated",
+                "lode": {"id": "test-session", "state": "teardown"},
+            }
+        )
+
+        assert not runner._done.is_set()
 
     def test_on_server_message_records_gate_epoch(self):
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
@@ -1398,7 +1411,7 @@ class TestBaseRunnerServerMessages:
         assert not runner._done.is_set()
 
     def test_on_server_message_ignores_other_states(self):
-        """Callback ignores non-completed states."""
+        """Callback ignores states unrelated to gate control."""
         runner = BaseRunner("test-session", Path("/tmp/test.sock"))
 
         msg = {

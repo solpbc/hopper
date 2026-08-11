@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -16,6 +17,7 @@ from hopper import config, oom, prompt
 from hopper.client import (
     OOM_SCOPE_ENV,
     RUN_GENERATION_ENV,
+    register_lode_supervisor,
     report_lode_run_result,
     set_codex_thread_id,
     set_lode_state,
@@ -797,23 +799,62 @@ def run_process(lode_id: str, socket_path: Path, *, expect_scope: bool = False) 
 
 def run_process_supervisor(lode_id: str, socket_path: Path) -> int:
     """Run a guarded Linux worker while this process remains outside its scope."""
-    if not oom.is_linux():
-        return run_process(lode_id, socket_path, expect_scope=False)
-
     run_generation = os.environ.get(RUN_GENERATION_ENV)
     unit_name = os.environ.get(OOM_SCOPE_ENV)
-    tools = oom.find_scope_tools()
-    hop_executable = oom.find_hop_executable()
-    if not run_generation or not unit_name or not tools or not hop_executable:
+    if not run_generation:
+        logger.error("outside supervisor has no run generation lode=%s", lode_id)
+        return 1
+
+    linux = oom.is_linux()
+    tools = oom.find_scope_tools() if linux else None
+    hop_executable = oom.find_hop_executable() if linux else None
+    if not linux:
+        proof_mode = "darwin-bounded" if sys.platform == "darwin" else "other-bounded-no-birth"
+        degraded_reason = "non-Linux bounded observation; leak-free cleanup unproven"
+        strict = False
+    elif not tools or not hop_executable or not unit_name:
+        proof_mode = "linux-degraded"
+        degraded_reason = (
+            "systemd scope launch unavailable; strict pidfd/systemd proof and "
+            "leak-free cleanup unproven"
+        )
+        strict = False
+    else:
+        proof_mode = "linux-strict"
+        degraded_reason = None
+        strict = True
+
+    registration = register_lode_supervisor(
+        socket_path,
+        lode_id,
+        run_generation,
+        tmux_pane=os.environ.get("TMUX_PANE"),
+        pid=os.getpid(),
+        ppid=os.getppid(),
+        pgid=os.getpgid(0),
+        proof_mode=proof_mode,
+        degraded_reason=degraded_reason,
+        unit_name=unit_name if strict else None,
+    )
+    if not registration or registration.get("accepted") is not True:
+        logger.error("outside supervisor registration failed lode=%s", lode_id)
+        return 1
+
+    if not strict:
+        if degraded_reason:
+            logger.warning("lode=%s teardown capability degraded: %s", lode_id, degraded_reason)
         return run_process(lode_id, socket_path, expect_scope=False)
 
+    assert tools is not None
+    assert hop_executable is not None
+    assert unit_name is not None
     systemd_run, systemctl = tools
     argv = oom.build_scope_argv(systemd_run, hop_executable, unit_name, lode_id)
     try:
         worker_returncode = oom.launch_scope(argv)
     except OSError:
         logger.warning("failed to launch guarded systemd scope", exc_info=True)
-        return run_process(lode_id, socket_path, expect_scope=False)
+        return 1
 
     if worker_returncode == 0:
         unit_result = oom.read_scope_result(systemctl, unit_name)

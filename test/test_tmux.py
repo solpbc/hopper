@@ -7,11 +7,14 @@ from unittest.mock import patch
 
 import pytest
 
+from hopper import completion
 from hopper.tmux import (
     Liveness,
     PanePhase,
+    bootstrap_spawn_receipt,
     capture_pane,
     classify_pane_phase,
+    completion_action_panes,
     get_current_pane_id,
     get_current_tmux_location,
     get_pane_pid,
@@ -19,6 +22,7 @@ from hopper.tmux import (
     is_inside_tmux,
     is_tmux_server_running,
     kill_pane,
+    pane_identity,
     pane_liveness,
     pane_needs_answer,
     pane_title,
@@ -27,6 +31,41 @@ from hopper.tmux import (
     rename_window,
     send_keys,
 )
+
+
+def test_spawn_bootstrap_tags_exact_pane_before_durable_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr("hopper.completion.config.hopper_dir", lambda: tmp_path)
+    monkeypatch.setenv("TMUX_PANE", "%17")
+    action_id = "a" * 32
+    generation = "b" * 32
+    path = completion.spawn_receipt_path("abcd2345", action_id)
+
+    with patch("hopper.tmux.subprocess.run") as run:
+        run.return_value.returncode = 0
+        bootstrap_spawn_receipt(str(path), action_id, "abcd2345", "bcde2345", generation)
+
+    run.assert_called_once_with(
+        [
+            "tmux",
+            "set-option",
+            "-p",
+            "-t",
+            "%17",
+            "@hopper_completion_action",
+            action_id,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert completion.load_spawn_receipt("abcd2345", action_id)["pane_id"] == "%17"
+
+
+def test_completion_action_panes_fails_closed_on_ambiguous_rows():
+    with patch("hopper.tmux.subprocess.run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = "%1\taction\nmalformed\n"
+        assert completion_action_panes("action") is None
+
 
 # Constructed by trimming the real prep capture while retaining its verified U+2500 rules,
 # U+276F prompt, U+00A0 spacing, and processing content.
@@ -89,6 +128,47 @@ class TestGetPanePid:
             mock_run.return_value.stdout = ""
 
             assert get_pane_pid("%7") is None
+
+
+class TestPaneIdentity:
+    def test_returns_exact_pane_window_and_root_pid(self):
+        with patch("hopper.tmux.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "%7\t@3\t12345\n"
+
+            assert pane_identity("%7") == {
+                "pane_id": "%7",
+                "window_id": "@3",
+                "pane_pid": 12345,
+            }
+
+        mock_run.assert_called_once_with(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "%7",
+                "#{pane_id}\t#{window_id}\t#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize(
+        "stdout",
+        ["", "%8\t@3\t12345\n", "%7\t\t12345\n", "%7\t@3\tbad\n", "%7\t@3\t0\n"],
+    )
+    def test_ambiguous_identity_is_none(self, stdout):
+        with patch("hopper.tmux.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = stdout
+
+            assert pane_identity("%7") is None
+
+    def test_command_failure_is_none(self):
+        with patch("hopper.tmux.subprocess.run", side_effect=PermissionError):
+            assert pane_identity("%7") is None
 
 
 class TestPaneTitle:

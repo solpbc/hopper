@@ -14,6 +14,7 @@ def spawn_claude(
     project_path: str | None = None,
     foreground: bool = False,
     env: dict[str, str] | None = None,
+    spawn_receipt: dict | None = None,
 ) -> str | None:
     """Spawn Claude via hopper in a new tmux window.
 
@@ -30,7 +31,10 @@ def spawn_claude(
     fail = "echo 'Failed. Press Enter to close.'; read"
     inner = f"export PATH={shlex.quote(path)}; hop process {lode_id} || {{ {fail}; }}"
     command = f"/bin/sh -c {shlex.quote(inner)}"
-    return new_window(command, cwd=project_path, env=env, background=not foreground)
+    kwargs = {"cwd": project_path, "env": env, "background": not foreground}
+    if spawn_receipt is not None:
+        kwargs["spawn_receipt"] = spawn_receipt
+    return new_window(command, **kwargs)
 
 
 def switch_to_pane(pane_id: str) -> bool:

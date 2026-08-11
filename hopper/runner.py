@@ -330,6 +330,8 @@ class BaseRunner:
                         lode_id=self.lode_id,
                         tmux_pane=get_current_pane_id(),
                         pid=os.getpid(),
+                        ppid=os.getppid(),
+                        pgid=os.getpgid(0),
                         armed_mode=self.armed_mode,
                         actual_unit=self.actual_unit,
                     ),
@@ -464,6 +466,8 @@ class BaseRunner:
             self._start_monitor()
 
             if self._pane_id:
+                # Retained with _wait_and_dismiss_claude for the sequential
+                # completion-dismissal follow-up.
                 threading.Thread(
                     target=self._wait_and_dismiss_claude,
                     name=f"{self._done_label.lower().replace(' ', '-')}-dismiss",
@@ -595,7 +599,10 @@ class BaseRunner:
         self._gate_epoch = lode.get("gate_epoch", 0)
 
     def _wait_and_dismiss_claude(self) -> None:
-        """Wait for completion, then dismiss Claude with bounded keystroke retries."""
+        """Wait for completion, then dismiss Claude with bounded keystroke retries.
+
+        Retained temporarily for the sequential completion-dismissal follow-up.
+        """
         while not self._done.is_set():
             self._done.wait(timeout=1.0)
             if self._monitor_stop.is_set():

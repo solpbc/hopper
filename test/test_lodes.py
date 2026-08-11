@@ -26,7 +26,9 @@ from hopper.lodes import (
     PARK_LIVENESS_UNVERIFIED_SUFFIX,
     PARK_PANE_GONE_STATUS,
     RUNNER_EXIT_UNVERIFIED_STATUS,
+    STATUS_TEARDOWN,
     archive_lode,
+    archive_lode_for_action,
     compute_runtime_ms,
     create_lode,
     current_time_ms,
@@ -42,6 +44,7 @@ from hopper.lodes import (
     is_terminal_failure_kind,
     load_archived_lodes,
     load_lodes,
+    lode_icon,
     lode_status_for_display,
     lode_with_status_annotations,
     reset_lode_claude_stage,
@@ -57,6 +60,11 @@ from hopper.lodes import (
     update_lode_title,
 )
 from hopper.tmux import Liveness
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_teardown_icon_is_not_disconnected(active):
+    assert lode_icon({"stage": "mill", "state": "teardown", "active": active}) == STATUS_TEARDOWN
 
 
 def test_lode_dict_json_roundtrip():
@@ -86,6 +94,31 @@ def test_lode_dict_json_roundtrip():
     assert restored["state"] == lode["state"]
     assert restored["active"] == lode["active"]
     assert restored["tmux_pane"] == lode["tmux_pane"]
+
+
+def test_archive_lode_for_action_reconciles_append_before_active_remove(
+    tmp_path, monkeypatch, make_lode
+):
+    monkeypatch.setattr("hopper.lodes.config.hopper_dir", lambda: tmp_path)
+    action_id = "a" * 32
+    active = [make_lode(id="abcd2345", stage="shipped")]
+    archived = []
+
+    with (
+        patch("hopper.lodes.save_lodes", side_effect=OSError("crash after append")),
+        pytest.raises(OSError, match="crash after append"),
+    ):
+        archive_lode_for_action(active, archived, "abcd2345", action_id)
+    assert len(active) == 1
+    assert len(archived) == 1
+
+    second = archive_lode_for_action(active, archived, "abcd2345", action_id)
+
+    assert active == []
+    assert len(archived) == 1
+    assert second["archive_action_id"] == action_id
+    assert load_lodes() == []
+    assert len(load_archived_lodes()) == 1
 
 
 def test_lode_dict_includes_codex_thread_id():
@@ -160,6 +193,7 @@ def test_create_lode(temp_config):
     assert lode["run_generation"] is None
     assert lode["oom_scope"] is None
     assert lode["failure_kind"] is None
+    assert lode["archive_action_id"] is None
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
