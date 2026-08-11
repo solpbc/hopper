@@ -96,10 +96,254 @@ def test_run_remote_expands_preserved_tilde_on_remote(monkeypatch):
 def test_remote_registry_set_remove():
     set_remote("solstone-android", "suze.local")
 
-    assert remote_registry() == {"solstone-android": "suze.local"}
+    assert remote_registry() == {"solstone-android": ["suze.local"]}
     assert remove_remote("solstone-android") is True
     assert remove_remote("solstone-android") is False
     assert remote_registry() == {}
+
+
+def test_remove_remote_absent_preserves_original_bytes(temp_config):
+    path = temp_config / "config.json"
+    original = b'{\n  "z-last": true,\n  "remote.other": ["other.example"]\n}\n'
+    path.write_bytes(original)
+
+    assert remove_remote("absent") is False
+    assert path.read_bytes() == original
+
+
+def test_remote_registry_migrates_all_scalars_and_preserves_unrelated_values(temp_config):
+    path = temp_config / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "sol",
+                "nested": {"keep": True},
+                "remote.alpha": " alpha.example ",
+                "remote.beta": "beta.example",
+            }
+        )
+        + "\n"
+    )
+
+    assert remote_registry() == {
+        "alpha": ["alpha.example"],
+        "beta": ["beta.example"],
+    }
+    assert json.loads(path.read_text()) == {
+        "name": "sol",
+        "nested": {"keep": True},
+        "remote.alpha": ["alpha.example"],
+        "remote.beta": ["beta.example"],
+    }
+
+
+def test_remote_registry_refuses_whitespace_in_pool_without_rewriting(temp_config):
+    path = temp_config / "config.json"
+    original = b'{"remote.alpha": ["a ", "b"]}\n'
+    path.write_bytes(original)
+
+    with pytest.raises(config.ConfigError) as raised:
+        remote_registry()
+
+    assert raised.value.reason == "wrong_shape"
+    assert path.read_bytes() == original
+
+
+def test_remote_registry_trims_legacy_scalar_during_migration(temp_config):
+    path = temp_config / "config.json"
+    path.write_bytes(b'{"remote.alpha": " a "}\n')
+
+    assert remote_registry() == {"alpha": ["a"]}
+    assert json.loads(path.read_text()) == {"remote.alpha": ["a"]}
+
+
+@pytest.mark.parametrize(
+    "pool",
+    [[], [1], [""], ["same.example", "same.example"]],
+    ids=["empty", "non-string", "blank", "duplicate"],
+)
+def test_remote_registry_refuses_invalid_pool_without_rewriting(temp_config, pool):
+    path = temp_config / "config.json"
+    path.write_text(json.dumps({"name": "sol", "remote.alpha": pool}) + "\n")
+    before = path.read_bytes()
+
+    with pytest.raises(config.ConfigError) as raised:
+        remote_registry()
+
+    assert raised.value.reason == "wrong_shape"
+    assert path.read_bytes() == before
+
+
+def test_remote_registry_refuses_empty_scalar_without_rewriting(temp_config):
+    path = temp_config / "config.json"
+    path.write_bytes(b'{"remote.alpha": "   ", "keep": true}\n')
+    before = path.read_bytes()
+
+    with pytest.raises(config.ConfigError) as raised:
+        remote_registry()
+
+    assert raised.value.reason == "wrong_shape"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("migration", "config"),
+        ("migration", "project"),
+        ("migration", "remote"),
+        ("config", "migration"),
+        ("project", "migration"),
+        ("remote", "migration"),
+        ("config", "config"),
+        ("project", "project"),
+        ("remote", "remote"),
+        ("config", "project"),
+        ("project", "remote"),
+        ("remote", "config"),
+    ],
+)
+def test_config_transactions_serialize_process_interleavings(tmp_path, first, second):
+    """Migration and all writer families read only while holding config.lock."""
+    child_code = r"""
+import json
+import socket
+import sys
+
+import hopper.config as config
+import hopper.projects as projects
+import hopper.remote as remote
+
+host, port, role, operation = sys.argv[1:]
+control = socket.create_connection((host, int(port)), timeout=10)
+control_file = control.makefile("rwb", buffering=0)
+control_file.write(f"READY {role}\n".encode())
+assert control_file.readline() == b"GO\n"
+if role == "B":
+    control_file.write(b"ATTEMPT B\n")
+
+original_publish = config._publish_config
+
+def synchronized_publish(data, path):
+    payload = json.dumps(data, sort_keys=True)
+    control_file.write(f"PUBLISH_READY {role} {payload}\n".encode())
+    assert control_file.readline() == b"RELEASE\n"
+    original_publish(data, path)
+
+config._publish_config = synchronized_publish
+projects.current_time_ms = lambda: 100 if role == "A" else 200
+
+if operation == "migration":
+    remote.remote_registry()
+elif operation == "config":
+    with config.config_transaction() as stored:
+        stored[f"writer-{role.lower()}"] = f"value-{role.lower()}"
+elif operation == "project":
+    projects.touch_project(f"project-{role.lower()}")
+elif operation == "remote":
+    remote.set_remote(f"route-{role.lower()}", f"{role.lower()}.example")
+else:
+    raise AssertionError(operation)
+
+control_file.write(f"DONE {role}\n".encode())
+"""
+    xdg_home = tmp_path / "xdg"
+    data_dir = xdg_home / "hopper"
+    data_dir.mkdir(parents=True)
+    initial = {
+        "name": "sol",
+        "remote.legacy": "legacy.example",
+        "projects": [
+            {"path": "/tmp/a", "name": "project-a", "last_used_at": 0},
+            {"path": "/tmp/b", "name": "project-b", "last_used_at": 0},
+        ],
+    }
+    config_path = data_dir / "config.json"
+    config_path.write_text(json.dumps(initial, indent=2) + "\n")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(10)
+    host, port = listener.getsockname()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = str(xdg_home)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in [repo_root, env.get("PYTHONPATH", "")] if part
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", child_code, host, str(port), role, operation],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for role, operation in [("A", first), ("B", second)]
+    ]
+    controls = {}
+    files = {}
+    try:
+        for _ in processes:
+            connection, _ = listener.accept()
+            connection.settimeout(10)
+            control_file = connection.makefile("rwb", buffering=0)
+            ready, role = control_file.readline().decode().strip().split()
+            assert ready == "READY"
+            controls[role] = connection
+            files[role] = control_file
+
+        files["A"].write(b"GO\n")
+        publish, role, _payload = files["A"].readline().decode().strip().split(" ", 2)
+        assert (publish, role) == ("PUBLISH_READY", "A")
+
+        lock_probe = open(data_dir / "config.lock", "a+")
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock_probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            lock_probe.close()
+
+        files["B"].write(b"GO\n")
+        assert files["B"].readline() == b"ATTEMPT B\n"
+        files["A"].write(b"RELEASE\n")
+        assert files["A"].readline() == b"DONE A\n"
+
+        publish, role, payload = files["B"].readline().decode().strip().split(" ", 2)
+        assert (publish, role) == ("PUBLISH_READY", "B")
+        merged = json.loads(payload)
+        files["B"].write(b"RELEASE\n")
+        assert files["B"].readline() == b"DONE B\n"
+
+        results = [process.communicate(timeout=10) for process in processes]
+        assert [process.returncode for process in processes] == [0, 0], results
+    finally:
+        for control_file in files.values():
+            control_file.close()
+        for connection in controls.values():
+            connection.close()
+        listener.close()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    final = json.loads(config_path.read_text())
+    assert final == merged
+    assert final["name"] == "sol"
+    assert not list(data_dir.glob("config.json.*.tmp"))
+    for operation, role in [(first, "a"), (second, "b")]:
+        if operation == "migration":
+            assert final["remote.legacy"] == ["legacy.example"]
+        elif operation == "config":
+            assert final[f"writer-{role}"] == f"value-{role}"
+        elif operation == "project":
+            project = next(item for item in final["projects"] if item["name"] == f"project-{role}")
+            assert project["last_used_at"] == (100 if role == "a" else 200)
+        elif operation == "remote":
+            assert final[f"remote.route-{role}"] == [f"{role}.example"]
 
 
 def test_remember_lode_prunes_old_entries(temp_config):

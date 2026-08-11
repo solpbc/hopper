@@ -368,9 +368,10 @@ def _remote_host_for_create(project: str) -> tuple[str, str] | None:
     from hopper.remote import remote_registry
 
     registry = remote_registry()
-    host = registry.get(project)
-    if not host:
+    hosts = registry.get(project)
+    if not hosts:
         return None
+    host = hosts[0]
     project_record = find_project(project)
     if project_record and not project_record.disabled:
         return None
@@ -815,7 +816,7 @@ def _is_simple_value(value: object) -> bool:
 @command("config", "Get or set config values")
 def cmd_config(args: list[str]) -> int:
     """Get or set config values used as prompt template variables."""
-    from hopper.config import load_config, save_config
+    from hopper.config import config_transaction, load_config
 
     parser = make_parser(
         "config",
@@ -845,9 +846,19 @@ def cmd_config(args: list[str]) -> int:
         print(config.hopper_dir())
         return 0
 
-    cfg = load_config()
+    if parsed.action in {"set", "delete"} and parsed.key and parsed.key.startswith("remote."):
+        project = parsed.key.removeprefix("remote.")
+        print("error: config mutation refused")
+        print(f"observed: '{parsed.key}' is reserved for remote routing")
+        print("Hopper did not change config.json.")
+        if parsed.action == "set":
+            print(f"recover with: hop remote set {project or '<project>'} <host>")
+        else:
+            print(f"recover with: hop remote rm {project or '<project>'}")
+        return 1
 
     if parsed.action == "json":
+        cfg = load_config()
         print(json.dumps(cfg, indent=2))
         return 0
 
@@ -856,14 +867,14 @@ def cmd_config(args: list[str]) -> int:
             print("error: key required for delete")
             parser.print_usage()
             return 1
-        if parsed.key not in cfg:
-            print(f"Config '{parsed.key}' not set.")
-            return 1
-        if not _is_simple_value(cfg[parsed.key]):
-            print(f"Cannot delete complex key '{parsed.key}'. Use its own command.")
-            return 1
-        del cfg[parsed.key]
-        save_config(cfg)
+        with config_transaction() as cfg:
+            if parsed.key not in cfg:
+                print(f"Config '{parsed.key}' not set.")
+                return 1
+            if not _is_simple_value(cfg[parsed.key]):
+                print(f"Cannot delete complex key '{parsed.key}'. Use its own command.")
+                return 1
+            del cfg[parsed.key]
         print(f"Deleted '{parsed.key}'.")
         return 0
 
@@ -872,6 +883,7 @@ def cmd_config(args: list[str]) -> int:
             print("error: key required for get")
             parser.print_usage()
             return 1
+        cfg = load_config()
         if parsed.key in cfg:
             print(cfg[parsed.key])
         else:
@@ -884,12 +896,13 @@ def cmd_config(args: list[str]) -> int:
             print("error: key and value required for set")
             parser.print_usage()
             return 1
-        cfg[parsed.key] = parsed.value
-        save_config(cfg)
+        with config_transaction() as cfg:
+            cfg[parsed.key] = parsed.value
         print(f"{parsed.key}={parsed.value}")
         return 0
 
     # list (default)
+    cfg = load_config()
     print(f"config: {config.hopper_dir()}")
     simple = {k: v for k, v in cfg.items() if _is_simple_value(v)}
     if not simple:
@@ -933,7 +946,9 @@ def cmd_remote(args: list[str]) -> int:
     subcommand = parsed.subcommand or "list"
     if subcommand in ("list", "ls"):
         registry = remote_registry()
-        rows = [{"project": project, "host": host} for project, host in sorted(registry.items())]
+        rows = [
+            {"project": project, "host": hosts[0]} for project, hosts in sorted(registry.items())
+        ]
         if getattr(parsed, "json_output", False):
             print(json.dumps({"remotes": rows}, indent=2))
             return 0
@@ -1943,7 +1958,7 @@ def _remote_hosts() -> list[str]:
         return []
     from hopper.remote import remote_registry
 
-    return sorted(set(remote_registry().values()))
+    return sorted({host for hosts in remote_registry().values() for host in hosts})
 
 
 def _cached_lode_host(key: str, hosts: list[str]) -> str | None:
@@ -2622,7 +2637,8 @@ def cmd_lode(args: list[str]) -> int:
                 remote_args.append("--archived")
             if project_filter:
                 remote_args.extend(["--project", project_filter])
-            for host in sorted(set(remote_registry().values())):
+            hosts = {host for pool in remote_registry().values() for host in pool}
+            for host in sorted(hosts):
                 try:
                     result = run_remote(host, remote_args, timeout=8)
                 except (OSError, subprocess.TimeoutExpired):
@@ -3555,7 +3571,7 @@ def _hop_own_args(cmd_args: list[str]) -> list[str]:
     return cmd_args
 
 
-def main() -> int:
+def _main() -> int:
     """Main entry point with command dispatch."""
     args = sys.argv[1:]
     explicit_host, args, host_error = _global_host_arg(args)
@@ -3648,3 +3664,29 @@ def main() -> int:
     # Dispatch to command handler
     handler, *_ = COMMANDS[cmd]
     return handler(cmd_args)
+
+
+def main() -> int:
+    """Run command dispatch with one config-unavailable refusal boundary."""
+    try:
+        return _main()
+    except config.ConfigError as error:
+        observed = {
+            "malformed": "contains malformed JSON",
+            "wrong_shape": "does not contain the required JSON object shape",
+            "unreadable": "could not be read or published",
+            "locked": "could not be locked before the acquisition deadline",
+        }[error.reason]
+        quoted_path = shlex.quote(str(error.path))
+        print("error: Hopper config is unavailable", file=sys.stderr)
+        print(f"observed: {error.path} {observed}.", file=sys.stderr)
+        print(
+            "Hopper did not treat the config as empty or continue the command.",
+            file=sys.stderr,
+        )
+        print(
+            f"recover with: inspect `python -m json.tool {quoted_path}`, repair the config, "
+            "then retry.",
+            file=sys.stderr,
+        )
+        return 2

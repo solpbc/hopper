@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from hopper.config import load_config, save_config
+from hopper.config import config_transaction, load_config
 from hopper.projects import (
     Project,
     add_project,
@@ -131,7 +131,9 @@ def test_load_projects_missing_disabled_reason_defaults_empty(mock_config, git_d
     config = load_config()
     for p in config["projects"]:
         p.pop("disabled_reason", None)
-    save_config(config)
+    with config_transaction() as stored:
+        stored.clear()
+        stored.update(config)
     projects = load_projects()
     assert projects[0].disabled_reason == ""
 
@@ -539,6 +541,8 @@ def test_load_projects_missing_last_used_at(mock_config, git_dir):
     config = load_config()
     for p in config["projects"]:
         p.pop("last_used_at", None)
-    save_config(config)
+    with config_transaction() as stored:
+        stored.clear()
+        stored.update(config)
     projects = load_projects()
     assert projects[0].last_used_at == 0

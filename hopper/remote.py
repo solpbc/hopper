@@ -90,34 +90,74 @@ def _quote_remote_arg(arg: str) -> str:
     return shlex.quote(arg)
 
 
-def remote_registry() -> dict[str, str]:
-    """Return configured project -> remote host mappings."""
-    cfg = config.load_config()
-    registry: dict[str, str] = {}
+def _normalized_pool(value: object) -> list[str] | None:
+    """Validate one configured host pool without rewriting its entries."""
+    if not isinstance(value, list) or not value:
+        return None
+    hosts: list[str] = []
+    for host in value:
+        if not isinstance(host, str):
+            return None
+        normalized = host.strip()
+        if not normalized or host != normalized:
+            return None
+        hosts.append(host)
+    if len(set(hosts)) != len(hosts):
+        return None
+    return hosts
+
+
+def _remote_pools(cfg: dict[str, object]) -> dict[str, list[str]]:
+    """Validate every remote config value and return normalized pools."""
+    registry: dict[str, list[str]] = {}
     for key, value in cfg.items():
-        if key.startswith(REMOTE_CONFIG_PREFIX) and isinstance(value, str):
-            project = key.removeprefix(REMOTE_CONFIG_PREFIX)
-            if project:
-                registry[project] = value
+        if not key.startswith(REMOTE_CONFIG_PREFIX):
+            continue
+        project = key.removeprefix(REMOTE_CONFIG_PREFIX)
+        pool = _normalized_pool(value)
+        if not project or pool is None:
+            raise config.ConfigError(config.config_path(), "wrong_shape")
+        registry[project] = pool
     return registry
+
+
+def remote_registry() -> dict[str, list[str]]:
+    """Return configured host pools, migrating legacy scalar routes once."""
+    cfg = config.load_config()
+    has_scalar = any(
+        key.startswith(REMOTE_CONFIG_PREFIX) and isinstance(value, str)
+        for key, value in cfg.items()
+    )
+    if not has_scalar:
+        return _remote_pools(cfg)
+
+    with config.config_transaction() as locked:
+        for key, value in tuple(locked.items()):
+            if key.startswith(REMOTE_CONFIG_PREFIX) and isinstance(value, str):
+                # Trimming is an intentional one-time legacy scalar migration;
+                # established list entries must already be normalized.
+                locked[key] = [value.strip()]
+        return _remote_pools(locked)
 
 
 def set_remote(project: str, host: str) -> None:
     """Set a project -> remote host mapping."""
-    cfg = config.load_config()
-    cfg[f"{REMOTE_CONFIG_PREFIX}{project}"] = host
-    config.save_config(cfg)
+    project = project.strip()
+    host = host.strip()
+    if not project or not host:
+        raise ValueError("project and host must be non-empty")
+    with config.config_transaction() as cfg:
+        cfg[f"{REMOTE_CONFIG_PREFIX}{project}"] = [host]
 
 
 def remove_remote(project: str) -> bool:
     """Remove a project -> remote host mapping."""
-    cfg = config.load_config()
-    key = f"{REMOTE_CONFIG_PREFIX}{project}"
-    if key not in cfg:
-        return False
-    del cfg[key]
-    config.save_config(cfg)
-    return True
+    key = f"{REMOTE_CONFIG_PREFIX}{project.strip()}"
+    with config.config_transaction() as cfg:
+        if key not in cfg:
+            return False
+        del cfg[key]
+        return True
 
 
 def remote_lode_cache_path() -> Path:

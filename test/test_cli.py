@@ -3038,10 +3038,15 @@ def test_config_delete(temp_config, capsys):
     assert saved == {"name": "jer"}
 
 
-def test_config_delete_missing(capsys):
+def test_config_delete_missing(temp_config, capsys):
     """config delete on missing key returns error."""
+    config_file = temp_config / "config.json"
+    original = b'{\n  "z-last": true,\n  "a-first": "keep"\n}\n'
+    config_file.write_bytes(original)
+
     result = cmd_config(["delete", "nope"])
     assert result == 1
+    assert config_file.read_bytes() == original
     captured = capsys.readouterr()
     assert "not set" in captured.out
 
@@ -3056,13 +3061,13 @@ def test_config_delete_missing_key_arg(capsys):
 
 def test_config_delete_complex_blocked(temp_config, capsys):
     """config delete refuses to delete complex values."""
-    import json
-
     config_file = temp_config / "config.json"
-    config_file.write_text(json.dumps({"projects": [{"path": "/tmp", "name": "x"}]}))
+    original = b'{\n  "projects": [ { "path": "/tmp", "name": "x" } ],\n  "keep": true\n}\n'
+    config_file.write_bytes(original)
 
     result = cmd_config(["delete", "projects"])
     assert result == 1
+    assert config_file.read_bytes() == original
     captured = capsys.readouterr()
     assert "Cannot delete complex key" in captured.out
 
@@ -3108,6 +3113,108 @@ def test_config_set_value(temp_config, capsys):
 
     saved = json.loads(config_file.read_text())
     assert saved == {"name": "jer"}
+
+
+@pytest.mark.parametrize(
+    ("args", "recovery"),
+    [
+        (["set", "remote.journal", "host.example"], "hop remote set journal <host>"),
+        (["delete", "remote.journal"], "hop remote rm journal"),
+        (["set", "remote.", "host.example"], "hop remote set <project> <host>"),
+        (["delete", "remote."], "hop remote rm <project>"),
+    ],
+)
+def test_config_refuses_reserved_remote_keys_without_mutation(temp_config, capsys, args, recovery):
+    path = temp_config / "config.json"
+    original = b'{"name": "sol", "remote.journal": ["old.example"]}\n'
+    path.write_bytes(original)
+
+    assert cmd_config(args) == 1
+
+    assert path.read_bytes() == original
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "error: config mutation refused",
+        f"observed: '{args[1]}' is reserved for remote routing",
+        "Hopper did not change config.json.",
+        f"recover with: {recovery}",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync", "replace"])
+def test_migration_publication_failure_stops_predispatch_routing(
+    temp_config, monkeypatch, capsys, failure
+):
+    path = temp_config / "config.json"
+    original = b'{"name": "sol", "remote.journal": "host.example"}\n'
+    path.write_bytes(original)
+
+    def fail(*_args, **_kwargs):
+        raise OSError(failure)
+
+    if failure == "write":
+        monkeypatch.setattr(config.json, "dumps", fail)
+    elif failure == "fsync":
+        monkeypatch.setattr(config.os, "fsync", fail)
+    else:
+        monkeypatch.setattr(config.os, "replace", fail)
+    monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal"])
+
+    with patch("hopper.remote.run_remote") as remote_probe:
+        assert main() == 2
+
+    remote_probe.assert_not_called()
+    assert path.read_bytes() == original
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 4
+    assert lines[0] == "error: Hopper config is unavailable"
+    assert str(path) in lines[1]
+    assert "did not treat the config as empty" in lines[2]
+    assert "python -m json.tool" in lines[3]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hop", "implement", "journal"],
+        ["hop", "remote", "list"],
+        ["hop", "lode", "list", "--all-hosts"],
+    ],
+    ids=["predispatch-project-routing", "remote-list", "all-hosts"],
+)
+def test_invalid_config_fails_unavailable_without_remote_contact(
+    temp_config, monkeypatch, capsys, argv
+):
+    path = temp_config / "config.json"
+    path.write_bytes(b'{"remote.journal": []}\n')
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[]),
+        patch("hopper.remote.run_remote") as remote_probe,
+    ):
+        assert main() == 2
+
+    remote_probe.assert_not_called()
+    assert str(path) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reason", ["malformed", "wrong_shape", "unreadable", "locked"])
+def test_main_renders_every_config_error_reason_as_four_line_unavailable_refusal(
+    temp_config, capsys, reason
+):
+    error = config.ConfigError(temp_config / "config.json", reason)
+
+    with patch("hopper.cli._main", side_effect=error):
+        assert main() == 2
+
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 4
+    assert lines[0] == "error: Hopper config is unavailable"
+    assert str(error.path) in lines[1]
+    assert "did not treat the config as empty" in lines[2]
+    assert lines[3].startswith("recover with:")
 
 
 def test_config_set_updates_existing(temp_config, capsys):
@@ -5172,7 +5279,7 @@ def test_find_remote_lode_can_skip_cache_publish():
         "project": "journal",
     }
     with patch("hopper.remote.load_lode_cache", return_value={}):
-        with patch("hopper.remote.remote_registry", return_value={"journal": "fedora.local"}):
+        with patch("hopper.remote.remote_registry", return_value={"journal": ["fedora.local"]}):
             with patch("hopper.cli._remote_lode_status", return_value=(lode, "found")):
                 with patch("hopper.remote.remember_lode") as remember:
                     found, _ = _find_remote_lode("remote123", remember_result=False)
@@ -5192,7 +5299,7 @@ def test_find_remote_lode_survives_cache_publish_failure(cached, caplog):
     }
     cache = {"remote123": {"host": "fedora.local"}} if cached else {}
     with patch("hopper.remote.load_lode_cache", return_value=cache):
-        with patch("hopper.remote.remote_registry", return_value={"journal": "fedora.local"}):
+        with patch("hopper.remote.remote_registry", return_value={"journal": ["fedora.local"]}):
             with patch("hopper.cli._remote_lode_status", return_value=(lode, "found")):
                 with patch("hopper.remote.remember_lode", side_effect=ValueError("bad cache")):
                     found, _ = _find_remote_lode("remote123")
@@ -5418,7 +5525,7 @@ def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(ca
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.list_lodes", return_value=[]),
-        patch("hopper.remote.remote_registry", return_value={"proj": "builder.example"}),
+        patch("hopper.remote.remote_registry", return_value={"proj": ["builder.example"]}),
         patch("hopper.remote.run_remote", return_value=remote_result),
         patch(
             "hopper.lodes.pane_liveness",
@@ -5818,7 +5925,7 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
             stdout='{"id": "remote123", "project": "journal", "host": "local"}\n',
             stderr="",
         )
-        with patch("hopper.remote.remote_registry", return_value={"journal": "fedora.local"}):
+        with patch("hopper.remote.remote_registry", return_value={"journal": ["fedora.local"]}):
             monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal", "--json"])
             monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
             rc = main()
@@ -6100,7 +6207,7 @@ def test_resolver_ignores_unregistered_cached_host():
 
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
-        patch("hopper.remote.remote_registry", return_value={"project": "current.example"}),
+        patch("hopper.remote.remote_registry", return_value={"project": ["current.example"]}),
         patch(
             "hopper.remote.load_lode_cache",
             return_value={"abc": {"host": "stale.example"}},
@@ -6117,7 +6224,7 @@ def test_find_remote_lode_ignores_unregistered_cached_host():
     from hopper.cli import _find_remote_lode
 
     with (
-        patch("hopper.remote.remote_registry", return_value={"project": "current.example"}),
+        patch("hopper.remote.remote_registry", return_value={"project": ["current.example"]}),
         patch(
             "hopper.remote.load_lode_cache",
             return_value={"abc": {"host": "stale.example"}},

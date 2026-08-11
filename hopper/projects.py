@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from hopper.config import load_config, save_config
+from hopper.config import config_transaction, load_config
 from hopper.lodes import current_time_ms
 
 
@@ -78,13 +78,8 @@ def validate_makefile_install(path: str) -> bool:
     return False
 
 
-def load_projects() -> list[Project]:
-    """Load projects from config.
-
-    Returns:
-        List of Project objects, empty if none configured.
-    """
-    config = load_config()
+def _projects_from_config(config: dict[str, object]) -> list[Project]:
+    """Build project records from an already loaded config object."""
     projects_data = config.get("projects", [])
     if not isinstance(projects_data, list):
         return []
@@ -104,34 +99,48 @@ def load_projects() -> list[Project]:
     return projects
 
 
+def _store_projects(config: dict[str, object], projects: list[Project]) -> None:
+    """Replace only the projects value in an open config transaction."""
+    config["projects"] = [
+        {
+            "path": project.path,
+            "name": project.name,
+            "disabled": project.disabled,
+            "disabled_reason": project.disabled_reason,
+            "last_used_at": project.last_used_at,
+        }
+        for project in projects
+    ]
+
+
+def load_projects() -> list[Project]:
+    """Load projects from config.
+
+    Returns:
+        List of Project objects, empty if none configured.
+    """
+    return _projects_from_config(load_config())
+
+
 def save_projects(projects: list[Project]) -> None:
     """Save projects to config.
 
     Args:
         projects: List of projects to save.
     """
-    config = load_config()
-    config["projects"] = [
-        {
-            "path": p.path,
-            "name": p.name,
-            "disabled": p.disabled,
-            "disabled_reason": p.disabled_reason,
-            "last_used_at": p.last_used_at,
-        }
-        for p in projects
-    ]
-    save_config(config)
+    with config_transaction() as config:
+        _store_projects(config, projects)
 
 
 def touch_project(name: str) -> None:
     """Update last_used_at timestamp for a project."""
-    projects = load_projects()
-    for p in projects:
-        if p.name == name:
-            p.last_used_at = current_time_ms()
-            break
-    save_projects(projects)
+    with config_transaction() as config:
+        projects = _projects_from_config(config)
+        for project in projects:
+            if project.name == name:
+                project.last_used_at = current_time_ms()
+                break
+        _store_projects(config, projects)
 
 
 def add_project(path: str) -> Project:
@@ -159,16 +168,17 @@ def add_project(path: str) -> Project:
         raise ValueError(f"No Makefile with 'hopper-install' or 'install' target: {abs_path}")
 
     name = Path(abs_path).name
-    projects = load_projects()
+    with config_transaction() as config:
+        projects = _projects_from_config(config)
 
-    # Check for duplicate name (including disabled projects)
-    for p in projects:
-        if p.name == name:
-            raise ValueError(f"Project with name '{name}' already exists")
+        # Check for duplicate name (including disabled projects)
+        for existing in projects:
+            if existing.name == name:
+                raise ValueError(f"Project with name '{name}' already exists")
 
-    project = Project(path=abs_path, name=name)
-    projects.append(project)
-    save_projects(projects)
+        project = Project(path=abs_path, name=name)
+        projects.append(project)
+        _store_projects(config, projects)
     return project
 
 
@@ -181,60 +191,64 @@ def remove_project(name: str) -> bool:
     Returns:
         True if project was found and disabled, False otherwise.
     """
-    projects = load_projects()
-    for p in projects:
-        if p.name == name:
-            p.disabled = True
-            save_projects(projects)
-            return True
-    return False
+    with config_transaction() as config:
+        projects = _projects_from_config(config)
+        for project in projects:
+            if project.name == name:
+                project.disabled = True
+                _store_projects(config, projects)
+                return True
+        return False
 
 
 def disable_project(name: str, reason: str = "") -> bool:
     """Disable a project by name with an optional reason."""
-    projects = load_projects()
-    for p in projects:
-        if p.name == name:
-            p.disabled = True
-            p.disabled_reason = reason
-            save_projects(projects)
-            return True
-    return False
+    with config_transaction() as config:
+        projects = _projects_from_config(config)
+        for project in projects:
+            if project.name == name:
+                project.disabled = True
+                project.disabled_reason = reason
+                _store_projects(config, projects)
+                return True
+        return False
 
 
 def enable_project(name: str) -> bool:
     """Enable a disabled project by name."""
-    projects = load_projects()
-    for p in projects:
-        if p.name == name:
-            p.disabled = False
-            p.disabled_reason = ""
-            save_projects(projects)
-            return True
-    return False
+    with config_transaction() as config:
+        projects = _projects_from_config(config)
+        for project in projects:
+            if project.name == name:
+                project.disabled = False
+                project.disabled_reason = ""
+                _store_projects(config, projects)
+                return True
+        return False
 
 
 def rename_project(current_name: str, new_name: str) -> None:
     """Rename an active project."""
-    projects = load_projects()
+    with config_transaction() as config:
+        projects = _projects_from_config(config)
 
-    target = None
-    for p in projects:
-        if p.name == current_name:
-            target = p
-            break
+        target = None
+        for project in projects:
+            if project.name == current_name:
+                target = project
+                break
 
-    if target is None:
-        raise ValueError(f"Project not found: {current_name}")
-    if target.disabled:
-        raise ValueError(f"Project '{current_name}' is disabled")
+        if target is None:
+            raise ValueError(f"Project not found: {current_name}")
+        if target.disabled:
+            raise ValueError(f"Project '{current_name}' is disabled")
 
-    for p in projects:
-        if p.name == new_name:
-            raise ValueError(f"Project with name '{new_name}' already exists")
+        for project in projects:
+            if project.name == new_name:
+                raise ValueError(f"Project with name '{new_name}' already exists")
 
-    target.name = new_name
-    save_projects(projects)
+        target.name = new_name
+        _store_projects(config, projects)
 
 
 def rename_project_in_data(current_name: str, new_name: str) -> None:

@@ -23,7 +23,7 @@ import hopper.server as hopper_server
 from hopper.backlog import BacklogItem
 from hopper.client import HopperConnection, read_lode_snapshot, send_message, send_pane_input
 from hopper.client import create_lode as request_lode_creation
-from hopper.config import save_config
+from hopper.config import config_transaction
 from hopper.lodes import (
     format_terminal_failure_status,
     save_archived_lodes,
@@ -5094,14 +5094,15 @@ class TestActivityLog:
 
     def test_projects_reload_refreshes_project_order_after_touch(self, socket_path):
         """projects_reload updates in-memory project recency order after touch_project."""
-        save_config(
-            {
-                "projects": [
-                    {"path": "/tmp/A", "name": "A", "disabled": False, "last_used_at": 200},
-                    {"path": "/tmp/B", "name": "B", "disabled": False, "last_used_at": 100},
-                ]
-            }
-        )
+        with config_transaction() as stored:
+            stored.update(
+                {
+                    "projects": [
+                        {"path": "/tmp/A", "name": "A", "disabled": False, "last_used_at": 200},
+                        {"path": "/tmp/B", "name": "B", "disabled": False, "last_used_at": 100},
+                    ]
+                }
+            )
 
         srv = Server(socket_path)
         thread = threading.Thread(target=srv.start, daemon=True)
