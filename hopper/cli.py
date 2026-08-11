@@ -520,6 +520,7 @@ def _run_remote_cli(
     *,
     reason: str,
     stdin_text: str | None = None,
+    stdin_bytes: bytes | None = None,
     annotate_json: bool = False,
 ) -> int:
     """Run a remote hop command and mirror its result locally."""
@@ -527,7 +528,10 @@ def _run_remote_cli(
 
     print(f"→ {host} ({reason})", file=sys.stderr)
     try:
-        result = run_remote(host, hop_args, stdin_text=stdin_text)
+        if stdin_bytes is None:
+            result = run_remote(host, hop_args, stdin_text=stdin_text)
+        else:
+            result = run_remote(host, hop_args, stdin_bytes=stdin_bytes)
     except subprocess.TimeoutExpired as e:
         print(f"remote command timed out on {host}: {e}", file=sys.stderr)
         return 1
@@ -1289,6 +1293,8 @@ def cmd_processed(args: list[str]) -> int:
         return 1
     if acknowledgement["accepted"] is False:
         reason = acknowledgement.get("reason")
+        detail = acknowledgement.get("detail")
+        detail_suffix = f" Server detail: {detail}." if isinstance(detail, str) and detail else ""
         refusal_messages = {
             "lode_not_found": f"Lode {lode_id} not found or archived.",
             "missing_run_generation": (
@@ -1317,8 +1323,9 @@ def cmd_processed(args: list[str]) -> int:
             ),
             "ownership_unavailable": (
                 "Completion was refused because Hopper could not verify this runner's "
-                "launch ownership. Restart the runner with `hop lode restart "
-                f"{lode_id}`, then retry."
+                "launch ownership. Inspect the current state with `hop lode status "
+                f"{lode_id}`, then replace this runner with `hop lode restart {lode_id} "
+                "--force` and retry `hop processed`." + detail_suffix
             ),
             "pidfd_unavailable": (
                 "Completion was refused because strict Linux teardown requires "
@@ -1332,7 +1339,19 @@ def cmd_processed(args: list[str]) -> int:
             ),
             "ship_provenance_unavailable": (
                 "Completion was refused because Hopper could not capture the ship "
-                f"repository identity. Check `hop lode status {lode_id}` and retry."
+                f"repository identity. Inspect its worktree with `hop lode path {lode_id}`, "
+                "repair the Git worktree registration if needed with `git worktree repair`, "
+                "then retry `hop processed`." + detail_suffix
+            ),
+            "output_staging_unavailable": (
+                "Completion was refused because Hopper could not durably stage the submitted "
+                "bytes. Free space or fix permissions in the Hopper data directory, then retry "
+                "`hop processed`." + detail_suffix
+            ),
+            "completion_persistence_unavailable": (
+                "Completion was refused because Hopper could not durably record ownership of "
+                "the staged bytes and next action. Free space or fix permissions in the Hopper "
+                "data directory, then retry `hop processed`." + detail_suffix
             ),
         }
         print(
@@ -3128,16 +3147,11 @@ def cmd_lode(args: list[str]) -> int:
         lode_id = resolved["canonical_id"]
         data = sys.stdin.buffer.read()
         if resolved["host"] != "local":
-            try:
-                stdin_text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                print("Accepted output repair cannot route non-UTF-8 bytes to a remote host.")
-                return 1
             return _run_remote_cli(
                 resolved["host"],
                 ["lode", "repair-output", lode_id, "-", "--token", parsed.token],
                 reason=f"lode {lode_id}",
-                stdin_text=stdin_text,
+                stdin_bytes=data,
             )
 
         from hopper import completion

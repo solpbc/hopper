@@ -697,7 +697,10 @@ def register_lode_supervisor(
         timeout=timeout,
         wait_for_response=True,
     )
-    if response and response.get("type") == "lode_supervisor_registered":
+    if response and response.get("type") in {
+        "lode_supervisor_registered",
+        "lode_supervisor_register_refused",
+    }:
         return response
     return None
 

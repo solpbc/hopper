@@ -56,10 +56,10 @@ def classify(snapshot: dict) -> tuple[str, int] | None:
         return "gated", 2
     if snapshot["state"] == "stuck":
         return "stuck", 3
-    if snapshot["stage"] == "shipped":
-        return "shipped", 0
     if snapshot["state"] == "teardown":
         return None
+    if snapshot["stage"] == "shipped":
+        return "shipped", 0
     # A ready handoff and accepted teardown may both be inactive while durable
     # work continues. Other inactive states still require recovery.
     if not snapshot["active"] and snapshot["state"] != "ready":

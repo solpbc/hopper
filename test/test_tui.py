@@ -341,6 +341,23 @@ def test_lode_to_row_teardown_keeps_status_and_icon(active):
     assert row.status_text == "Teardown: waiting for Linux containment"
 
 
+def test_lode_to_row_shipped_teardown_keeps_pending_status_and_icon():
+    row = lode_to_row(
+        {
+            "id": "abcd1234",
+            "stage": "shipped",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "teardown",
+            "status": "Teardown: applying backlog disposition",
+            "active": False,
+        }
+    )
+
+    assert row.status == STATUS_TEARDOWN
+    assert row.status_text == "Teardown: applying backlog disposition"
+
+
 def test_lode_to_row_shipped_inactive():
     """Shipped lode shows STATUS_SHIPPED even when inactive."""
     lode = {
@@ -1070,6 +1087,15 @@ def test_update_window_title_clears_jam_when_all_healthy():
     app._window_title = "hopJAM"
     app._lodes = [{"state": "running", "active": True, "stage": "refine"}]
     app._update_window_title()
+    assert app._window_title == "hopping"
+
+
+def test_update_window_title_keeps_shipped_teardown_hopping():
+    app = HopperApp()
+    app._lodes = [{"state": "teardown", "active": False, "stage": "shipped"}]
+
+    app._update_window_title()
+
     assert app._window_title == "hopping"
 
 

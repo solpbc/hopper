@@ -93,6 +93,7 @@ def test_completion_disposition_is_idempotent(tmp_path, monkeypatch):
 
     kwargs = {
         "source_lode_id": "source01",
+        "source_project": "proj",
         "selected_item_id": selected.id,
         "promoted_lode_id": "promote1",
         "remaining_item_ids": [remaining.id],
@@ -112,6 +113,7 @@ def test_completion_disposition_reconciles_persistence_failure(tmp_path, monkeyp
     ]
     kwargs = {
         "source_lode_id": "source01",
+        "source_project": "proj",
         "selected_item_id": "select01",
         "promoted_lode_id": "promote1",
         "remaining_item_ids": ["remain01"],
@@ -127,6 +129,26 @@ def test_completion_disposition_reconciles_persistence_failure(tmp_path, monkeyp
     loaded = load_backlog()
     assert [item.id for item in loaded] == ["remain01"]
     assert loaded[0].queued == "promote1"
+
+
+def test_completion_disposition_detaches_nonpromotable_items_idempotently(tmp_path, monkeypatch):
+    monkeypatch.setattr("hopper.backlog.config.hopper_dir", lambda: tmp_path)
+    same_project = BacklogItem("remain01", "proj", "same", 2, queued="source01")
+    other_project = BacklogItem("other001", "other", "other", 3, queued="source01")
+    items = [same_project, other_project]
+    kwargs = {
+        "source_lode_id": "source01",
+        "source_project": "proj",
+        "selected_item_id": None,
+        "promoted_lode_id": None,
+        "remaining_item_ids": [same_project.id, other_project.id],
+    }
+
+    apply_completion_disposition(items, **kwargs)
+    apply_completion_disposition(items, **kwargs)
+
+    assert same_project.queued is None
+    assert other_project.queued is None
 
 
 def test_set_backlog_queued_not_found(tmp_path, monkeypatch):

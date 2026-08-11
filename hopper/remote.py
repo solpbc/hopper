@@ -72,18 +72,31 @@ def run_remote(
     host: str,
     hop_args: list[str],
     stdin_text: str | None = None,
+    stdin_bytes: bytes | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hop on a remote host over ssh and return the completed process."""
+    if stdin_text is not None and stdin_bytes is not None:
+        raise ValueError("remote stdin must be either text or bytes")
     command = _remote_command(host, hop_args)
     kwargs: dict[str, object] = {
         "capture_output": True,
-        "text": True,
+        "text": stdin_bytes is None,
         "timeout": timeout,
     }
-    if stdin_text is not None:
+    if stdin_bytes is not None:
+        kwargs["input"] = stdin_bytes
+    elif stdin_text is not None:
         kwargs["input"] = stdin_text
-    return subprocess.run(command, **kwargs)
+    result = subprocess.run(command, **kwargs)
+    if stdin_bytes is None:
+        return result
+    return subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        stdout=result.stdout.decode("utf-8", errors="replace"),
+        stderr=result.stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def run_remote_streaming(host: str, hop_args: list[str]) -> int:

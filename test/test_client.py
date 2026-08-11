@@ -746,7 +746,7 @@ def test_register_lode_supervisor_sends_complete_identity(socket_path):
                 ppid=9,
                 pgid=10,
                 proof_mode="linux-degraded",
-                degraded_reason="pidfd unavailable",
+                degraded_reason="systemd scope unavailable",
                 unit_name=None,
             )
             == response
@@ -762,10 +762,33 @@ def test_register_lode_supervisor_sends_complete_identity(socket_path):
         "ppid": 9,
         "pgid": 10,
         "proof_mode": "linux-degraded",
-        "degraded_reason": "pidfd unavailable",
+        "degraded_reason": "systemd scope unavailable",
         "unit_name": None,
     }
     assert send.call_args.kwargs == {"timeout": 15.0, "wait_for_response": True}
+
+
+def test_register_lode_supervisor_propagates_server_refusal(socket_path):
+    response = {
+        "type": "lode_supervisor_register_refused",
+        "accepted": False,
+        "reason": "reported process identity is invalid",
+    }
+    with patch("hopper.client.send_message", return_value=response):
+        observed = register_lode_supervisor(
+            socket_path,
+            "test-id",
+            TEST_RUN_GENERATION,
+            tmux_pane="%1",
+            pid=10,
+            ppid=9,
+            pgid=10,
+            proof_mode="linux-strict",
+            degraded_reason=None,
+            unit_name="hopper-test.scope",
+        )
+
+    assert observed == response
 
 
 def test_complete_lode_sends_exact_bytes_metadata(socket_path):

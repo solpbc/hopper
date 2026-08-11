@@ -837,7 +837,12 @@ def run_process_supervisor(lode_id: str, socket_path: Path) -> int:
         unit_name=unit_name if strict else None,
     )
     if not registration or registration.get("accepted") is not True:
-        logger.error("outside supervisor registration failed lode=%s", lode_id)
+        reason = (
+            registration.get("reason", "server returned no registration disposition")
+            if registration
+            else "server returned no registration disposition"
+        )
+        logger.error("outside supervisor registration failed lode=%s: %s", lode_id, reason)
         return 1
 
     if not strict:

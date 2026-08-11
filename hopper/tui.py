@@ -1504,8 +1504,8 @@ class HopperApp(App):
         if needs_attention:
             target = "hopJAM"
         elif any(
-            (lode.get("active", False) or lode.get("state") == "teardown")
-            and lode.get("stage", "mill") != "shipped"
+            lode.get("state") == "teardown"
+            or (lode.get("active", False) and lode.get("stage", "mill") != "shipped")
             for lode in self._lodes
         ):
             target = "hopping"

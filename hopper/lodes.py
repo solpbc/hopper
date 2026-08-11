@@ -723,7 +723,9 @@ def lode_icon(lode: dict) -> str:
     """Derive the status icon for a lode based on its state, stage, and active flag."""
     stage = lode.get("stage", "mill")
     state = lode.get("state", "new")
-    if stage == "shipped":
+    if state == "teardown":
+        icon = STATUS_TEARDOWN
+    elif stage == "shipped":
         icon = STATUS_SHIPPED
     elif state == "new":
         icon = STATUS_NEW
@@ -731,8 +733,6 @@ def lode_icon(lode: dict) -> str:
         icon = STATUS_ERROR
     elif state == "gated":
         icon = STATUS_GATED
-    elif state == "teardown":
-        icon = STATUS_TEARDOWN
     elif state == "stuck":
         icon = STATUS_STUCK
     else:

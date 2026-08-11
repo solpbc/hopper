@@ -419,6 +419,96 @@ def test_completion_acceptance_commits_fence_before_publication(
     schedule.assert_called_once_with(record, "output_publish", "publishing_output")
 
 
+def test_completion_staging_failure_reports_its_real_phase(socket_path, make_lode):
+    lode_id = "abcd2345"
+    generation = TEST_RUN_GENERATION
+    completion.write_run_ownership(_completion_run_ownership(lode_id, generation))
+    server = Server(socket_path)
+    lode = make_lode(
+        id=lode_id,
+        state="running",
+        active=True,
+        tmux_pane="%1",
+        pid=101,
+        run_generation=generation,
+    )
+    server.lodes = [lode]
+    owner = _mock_client(server)
+    submitter = _mock_client(server)
+    server.lode_clients[lode_id] = owner
+    server.client_lodes[owner] = lode_id
+    server.client_generations[owner] = generation
+    output = b"durable output\n"
+    message = {
+        "type": "lode_complete",
+        "lode_id": lode_id,
+        "run_generation": generation,
+        "stage": "mill",
+        "output_base64": base64.b64encode(output).decode("ascii"),
+        "byte_length": len(output),
+        "digest_algorithm": "sha256",
+        "digest_hex": hashlib.sha256(output).hexdigest(),
+    }
+
+    with patch("hopper.server.completion.stage_output", side_effect=OSError("disk full")):
+        server._handle_lode_complete(message, submitter)
+        server.registration_threads[f"accept:{lode_id}:{generation}"].join(timeout=2)
+    internal, response_conn = server.event_queue.get(timeout=2)
+    server._handle_mutation(internal, response_conn)
+
+    response = _decode_mock_response(submitter)
+    assert response["accepted"] is False
+    assert response["reason"] == "output_staging_unavailable"
+    assert response["detail"] == "disk full"
+    assert completion.load_pending_completion(lode_id) is None
+
+
+def test_completion_record_failure_reports_persistence_not_ownership(socket_path, make_lode):
+    lode_id = "abcd2345"
+    generation = TEST_RUN_GENERATION
+    completion.write_run_ownership(_completion_run_ownership(lode_id, generation))
+    server = Server(socket_path)
+    lode = make_lode(
+        id=lode_id,
+        state="running",
+        active=True,
+        tmux_pane="%1",
+        pid=101,
+        run_generation=generation,
+    )
+    server.lodes = [lode]
+    owner = _mock_client(server)
+    submitter = _mock_client(server)
+    server.lode_clients[lode_id] = owner
+    server.client_lodes[owner] = lode_id
+    server.client_generations[owner] = generation
+    output = b"durable output\n"
+    message = {
+        "type": "lode_complete",
+        "lode_id": lode_id,
+        "run_generation": generation,
+        "stage": "mill",
+        "output_base64": base64.b64encode(output).decode("ascii"),
+        "byte_length": len(output),
+        "digest_algorithm": "sha256",
+        "digest_hex": hashlib.sha256(output).hexdigest(),
+    }
+
+    server._handle_lode_complete(message, submitter)
+    server.registration_threads[f"accept:{lode_id}:{generation}"].join(timeout=2)
+    internal, response_conn = server.event_queue.get(timeout=2)
+    with patch(
+        "hopper.server.completion.write_pending_completion", side_effect=OSError("disk full")
+    ):
+        server._handle_mutation(internal, response_conn)
+
+    response = _decode_mock_response(submitter)
+    assert response["accepted"] is False
+    assert response["reason"] == "completion_persistence_unavailable"
+    assert response["detail"] == "disk full"
+    assert completion.load_pending_completion(lode_id) is None
+
+
 def test_strict_completion_refuses_missing_pidfd_interface_before_acceptance(
     socket_path, make_lode, temp_config, monkeypatch
 ):
@@ -766,6 +856,56 @@ def test_completion_step_result_discards_stale_attempt(socket_path, make_lode):
     assert completion.load_pending_completion(record["lode_id"]) == record
 
 
+@pytest.mark.parametrize(
+    ("remove_staged", "expected_kind"),
+    [(False, "publication"), (True, "output")],
+)
+def test_publication_failure_distinguishes_retryable_staging(
+    socket_path, make_lode, remove_staged, expected_kind
+):
+    record = _pending_completion_record()
+    completion.transition_marker(record, "output_publish", "intent", attempt_id="d" * 32)
+    record["phase"] = "publishing_output"
+    completion.write_pending_completion(record)
+    if remove_staged:
+        staged = completion.lode_dir(record["lode_id"]) / record["output"]["staged_relative_path"]
+        staged.unlink()
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(
+            id=record["lode_id"],
+            state="teardown",
+            run_generation=record["run_generation"],
+        )
+    ]
+
+    with patch("hopper.server.completion.publish_output", side_effect=OSError("read-only")):
+        server._run_completion_step(
+            record,
+            "output_publish",
+            "publishing_output",
+            record["markers"]["output_publish"]["attempt_id"],
+            None,
+            None,
+        )
+    internal, _conn = server.event_queue.get(timeout=2)
+    server._handle_completion_step_result(internal)
+
+    blocked = completion.load_pending_completion(record["lode_id"])
+    assert blocked["recovery"]["kind"] == expected_kind
+    if expected_kind == "publication":
+        assert blocked["recovery"]["command"] == f"hop lode restart {record['lode_id']}"
+        assert completion.pending_output_recovery(blocked) is None
+        conn = _mock_client(server)
+        with patch.object(server, "_schedule_completion_step") as schedule:
+            server._retry_completion(record["lode_id"], conn)
+        schedule.assert_called_once_with(blocked, "output_publish", "publishing_output")
+        assert _decode_mock_response(conn)["type"] == "lode_completion_retrying"
+    else:
+        assert blocked["recovery"]["command"] == completion.recovery_command(blocked, "output")
+        assert completion.pending_output_recovery(blocked) is not None
+
+
 def test_force_kill_refuses_without_durable_target_intents(socket_path):
     record = _pending_completion_record()
     record["ownership"]["proof_mode"] = "linux-strict"
@@ -932,6 +1072,8 @@ def test_post_containment_advance_reuses_one_generation_across_reconcile(socket_
             stage="mill",
             state="teardown",
             run_generation=record["run_generation"],
+            tmux_pane=record["ownership"]["pane"]["pane_id"],
+            pid=record["ownership"]["worker"]["pid"],
         )
     ]
 
@@ -946,6 +1088,27 @@ def test_post_containment_advance_reuses_one_generation_across_reconcile(socket_
     assert record["markers"]["spawn"]["state"] == "intent"
     assert schedule.call_count == 2
     assert all(item.args[1:] == ("spawn", "spawning") for item in schedule.call_args_list)
+
+
+def test_completion_spawn_refuses_retained_pane_from_another_generation(socket_path, make_lode):
+    record = _pending_completion_record()
+    _complete_marker(record, "containment")
+    _complete_marker(record, "stage_mutation")
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="refine",
+        state="teardown",
+        run_generation="f" * 32,
+        tmux_pane=record["ownership"]["pane"]["pane_id"],
+    )
+    server.lodes = [lode]
+
+    with patch.object(server, "_schedule_completion_step") as schedule:
+        assert server._prepare_completion_spawn(record) is False
+
+    schedule.assert_not_called()
+    assert completion.load_pending_completion(record["lode_id"])["recovery"]["kind"] == "spawn"
 
 
 def test_completion_spawn_adopts_only_the_fsynced_receipt_pane(socket_path, make_lode):
@@ -1048,6 +1211,74 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
     assert record["markers"]["archive"]["state"] == "done"
     assert record["markers"]["backlog"]["state"] == "done"
     assert schedule.call_count == 2
+
+
+@pytest.mark.parametrize("disabled", [False, True], ids=["cross-project", "disabled-project"])
+def test_ship_backlog_plan_detaches_items_that_cannot_be_promoted(
+    socket_path, make_lode, monkeypatch, disabled
+):
+    record = _pending_completion_record(stage="ship")
+    source = make_lode(
+        id=record["lode_id"],
+        project="proj",
+        stage="shipped",
+        state="teardown",
+        run_generation=record["run_generation"],
+        archive_action_id=record["action_id"],
+    )
+    item_project = "proj" if disabled else "other"
+    queued = BacklogItem("queued01", item_project, "keep me", 1, queued=record["lode_id"])
+    server = Server(socket_path)
+    server.archived_lodes = [source]
+    server.backlog = [queued]
+    monkeypatch.setattr(
+        hopper_server,
+        "find_project",
+        lambda _name: Project(path="/repo", name="proj", disabled=disabled),
+    )
+
+    assert server._apply_completion_backlog(record) is True
+
+    assert server.backlog == [queued]
+    assert queued.queued is None
+    assert record["ship"]["backlog"] == {
+        "planned": True,
+        "selected_item_id": None,
+        "promoted_lode_id": None,
+        "remaining_item_ids": [queued.id],
+        "applied": True,
+    }
+    assert record["markers"]["backlog"]["state"] == "done"
+
+
+def test_ship_completion_clear_replaces_teardown_projection_before_removing_record(
+    socket_path, make_lode
+):
+    record = _pending_completion_record(stage="ship")
+    archived = make_lode(
+        id=record["lode_id"],
+        stage="shipped",
+        state="teardown",
+        status="Teardown: cleaning quarantined worktree",
+        active=True,
+        tmux_pane="%1",
+        pid=101,
+        run_generation=record["run_generation"],
+        archive_action_id=record["action_id"],
+    )
+    server = Server(socket_path)
+    server.archived_lodes = [archived]
+
+    server._clear_completed_action(record)
+
+    assert completion.load_pending_completion(record["lode_id"]) is None
+    assert archived["state"] == "ready"
+    assert archived["active"] is False
+    assert archived["tmux_pane"] is None
+    assert archived["pid"] is None
+    assert archived["status"] == (
+        "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)"
+    )
 
 
 def test_ship_landing_worker_calls_canonical_proof_directly(socket_path):
@@ -3495,6 +3726,40 @@ def test_server_handles_lode_set_state(socket_path, server, temp_config, make_lo
     assert server.lodes[0]["state"] == "running"
 
     client.close()
+
+
+def test_raw_teardown_state_requires_canonical_pending_record(socket_path, make_lode):
+    server = Server(socket_path)
+    lode = make_lode(
+        id="abcd2345",
+        state="running",
+        active=True,
+        run_generation=TEST_RUN_GENERATION,
+    )
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    server._handle_mutation(
+        _runner_message(
+            server,
+            "lode_set_state",
+            lode["id"],
+            state="teardown",
+            status="synthetic teardown",
+            ack_requested=True,
+        ),
+        conn,
+    )
+
+    assert lode["state"] == "running"
+    assert _decode_mock_response(conn) == {
+        "type": "mutation_ack",
+        "ts": ANY,
+        "mutation_type": "lode_set_state",
+        "lode_id": lode["id"],
+        "accepted": False,
+        "reason": "teardown_requires_pending_completion",
+    }
 
 
 def test_server_handles_lode_set_progress(socket_path, server, temp_config, make_lode):

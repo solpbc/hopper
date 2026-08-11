@@ -622,7 +622,15 @@ def validate_pending_completion(record: dict) -> dict:
     _string(
         recovery["kind"],
         "recovery.kind",
-        choices={"output", "ownership", "containment", "landing", "spawn", "cleanup"},
+        choices={
+            "output",
+            "publication",
+            "ownership",
+            "containment",
+            "landing",
+            "spawn",
+            "cleanup",
+        },
         nullable=True,
     )
     _string(recovery["message"], "recovery.message", nullable=True)
@@ -983,9 +991,7 @@ def pending_output_recovery(record: dict) -> dict | None:
         "byte_length": output["byte_length"],
         "repair_token": output["repair_token"],
         "failure": output["failure"] or record["recovery"]["message"],
-        "command": (
-            f"hop lode repair-output {record['lode_id']} - --token {output['repair_token']}"
-        ),
+        "command": record["recovery"]["command"],
     }
 
 
@@ -1006,15 +1012,22 @@ def verify_output_file(path: Path, length: int, digest_hex: str) -> dict:
     return {"st_dev": before.st_dev, "st_ino": before.st_ino}
 
 
-def publish_output(record: dict) -> Path:
-    """Publish a verified staged blob to its canonical stage output path."""
+def verify_staged_output(record: dict) -> Path:
+    """Verify that the server-owned staged blob still matches its accepted identity."""
     validate_pending_completion(record)
     output = record["output"]
-    directory = lode_dir(record["lode_id"])
-    staged = directory / output["staged_relative_path"]
-    staged_identity = verify_output_file(staged, output["byte_length"], output["digest_hex"])
-    if staged_identity != output["staged_identity"]:
+    staged = lode_dir(record["lode_id"]) / output["staged_relative_path"]
+    identity = verify_output_file(staged, output["byte_length"], output["digest_hex"])
+    if identity != output["staged_identity"]:
         raise OSError("staged completion output identity changed")
+    return staged
+
+
+def publish_output(record: dict) -> Path:
+    """Publish a verified staged blob to its canonical stage output path."""
+    output = record["output"]
+    directory = lode_dir(record["lode_id"])
+    staged = verify_staged_output(record)
 
     canonical = directory / output["canonical_name"]
 
@@ -1094,27 +1107,38 @@ def transition_marker(
     return record
 
 
+def recovery_command(record: dict, kind: str) -> str:
+    """Return the single operator command for a blocked completion phase."""
+    if kind == "output":
+        return (
+            f"hop lode repair-output {record['lode_id']} - "
+            f"--token {record['output']['repair_token']}"
+        )
+    return f"hop lode restart {record['lode_id']}"
+
+
 def completion_status(record: dict) -> str:
     """Project one pending record into the exact operator-facing status text."""
     phase = record["phase"]
     stage = record["stage"]
     recovery = record["recovery"]
     if phase == "output_blocked":
+        detail = recovery["message"] or "completion output publication failed"
+        command = recovery["command"]
+        if recovery["kind"] == "publication":
+            return f"Teardown blocked: {detail}. Retry with: {command}"
         output = record["output"]
         return (
             f"Teardown blocked: accepted {stage} output is unavailable "
             f"(sha256 {output['digest_hex']}, {output['byte_length']} bytes). Repair with: "
-            f"hop lode repair-output {record['lode_id']} - --token {output['repair_token']}"
+            f"{command}"
         )
     if phase in {"containment_blocked", "ship_blocked", "cleanup_blocked"}:
         detail = recovery["message"] or "unknown teardown failure"
         ship = record.get("ship")
         if phase == "cleanup_blocked" and ship is not None and ship["archive_published"]:
-            return (
-                f"Shipped; cleanup retained: {detail}. Retry with: "
-                f"hop lode restart {record['lode_id']}"
-            )
-        return f"Teardown blocked: {detail}. Retry with: hop lode restart {record['lode_id']}"
+            return f"Shipped; cleanup retained: {detail}. Retry with: {recovery['command']}"
+        return f"Teardown blocked: {detail}. Retry with: {recovery['command']}"
     if phase in {"accepted", "publishing_output"}:
         return f"Teardown: publishing accepted {stage} output"
     if phase == "capturing_ownership":
@@ -1155,6 +1179,8 @@ def completion_status(record: dict) -> str:
         return f"Teardown: starting {record['next_action']['target_stage']}"
     if phase == "complete" and record["ownership"]["proof_mode"] == "darwin-bounded":
         return "Shipped (bounded Darwin teardown; leak-free cleanup unproven)"
+    if phase == "complete" and record["ownership"]["proof_mode"] == "linux-degraded":
+        return "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)"
     if phase == "complete" and record["ownership"]["proof_mode"] != "linux-strict":
         return "Shipped (degraded teardown; birth identity and leak-free cleanup unproven)"
     if phase == "complete":

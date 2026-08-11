@@ -436,6 +436,10 @@ def test_inactive_teardown_waits_without_reporting_failure():
     )
 
 
+def test_shipped_teardown_waits_until_the_pending_action_clears():
+    assert wait.classify(snapshot(stage="shipped", state="teardown", active=False)) is None
+
+
 def test_later_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
     handoff = snapshot(stage="ship", state="ready", status="Refine complete", active=False)
     shipped = snapshot(stage="shipped", state="ready", status="Ship complete", active=False)

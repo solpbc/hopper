@@ -67,6 +67,10 @@ def test_teardown_icon_is_not_disconnected(active):
     assert lode_icon({"stage": "mill", "state": "teardown", "active": active}) == STATUS_TEARDOWN
 
 
+def test_shipped_teardown_icon_remains_pending():
+    assert lode_icon({"stage": "shipped", "state": "teardown", "active": False}) == STATUS_TEARDOWN
+
+
 def test_lode_dict_json_roundtrip():
     """Test lode dict serialization roundtrip."""
     lode = {

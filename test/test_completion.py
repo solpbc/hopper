@@ -107,7 +107,7 @@ def _run_ownership() -> dict:
         "boot_id": pending["boot_id"],
         "platform": facts["platform"],
         "proof_mode": facts["proof_mode"],
-        "degraded_reason": "pidfd bindings unavailable",
+        "degraded_reason": "systemd scope unavailable",
         "pane": facts["pane"],
         "supervisor": facts["supervisor"],
         "worker": facts["worker"],
@@ -263,7 +263,7 @@ def test_pending_output_recovery_exposes_capability_only_for_output_block(temp_c
     pending["recovery"] = {
         "kind": "output",
         "message": "staged blob missing",
-        "command": "hop lode restart abcd2345",
+        "command": completion.recovery_command(pending, "output"),
     }
 
     summary = completion.pending_output_recovery(pending)
@@ -446,11 +446,77 @@ def test_completion_status_projects_phase(phase, expected):
 def test_completion_status_projects_exact_output_recovery():
     output, pending = _stage()
     pending["phase"] = "output_blocked"
+    pending["recovery"] = {
+        "kind": "output",
+        "message": "staged output unavailable",
+        "command": completion.recovery_command(pending, "output"),
+    }
     assert completion.completion_status(pending) == (
         "Teardown blocked: accepted mill output is unavailable "
         f"(sha256 {output['digest_hex']}, 15 bytes). Repair with: "
         f"hop lode repair-output abcd2345 - --token {'A' * 43}"
     )
+
+
+def test_completion_status_projects_retryable_publication_failure():
+    _output, pending = _stage()
+    pending["phase"] = "output_blocked"
+    pending["recovery"] = {
+        "kind": "publication",
+        "message": "canonical directory is temporarily read-only",
+        "command": completion.recovery_command(pending, "publication"),
+    }
+
+    assert completion.completion_status(pending) == (
+        "Teardown blocked: canonical directory is temporarily read-only. "
+        "Retry with: hop lode restart abcd2345"
+    )
+    assert completion.pending_output_recovery(pending) is None
+
+
+def test_linux_degraded_completion_status_preserves_birth_identity_proof():
+    _output, pending = _stage()
+    pending["stage"] = "ship"
+    pending["next_action"] = {"kind": "ship_archive", "target_stage": None}
+    pending["ship"] = {
+        "provenance": {
+            name: {"realpath": f"/tmp/{name}", "identity": {"st_dev": 1, "st_ino": index}}
+            for index, name in enumerate(
+                ("project", "git_common_dir", "worktree", "worktree_git_dir"), start=1
+            )
+        }
+        | {
+            "branch_ref": "refs/heads/hopper-abcd2345",
+            "branch_oid": "a" * 40,
+            "head_oid": "a" * 40,
+        },
+        "landing": {"cause": None, "base_ref": None, "detail": None, "accepted": False},
+        "backlog": {
+            "planned": False,
+            "selected_item_id": None,
+            "promoted_lode_id": None,
+            "remaining_item_ids": [],
+            "applied": False,
+        },
+        "archive_published": False,
+        "quarantine": {
+            "original_path": "/tmp/worktree",
+            "quarantine_path": "/tmp/quarantine",
+            "expected_identity": {"st_dev": 1, "st_ino": 4},
+            "registration_repaired": False,
+            "removal_outcome": "pending",
+            "branch_outcome": "pending",
+        },
+        "cleanup_failure": None,
+    }
+    pending["phase"] = "complete"
+
+    status = completion.completion_status(pending)
+
+    assert status == (
+        "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)"
+    )
+    assert "birth identity" not in status
 
 
 def test_completion_status_projects_generic_block():

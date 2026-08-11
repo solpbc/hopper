@@ -105,6 +105,23 @@ def test_run_remote_rejects_unsafe_host_before_spawning(host, monkeypatch):
     spawn.assert_not_called()
 
 
+def test_run_remote_preserves_arbitrary_binary_stdin(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_remote("suze.local", ["lode", "repair-output"], stdin_bytes=b"\xff\x00\n")
+
+    assert calls[0]["input"] == b"\xff\x00\n"
+    assert calls[0]["text"] is False
+    assert result.stdout == "ok\n"
+    assert result.stderr == ""
+
+
 def test_run_remote_expands_preserved_tilde_on_remote(monkeypatch):
     calls = []
 

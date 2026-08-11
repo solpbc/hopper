@@ -2389,6 +2389,22 @@ class TestOomBoundary:
             self.now += min(consumed, timeout)
             return result
 
+    def test_supervisor_logs_server_registration_refusal_reason(self, monkeypatch, caplog):
+        monkeypatch.setenv("HOPPER_RUN_GENERATION", "a" * 32)
+        monkeypatch.setattr(oom, "is_linux", lambda: False)
+        monkeypatch.setattr(
+            "hopper.process.register_lode_supervisor",
+            lambda *_args, **_kwargs: {
+                "accepted": False,
+                "reason": "reported process identity is invalid",
+            },
+        )
+
+        with caplog.at_level(logging.ERROR, logger="hopper.process"):
+            assert run_process_supervisor("test-id", Path("server.sock")) == 1
+
+        assert "reported process identity is invalid" in caplog.text
+
     def test_pane_command_is_identical_when_guard_environment_is_present(self):
         with patch("hopper.claude.new_window", return_value="%1") as new_window:
             spawn_claude("test-id", "/repo")

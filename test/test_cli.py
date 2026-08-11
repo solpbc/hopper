@@ -1563,6 +1563,34 @@ def test_lode_repair_output_sends_exact_bytes_and_record_identity(capsys):
     assert "Accepted exact replacement bytes" in capsys.readouterr().out
 
 
+def test_remote_lode_repair_output_preserves_non_utf8_bytes(capsys):
+    import io
+
+    data = b"\xff\x00accepted\n"
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(data)
+    with (
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value={
+                "outcome": "found",
+                "canonical_id": "abcd2345",
+                "host": "remote.example",
+            },
+        ),
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+        patch("sys.stdin", stdin),
+    ):
+        assert cmd_lode(["repair-output", "abcd2345", "-", "--token", "T" * 43]) == 0
+
+    run_remote.assert_called_once_with(
+        "remote.example",
+        ["lode", "repair-output", "abcd2345", "-", "--token", "T" * 43],
+        reason="lode abcd2345",
+        stdin_bytes=data,
+    )
+
+
 def test_lode_repair_output_refusal_is_nonzero_and_names_unchanged_canonical(capsys):
     lode = {"id": "abcd2345", "stage": "mill", "state": "teardown", "active": False}
     with (
@@ -3941,6 +3969,47 @@ def test_processed_server_refusal_leaves_existing_canonical_unchanged(temp_confi
 
     assert canonical.read_bytes() == b"known good\n"
     assert "hop lode restart" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("reason", "detail", "guidance"),
+    [
+        ("output_staging_unavailable", "disk full", "Free space or fix permissions"),
+        (
+            "completion_persistence_unavailable",
+            "read-only filesystem",
+            "could not durably record ownership",
+        ),
+    ],
+)
+def test_processed_preparation_refusal_names_phase_and_remedy(
+    temp_config, capsys, reason, detail, guidance
+):
+    import io
+
+    lode_id = "test-session"
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(b"new output\n")
+    with (
+        patch.dict(
+            os.environ,
+            {"HOPPER_LID": lode_id, "HOPPER_RUN_GENERATION": "a" * 32},
+        ),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
+        patch(
+            "hopper.client.complete_lode",
+            return_value={"accepted": False, "reason": reason, "detail": detail},
+        ),
+        patch("sys.stdin", stdin),
+    ):
+        assert cmd_processed([]) == 1
+
+    error = capsys.readouterr().err
+    assert guidance in error
+    assert detail in error
+    assert "retry `hop processed`" in error
 
 
 def test_processed_pidfd_capability_refusal_is_prescriptive(temp_config, capsys):

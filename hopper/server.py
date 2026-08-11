@@ -1259,11 +1259,14 @@ class Server:
         accepted: bool,
         reason: str,
         action_id: str | None = None,
+        detail: str | None = None,
     ) -> None:
         if conn:
             response = {"type": "lode_complete_ack", "accepted": accepted, "reason": reason}
             if action_id is not None:
                 response["action_id"] = action_id
+            if detail is not None:
+                response["detail"] = detail
             self._send_response(conn, response)
 
     def _handle_lode_complete(self, message: dict, conn: socket.socket | None) -> None:
@@ -1361,6 +1364,20 @@ class Server:
         snapshot = copy.deepcopy(lode)
 
         def prepare() -> None:
+            def finish(result: dict) -> None:
+                self._enqueue_event(
+                    {
+                        "type": "_completion_acceptance_result",
+                        "exchange_id": message.get("exchange_id"),
+                        "lode_id": lode_id,
+                        "run_generation": generation,
+                        "stage": snapshot["stage"],
+                        "action_id": action_id,
+                        "result": result,
+                    },
+                    conn,
+                )
+
             try:
                 completion.collect_orphaned_staging(lode_id, None)
                 output = completion.stage_output(
@@ -1369,36 +1386,39 @@ class Server:
                     expected_length=length,
                     expected_sha256=digest_hex,
                 )
+            except Exception as error:
+                finish({"ok": False, "reason": "output_staging_unavailable", "error": str(error)})
+                return
+            try:
                 source_path = completion.run_ownership_path(lode_id, generation)
                 source_digest = completion.durable_json_sha256(source_path)
                 source = completion.load_run_ownership(lode_id, generation, require_worker=True)
                 if source is None:
                     raise RuntimeError("generation ownership disappeared")
-                ship = (
-                    _capture_ship_acceptance(snapshot, project.path, action_id)
-                    if project is not None
-                    else None
+            except Exception as error:
+                finish({"ok": False, "reason": "ownership_unavailable", "error": str(error)})
+                return
+            try:
+                ship = None
+                if project is not None:
+                    ship = _capture_ship_acceptance(snapshot, project.path, action_id)
+            except Exception as error:
+                finish(
+                    {
+                        "ok": False,
+                        "reason": "ship_provenance_unavailable",
+                        "error": str(error),
+                    }
                 )
-                result = {
+                return
+            finish(
+                {
                     "ok": True,
                     "output": output,
                     "ownership": source,
                     "source_digest": source_digest,
                     "ship": ship,
                 }
-            except Exception as error:
-                result = {"ok": False, "error": str(error)}
-            self._enqueue_event(
-                {
-                    "type": "_completion_acceptance_result",
-                    "exchange_id": message.get("exchange_id"),
-                    "lode_id": lode_id,
-                    "run_generation": generation,
-                    "stage": snapshot["stage"],
-                    "action_id": action_id,
-                    "result": result,
-                },
-                conn,
             )
 
         thread = threading.Thread(target=prepare, name="hopper-completion-accept", daemon=True)
@@ -1440,13 +1460,11 @@ class Server:
             self._send_completion_ack(conn, accepted=False, reason="completion_pending")
             return
         if result.get("ok") is not True:
-            reason = (
-                "ship_provenance_unavailable"
-                if message.get("stage") == "ship"
-                else "ownership_unavailable"
-            )
+            reason = result.get("reason", "ownership_unavailable")
             logger.error("Completion preparation failed lode=%s: %s", lode_id, result.get("error"))
-            self._send_completion_ack(conn, accepted=False, reason=reason)
+            self._send_completion_ack(
+                conn, accepted=False, reason=reason, detail=result.get("error")
+            )
             return
         try:
             record = completion.new_pending_completion(
@@ -1462,7 +1480,12 @@ class Server:
             completion.write_pending_completion(record)
         except Exception as error:
             logger.error("Completion record persistence failed lode=%s: %s", lode_id, error)
-            self._send_completion_ack(conn, accepted=False, reason="ownership_unavailable")
+            self._send_completion_ack(
+                conn,
+                accepted=False,
+                reason="completion_persistence_unavailable",
+                detail=str(error),
+            )
             return
 
         # The fsynced record above is the acceptance linearization point.
@@ -1519,8 +1542,28 @@ class Server:
         """Perform one completion side effect without mutating server state."""
         try:
             if phase == "publishing_output":
-                completion.publish_output(record)
-                result = {"ok": True}
+                try:
+                    completion.publish_output(record)
+                except Exception as publish_error:
+                    try:
+                        completion.verify_staged_output(record)
+                    except Exception as staged_error:
+                        result = {
+                            "ok": False,
+                            "staged_bytes": "unrecoverable",
+                            "error": (
+                                f"output publication failed: {publish_error}; accepted staged "
+                                f"bytes are unavailable: {staged_error}"
+                            ),
+                        }
+                    else:
+                        result = {
+                            "ok": False,
+                            "staged_bytes": "verified",
+                            "error": f"output publication failed: {publish_error}",
+                        }
+                else:
+                    result = {"ok": True}
             elif phase == "capturing_ownership":
                 result = self._recapture_completion_ownership(record, retained_pidfd)
             elif phase == "closing_pane":
@@ -1910,7 +1953,7 @@ class Server:
         record["recovery"] = {
             "kind": recovery_kind,
             "message": error or "completion phase failed",
-            "command": f"hop lode restart {record['lode_id']}",
+            "command": completion.recovery_command(record, recovery_kind),
         }
         if marker_name == "output_publish":
             record["output"]["failure"] = error or "completion output publication failed"
@@ -1989,7 +2032,9 @@ class Server:
             if "containment" in result:
                 record["containment"] = result["containment"]
             recovery_kind = {
-                "publishing_output": "output",
+                "publishing_output": (
+                    "publication" if result.get("staged_bytes") == "verified" else "output"
+                ),
                 "capturing_ownership": "ownership",
                 "closing_pane": "ownership",
                 "observing_containment": "containment",
@@ -2250,11 +2295,8 @@ class Server:
             return False
         if not plan["planned"]:
             project = find_project(source.get("project", ""))
-            candidates = [
-                item
-                for item in self.backlog
-                if item.queued == record["lode_id"] and item.project == source.get("project", "")
-            ]
+            queued = [item for item in self.backlog if item.queued == record["lode_id"]]
+            candidates = [item for item in queued if item.project == source.get("project", "")]
             selected = (
                 None
                 if project and project.disabled
@@ -2265,12 +2307,23 @@ class Server:
                 selected_item_id=selected.id if selected else None,
                 promoted_lode_id=(reserve_lode_id(self.lodes) if selected is not None else None),
                 remaining_item_ids=(
-                    [item.id for item in candidates if item.id != selected.id]
+                    [item.id for item in queued if item.id != selected.id]
                     if selected is not None
-                    else []
+                    else [item.id for item in queued]
                 ),
             )
             self._persist_completion(record, via="completion_backlog:plan")
+        planned_item_ids = set(plan["remaining_item_ids"])
+        if plan["selected_item_id"] is not None:
+            planned_item_ids.add(plan["selected_item_id"])
+        newly_queued = [
+            item.id
+            for item in self.backlog
+            if item.queued == record["lode_id"] and item.id not in planned_item_ids
+        ]
+        if newly_queued:
+            plan["remaining_item_ids"].extend(newly_queued)
+            self._persist_completion(record, via="completion_backlog:extend_plan")
         selected_id = plan["selected_item_id"]
         promoted_id = plan["promoted_lode_id"]
         if selected_id is not None and promoted_id is not None:
@@ -2319,22 +2372,33 @@ class Server:
                     "selected backlog item disappeared before its disposition",
                 )
                 return False
-            try:
-                apply_completion_disposition(
-                    self.backlog,
-                    source_lode_id=record["lode_id"],
-                    selected_item_id=selected_id,
-                    promoted_lode_id=promoted_id,
-                    remaining_item_ids=plan["remaining_item_ids"],
-                )
-            except (OSError, ValueError) as error:
-                self._block_completion(record, "backlog", "cleanup", str(error))
-                return False
-            if selected_data is not None:
-                self.broadcast({"type": "backlog_removed", "item": selected_data})
-            for item in self.backlog:
-                if item.id in plan["remaining_item_ids"]:
-                    self.broadcast({"type": "backlog_updated", "item": item.to_dict()})
+        else:
+            selected_data = None
+        try:
+            apply_completion_disposition(
+                self.backlog,
+                source_lode_id=record["lode_id"],
+                source_project=source.get("project", ""),
+                selected_item_id=selected_id,
+                promoted_lode_id=promoted_id,
+                remaining_item_ids=plan["remaining_item_ids"],
+            )
+        except (OSError, ValueError) as error:
+            self._block_completion(record, "backlog", "cleanup", str(error))
+            return False
+        if any(item.queued == record["lode_id"] for item in self.backlog):
+            self._block_completion(
+                record,
+                "backlog",
+                "cleanup",
+                "backlog changed while its recorded disposition was being applied",
+            )
+            return False
+        if selected_data is not None:
+            self.broadcast({"type": "backlog_removed", "item": selected_data})
+        for item in self.backlog:
+            if item.id in plan["remaining_item_ids"]:
+                self.broadcast({"type": "backlog_updated", "item": item.to_dict()})
         plan["applied"] = True
         completion.transition_marker(
             record,
@@ -2388,7 +2452,14 @@ class Server:
             )
             return False
         pane_id = receipt["pane_id"] if receipt is not None else None
-        if target.get("tmux_pane") not in {None, pane_id}:
+        current_pane = target.get("tmux_pane")
+        retained_source_pane = bool(
+            receipt is None
+            and target["id"] == record["lode_id"]
+            and current_generation == record["run_generation"]
+            and current_pane == record["ownership"]["pane"]["pane_id"]
+        )
+        if current_pane not in {None, pane_id} and not retained_source_pane:
             self._block_completion(
                 record, "spawn", "spawn", "spawn target pane conflicts with this action"
             )
@@ -2464,6 +2535,18 @@ class Server:
         record["phase"] = "complete"
         if record["stage"] == "ship":
             self._persist_completion(record, via="completion_result:complete")
+            lode = self._find_completion_lode(record["lode_id"])
+            if lode is not None:
+                lode["state"] = "ready"
+                lode["status"] = completion.completion_status(record)
+                lode["active"] = False
+                lode["pid"] = None
+                lode["tmux_pane"] = None
+                lode["oom_scope"] = None
+                touch(lode)
+                save_archived_lodes(self.archived_lodes)
+                _log_state_change(lode["id"], lode["state"], lode["status"], "completion_clear")
+                self.broadcast({"type": "lode_updated", "lode": lode})
         else:
             completion.write_pending_completion(record)
             lode = self._find_lode(record["lode_id"])
@@ -2489,6 +2572,13 @@ class Server:
                 self._send_response(conn, {"type": "error", "error": "no pending completion"})
             return
         if record["phase"] == "output_blocked":
+            if record["recovery"]["kind"] == "publication":
+                self._schedule_completion_step(record, "output_publish", "publishing_output")
+                if conn:
+                    self._send_response(
+                        conn, {"type": "lode_completion_retrying", "lode_id": lode_id}
+                    )
+                return
             if conn:
                 self._send_response(
                     conn,
@@ -3533,6 +3623,16 @@ class Server:
                 )
 
         lode_id = message.get("lode_id")
+        if (
+            msg_type == "lode_set_state"
+            and message.get("state") == "teardown"
+            and (not isinstance(lode_id, str) or not _pending_completion_exists(lode_id))
+        ):
+            logger.warning(
+                "Refusing teardown projection without pending completion lode=%s", lode_id
+            )
+            acknowledge_mutation(False, "teardown_requires_pending_completion")
+            return
         if (
             msg_type in PENDING_ACTION_FENCED_MUTATIONS
             and isinstance(lode_id, str)

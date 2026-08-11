@@ -147,11 +147,12 @@ def apply_completion_disposition(
     items: list[BacklogItem],
     *,
     source_lode_id: str,
-    selected_item_id: str,
-    promoted_lode_id: str,
+    source_project: str,
+    selected_item_id: str | None,
+    promoted_lode_id: str | None,
     remaining_item_ids: list[str],
 ) -> None:
-    """Apply one previously persisted ship backlog plan idempotently."""
+    """Apply one persisted ship plan, promoting matches and detaching the rest."""
     by_id: dict[str, BacklogItem] = {}
     for item in items:
         if item.id in by_id:
@@ -165,13 +166,19 @@ def apply_completion_disposition(
         item = by_id.get(item_id)
         if item is None:
             raise ValueError(f"planned backlog item {item_id} is absent")
-        if item.queued not in {source_lode_id, promoted_lode_id}:
+        destination = (
+            promoted_lode_id if promoted_lode_id and item.project == source_project else None
+        )
+        if item.queued not in {source_lode_id, destination}:
             raise ValueError(f"planned backlog item {item_id} has conflicting queue ownership")
 
     if selected is not None:
         items.remove(selected)
     for item_id in remaining_item_ids:
-        by_id[item_id].queued = promoted_lode_id
+        item = by_id[item_id]
+        item.queued = (
+            promoted_lode_id if promoted_lode_id and item.project == source_project else None
+        )
     save_backlog(items)
 
 
