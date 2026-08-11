@@ -763,7 +763,7 @@ def run_process(lode_id: str, socket_path: Path, *, expect_scope: bool = False) 
 
         run_generation = os.environ.get(RUN_GENERATION_ENV)
         candidate_unit = os.environ.get(OOM_SCOPE_ENV)
-        actual_unit = candidate_unit if capability is oom.OomCapability.SUPPORTED else None
+        actual_unit = candidate_unit if expect_scope else None
         runner = ProcessRunner(
             lode_id,
             socket_path,

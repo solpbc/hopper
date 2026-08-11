@@ -374,6 +374,127 @@ def capture_scope_cgroup(
     }
 
 
+def capture_worker_cgroup_membership(
+    worker: dict,
+    control_group: str,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> dict:
+    """Prove that one birth-identified Linux worker occupies a control group."""
+    pid = worker.get("pid") if isinstance(worker, dict) else None
+    birth = worker.get("birth") if isinstance(worker, dict) else None
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid < 1
+        or not isinstance(birth, dict)
+        or birth.get("kind") != "linux-proc-starttime"
+        or not isinstance(birth.get("boot_id"), str)
+        or not birth["boot_id"]
+        or not isinstance(birth.get("value"), str)
+        or not birth["value"]
+    ):
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": "worker does not have a Linux proc-stat birth identity",
+        }
+
+    try:
+        text = oom._read_text(proc_root / str(pid) / "cgroup")
+    except FileNotFoundError:
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": "worker cgroup membership file is missing",
+        }
+    except ProcessLookupError:
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": "worker exited before cgroup membership could be read",
+        }
+    except OSError as error:
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": f"worker cgroup membership is unreadable: {error}",
+        }
+
+    memberships = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            return {
+                "state": "cannot-tell",
+                "control_group": None,
+                "error": "worker cgroup membership is malformed",
+            }
+        if fields[0] == "0" and fields[1] == "":
+            memberships.append(fields[2])
+
+    if not memberships:
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": "worker has no cgroup-v2 membership",
+        }
+    if len(memberships) != 1:
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": "worker has ambiguous cgroup-v2 membership",
+        }
+
+    observed_path = PurePosixPath(memberships[0])
+    if (
+        not memberships[0]
+        or not observed_path.is_absolute()
+        or observed_path == PurePosixPath("/")
+        or ".." in observed_path.parts
+    ):
+        return {
+            "state": "cannot-tell",
+            "control_group": None,
+            "error": f"worker cgroup-v2 membership path is invalid: {memberships[0]!r}",
+        }
+    observed_group = str(observed_path)
+    expected_path = PurePosixPath(control_group)
+    if observed_path.parts != expected_path.parts:
+        return {
+            "state": "cannot-tell",
+            "control_group": observed_group,
+            "error": (
+                f"worker cgroup membership {observed_group} does not match "
+                f"unit control group {expected_path}"
+            ),
+        }
+
+    current = read_linux_process_identity(
+        pid,
+        proc_root=proc_root,
+        boot_id=birth["boot_id"],
+    )
+    if current["state"] != "alive":
+        return {
+            "state": "cannot-tell",
+            "control_group": observed_group,
+            "error": (
+                "worker identity became unavailable while membership was observed: "
+                f"{current['error'] or current['state']}"
+            ),
+        }
+    if not same_birth(worker, current["identity"]):
+        return {
+            "state": "cannot-tell",
+            "control_group": observed_group,
+            "error": "worker identity changed while membership was observed",
+        }
+    return {"state": "proven", "control_group": observed_group, "error": None}
+
+
 def capture_ownership(
     *,
     pane_id: str,

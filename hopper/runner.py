@@ -231,6 +231,7 @@ class BaseRunner:
         self.connection: HopperConnection | None = None
         self._registration_complete = threading.Event()
         self._registration_accepted = False
+        self._registration_refusal_reason: str | None = None
         self._expected_lode_branch: str | None = None
         self._branch_persisted = threading.Event()
         self.is_first_run = False
@@ -326,7 +327,8 @@ class BaseRunner:
                     return 1
                 if not self._registration_accepted:
                     logger.error(f"registration refused lode={self.lode_id}")
-                    print(f"Failed to register lode {self.lode_id}: server refused ownership")
+                    reason = self._registration_refusal_reason or "server refused ownership"
+                    print(f"Failed to register lode {self.lode_id}: {reason}")
                     return 1
 
                 # Subclass pre-flight validation and setup
@@ -515,11 +517,16 @@ class BaseRunner:
         """Handle incoming server broadcast messages."""
         if message.get("type") == "lode_registered":
             if message.get("lode_id") == self.lode_id:
+                self._registration_refusal_reason = None
                 self._registration_accepted = True
                 self._registration_complete.set()
             return
         if message.get("type") == "lode_register_refused":
             if message.get("lode_id") == self.lode_id:
+                reason = message.get("reason")
+                self._registration_refusal_reason = (
+                    reason if isinstance(reason, str) and reason else None
+                )
                 self._registration_accepted = False
                 self._registration_complete.set()
             return

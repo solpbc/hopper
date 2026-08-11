@@ -345,6 +345,211 @@ def test_capture_scope_cgroup_rejects_root_or_unknown_control_group(tmp_path, mo
     )
 
 
+@pytest.mark.parametrize(
+    "membership",
+    [
+        "0::/user.slice/hopper.scope\n",
+        ("7:memory:/legacy/memory\n3:cpu,cpuacct:/legacy/cpu\n0::/user.slice/hopper.scope\n"),
+    ],
+)
+def test_capture_worker_cgroup_membership_proves_exact_membership(
+    tmp_path, monkeypatch, membership
+):
+    worker = _linux_process(102, 101, 102, 3)
+
+    def read(path):
+        if path == tmp_path / "102/cgroup":
+            return membership
+        assert path == tmp_path / "102/stat"
+        return _linux_stat(pid=102, ppid=101, pgid=102, starttime=3)
+
+    monkeypatch.setattr(oom, "_read_text", read)
+
+    assert teardown.capture_worker_cgroup_membership(
+        worker, "/user.slice/hopper.scope", proc_root=tmp_path
+    ) == {
+        "state": "proven",
+        "control_group": "/user.slice/hopper.scope",
+        "error": None,
+    }
+
+
+def test_capture_worker_cgroup_membership_refuses_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(oom, "_read_text", MagicMock(side_effect=FileNotFoundError))
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed == {
+        "state": "cannot-tell",
+        "control_group": None,
+        "error": "worker cgroup membership file is missing",
+    }
+
+
+def test_capture_worker_cgroup_membership_refuses_process_lookup(tmp_path, monkeypatch):
+    monkeypatch.setattr(oom, "_read_text", MagicMock(side_effect=ProcessLookupError))
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed == {
+        "state": "cannot-tell",
+        "control_group": None,
+        "error": "worker exited before cgroup membership could be read",
+    }
+
+
+def test_capture_worker_cgroup_membership_refuses_unreadable_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(oom, "_read_text", MagicMock(side_effect=PermissionError("denied")))
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed == {
+        "state": "cannot-tell",
+        "control_group": None,
+        "error": "worker cgroup membership is unreadable: denied",
+    }
+
+
+def test_capture_worker_cgroup_membership_refuses_malformed_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(oom, "_read_text", lambda _path: "malformed\n")
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["error"] == "worker cgroup membership is malformed"
+
+
+def test_capture_worker_cgroup_membership_refuses_missing_v2_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(oom, "_read_text", lambda _path: "7:memory:/legacy\n")
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["error"] == "worker has no cgroup-v2 membership"
+
+
+def test_capture_worker_cgroup_membership_refuses_ambiguous_v2_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        oom,
+        "_read_text",
+        lambda _path: "0::/user.slice/hopper.scope\n0::/user.slice/hopper.scope\n",
+    )
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["error"] == "worker has ambiguous cgroup-v2 membership"
+
+
+@pytest.mark.parametrize("path", ["", "relative.scope", "/", "/user.slice/../other.scope"])
+def test_capture_worker_cgroup_membership_refuses_invalid_v2_paths(tmp_path, monkeypatch, path):
+    monkeypatch.setattr(oom, "_read_text", lambda _path: f"0::{path}\n")
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["error"] == f"worker cgroup-v2 membership path is invalid: {path!r}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/user.slice/hopper.scope-extra",
+        "/user.slice/hopper.scope/inner",
+        "/user.slice/sibling.scope",
+    ],
+)
+def test_capture_worker_cgroup_membership_refuses_non_exact_paths(tmp_path, monkeypatch, path):
+    monkeypatch.setattr(oom, "_read_text", lambda _path: f"0::{path}\n")
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed == {
+        "state": "cannot-tell",
+        "control_group": path,
+        "error": (
+            f"worker cgroup membership {path} does not match "
+            "unit control group /user.slice/hopper.scope"
+        ),
+    }
+
+
+def test_capture_worker_cgroup_membership_requires_linux_birth(tmp_path, monkeypatch):
+    worker = _linux_process(102)
+    worker["birth"] = {"kind": "ps-lstart", "boot_id": None, "value": "opaque"}
+    read = MagicMock(side_effect=AssertionError("procfs must not be read"))
+    monkeypatch.setattr(oom, "_read_text", read)
+
+    observed = teardown.capture_worker_cgroup_membership(
+        worker, "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["error"] == "worker does not have a Linux proc-stat birth identity"
+    read.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error", "detail"),
+    [
+        (FileNotFoundError(), "gone"),
+        (PermissionError("denied"), "denied"),
+    ],
+)
+def test_capture_worker_cgroup_membership_refuses_unavailable_birth_recheck(
+    tmp_path, monkeypatch, error, detail
+):
+    def read(path):
+        if path.name == "cgroup":
+            return "0::/user.slice/hopper.scope\n"
+        raise error
+
+    monkeypatch.setattr(oom, "_read_text", read)
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["control_group"] == "/user.slice/hopper.scope"
+    assert observed["error"].endswith(detail)
+
+
+def test_capture_worker_cgroup_membership_refuses_birth_change(tmp_path, monkeypatch):
+    def read(path):
+        if path.name == "cgroup":
+            return "0::/user.slice/hopper.scope\n"
+        return _linux_stat(pid=102, ppid=1, pgid=102, starttime=99)
+
+    monkeypatch.setattr(oom, "_read_text", read)
+
+    observed = teardown.capture_worker_cgroup_membership(
+        _linux_process(102, start=3), "/user.slice/hopper.scope", proc_root=tmp_path
+    )
+
+    assert observed == {
+        "state": "cannot-tell",
+        "control_group": "/user.slice/hopper.scope",
+        "error": "worker identity changed while membership was observed",
+    }
+
+
 def test_capture_ownership_collects_all_linux_facts_before_close(monkeypatch):
     pane_root = _linux_process(100, 1, 100, 1)
     supervisor = _linux_process(101, 100, 100, 2)

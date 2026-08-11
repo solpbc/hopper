@@ -79,7 +79,7 @@ def test_run_teardown_terminates_children_and_sweeps_platform_orphans():
 
 
 class TestBaseRunnerRegistration:
-    def test_missing_generation_refusal_exits_before_any_child_launch(self):
+    def test_missing_generation_refusal_exits_before_any_child_launch(self, capsys):
         runner = BaseRunner("test-id", Path("server.sock"))
         connection = MagicMock()
 
@@ -108,6 +108,43 @@ class TestBaseRunnerRegistration:
         setup_command.assert_not_called()
         codex_bootstrap.assert_not_called()
         claude_popen.assert_not_called()
+        assert (
+            "Failed to register lode test-id: server refused ownership" in capsys.readouterr().out
+        )
+
+    def test_registration_refusal_prints_server_reason(self, capsys):
+        runner = BaseRunner("test-id", Path("server.sock"))
+        connection = MagicMock()
+
+        def start(callback=None, on_connect=None):
+            on_connect()
+            callback(
+                {
+                    "type": "lode_register_refused",
+                    "lode_id": "test-id",
+                    "reason": "worker has no cgroup-v2 membership",
+                }
+            )
+
+        connection.emit.return_value = True
+        connection.start.side_effect = start
+        with (
+            patch(
+                "hopper.runner.connect",
+                return_value={"lode": {"active": False, "claude": {}}},
+            ),
+            patch("hopper.runner.HopperConnection", return_value=connection),
+            patch.object(runner, "_setup") as setup,
+            patch.object(runner, "_run_claude") as run_model,
+        ):
+            assert runner.run() == 1
+
+        setup.assert_not_called()
+        run_model.assert_not_called()
+        assert (
+            "Failed to register lode test-id: worker has no cgroup-v2 membership"
+            in capsys.readouterr().out
+        )
 
 
 class TestPsCpuHelpers:

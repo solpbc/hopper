@@ -205,6 +205,42 @@ def _strict_completion_run_ownership(lode_id="abcd2345", generation=TEST_RUN_GEN
     return record
 
 
+def _strict_registration_facts(
+    lode_id="abcd2345", generation=TEST_RUN_GENERATION
+) -> tuple[dict, dict, dict]:
+    final = _strict_completion_run_ownership(lode_id, generation)
+    worker = _completion_process(102, 101, 102)
+    source = {
+        **final,
+        "worker": None,
+        "descendants": [],
+        "unit": None,
+        "cgroup": None,
+    }
+    ownership = {
+        "platform": "linux",
+        "proof_mode": "linux-strict",
+        "pane": copy.deepcopy(source["pane"]),
+        "supervisor": copy.deepcopy(source["supervisor"]),
+        "worker": worker,
+        "process_group": source["process_group"],
+        "descendants": [],
+        "unit": copy.deepcopy(final["unit"]),
+        "cgroup": copy.deepcopy(final["cgroup"]),
+    }
+    message = {
+        "type": "lode_register",
+        "lode_id": lode_id,
+        "run_generation": generation,
+        "tmux_pane": source["pane"]["pane_id"],
+        "pid": worker["pid"],
+        "ppid": worker["ppid"],
+        "pgid": worker["pgid"],
+        "actual_unit": source["unit_name"],
+    }
+    return source, ownership, message
+
+
 def _ship_completion_facts(lode_id: str, action_id: str) -> dict:
     worktree = f"/tmp/{lode_id}"
     return {
@@ -638,6 +674,22 @@ def _apply_prepared_action(server: Server, lode_id: str, generation: str | None)
     server._handle_mutation(internal, response_conn)
 
 
+def _apply_worker_registration_capture(
+    server: Server,
+    lode: dict,
+    message: dict,
+    conn: MagicMock,
+) -> dict:
+    server._start_registration_capture("worker", lode, message, conn)
+    thread = server.registration_threads[f"worker:{lode['id']}:{lode['run_generation']}"]
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    internal, response_conn = server.event_queue.get(timeout=2)
+    assert internal["type"] == "_registration_capture_result"
+    server._handle_registration_capture_result(internal, response_conn)
+    return _decode_mock_response(conn)
+
+
 def _runner_message(server: Server, msg_type: str, lode_id: str, **fields) -> dict:
     """Build a current-generation runner protocol message for server tests."""
     lode = server._find_lode(lode_id)
@@ -693,6 +745,268 @@ def registered_generation_capture(monkeypatch):
     monkeypatch.setattr(actions, "load_run_ownership", source)
     monkeypatch.setattr(actions, "write_run_ownership", lambda _record: Path("ownership"))
     monkeypatch.setattr(hopper_server, "_capture_worker_registration", capture)
+
+
+@pytest.mark.parametrize(
+    "armed_mode",
+    ["supported", "degraded-no-controller", "degraded-no-score"],
+)
+def test_capture_worker_registration_accepts_strict_linux_oom_modes(armed_mode):
+    source, ownership, message = _strict_registration_facts()
+    message["armed_mode"] = armed_mode
+    captured = {"state": "captured", "ownership": ownership, "error": None}
+    membership = {
+        "state": "proven",
+        "control_group": ownership["cgroup"]["relative_path"],
+        "error": None,
+    }
+
+    with (
+        patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+        patch("hopper.server.teardown.capture_ownership", return_value=captured) as capture,
+        patch(
+            "hopper.server.teardown.capture_worker_cgroup_membership",
+            return_value=membership,
+        ) as prove,
+        patch("hopper.server.teardown.resolve_pidfd_interface", return_value=None),
+    ):
+        result = hopper_server._capture_worker_registration(source, message)
+
+    assert result["record"]["proof_mode"] == "linux-strict"
+    assert result["record"]["worker"] == ownership["worker"]
+    assert result["pidfd"] is None
+    capture.assert_called_once_with(
+        pane_id=source["pane"]["pane_id"],
+        supervisor_pid=source["supervisor"]["pid"],
+        worker_pid=message["pid"],
+        process_group=source["process_group"],
+        unit_name=source["unit_name"],
+        systemctl="systemctl",
+        platform="linux",
+    )
+    prove.assert_called_once_with(ownership["worker"], ownership["cgroup"]["relative_path"])
+
+
+@pytest.mark.parametrize(
+    "armed_mode",
+    ["supported", "degraded-no-controller", "degraded-no-score"],
+)
+def test_strict_registration_accepts_and_preserves_scope(
+    socket_path, make_lode, armed_mode, caplog
+):
+    source, ownership, message = _strict_registration_facts()
+    message["armed_mode"] = armed_mode
+    actions.write_run_ownership(source)
+    server = Server(socket_path)
+    lode = make_lode(
+        id=source["lode_id"],
+        state="running",
+        tmux_pane=source["pane"]["pane_id"],
+        run_generation=source["run_generation"],
+        oom_scope=source["unit_name"],
+    )
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    captured = {"state": "captured", "ownership": ownership, "error": None}
+    membership = {
+        "state": "proven",
+        "control_group": ownership["cgroup"]["relative_path"],
+        "error": None,
+    }
+
+    with (
+        patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+        patch("hopper.server.teardown.capture_ownership", return_value=captured),
+        patch(
+            "hopper.server.teardown.capture_worker_cgroup_membership",
+            return_value=membership,
+        ) as prove,
+        patch("hopper.server.teardown.resolve_pidfd_interface", return_value=None),
+        caplog.at_level(logging.INFO, logger="hopper.server"),
+    ):
+        response = _apply_worker_registration_capture(server, lode, message, conn)
+
+    assert response["type"] == "lode_registered"
+    assert response["accepted"] is True
+    assert server.lode_clients[lode["id"]] is conn
+    assert lode["oom_scope"] == source["unit_name"]
+    assert lode["run_generation"] == source["run_generation"]
+    durable = actions.load_run_ownership(lode["id"], lode["run_generation"], require_worker=True)
+    assert durable is not None
+    assert durable["proof_mode"] == "linux-strict"
+    assert durable["unit_name"] == source["unit_name"]
+    prove.assert_called_once_with(ownership["worker"], ownership["cgroup"]["relative_path"])
+    expected_log = (
+        f"Worker registration accepted lode={lode['id']} "
+        f"generation={lode['run_generation']} containment=linux-strict oom_mode={armed_mode}"
+    )
+    assert caplog.messages.count(expected_log) == 1
+
+
+@pytest.mark.parametrize(
+    "armed_mode",
+    ["supported", "degraded-no-controller", "degraded-no-score"],
+)
+def test_strict_registration_refuses_unit_claim_mismatch_without_mutation(
+    socket_path, make_lode, armed_mode
+):
+    source, _ownership, message = _strict_registration_facts()
+    message.update(armed_mode=armed_mode, actual_unit="hopper-other.scope")
+    path = actions.write_run_ownership(source)
+    before_bytes = path.read_bytes()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=source["lode_id"],
+        state="running",
+        tmux_pane=source["pane"]["pane_id"],
+        run_generation=source["run_generation"],
+        oom_scope=source["unit_name"],
+    )
+    before_lode = copy.deepcopy(lode)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    with (
+        patch("hopper.server.oom.find_systemctl") as systemctl,
+        patch("hopper.server.teardown.capture_ownership") as capture,
+        patch("hopper.server.teardown.capture_worker_cgroup_membership") as prove,
+    ):
+        response = _apply_worker_registration_capture(server, lode, message, conn)
+
+    response.pop("ts", None)
+    assert response == {
+        "type": "lode_register_refused",
+        "lode_id": lode["id"],
+        "accepted": False,
+        "reason": "worker did not enter the recorded systemd unit",
+    }
+    assert lode["id"] not in server.lode_clients
+    assert lode == before_lode
+    assert lode["oom_scope"] == source["unit_name"]
+    assert lode["run_generation"] == source["run_generation"]
+    assert path.read_bytes() == before_bytes
+    systemctl.assert_not_called()
+    capture.assert_not_called()
+    prove.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "armed_mode",
+    ["supported", "degraded-no-controller", "degraded-no-score"],
+)
+def test_strict_registration_refuses_unproven_membership_without_mutation(
+    socket_path, make_lode, armed_mode
+):
+    source, ownership, message = _strict_registration_facts()
+    message["armed_mode"] = armed_mode
+    path = actions.write_run_ownership(source)
+    before_bytes = path.read_bytes()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=source["lode_id"],
+        state="running",
+        tmux_pane=source["pane"]["pane_id"],
+        run_generation=source["run_generation"],
+        oom_scope=source["unit_name"],
+    )
+    before_lode = copy.deepcopy(lode)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    captured = {"state": "captured", "ownership": ownership, "error": None}
+    reason = (
+        "worker cgroup membership /user.slice/other.scope does not match "
+        f"unit control group {ownership['cgroup']['relative_path']}"
+    )
+
+    with (
+        patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+        patch("hopper.server.teardown.capture_ownership", return_value=captured),
+        patch(
+            "hopper.server.teardown.capture_worker_cgroup_membership",
+            return_value={
+                "state": "cannot-tell",
+                "control_group": "/user.slice/other.scope",
+                "error": reason,
+            },
+        ) as prove,
+        patch("hopper.server.teardown.resolve_pidfd_interface") as pidfd,
+    ):
+        response = _apply_worker_registration_capture(server, lode, message, conn)
+
+    response.pop("ts", None)
+    assert response == {
+        "type": "lode_register_refused",
+        "lode_id": lode["id"],
+        "accepted": False,
+        "reason": reason,
+    }
+    assert lode["id"] not in server.lode_clients
+    assert lode == before_lode
+    assert lode["oom_scope"] == source["unit_name"]
+    assert lode["run_generation"] == source["run_generation"]
+    assert path.read_bytes() == before_bytes
+    prove.assert_called_once_with(ownership["worker"], ownership["cgroup"]["relative_path"])
+    pidfd.assert_not_called()
+
+
+def test_linux_degraded_registration_refuses_worker_unit_claim():
+    source = _completion_run_ownership()
+    source.update(worker=None, descendants=[])
+    message = {
+        "armed_mode": "degraded-no-controller",
+        "actual_unit": "hopper-test.scope",
+    }
+
+    with (
+        patch("hopper.server.oom.find_systemctl") as systemctl,
+        patch("hopper.server.teardown.capture_ownership") as capture,
+    ):
+        with pytest.raises(ValueError, match="degraded worker cannot claim a systemd unit"):
+            hopper_server._capture_worker_registration(source, message)
+
+    systemctl.assert_not_called()
+    capture.assert_not_called()
+
+
+def test_late_registration_claim_race_sends_specific_reason(socket_path, make_lode):
+    source, ownership, message = _strict_registration_facts()
+    message["armed_mode"] = "supported"
+    final = {
+        **source,
+        "worker": ownership["worker"],
+        "descendants": ownership["descendants"],
+        "unit": ownership["unit"],
+        "cgroup": ownership["cgroup"],
+    }
+    server = Server(socket_path)
+    lode = make_lode(
+        id=source["lode_id"],
+        run_generation=source["run_generation"],
+        oom_scope=source["unit_name"],
+    )
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    internal = {
+        "type": "_registration_capture_result",
+        "kind": "worker",
+        "key": f"worker:{lode['id']}:{lode['run_generation']}",
+        "lode_id": lode["id"],
+        "run_generation": lode["run_generation"],
+        "request": message,
+        "result": {"ok": True, "record": final, "pidfd": None},
+    }
+
+    with patch.object(server, "_register_lode_client", return_value=False):
+        server._handle_registration_capture_result(internal, conn)
+
+    response = _decode_mock_response(conn)
+    response.pop("ts", None)
+    assert response == {
+        "type": "lode_register_refused",
+        "lode_id": lode["id"],
+        "accepted": False,
+        "reason": "worker registration claim no longer matches the current generation",
+    }
 
 
 def test_completion_acceptance_commits_fence_before_publication(
@@ -4435,7 +4749,7 @@ def test_runner_registration_clears_spawn_status(socket_path, make_lode, status)
         tmux_pane="%25",
         pid=2525,
         run_generation=TEST_RUN_GENERATION,
-        armed_mode="non-linux",
+        proof_mode="other-bounded-no-birth",
     )
 
     assert lode["status"] == ""
@@ -7696,16 +8010,16 @@ class TestOomLifecycle:
             tmux_pane="%2",
             pid=222,
             run_generation=lode["run_generation"],
-            armed_mode="supported",
+            proof_mode="linux-strict",
             actual_unit=lode["oom_scope"],
         )
         assert lode["failure_kind"] is None
         assert lode["state"] == "running"
         assert lode["status"] == "Starting mill"
 
-    @pytest.mark.parametrize("armed_mode", ["degraded-no-controller", "non-linux"])
+    @pytest.mark.parametrize("proof_mode", ["linux-degraded", "other-bounded-no-birth"])
     def test_terminal_resume_commits_recovery_in_degraded_mode(
-        self, socket_path, make_lode, armed_mode
+        self, socket_path, make_lode, proof_mode
     ):
         srv = Server(socket_path)
         status = format_terminal_failure_status("oom", "test-id")
@@ -7740,7 +8054,7 @@ class TestOomLifecycle:
                 tmux_pane="%4",
                 pid=444,
                 run_generation=lode["run_generation"],
-                armed_mode=armed_mode,
+                proof_mode=proof_mode,
                 actual_unit=None,
             )
 
@@ -7754,19 +8068,19 @@ class TestOomLifecycle:
         broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
     @pytest.mark.parametrize(
-        ("armed_mode", "actual_unit", "run_generation"),
+        ("proof_mode", "actual_unit", "run_generation"),
         [
-            ("supported", None, "4" * 32),
-            ("supported", "hopper-other.scope", "4" * 32),
-            ("supported", "hopper-terminal.scope", "3" * 32),
-            ("degraded-no-controller", "hopper-terminal.scope", "4" * 32),
+            ("linux-strict", None, "4" * 32),
+            ("linux-strict", "hopper-other.scope", "4" * 32),
+            ("linux-strict", "hopper-terminal.scope", "3" * 32),
+            ("linux-degraded", "hopper-terminal.scope", "4" * 32),
         ],
     )
-    def test_terminal_registration_refuses_invalid_armed_claim(
+    def test_terminal_registration_refuses_invalid_proof_claim(
         self,
         socket_path,
         make_lode,
-        armed_mode,
+        proof_mode,
         actual_unit,
         run_generation,
     ):
@@ -7794,7 +8108,7 @@ class TestOomLifecycle:
                 tmux_pane="%4",
                 pid=444,
                 run_generation=run_generation,
-                armed_mode=armed_mode,
+                proof_mode=proof_mode,
                 actual_unit=actual_unit,
             )
 

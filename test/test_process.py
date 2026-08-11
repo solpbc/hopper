@@ -2728,11 +2728,20 @@ class TestOomBoundary:
         assert run_process_supervisor("test-id", Path("server.sock")) == 7
         inline.assert_called_once_with("test-id", Path("server.sock"), expect_scope=False)
 
-    def test_degraded_warning_is_printed_and_logged_once(self, monkeypatch, capsys, caplog):
+    @pytest.mark.parametrize(
+        ("capability", "expected_warning"),
+        [
+            (oom.OomCapability.DEGRADED_NO_CONTROLLER, oom.OOM_DEGRADED_WARNING),
+            (oom.OomCapability.DEGRADED_NO_SCORE, oom.OOM_SCORE_DEGRADED_WARNING),
+        ],
+    )
+    def test_degraded_warning_is_printed_and_logged_once(
+        self, monkeypatch, capsys, caplog, capability, expected_warning
+    ):
         monkeypatch.setattr(
             oom,
             "arm_worker",
-            lambda **kwargs: oom.OomCapability.DEGRADED_NO_CONTROLLER,
+            lambda **kwargs: capability,
         )
         monkeypatch.setattr(
             "hopper.client.connect", lambda *args, **kwargs: {"lode": {"stage": "mill"}}
@@ -2742,8 +2751,58 @@ class TestOomBoundary:
         with caplog.at_level(logging.WARNING, logger="hopper.process"):
             assert run_process("test-id", Path("server.sock")) == 0
 
-        assert capsys.readouterr().out.count(oom.OOM_DEGRADED_WARNING) == 1
-        assert caplog.messages.count(oom.OOM_DEGRADED_WARNING) == 1
+        assert capsys.readouterr().out.count(expected_warning) == 1
+        assert caplog.messages.count(expected_warning) == 1
+
+    @pytest.mark.parametrize(
+        "capability",
+        [
+            oom.OomCapability.SUPPORTED,
+            oom.OomCapability.DEGRADED_NO_CONTROLLER,
+            oom.OomCapability.DEGRADED_NO_SCORE,
+        ],
+    )
+    def test_scoped_worker_reports_unit_for_linux_oom_modes(self, monkeypatch, capability):
+        observed = {}
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", "hopper-test.scope")
+        monkeypatch.setattr(oom, "arm_worker", lambda **_kwargs: capability)
+        monkeypatch.setattr(
+            "hopper.client.connect", lambda *_args, **_kwargs: {"lode": {"stage": "mill"}}
+        )
+
+        def run(runner):
+            observed["actual_unit"] = runner.actual_unit
+            observed["armed_mode"] = runner.armed_mode
+            return 0
+
+        monkeypatch.setattr(ProcessRunner, "run", run)
+
+        assert run_process("test-id", Path("server.sock"), expect_scope=True) == 0
+        assert observed == {
+            "actual_unit": "hopper-test.scope",
+            "armed_mode": capability.value,
+        }
+
+    def test_unscoped_worker_ignores_candidate_unit(self, monkeypatch):
+        observed = {}
+        monkeypatch.setenv("HOPPER_OOM_SCOPE", "hopper-test.scope")
+        monkeypatch.setattr(
+            oom,
+            "arm_worker",
+            lambda **_kwargs: oom.OomCapability.DEGRADED_NO_CONTROLLER,
+        )
+        monkeypatch.setattr(
+            "hopper.client.connect", lambda *_args, **_kwargs: {"lode": {"stage": "mill"}}
+        )
+
+        def run(runner):
+            observed["actual_unit"] = runner.actual_unit
+            return 0
+
+        monkeypatch.setattr(ProcessRunner, "run", run)
+
+        assert run_process("test-id", Path("server.sock"), expect_scope=False) == 0
+        assert observed["actual_unit"] is None
 
     def test_read_scope_result_passes_bounded_timeout(self):
         """The systemctl show probe uses the shared bounded timeout."""

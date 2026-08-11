@@ -255,7 +255,11 @@ def _capture_worker_registration(source: dict, message: dict) -> dict:
     """Complete and verify the durable launch ownership record."""
     proof_mode = source["proof_mode"]
     expected_armed = {
-        "linux-strict": {oom.OomCapability.SUPPORTED.value},
+        "linux-strict": {
+            oom.OomCapability.SUPPORTED.value,
+            oom.OomCapability.DEGRADED_NO_CONTROLLER.value,
+            oom.OomCapability.DEGRADED_NO_SCORE.value,
+        },
         "linux-degraded": {
             oom.OomCapability.DEGRADED_NO_CONTROLLER.value,
             oom.OomCapability.DEGRADED_NO_SCORE.value,
@@ -309,6 +313,12 @@ def _capture_worker_registration(source: dict, message: dict) -> dict:
         "cgroup": ownership["cgroup"],
     }
     actions.validate_run_ownership(record, require_worker=True)
+    if proof_mode == "linux-strict":
+        membership = teardown.capture_worker_cgroup_membership(
+            record["worker"], record["cgroup"]["relative_path"]
+        )
+        if membership["state"] != "proven":
+            raise RuntimeError(membership["error"] or "worker cgroup membership is unavailable")
     pidfd = None
     if proof_mode == "linux-strict":
         pidfd_interface = teardown.resolve_pidfd_interface()
@@ -1219,7 +1229,7 @@ class Server:
                     result["record"]["pane"]["pane_id"],
                     result["record"]["worker"]["pid"],
                     generation,
-                    request.get("armed_mode"),
+                    result["record"]["proof_mode"],
                     request.get("actual_unit"),
                 )
             )
@@ -1230,9 +1240,23 @@ class Server:
                 if conn:
                     self._send_response(
                         conn,
-                        {"type": refused_type, "lode_id": lode_id, "accepted": False},
+                        {
+                            "type": refused_type,
+                            "lode_id": lode_id,
+                            "accepted": False,
+                            "reason": (
+                                "worker registration claim no longer matches the current generation"
+                            ),
+                        },
                     )
                 return
+            logger.info(
+                "Worker registration accepted lode=%s generation=%s containment=%s oom_mode=%s",
+                lode_id,
+                generation,
+                result["record"]["proof_mode"],
+                request.get("armed_mode"),
+            )
         elif result["record"]["proof_mode"] == "linux-degraded":
             lode["oom_scope"] = None
             touch(lode)
@@ -4405,7 +4429,7 @@ class Server:
         tmux_pane: str | None = None,
         pid: int | None = None,
         run_generation: str | None = None,
-        armed_mode: str | None = None,
+        proof_mode: str | None = None,
         actual_unit: str | None = None,
     ) -> bool:
         """Register a client as owning a lode.
@@ -4419,13 +4443,13 @@ class Server:
         terminal_recovery = is_terminal_failure_kind(lode.get("failure_kind"))
         if terminal_recovery and (not tmux_pane or tmux_pane != lode.get("tmux_pane")):
             return False
-        if armed_mode == oom.OomCapability.SUPPORTED.value:
+        if proof_mode == "linux-strict":
             if not actual_unit or actual_unit != lode.get("oom_scope"):
                 return False
-        elif armed_mode in {
-            oom.OomCapability.DEGRADED_NO_CONTROLLER.value,
-            oom.OomCapability.DEGRADED_NO_SCORE.value,
-            oom.OomCapability.NON_LINUX.value,
+        elif proof_mode in {
+            "linux-degraded",
+            "darwin-bounded",
+            "other-bounded-no-birth",
         }:
             if actual_unit is not None:
                 return False
@@ -4470,7 +4494,6 @@ class Server:
         save_lodes(self.lodes)
         self.broadcast({"type": "lode_updated", "lode": lode})
 
-        logger.info(f"Registered client for lode {lode_id}, active=True")
         return True
 
     def _handle_read_only(self, message: dict, conn: socket.socket) -> None:
