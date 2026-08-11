@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from hopper.cleanup import reap_swiftpm_testing_helpers
-from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
+from hopper.client import MUTATION_ACK_TIMEOUT_SEC, RUN_GENERATION_ENV, HopperConnection, connect
 from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
 from hopper.projects import find_project
 from hopper.tmux import (
@@ -39,6 +39,7 @@ DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
 REGISTRATION_TIMEOUT_SEC = 30.0
 BRANCH_PERSIST_TIMEOUT_SEC = 5.0
+WORKTREE_PUBLICATION_TIMEOUT_SEC = MUTATION_ACK_TIMEOUT_SEC
 PS_SCAN_TIMEOUT_SEC = 5.0
 
 
@@ -234,6 +235,10 @@ class BaseRunner:
         self._registration_refusal_reason: str | None = None
         self._expected_lode_branch: str | None = None
         self._branch_persisted = threading.Event()
+        self._worktree_publication_condition = threading.Condition()
+        self._expected_worktree_path: str | None = None
+        self._worktree_publication_ack: dict | None = None
+        self._worktree_path_persisted = False
         self.is_first_run = False
         self.claude_session_id: str = ""
         self.project_name: str = ""
@@ -486,6 +491,53 @@ class BaseRunner:
         finally:
             self._expected_lode_branch = None
 
+    def _publish_lode_worktree_path(self, worktree_path: str) -> dict:
+        """Publish provenance and wait for admission plus post-save evidence."""
+        expires_at = time.monotonic() + WORKTREE_PUBLICATION_TIMEOUT_SEC
+        with self._worktree_publication_condition:
+            self._expected_worktree_path = worktree_path
+            self._worktree_publication_ack = None
+            self._worktree_path_persisted = False
+        try:
+            if not self.connection:
+                return {"accepted": False, "reason": "transport_unavailable"}
+            try:
+                emitted = self.connection.emit(
+                    "lode_set_worktree_path",
+                    lode_id=self.lode_id,
+                    project=self.project_name,
+                    worktree_path=worktree_path,
+                    ack_requested=True,
+                )
+            except (OSError, RuntimeError):
+                logger.exception("worktree publication transport failed lode=%s", self.lode_id)
+                return {"accepted": False, "reason": "transport_loss"}
+            if not emitted:
+                return {"accepted": False, "reason": "transport_unavailable"}
+
+            with self._worktree_publication_condition:
+                while True:
+                    ack = self._worktree_publication_ack
+                    if ack is not None and ack.get("accepted") is not True:
+                        reason = ack.get("reason")
+                        if not isinstance(reason, str) or not reason:
+                            reason = "server_refused"
+                        return {"accepted": False, "reason": reason}
+                    if ack is not None and self._worktree_path_persisted:
+                        return {"accepted": True, "reason": "persisted"}
+                    remaining = expires_at - time.monotonic()
+                    if remaining <= 0:
+                        reason = (
+                            "persistence_unconfirmed"
+                            if ack is not None and ack.get("accepted") is True
+                            else "mutation_ack_timeout"
+                        )
+                        return {"accepted": False, "reason": reason}
+                    self._worktree_publication_condition.wait(remaining)
+        finally:
+            with self._worktree_publication_condition:
+                self._expected_worktree_path = None
+
     def _emit_state(
         self,
         state: str,
@@ -515,6 +567,16 @@ class BaseRunner:
 
     def _on_server_message(self, message: dict) -> None:
         """Handle incoming server broadcast messages."""
+        if message.get("type") == "mutation_ack":
+            if (
+                message.get("mutation_type") == "lode_set_worktree_path"
+                and message.get("lode_id") == self.lode_id
+            ):
+                with self._worktree_publication_condition:
+                    if self._expected_worktree_path is not None:
+                        self._worktree_publication_ack = message
+                        self._worktree_publication_condition.notify_all()
+            return
         if message.get("type") == "lode_registered":
             if message.get("lode_id") == self.lode_id:
                 self._registration_refusal_reason = None
@@ -535,6 +597,13 @@ class BaseRunner:
         lode = message.get("lode", {})
         if lode.get("id") != self.lode_id:
             return
+        with self._worktree_publication_condition:
+            if (
+                self._expected_worktree_path is not None
+                and lode.get("worktree_path") == self._expected_worktree_path
+            ):
+                self._worktree_path_persisted = True
+                self._worktree_publication_condition.notify_all()
         if "branch" in lode:
             observed_branch = lode["branch"]
             if (

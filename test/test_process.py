@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -86,6 +87,25 @@ def _mock_conn(emitted=None):
                     "lode": {
                         "id": kw["lode_id"],
                         "branch": kw["branch"],
+                    },
+                }
+            )
+        if msg_type == "lode_set_worktree_path" and callback_ref:
+            callback_ref(
+                {
+                    "type": "mutation_ack",
+                    "mutation_type": msg_type,
+                    "lode_id": kw["lode_id"],
+                    "accepted": True,
+                    "reason": "accepted",
+                }
+            )
+            callback_ref(
+                {
+                    "type": "lode_updated",
+                    "lode": {
+                        "id": kw["lode_id"],
+                        "worktree_path": kw["worktree_path"],
                     },
                 }
             )
@@ -645,6 +665,9 @@ class TestMillStage:
         refine.project_name = "my-project"
         refine.lode_branch = runner.lode_branch
         refine.is_first_run = True
+        refine_connection = _mock_conn()
+        refine_connection.start(callback=refine._on_server_message)
+        refine.connection = refine_connection
         with (
             patch("hopper.process.create_worktree") as mock_create,
             patch.object(refine, "_bootstrap_codex", return_value=None) as mock_bootstrap,
@@ -666,7 +689,7 @@ class TestMillStage:
     def test_resumed_mill_reuses_recorded_legacy_worktree_without_creation(self, tmp_path):
         """A resumed mill reuses its recorded legacy branch and existing snapshot."""
         repo_dir = _init_git_repo(tmp_path)
-        worktree = get_worktree_dir("test-id")
+        worktree = get_lode_dir("test-id") / "worktree"
         worktree.parent.mkdir(parents=True, exist_ok=True)
         branch = "hopper-test-id-legacy-title"
         _run_git(repo_dir, "worktree", "add", "-b", branch, str(worktree))
@@ -674,6 +697,7 @@ class TestMillStage:
         runner.project_dir = str(repo_dir)
         runner.is_first_run = False
         runner.lode_branch = branch
+        runner.connection = MagicMock()
 
         with (
             patch("hopper.process.current_branch") as mock_current_branch,
@@ -685,9 +709,206 @@ class TestMillStage:
         assert runner.worktree_path == worktree
         assert runner.lode_branch == branch
         assert runner._cwd == str(worktree)
+        assert runner.worktree_path_basis == "unavailable"
+        runner.connection.emit.assert_not_called()
         mock_current_branch.assert_not_called()
         mock_create.assert_not_called()
         mock_persist.assert_not_called()
+
+    def test_managed_worktree_reuse_publishes_before_return(self):
+        worktree = get_worktree_dir("test-id")
+        worktree.mkdir(parents=True)
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_name = "my-project"
+        runner.lode_branch = "hopper-test-id"
+        emitted = []
+        connection = _mock_conn(emitted)
+        connection.start(callback=runner._on_server_message)
+        runner.connection = connection
+
+        assert runner._establish_lode_worktree() is True
+
+        publication = [item for item in emitted if item[0] == "lode_set_worktree_path"]
+        assert publication == [
+            (
+                "lode_set_worktree_path",
+                {
+                    "lode_id": "test-id",
+                    "project": "my-project",
+                    "worktree_path": str(worktree),
+                    "ack_requested": True,
+                },
+            )
+        ]
+        assert runner.worktree_path_basis == "recorded"
+
+    def test_managed_worktree_creation_publishes_and_retains_on_refusal(self):
+        worktree = get_worktree_dir("test-id")
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_dir = "/project"
+        runner.project_name = "my-project"
+        connection = MagicMock()
+
+        def refuse(msg_type, **payload):
+            if msg_type == "lode_set_worktree_path":
+                runner._on_server_message(
+                    {
+                        "type": "mutation_ack",
+                        "mutation_type": msg_type,
+                        "lode_id": payload["lode_id"],
+                        "accepted": False,
+                        "reason": "worktree_provenance_conflict",
+                    }
+                )
+            return True
+
+        connection.emit.side_effect = refuse
+        runner.connection = connection
+
+        def create(_project, path, _branch):
+            path.mkdir(parents=True)
+            return True, None
+
+        with (
+            patch("hopper.process.create_worktree", side_effect=create),
+            patch.object(runner, "_persist_lode_branch", return_value=True),
+        ):
+            assert runner._establish_lode_worktree() is False
+
+        assert worktree.is_dir()
+        assert runner._setup_error is not None
+        assert "worktree_provenance_conflict" in runner._setup_error
+        assert "Hopper did not proceed" in runner._setup_error
+        assert "hop lode restart test-id" in runner._setup_error
+
+    def test_managed_worktree_creation_publishes_before_return(self):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_dir = "/project"
+        runner.project_name = "my-project"
+        events = []
+        connection = _mock_conn()
+        connection.start(callback=runner._on_server_message)
+        original_emit = connection.emit.side_effect
+
+        def observed_emit(msg_type, **payload):
+            if msg_type == "lode_set_worktree_path":
+                events.append("publish")
+            return original_emit(msg_type, **payload)
+
+        connection.emit.side_effect = observed_emit
+        runner.connection = connection
+
+        def create(_project, path, _branch):
+            events.append("create")
+            path.mkdir(parents=True)
+            return True, None
+
+        with (
+            patch("hopper.process.create_worktree", side_effect=create),
+            patch.object(runner, "_persist_lode_branch", return_value=True),
+        ):
+            assert runner._establish_lode_worktree() is True
+
+        assert events == ["create", "publish"]
+        assert runner.worktree_path_basis == "recorded"
+
+    def test_accepted_worktree_ack_without_broadcast_stops_setup(self):
+        worktree = get_worktree_dir("test-id")
+        worktree.mkdir(parents=True)
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        runner.project_name = "my-project"
+        runner.lode_branch = "hopper-test-id"
+        connection = MagicMock()
+
+        def accept_without_broadcast(msg_type, **payload):
+            runner._on_server_message(
+                {
+                    "type": "mutation_ack",
+                    "mutation_type": msg_type,
+                    "lode_id": payload["lode_id"],
+                    "accepted": True,
+                    "reason": "accepted",
+                }
+            )
+            return True
+
+        connection.emit.side_effect = accept_without_broadcast
+        runner.connection = connection
+
+        with patch("hopper.runner.WORKTREE_PUBLICATION_TIMEOUT_SEC", 0):
+            assert runner._establish_lode_worktree() is False
+
+        assert runner._setup_error is not None
+        assert "persistence_unconfirmed" in runner._setup_error
+
+    def test_crash_after_creation_is_recovered_by_directory_rediscovery(self):
+        worktree = get_worktree_dir("test-id")
+        first = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        first.project_dir = "/project"
+        first.project_name = "my-project"
+        first.connection = MagicMock()
+        first.connection.emit.return_value = False
+
+        def create(_project, path, _branch):
+            path.mkdir(parents=True)
+            return True, None
+
+        with (
+            patch("hopper.process.create_worktree", side_effect=create),
+            patch.object(first, "_persist_lode_branch", return_value=True),
+        ):
+            assert first._establish_lode_worktree() is False
+        assert worktree.is_dir()
+
+        second = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        second.project_name = "my-project"
+        second.lode_branch = "hopper-test-id"
+        emitted = []
+        connection = _mock_conn(emitted)
+        connection.start(callback=second._on_server_message)
+        second.connection = connection
+        with patch("hopper.process.create_worktree") as second_create:
+            assert second._establish_lode_worktree() is True
+
+        second_create.assert_not_called()
+        assert any(msg_type == "lode_set_worktree_path" for msg_type, _ in emitted)
+        assert second.worktree_path_basis == "recorded"
+
+    def test_ship_publishes_worktree_before_environment_or_project_checks(self):
+        worktree = get_worktree_dir("test-id")
+        worktree.mkdir(parents=True)
+        project = worktree.parent / "project"
+        project.mkdir()
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "ship")
+        runner.project_dir = str(project)
+        runner.project_name = "my-project"
+        runner.is_first_run = False
+        events = []
+        connection = _mock_conn()
+        connection.start(callback=runner._on_server_message)
+        original_emit = connection.emit.side_effect
+
+        def observed_emit(msg_type, **payload):
+            if msg_type == "lode_set_worktree_path":
+                events.append("publish")
+            return original_emit(msg_type, **payload)
+
+        connection.emit.side_effect = observed_emit
+        runner.connection = connection
+
+        with (
+            patch(
+                "hopper.process._has_makefile",
+                side_effect=lambda _path: events.append("tooling") or False,
+            ),
+            patch(
+                "hopper.process.is_dirty",
+                side_effect=lambda _path: events.append("dirty") or False,
+            ),
+        ):
+            assert runner._setup_ship() is None
+
+        assert events == ["publish", "tooling", "dirty"]
 
     @pytest.mark.parametrize("branch", ["", "hopper-test-id-legacy-title"])
     def test_resumed_mill_without_worktree_fails_before_launch(self, tmp_path, branch):
@@ -755,8 +976,14 @@ class TestMillStage:
             run_generation=generation,
         )
         runner.project_dir = str(repo_dir)
+        runner.project_name = "my-project"
         runner.is_first_run = False
         connection = MagicMock()
+        ack_conn = MagicMock()
+        server.write_locks[ack_conn] = threading.Lock()
+        ack_conn.sendall.side_effect = lambda data: runner._on_server_message(
+            json.loads(data.decode("utf-8"))
+        )
 
         def emit(msg_type, **payload):
             server._handle_mutation(
@@ -765,7 +992,7 @@ class TestMillStage:
                     "run_generation": generation,
                     **payload,
                 },
-                None,
+                ack_conn if msg_type == "lode_set_worktree_path" else None,
             )
             return True
 
@@ -781,6 +1008,7 @@ class TestMillStage:
         persisted = load_lodes()
         assert persisted[0]["branch"] == branch
         assert json.loads((tmp_path / "active.jsonl").read_text())["branch"] == branch
+        assert persisted[0]["worktree_path"] == str(worktree)
         assert runner.worktree_path == worktree
         assert runner.lode_branch == branch
         assert runner._cwd == str(worktree)
@@ -896,7 +1124,11 @@ class TestMillStage:
             expected_sha = _run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         runner.project_dir = str(repo_dir)
+        runner.project_name = "my-project"
         runner.is_first_run = True
+        connection = _mock_conn()
+        connection.start(callback=runner._on_server_message)
+        runner.connection = connection
 
         with (
             patch.object(runner, "_persist_lode_branch", return_value=True),
@@ -1008,8 +1240,12 @@ class TestMillStage:
         (repo_dir / "new.txt").write_text("new\n")
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
         runner.project_dir = str(repo_dir)
+        runner.project_name = "my-project"
         runner.is_first_run = False
         runner.lode_branch = "hopper-test-id"
+        connection = _mock_conn()
+        connection.start(callback=runner._on_server_message)
+        runner.connection = connection
 
         with patch("hopper.process.set_lode_status") as mock_status:
             assert runner._setup_mill() is None

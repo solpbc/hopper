@@ -23,7 +23,7 @@ import pytest
 
 import hopper.client as hopper_client
 import hopper.server as hopper_server
-from hopper import actions, git
+from hopper import actions, config, git
 from hopper.backlog import BacklogItem
 from hopper.client import (
     HopperConnection,
@@ -9635,3 +9635,203 @@ def test_pane_awaiting_choice_message_names_the_verb_that_works():
     assert "hop lode answer abc12345" in message
     assert "Nothing was pasted" in message
     assert "Type something" in message
+
+
+def _worktree_publication_message(lode_id: str, path: Path, **overrides) -> dict:
+    message = {
+        "type": "lode_set_worktree_path",
+        "lode_id": lode_id,
+        "run_generation": TEST_RUN_GENERATION,
+        "project": "project-one",
+        "worktree_path": str(path),
+        "ack_requested": True,
+    }
+    message.update(overrides)
+    return message
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "lode_not_found",
+        "missing_run_generation",
+        "stale_run_generation",
+        "expected_teardown",
+        "terminal_failure",
+        "lifecycle_grace_pending",
+    ],
+)
+def test_worktree_publication_reports_every_runner_gate(socket_path, make_lode, reason):
+    srv = Server(socket_path)
+    managed = config.worktree_root() / "testid11"
+    managed.mkdir(parents=True)
+    lode = make_lode(
+        project="project-one",
+        state="running",
+        active=True,
+        run_generation=TEST_RUN_GENERATION,
+    )
+    if reason != "lode_not_found":
+        srv.lodes = [lode]
+    if reason == "terminal_failure":
+        lode["failure_kind"] = "oom"
+    if reason == "lifecycle_grace_pending":
+        lode.update(state="new", active=False)
+
+    message = _worktree_publication_message("testid11", managed)
+    if reason == "missing_run_generation":
+        message.pop("run_generation")
+    elif reason == "stale_run_generation":
+        message["run_generation"] = "b" * 32
+    conn = _mock_client(srv)
+    before = copy.deepcopy(lode)
+
+    with (
+        patch.object(
+            srv,
+            "_generation_has_teardown_intent",
+            return_value=reason == "expected_teardown",
+        ),
+        patch("hopper.lodes.save_lodes") as save,
+        patch.object(srv, "broadcast") as broadcast,
+    ):
+        srv._handle_mutation(message, conn)
+
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == reason
+    assert lode == before
+    save.assert_not_called()
+    broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "invalid_project",
+        "project_mismatch",
+        "invalid_worktree_path",
+        "worktree_not_absolute",
+        "worktree_missing",
+        "worktree_outside_root",
+        "worktree_identity_mismatch",
+        "worktree_provenance_conflict",
+    ],
+)
+def test_worktree_publication_reports_every_field_refusal(socket_path, tmp_path, make_lode, reason):
+    srv = Server(socket_path)
+    managed = config.worktree_root() / "testid11"
+    managed.mkdir(parents=True)
+    lode = make_lode(
+        project="project-one",
+        state="running",
+        active=True,
+        run_generation=TEST_RUN_GENERATION,
+    )
+    srv.lodes = [lode]
+    message = _worktree_publication_message("testid11", managed)
+    if reason == "invalid_project":
+        message["project"] = None
+    elif reason == "project_mismatch":
+        message["project"] = "project-two"
+    elif reason == "invalid_worktree_path":
+        message["worktree_path"] = ""
+    elif reason == "worktree_not_absolute":
+        message["worktree_path"] = "relative/worktree"
+    elif reason == "worktree_missing":
+        message["worktree_path"] = str(config.worktree_root() / "missing11")
+    elif reason == "worktree_outside_root":
+        outside = tmp_path / "outside-root"
+        outside.mkdir()
+        message["worktree_path"] = str(outside)
+    elif reason == "worktree_identity_mismatch":
+        other = config.worktree_root() / "other-id"
+        other.mkdir()
+        message["worktree_path"] = str(other)
+    elif reason == "worktree_provenance_conflict":
+        lode["worktree_path"] = str(config.worktree_root() / "previous-id")
+    conn = _mock_client(srv)
+    before = copy.deepcopy(lode)
+
+    with (
+        patch("hopper.lodes.save_lodes") as save,
+        patch.object(srv, "broadcast") as broadcast,
+    ):
+        srv._handle_mutation(message, conn)
+
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == reason
+    assert lode == before
+    save.assert_not_called()
+    broadcast.assert_not_called()
+
+
+def test_worktree_publication_is_idempotent_and_broadcasts_post_save(socket_path, make_lode):
+    srv = Server(socket_path)
+    managed = config.worktree_root() / "testid11"
+    managed.mkdir(parents=True)
+    lode = make_lode(
+        project="project-one",
+        state="running",
+        active=True,
+        run_generation=TEST_RUN_GENERATION,
+        worktree_path=str(managed),
+    )
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+    events = []
+
+    def record_broadcast(message):
+        events.append(("broadcast", message["lode"]["worktree_path"]))
+
+    with (
+        patch("hopper.lodes.save_lodes", side_effect=lambda _lodes: events.append(("save", None))),
+        patch.object(srv, "broadcast", side_effect=record_broadcast),
+    ):
+        srv._handle_mutation(_worktree_publication_message("testid11", managed), conn)
+
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is True
+    assert response["reason"] == "accepted"
+    assert lode["worktree_path"] == str(managed)
+    assert events == [("save", None), ("broadcast", str(managed))]
+
+
+def test_cleanup_uses_recorded_path_even_when_legacy_candidate_exists(socket_path, make_lode):
+    managed = config.worktree_root() / "testid11"
+    managed.mkdir(parents=True)
+    legacy = config.hopper_dir() / "lodes" / "testid11" / "worktree"
+    legacy.mkdir(parents=True)
+    lode = make_lode(
+        project="project-one",
+        branch="hopper-testid11",
+        worktree_path=str(managed),
+    )
+    srv = Server(socket_path)
+
+    with (
+        patch("hopper.server.find_project", return_value=MagicMock(path="/project")),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree") as remove,
+        patch("hopper.server.delete_branch") as delete,
+    ):
+        srv._cleanup_worktree(lode)
+
+    remove.assert_called_once_with("/project", str(managed))
+    delete.assert_called_once_with("/project", "hopper-testid11")
+
+
+def test_cleanup_does_not_guess_between_unrecorded_candidates(socket_path, make_lode):
+    (config.worktree_root() / "testid11").mkdir(parents=True)
+    (config.hopper_dir() / "lodes" / "testid11" / "worktree").mkdir(parents=True)
+    srv = Server(socket_path)
+
+    with (
+        patch("hopper.server.find_project") as find_project,
+        patch("hopper.server.remove_worktree") as remove,
+    ):
+        srv._cleanup_worktree(make_lode(project="project-one"))
+
+    find_project.assert_not_called()
+    remove.assert_not_called()

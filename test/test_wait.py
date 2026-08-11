@@ -5,6 +5,7 @@
 
 import copy
 import json
+import subprocess
 import threading
 from collections import deque
 from pathlib import Path
@@ -12,8 +13,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import hopper.cli as cli
 import hopper.wait as wait
-from hopper import actions
+from hopper import actions, remote
+from hopper import client as hopper_client
+from hopper import deadline as deadline_utils
+from hopper.deadline import make_deadline
 from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status, format_terminal_failure_status
 from hopper.tmux import Liveness
 
@@ -25,6 +30,9 @@ class FakeClock:
     def __call__(self):
         return self.now
 
+    def advance(self, seconds):
+        self.now += seconds
+
 
 class FakeConnection:
     def __init__(self, on_start=None):
@@ -33,7 +41,8 @@ class FakeConnection:
         self.on_connect = None
         self.stopped = False
 
-    def start(self, callback=None, on_connect=None):
+    def start(self, callback=None, on_connect=None, *, deadline=None):
+        del deadline
         self.callback = callback
         self.on_connect = on_connect
         if self.on_start:
@@ -41,7 +50,8 @@ class FakeConnection:
         elif on_connect:
             on_connect()
 
-    def stop(self):
+    def stop(self, *, deadline=None):
+        del deadline
         self.stopped = True
 
 
@@ -85,7 +95,7 @@ def run_local_wait(
     initial,
     observations=(),
     *,
-    timeout_s=0,
+    timeout_s=3600,
     observer_timeout_s=300,
     json_output=False,
     on_start=None,
@@ -98,7 +108,8 @@ def run_local_wait(
 
     monkeypatch.setattr(wait, "_monotonic", clock)
 
-    def condition_wait(condition, timeout):
+    def condition_wait(condition, deadline, wake_at):
+        timeout = max(0.0, wake_at - clock())
         if wait_action:
             wait_action(clock, timeout, connection)
         else:
@@ -108,7 +119,8 @@ def run_local_wait(
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: dict(initial))
     monkeypatch.setattr(wait.client, "HopperConnection", lambda socket_path: connection)
 
-    def read_snapshot(socket_path, lid):
+    def read_snapshot(socket_path, lid, timeout=2.0, *, deadline=None):
+        del deadline, timeout
         nonlocal last
         if scripted:
             current = scripted.popleft()
@@ -121,11 +133,11 @@ def run_local_wait(
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         [initial["id"]],
-        timeout_s=timeout_s,
+        deadline=make_deadline(timeout_s, clock=clock),
         poll_s=30,
         observer_timeout_s=observer_timeout_s,
         json_output=json_output,
-        resolver=lambda socket_path, lid: {
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": dict(initial),
             "host": "local",
@@ -155,9 +167,8 @@ def install_synchronous_remote_driver(monkeypatch, clock):
         wait._remote_worker(
             worker_state,
             lid,
-            record["host"],
+            record["route"],
             state["poll_s"],
-            state["probe_timeout_s"],
             probe_once,
         )
 
@@ -168,7 +179,8 @@ def install_synchronous_remote_driver(monkeypatch, clock):
             if state["records"][lid]["remote"]:
                 post_one(state, probe_remote, lid)
 
-    def condition_wait(condition, timeout):
+    def condition_wait(condition, deadline, wake_at):
+        timeout = max(0.0, wake_at - clock())
         clock.now += timeout
         state = holder["state"]
         for lid in list(state["pending"]):
@@ -177,7 +189,7 @@ def install_synchronous_remote_driver(monkeypatch, clock):
                 post_one(state, holder["probe"], lid)
 
     monkeypatch.setattr(wait, "_start_remote_workers", start_workers)
-    monkeypatch.setattr(wait, "_stop_remote_workers", lambda state: None)
+    monkeypatch.setattr(wait, "_stop_remote_workers", lambda state: state["stop_event"].set())
     monkeypatch.setattr(wait, "_condition_wait", condition_wait)
 
 
@@ -186,7 +198,7 @@ def run_remote_wait(
     initials,
     probes,
     *,
-    timeout_s=0,
+    timeout_s=3600,
     observer_timeout_s=300,
     json_output=False,
     publish=True,
@@ -195,10 +207,15 @@ def run_remote_wait(
     install_synchronous_remote_driver(monkeypatch, clock)
     monkeypatch.setattr(wait, "_monotonic", clock)
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        wait.remote,
+        "run_remote",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, "", ""),
+    )
     if not publish:
-        monkeypatch.setattr(wait, "_publish_resident_routes", lambda records: None)
+        monkeypatch.setattr(wait, "_publish_resident_routes", lambda records, **_kwargs: None)
 
-    def resolver(socket_path, lid):
+    def resolver(socket_path, lid, **_kwargs):
         lode = initials[lid]
         return {
             "outcome": "found",
@@ -211,7 +228,7 @@ def run_remote_wait(
     queues = {lid: deque(items) for lid, items in probes.items()}
     last = {}
 
-    def probe_remote(host, lid, timeout):
+    def probe_remote(host, lid, **_kwargs):
         if queues[lid]:
             current = queues[lid].popleft()
             last[lid] = current
@@ -224,7 +241,7 @@ def run_remote_wait(
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         list(initials),
-        timeout_s=timeout_s,
+        deadline=make_deadline(timeout_s, clock=clock),
         poll_s=30,
         observer_timeout_s=observer_timeout_s,
         json_output=json_output,
@@ -232,6 +249,266 @@ def run_remote_wait(
         probe_remote=probe_remote,
     )
     return rc, clock
+
+
+def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path):
+    clock = FakeClock()
+    ledger = []
+    expirations = []
+    refused = []
+    original_claim = deadline_utils.claim_call_budget
+
+    def record_claim(deadline, operation, *, cap_s=None):
+        start = deadline["clock"]()
+        budget = original_claim(deadline, operation, cap_s=cap_s)
+        if budget is None:
+            refused.append((operation, start))
+        else:
+            ledger.append((operation, start, budget))
+            expirations.append(deadline["expires_at"])
+        return budget
+
+    monkeypatch.setattr(deadline_utils, "claim_call_budget", record_claim)
+    monkeypatch.setattr(wait, "_monotonic", clock)
+
+    resolution_deadline = make_deadline(0.01, clock=clock)
+
+    def nearly_exhausted_resolver(_socket_path, _lid, **_kwargs):
+        clock.advance(0.009)
+        return {
+            "outcome": "found",
+            "lode": snapshot(),
+            "host": "local",
+            "canonical_id": "abc123",
+            "exit_code": 0,
+        }
+
+    records = wait._resolve_targets(
+        Path("server.sock"),
+        ["abc123"],
+        False,
+        nearly_exhausted_resolver,
+        deadline=resolution_deadline,
+        child_control=remote.make_child_registry(),
+    )
+    assert isinstance(records, dict)
+
+    exchange_calls = []
+
+    def exchange(*_args, **_kwargs):
+        exchange_calls.append(clock())
+        clock.advance(0.005)
+        return {"type": "lode_snapshot", "result": "absent"}
+
+    monkeypatch.setattr(hopper_client, "_exchange_message", exchange)
+    snapshot_deadline = make_deadline(0.01, clock=clock)
+    assert hopper_client.read_lode_snapshot(
+        Path("server.sock"),
+        "missing",
+        deadline=snapshot_deadline,
+    ) == ("absent", None)
+    clock.advance(0.005)
+    assert (
+        hopper_client.read_lode_snapshot(
+            Path("server.sock"),
+            "missing",
+            deadline=snapshot_deadline,
+        )[0]
+        == "unavailable"
+    )
+    assert len(exchange_calls) == 1
+
+    resolver_deadline = make_deadline(0.01, clock=clock)
+    local_resolution_calls = []
+
+    def nearly_exhausted_local(*_args, **_kwargs):
+        local_resolution_calls.append(clock())
+        clock.advance(0.01)
+        return "absent", None
+
+    monkeypatch.setattr(hopper_client, "read_lode_snapshot", nearly_exhausted_local)
+    monkeypatch.setattr(cli, "_remote_disabled", lambda: False)
+    cache_after_expiry = MagicMock(side_effect=AssertionError("cache read after expiry"))
+    monkeypatch.setattr(remote, "load_lode_cache", cache_after_expiry)
+    resolution = cli._resolve_lode(
+        Path("server.sock"),
+        "missing",
+        deadline=resolver_deadline,
+        child_control=remote.make_child_registry(),
+    )
+    assert resolution["outcome"] == "unavailable"
+    assert len(local_resolution_calls) == 1
+    cache_after_expiry.assert_not_called()
+
+    route_deadline = make_deadline(1.0, clock=clock)
+    monkeypatch.setattr(remote.config, "hopper_dir", lambda: tmp_path)
+    with remote._lode_cache_lock(deadline=route_deadline):
+        pass
+    assert remote._read_lode_cache(deadline=route_deadline) == ({}, False)
+    remote._save_lode_cache({}, deadline=route_deadline)
+
+    remote_record = wait._new_record(
+        "remote1",
+        snapshot(lid="remote1", host="worker.example", project="project"),
+        "worker.example",
+        clock(),
+        0,
+    )
+    route_calls = []
+    monkeypatch.setattr(
+        wait.remote,
+        "load_lode_cache",
+        lambda **_kwargs: route_calls.append("load") or {},
+    )
+    monkeypatch.setattr(
+        wait.remote,
+        "remember_lode",
+        lambda *_args, **_kwargs: route_calls.append("write"),
+    )
+    wait._publish_resident_routes({"remote1": remote_record}, deadline=route_deadline)
+    assert route_calls == ["load", "write"]
+
+    probe_deadline = make_deadline(0.01, clock=clock)
+    probe_calls = []
+
+    def blocked_probe(*_args, **_kwargs):
+        probe_calls.append(clock())
+        clock.advance(0.01)
+        return None, "unreadable"
+
+    wait._probe_remote_observation(
+        "remote1",
+        "worker.example",
+        probe_deadline,
+        blocked_probe,
+        remote.make_child_registry(),
+    )
+    wait._probe_remote_observation(
+        "remote1",
+        "worker.example",
+        probe_deadline,
+        blocked_probe,
+        remote.make_child_registry(),
+    )
+    assert len(probe_calls) == 1
+
+    enrichment_deadline = make_deadline(0.01, clock=clock)
+    enrich_calls = []
+
+    def annotate(lode, **_kwargs):
+        enrich_calls.append(lode["id"])
+        clock.advance(0.01)
+        return {**lode, "status_display": lode["status"], "pane_liveness": "alive"}
+
+    monkeypatch.setattr(wait, "lode_with_status_annotations", annotate)
+    wait._final_record(
+        remote_record,
+        "shipped",
+        0,
+        clock(),
+        None,
+        deadline=enrichment_deadline,
+        child_control=remote.make_child_registry(),
+    )
+    wait._final_record(
+        remote_record,
+        "shipped",
+        0,
+        clock(),
+        None,
+        deadline=enrichment_deadline,
+        child_control=remote.make_child_registry(),
+    )
+    assert enrich_calls == ["remote1"]
+
+    class NoWaitCondition:
+        def wait(self, timeout):
+            raise AssertionError(f"condition wait started after expiry: {timeout}")
+
+    wait._condition_wait(NoWaitCondition(), enrichment_deadline, clock() + 1.0)
+
+    class NoStartThread:
+        def __init__(self, **_kwargs):
+            raise AssertionError("worker created after expiry")
+
+    monkeypatch.setattr(wait.threading, "Thread", NoStartThread)
+    worker_state = {
+        "records": {"remote1": remote_record},
+        "pending": {"remote1"},
+        "poll_s": 30,
+        "probe_timeout_s": 5,
+        "workers": {},
+        "deadline": enrichment_deadline,
+        "child_control": remote.make_child_registry(),
+        "stop_event": threading.Event(),
+    }
+    wait._start_remote_workers(worker_state, blocked_probe)
+    wait._stop_remote_workers(worker_state)
+    assert worker_state["stop_event"].is_set()
+
+    connection = hopper_client.HopperConnection(Path("server.sock"))
+
+    class NoJoinThread:
+        def join(self, timeout):
+            raise AssertionError(f"connection joined after expiry: {timeout}")
+
+        def is_alive(self):
+            return True
+
+    connection.thread = NoJoinThread()
+    connection.stop(deadline=enrichment_deadline)
+
+    class CleanupChild:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout):
+            assert timeout == 0
+            return self.returncode
+
+    child_control = remote.make_child_registry()
+    cleanup_child = CleanupChild()
+    child_control["children"].add(cleanup_child)
+    remote.cancel_owned_children(child_control, enrichment_deadline)
+    assert cleanup_child.poll() == -9
+    assert child_control["children"] == set()
+
+    assert ledger
+    assert all(budget > 0 for _operation, _start, budget in ledger)
+    assert all(
+        budget <= expires_at - start
+        for (_operation, start, budget), expires_at in zip(ledger, expirations, strict=True)
+    )
+    assert {
+        "wait.resolve_target",
+        "client.read_lode_snapshot",
+        "cli.local_resolution",
+        "remote.cache_lock",
+        "remote.cache_read",
+        "remote.cache_write",
+        "wait.route_cache_load",
+        "wait.route_cache_remember",
+        "wait.remote_probe",
+        "wait.pane_liveness",
+    } <= {operation for operation, _start, _budget in ledger}
+    assert {
+        "client.read_lode_snapshot",
+        "cli.route_cache_load",
+        "wait.remote_probe",
+        "wait.pane_liveness",
+        "wait.condition_wait",
+        "wait.remote_worker_start",
+        "client.connection_stop",
+        "remote.child_reap_after_terminate",
+    } <= {operation for operation, _start in refused}
 
 
 @pytest.mark.parametrize(
@@ -269,21 +546,24 @@ def test_json_terminal_records_have_stable_and_additive_fields(
 
     assert rc == code
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {
-        "id": "abc123",
-        "outcome": outcome,
-        "stage": initial["stage"],
-        "state": initial["state"],
-        "status": initial["status"],
-        "failure_kind": initial.get("failure_kind"),
-        "active": initial["active"],
-        "archived": initial["archived"],
-        "reason": None,
-        "source": "local",
-        "observed_age_s": 0.0,
-        "status_display": initial["status"],
-        "pane_liveness": "not_probed",
-    }
+    assert set(payload) == wait.FINAL_RECORD_KEYS
+    assert {"host", "source", "reason"}.isdisjoint(payload)
+    assert payload["id"] == "abc123"
+    assert payload["outcome"] == outcome
+    assert payload["exit_code"] == code
+    assert payload["reason_code"] == wait.REASON_CODES[outcome]
+    if outcome == "shipped":
+        assert payload["recovery"] is None
+    else:
+        assert isinstance(payload["recovery"], str)
+    assert payload["stage"] == initial["stage"]
+    assert payload["state"] == initial["state"]
+    assert payload["status"] == initial["status"]
+    assert payload["server"] == "test-host"
+    assert payload["route"] == "local"
+    assert payload["observed_age_s"] == 0.0
+    assert payload["status_display"] == initial["status"]
+    assert payload["pane_liveness"] == "not_probed"
 
 
 @pytest.mark.parametrize(
@@ -340,6 +620,7 @@ def test_read_due_locals_uses_one_bounded_snapshot(
         "observations": deque(),
         "poll_s": 30.0,
         "shutdown": False,
+        "deadline": make_deadline(60),
     }
     monkeypatch.setattr(wait, "_monotonic", lambda: 12.5)
     read_snapshot = MagicMock(return_value=result)
@@ -357,7 +638,12 @@ def test_read_due_locals_uses_one_bounded_snapshot(
 
     wait._read_due_locals(state, Path("server.sock"), 0.0)
 
-    read_snapshot.assert_called_once_with(Path("server.sock"), "abc123")
+    read_snapshot.assert_called_once_with(
+        Path("server.sock"),
+        "abc123",
+        timeout=2.0,
+        deadline=state["deadline"],
+    )
     observation = state["observations"].popleft()
     assert observation["kind"] == expected_kind
     assert observation["payload"] == expected_payload
@@ -391,17 +677,21 @@ def test_initial_snapshot_with_invalid_archived_is_unavailable(archived, capsys)
         Path("server.sock"),
         ["abc123"],
         False,
-        resolver=lambda socket_path, lid: {
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": raw,
             "host": "local",
             "canonical_id": "abc123",
             "exit_code": 0,
         },
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
     )
 
-    assert result == 4
-    assert capsys.readouterr().out == "Lode status unavailable for 'abc123'.\n"
+    record = result["failure:abc123"]
+    assert record["preset_outcome"] == "status_unavailable"
+    assert record["preset_code"] == 4
+    assert capsys.readouterr().out == ""
 
 
 def test_ambiguous_local_observation_never_reaches_snapshot_validation(monkeypatch):
@@ -467,10 +757,12 @@ def test_archived_before_shipping_renders_preserved_diagnostics(monkeypatch, cap
         "✗ abc123 archived before shipping: Preserved legacy diagnostic",
         (
             "  stage=mill state=legacy active=True status=Preserved legacy diagnostic "
-            "source=local observed_age_s=0.000"
+            "route=local observed_age_s=0.000"
         ),
-        "Inspect with: hop lode status abc123",
-        "Recover with: hop lode unarchive abc123",
+        (
+            "Observed outcome archived for 'abc123'. Hopper did not proceed. "
+            "Recover with: hop lode unarchive abc123."
+        ),
     ]
 
 
@@ -482,7 +774,7 @@ def test_archived_before_shipping_json_has_fixed_reason(monkeypatch, capsys):
     assert rc == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "archived"
-    assert payload["reason"] == "archived_before_shipping"
+    assert payload["reason_code"] == "archived_before_shipping"
     assert payload["archived"] is True
     assert payload["state"] == "error"
     assert payload["status"] == "Preserved error"
@@ -495,17 +787,19 @@ def test_initial_local_unavailable_can_resolve_remotely(monkeypatch):
         Path("server.sock"),
         ["abc123"],
         False,
-        resolver=lambda socket_path, lid: {
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": remote_snapshot,
             "host": "fedora.local",
             "canonical_id": "abc123",
             "exit_code": 0,
         },
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
     )
 
     assert records["abc123"]["remote"] is True
-    assert records["abc123"]["host"] == "fedora.local"
+    assert records["abc123"]["route"] == "fedora.local"
 
 
 def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
@@ -515,25 +809,35 @@ def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
         Path("server.sock"),
         ["abc123"],
         False,
-        resolver=lambda socket_path, lid: {
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "unavailable",
             "error": error,
             "exit_code": 2,
         },
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
     )
 
-    assert records == 4
-    assert capsys.readouterr().out == f"{error}\n"
+    record = records["failure:abc123"]
+    assert record["preset_outcome"] == "status_unavailable"
+    assert record["preset_code"] == 4
+    assert capsys.readouterr().out == ""
 
 
 def test_initial_unavailable_has_wait_only_status_outcome(monkeypatch, capsys):
-    monkeypatch.setattr(wait, "_resolve_targets", lambda *args, **kwargs: 4)
+    record = wait._resolution_failure_record("abc123", {"outcome": "unavailable"}, 0, 0.0)
+    monkeypatch.setattr(
+        wait,
+        "_resolve_targets",
+        lambda *args, **kwargs: {record["key"]: record},
+    )
 
     rc, _, _ = run_local_wait(monkeypatch, snapshot())
 
     captured = capsys.readouterr()
     assert rc == 4
-    assert captured.err == "hop wait: status_unavailable — exited 4\n"
+    assert captured.err == "hop wait: abc123 status_unavailable — exited 4\n"
+    assert "abc123 status_unavailable" in captured.out
 
 
 def test_initial_unavailable_json_keeps_stdout_clean(capsys):
@@ -543,17 +847,21 @@ def test_initial_unavailable_json_keeps_stdout_clean(capsys):
         Path("server.sock"),
         ["abc123"],
         True,
-        resolver=lambda socket_path, lid: {
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "unavailable",
             "error": error,
             "exit_code": 2,
         },
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
     )
 
     captured = capsys.readouterr()
-    assert result == 4
+    record = result["failure:abc123"]
+    assert record["preset_outcome"] == "status_unavailable"
+    assert record["preset_code"] == 4
     assert captured.out == ""
-    assert captured.err == f"{error}\n"
+    assert captured.err == ""
 
 
 def test_local_event_is_only_a_reconciliation_hint(monkeypatch, capsys):
@@ -582,7 +890,6 @@ def test_local_event_is_only_a_reconciliation_hint(monkeypatch, capsys):
     assert connection.stopped
     out = capsys.readouterr().out
     assert out.count("shipped") == 1
-    assert "Real result" in out
     assert "Fabricated" not in out
 
 
@@ -611,16 +918,15 @@ def test_reconnect_requests_immediate_authoritative_read(monkeypatch, capsys):
     assert "Recovered ship" not in capsys.readouterr().out
 
 
-def test_later_inactive_snapshot_requires_inspection_before_runner_launch(monkeypatch, capsys):
+def test_later_inactive_snapshot_has_prescriptive_recovery(monkeypatch, capsys):
     inactive = snapshot(state="paused", status="Stopped", active=False)
     rc, _, _ = run_local_wait(monkeypatch, snapshot(), [("found", inactive)])
 
     assert rc == 1
     out = capsys.readouterr().out
     assert "state=paused active=False status=Stopped" in out
-    assert "Inspect with: hop lode status abc123" in out
-    assert "Do not start another runner until pane absence is proved." in out
-    assert "restart" not in out.lower()
+    assert "Hopper did not proceed" in out
+    assert "Recover with: hop lode resume abc123" in out
 
 
 def test_initial_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
@@ -677,7 +983,7 @@ def test_two_consecutive_not_found_win_observer_boundary(monkeypatch, capsys):
     assert clock.now == 30
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "not_found"
-    assert payload["source"] == "fedora.local"
+    assert payload["route"] == "fedora.local"
 
 
 def test_not_found_human_output_includes_inspection_guidance(monkeypatch, capsys):
@@ -691,8 +997,8 @@ def test_not_found_human_output_includes_inspection_guidance(monkeypatch, capsys
 
     assert rc == 1
     out = capsys.readouterr().out
-    assert "source=fedora.local" in out
-    assert "Inspect with: hop lode status abc123" in out
+    assert "route=fedora.local" in out
+    assert "Recover with: hop -H fedora.local lode status abc123" in out
 
 
 def test_not_found_streak_resets_on_observer_failure(monkeypatch, capsys):
@@ -890,10 +1196,10 @@ def test_reconnecting_uses_shared_grace_and_authoritative_confirmation(monkeypat
     assert clock.now == 120
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "reconnect_stalled"
-    assert payload["reason"] == "runner_reregistration_stalled"
+    assert payload["reason_code"] == "runner_reregistration_stalled"
 
 
-def test_reconnect_stalled_human_output_is_inspection_only(monkeypatch, capsys):
+def test_reconnect_stalled_human_output_has_prescriptive_recovery(monkeypatch, capsys):
     reconnecting = snapshot(
         state="reconnecting",
         active=False,
@@ -910,10 +1216,8 @@ def test_reconnect_stalled_human_output_is_inspection_only(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert rc == 1
     assert "runner reregistration stalled" in output
-    assert "Inspect with: hop lode status abc123" in output
-    assert "Inspect pane with: hop lode peek abc123" in output
-    assert "Do not start another runner until pane absence is proved." in output
-    assert "restart" not in output.lower()
+    assert "Hopper did not proceed" in output
+    assert "Recover with: hop lode restart abc123" in output
 
 
 def test_shared_grace_away_and_back_gets_fresh_origin(monkeypatch, capsys):
@@ -944,7 +1248,7 @@ def test_confirmed_stuck_still_beats_expired_observer_deadline():
         "pending": {"abc123"},
         "records": {"abc123": record},
         "observer_timeout_s": 45,
-        "overall_deadline": None,
+        "overall_deadline": float("inf"),
     }
 
     outcomes = wait._collect_boundary_outcomes(state, 120)
@@ -993,7 +1297,7 @@ def test_every_valid_action_phase_has_one_wait_boundary(phase, category):
         "pending": {"abcd2345"},
         "records": {"abcd2345": record},
         "observer_timeout_s": 300,
-        "overall_deadline": None,
+        "overall_deadline": float("inf"),
     }
 
     outcomes = wait._collect_boundary_outcomes(state, 0)
@@ -1022,7 +1326,7 @@ def test_structured_startup_action_projection_is_blocked(action_type):
         "pending": {"abc123"},
         "records": {"abc123": record},
         "observer_timeout_s": 300,
-        "overall_deadline": None,
+        "overall_deadline": float("inf"),
     }
 
     outcomes = wait._collect_boundary_outcomes(state, 0)
@@ -1067,7 +1371,7 @@ def test_action_spawn_grace_origin_ignores_projection_churn(monkeypatch, capsys)
     assert clock.now == 120
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "action_stalled"
-    assert payload["reason"] == "successor_adoption_stalled"
+    assert payload["reason_code"] == "successor_adoption_stalled"
 
 
 def test_action_spawn_grace_leaving_and_reentering_gets_fresh_origin(monkeypatch, capsys):
@@ -1102,7 +1406,7 @@ def test_action_spawn_grace_leaving_and_reentering_gets_fresh_origin(monkeypatch
     assert clock.now == 150
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "action_stalled"
-    assert payload["reason"] == "successor_adoption_stalled"
+    assert payload["reason_code"] == "successor_adoption_stalled"
 
 
 def test_action_blocked_uses_structured_recovery_command(monkeypatch, capsys):
@@ -1147,7 +1451,7 @@ def test_storage_error_and_gate_precede_action_attention(changes, expected):
         "pending": {"abc123"},
         "records": {"abc123": record},
         "observer_timeout_s": 300,
-        "overall_deadline": None,
+        "overall_deadline": float("inf"),
     }
 
     outcomes = wait._collect_boundary_outcomes(state, 0)
@@ -1158,7 +1462,7 @@ def test_storage_error_and_gate_precede_action_attention(changes, expected):
 @pytest.mark.parametrize(
     ("observer_timeout_s", "overall_deadline", "expected"),
     [
-        (45, None, "observer_unavailable"),
+        (45, float("inf"), "observer_unavailable"),
         (0, 30, "timeout"),
     ],
 )
@@ -1288,7 +1592,7 @@ def test_remote_stuck_human_uses_remote_peek_without_local_capture(monkeypatch, 
     assert "state=stuck" in out
     assert "active=True" in out
     assert "status=Confirmed wedge" in out
-    assert "source=fedora.local" in out
+    assert "route=fedora.local" in out
     assert "observed_age_s=" in out
     assert "Initial wedge" not in out
 
@@ -1309,7 +1613,7 @@ def test_remote_stuck_human_without_pane_uses_remote_peek(monkeypatch, capsys):
 
     assert rc == 3
     out = capsys.readouterr().out
-    assert "source=fedora.local" in out
+    assert "route=fedora.local" in out
     assert "pane: <unknown>" in out
     assert "hop -H fedora.local lode peek abc123" in out
 
@@ -1346,25 +1650,11 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
     payloads = [json.loads(line) for line in captured.out.splitlines()]
     assert len(payloads) == 1
     payload = payloads[0]
-    assert set(payload) == {
-        "id",
-        "outcome",
-        "stage",
-        "state",
-        "status",
-        "failure_kind",
-        "active",
-        "archived",
-        "reason",
-        "source",
-        "observed_age_s",
-        "host",
-        "status_display",
-        "pane_liveness",
-    }
+    assert set(payload) == wait.FINAL_RECORD_KEYS
+    assert {"host", "source", "reason"}.isdisjoint(payload)
     assert payload["outcome"] == "stuck"
-    assert payload["source"] == "fedora.local"
-    assert payload["host"] == "fedora.local"
+    assert payload["server"] == "fedora.local"
+    assert payload["route"] == "fedora.local"
     assert payload["stage"] == "refine"
     assert payload["state"] == "stuck"
     assert payload["status"] == "Confirmed wedge"
@@ -1372,7 +1662,7 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
     assert payload["pane_liveness"] == "not_probed"
     assert "fedora.local" in captured.err
     assert "%83" in captured.err
-    assert "hop -H fedora.local lode peek abc123" in captured.err
+    assert "hop -H fedora.local lode peek abc123" in payload["recovery"]
     assert "--- last 50 lines" not in captured.err
     assert "Inspect with" not in captured.out
 
@@ -1382,7 +1672,7 @@ def test_local_stuck_human_captures_only_last_50_pane_lines(monkeypatch, capsys)
     pane_capture = "\n".join(f"line {number}" for number in range(1, 61))
     captured_targets = []
 
-    def capture(target):
+    def capture(target, **_kwargs):
         captured_targets.append(target)
         return pane_capture
 
@@ -1403,7 +1693,7 @@ def test_local_stuck_human_captures_only_last_50_pane_lines(monkeypatch, capsys)
     assert "  line 11" in out_lines[start:end]
     assert "  line 60" in out_lines[start:end]
     assert any(
-        "stage=mill state=stuck active=True status=Local wedge source=local observed_age_s=" in line
+        "stage=mill state=stuck active=True status=Local wedge route=local observed_age_s=" in line
         for line in out_lines
     )
 
@@ -1419,7 +1709,7 @@ def test_gated_human_output_includes_latest_snapshot_summary(monkeypatch, capsys
     assert "state=gated" in out
     assert "active=True" in out
     assert "status=Review required" in out
-    assert "source=local" in out
+    assert "route=local" in out
     assert "observed_age_s=" in out
 
 
@@ -1443,8 +1733,12 @@ def test_gated_parked_gone_human_output_reports_restart_and_exits_two(monkeypatc
 
     assert rc == 2
     assert capsys.readouterr().out.splitlines() == [
-        "Lode abc123 is gated. Review with: hop gate show abc123",
-        f"  stage=mill state=gated active=True status={expected} source=local observed_age_s=0.000",
+        "Lode abc123 is gated.",
+        f"  stage=mill state=gated active=True status={expected} route=local observed_age_s=0.000",
+        (
+            "Observed outcome gated for 'abc123'. Hopper did not proceed. "
+            "Recover with: hop gate show abc123."
+        ),
     ]
 
 
@@ -1466,7 +1760,24 @@ def test_gated_display_copy_does_not_mutate_wait_record(capsys):
     )
 
     with patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE):
-        wait._emit_outcome(record, "gated", False, 0.0)
+        deadline = make_deadline(60)
+        final_record = wait._final_record(
+            record,
+            "gated",
+            2,
+            0.0,
+            None,
+            deadline=deadline,
+            child_control=remote.make_child_registry(),
+        )
+        wait._emit_outcome(
+            record,
+            "gated",
+            False,
+            0.0,
+            deadline=deadline,
+            final_record=final_record,
+        )
 
     assert f"status={expected}" in capsys.readouterr().out
     assert record == before
@@ -1496,7 +1807,9 @@ def test_gated_parked_json_reports_gone_status(monkeypatch, capsys):
     assert payload["status"] == stored
     assert payload["status_display"] == expected
     assert payload["pane_liveness"] == "gone"
-    mock_liveness.assert_called_once_with("%23")
+    mock_liveness.assert_called_once()
+    assert mock_liveness.call_args.args == ("%23",)
+    assert mock_liveness.call_args.kwargs["timeout"] > 0
 
 
 def test_remote_gated_wait_json_is_not_probed(monkeypatch, capsys):
@@ -1525,7 +1838,8 @@ def test_remote_gated_wait_json_is_not_probed(monkeypatch, capsys):
 
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
-    assert payload["host"] == "fedora.local"
+    assert payload["server"] == "fedora.local"
+    assert payload["route"] == "fedora.local"
     assert payload["status"] == stored
     assert payload["status_display"] == stored
     assert payload["pane_liveness"] == "not_probed"
@@ -1556,28 +1870,23 @@ def test_observer_failure_reports_latest_valid_snapshot(monkeypatch, capsys, jso
     captured = capsys.readouterr()
     if json_output:
         payload = json.loads(captured.out)
-        assert payload == {
-            "id": "abc123",
-            "outcome": "observer_unavailable",
-            "stage": "refine",
-            "state": "design",
-            "status": "Later durable status",
-            "failure_kind": None,
-            "active": True,
-            "archived": False,
-            "reason": None,
-            "source": "fedora.local",
-            "observed_age_s": 75.0,
-            "host": "fedora.local",
-            "status_display": "Later durable status",
-            "pane_liveness": "not_probed",
-        }
+        assert set(payload) == wait.FINAL_RECORD_KEYS
+        assert payload["id"] == "abc123"
+        assert payload["outcome"] == "observer_unavailable"
+        assert payload["reason_code"] == "observer_freshness_expired"
+        assert payload["server"] == "fedora.local"
+        assert payload["route"] == "fedora.local"
+        assert payload["stage"] == "refine"
+        assert payload["state"] == "design"
+        assert payload["status"] == "Later durable status"
+        assert payload["observed_age_s"] == 75.0
+        assert payload["tmux_pane"] is None
     else:
         assert "stage=refine state=design active=True" in captured.out
-        assert "status=Later durable status source=fedora.local" in captured.out
+        assert "status=Later durable status route=fedora.local" in captured.out
         assert "observed_age_s=75.000" in captured.out
-        assert "Check status with: hop lode status abc123" in captured.out
-        assert "Retry with: hop wait abc123" in captured.out
+        assert "Hopper did not proceed" in captured.out
+        assert "Recover with: hop -H fedora.local wait abc123" in captured.out
 
 
 @pytest.mark.parametrize("initial_state", ["running", "shipped"])
@@ -1590,7 +1899,7 @@ def test_cache_failure_warns_once_and_does_not_override_snapshot(
         active=initial_state != "shipped",
     )
     shipped = snapshot(host="fedora.local", stage="shipped", active=False, status="Done")
-    monkeypatch.setattr(wait.remote, "load_lode_cache", lambda: {})
+    monkeypatch.setattr(wait.remote, "load_lode_cache", lambda **_kwargs: {})
     monkeypatch.setattr(
         wait.remote,
         "remember_lode",
@@ -1616,7 +1925,7 @@ def test_cache_read_failure_warns_once_and_shipped_still_succeeds(monkeypatch, c
     monkeypatch.setattr(
         wait.remote,
         "load_lode_cache",
-        lambda: (_ for _ in ()).throw(OSError("unreadable cache")),
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("unreadable cache")),
     )
 
     rc, _ = run_remote_wait(
@@ -1633,7 +1942,7 @@ def test_cache_read_failure_warns_once_and_shipped_still_succeeds(monkeypatch, c
 
 def test_jsonl_cache_warning_stays_on_stderr(monkeypatch, capsys):
     initial = snapshot(host="fedora.local", stage="shipped", active=False)
-    monkeypatch.setattr(wait.remote, "load_lode_cache", lambda: {})
+    monkeypatch.setattr(wait.remote, "load_lode_cache", lambda **_kwargs: {})
     monkeypatch.setattr(
         wait.remote,
         "remember_lode",
@@ -1660,7 +1969,7 @@ def test_unchanged_remote_mapping_is_not_republished(monkeypatch):
     monkeypatch.setattr(
         wait.remote,
         "load_lode_cache",
-        lambda: {"abc123": {"host": "fedora.local"}},
+        lambda **_kwargs: {"abc123": {"host": "fedora.local"}},
     )
     calls = []
     monkeypatch.setattr(wait.remote, "remember_lode", lambda *args: calls.append(args))
@@ -1709,15 +2018,18 @@ def test_remote_worker_converts_every_outcome_to_observation(probe_result, expec
         "observations": deque(),
         "stop_event": stop_event,
         "shutdown": False,
+        "deadline": make_deadline(60),
+        "probe_timeout_s": 5,
+        "child_control": wait.remote.make_child_registry(),
     }
 
-    def probe(host, lid, timeout):
+    def probe(host, lid, **_kwargs):
         stop_event.set()
         if isinstance(probe_result, Exception):
             raise probe_result
         return probe_result
 
-    wait._remote_worker(state, "abc123", "fedora.local", 30, 5, probe)
+    wait._remote_worker(state, "abc123", "fedora.local", 30, probe)
 
     assert len(state["observations"]) == 1
     assert state["observations"][0]["kind"] == expected_kind
@@ -1738,7 +2050,7 @@ def test_remote_wait_workers_are_capped_and_shard_all_targets(monkeypatch):
 
     monkeypatch.setattr(wait.threading, "Thread", FakeThread)
     records = {
-        f"lode-{index}": {"remote": True, "host": f"host-{index}.example"} for index in range(24)
+        f"lode-{index}": {"remote": True, "route": f"host-{index}.example"} for index in range(24)
     }
     state = {
         "records": records,
@@ -1746,23 +2058,25 @@ def test_remote_wait_workers_are_capped_and_shard_all_targets(monkeypatch):
         "poll_s": 30,
         "probe_timeout_s": 5,
         "workers": {},
+        "deadline": make_deadline(60),
+        "child_control": wait.remote.make_child_registry(),
     }
 
     wait._start_remote_workers(state, lambda *_args, **_kwargs: None)
 
     assert len(started) == wait.remote.REMOTE_MAX_WORKERS
     assignments = [assignment for thread in started for assignment in thread.args[1]]
-    assert set(assignments) == {(lode_id, record["host"]) for lode_id, record in records.items()}
+    assert set(assignments) == {(lode_id, record["route"]) for lode_id, record in records.items()}
     assert max(len(thread.args[1]) for thread in started) == 2
 
 
-def test_remote_worker_join_is_bounded_and_logs_timeout(caplog):
+def test_remote_worker_stop_cancels_without_join():
     class StuckThread:
         def __init__(self):
             self.timeout = None
 
         def join(self, timeout):
-            self.timeout = timeout
+            raise AssertionError(f"unexpected worker join: {timeout}")
 
         def is_alive(self):
             return True
@@ -1776,21 +2090,21 @@ def test_remote_worker_join_is_bounded_and_logs_timeout(caplog):
 
     wait._stop_remote_workers(state)
 
-    assert thread.timeout == 6
-    assert "did not stop before join timeout" in caplog.text
+    assert state["stop_event"].is_set()
+    assert thread.timeout is None
 
 
-def test_keyboard_interrupt_returns_130_and_joins_remote_workers(monkeypatch):
+def test_keyboard_interrupt_returns_130_and_cancels_remote_workers(monkeypatch):
     initial = snapshot(host="fedora.local")
     stopped_workers = []
     original_stop = wait._stop_remote_workers
 
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
-    monkeypatch.setattr(wait, "_publish_resident_routes", lambda records: None)
+    monkeypatch.setattr(wait, "_publish_resident_routes", lambda records, **_kwargs: None)
     monkeypatch.setattr(
         wait,
         "_condition_wait",
-        lambda condition, timeout: (_ for _ in ()).throw(KeyboardInterrupt()),
+        lambda condition, deadline, wake_at: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
     def stop_workers(state):
@@ -1802,19 +2116,29 @@ def test_keyboard_interrupt_returns_130_and_joins_remote_workers(monkeypatch):
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         ["abc123"],
-        resolver=lambda socket_path, lid: {
+        deadline=make_deadline(60),
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": initial,
             "host": "fedora.local",
             "canonical_id": "abc123",
             "exit_code": 0,
         },
-        probe_remote=lambda host, lid, timeout: (initial, "found"),
+        probe_remote=lambda host, lid, **_kwargs: (initial, "found"),
     )
 
     assert rc == 130
     assert len(stopped_workers) == 1
-    assert all(not thread.is_alive() for thread in stopped_workers)
+
+
+def test_interrupt_at_3599_cannot_extend_cleanup_past_original_3600_deadline():
+    clock = FakeClock()
+    clock.now = 3599.0
+    original = {"expires_at": 3600.0, "clock": clock}
+
+    cleanup = wait._interrupt_cleanup_deadline(original)
+
+    assert cleanup["expires_at"] == 3600.0
 
 
 def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monkeypatch, capsys):
@@ -1825,9 +2149,17 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
     shipped = snapshot(lid="ship123", host="one.local", stage="shipped", active=False)
 
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
-    monkeypatch.setattr(wait, "_publish_resident_routes", lambda records: None)
+    monkeypatch.setattr(wait, "_publish_resident_routes", lambda records, **_kwargs: None)
+    stopped_states = []
+    original_stop = wait._stop_remote_workers
 
-    def resolver(socket_path, lid):
+    def stop_workers(state):
+        original_stop(state)
+        stopped_states.append(state)
+
+    monkeypatch.setattr(wait, "_stop_remote_workers", stop_workers)
+
+    def resolver(socket_path, lid, **_kwargs):
         return {
             "outcome": "found",
             "lode": initials[lid],
@@ -1836,7 +2168,7 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
             "exit_code": 0,
         }
 
-    def probe_remote(host, lid, timeout):
+    def probe_remote(host, lid, **_kwargs):
         if lid == "ship123":
             return shipped, "found"
         return None, "unreadable"
@@ -1844,7 +2176,7 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         list(initials),
-        timeout_s=1,
+        deadline=make_deadline(1),
         poll_s=30,
         observer_timeout_s=0.05,
         resolver=resolver,
@@ -1853,7 +2185,9 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
 
     assert rc == 4
     assert capsys.readouterr().out.count("ship123 shipped") == 1
-    assert not any(thread.name.startswith("wait-remote-") for thread in threading.enumerate())
+    assert stopped_states
+    assert stopped_states[-1]["stop_event"].is_set()
+    assert all(thread.daemon for thread in stopped_states[-1]["workers"].values())
 
 
 def test_jsonl_multi_lode_boundary_emits_independently_parseable_lines(monkeypatch, capsys):
@@ -1870,8 +2204,9 @@ def test_jsonl_multi_lode_boundary_emits_independently_parseable_lines(monkeypat
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         list(initials),
+        deadline=make_deadline(3600),
         json_output=True,
-        resolver=lambda socket_path, lid: {
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": dict(initials[lid]),
             "host": "local",
@@ -1902,21 +2237,8 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
     lines = captured.out.splitlines()
     assert len(lines) == 1
     payload = json.loads(lines[0])
-    assert set(payload) == {
-        "id",
-        "outcome",
-        "stage",
-        "state",
-        "status",
-        "failure_kind",
-        "active",
-        "archived",
-        "reason",
-        "source",
-        "observed_age_s",
-        "status_display",
-        "pane_liveness",
-    }
+    assert set(payload) == wait.FINAL_RECORD_KEYS
+    assert {"host", "source", "reason"}.isdisjoint(payload)
     assert "warning:" not in captured.out
     assert "warning:" in captured.err
 
@@ -1988,7 +2310,8 @@ def test_wait_summary_uses_canonical_dedup_for_requested_count(monkeypatch, caps
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         ["abc", "abc123"],
-        resolver=lambda socket_path, lid: {
+        deadline=make_deadline(3600),
+        resolver=lambda socket_path, lid, **_kwargs: {
             "outcome": "found",
             "lode": dict(canonical),
             "host": "local",
@@ -2051,13 +2374,18 @@ def test_wait_summary_for_observer_unavailable(monkeypatch, capsys):
 
 
 def test_wait_summary_for_resolution_failure(monkeypatch, capsys):
-    monkeypatch.setattr(wait, "_resolve_targets", lambda *args, **kwargs: None)
+    record = wait._resolution_failure_record("abc123", {"outcome": "absent"}, 0, 0.0)
+    monkeypatch.setattr(
+        wait,
+        "_resolve_targets",
+        lambda *args, **kwargs: {record["key"]: record},
+    )
 
     rc, _, _ = run_local_wait(monkeypatch, snapshot())
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert captured.err == "hop wait: could not resolve target — exited 1\n"
+    assert captured.err == "hop wait: abc123 target_absent — exited 1\n"
 
 
 def test_wait_summary_for_loop_interrupt(monkeypatch, capsys):
@@ -2068,7 +2396,8 @@ def test_wait_summary_for_loop_interrupt(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert rc == 130
-    assert captured.err == "hop wait: interrupted — exited 130\n"
+    assert captured.err == "hop wait: abc123 interrupted — exited 130\n"
+    assert "abc123 interrupted" in captured.out
 
 
 def test_wait_summary_for_pre_supervisor_interrupt(monkeypatch, capsys):
@@ -2081,7 +2410,8 @@ def test_wait_summary_for_pre_supervisor_interrupt(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert rc == 130
-    assert captured.err == "hop wait: interrupted — exited 130\n"
+    assert captured.err == "hop wait: abc123 interrupted — exited 130\n"
+    assert "abc123 interrupted" in captured.out
 
 
 def test_wait_summary_accumulates_resolved_and_reports_abandoned_sibling(monkeypatch, capsys):
@@ -2118,8 +2448,8 @@ def test_wait_summary_accumulates_resolved_and_reports_abandoned_sibling(monkeyp
     assert captured.err.splitlines() == [
         "  ship123: shipped",
         "  error123: error",
-        "  pending123: not resolved — wait returned first",
-        "hop wait: 2 of 3 lodes resolved — exited 1",
+        "  pending123: wait_aborted",
+        "hop wait: 3 of 3 lodes resolved — exited 1",
     ]
 
 
@@ -2136,10 +2466,10 @@ def test_wait_summary_keeps_json_stdout_parseable(monkeypatch, capsys):
     assert captured.err == "hop wait: abc123 shipped — exited 0\n"
 
 
-def test_wait_summary_uses_synthetic_collector_outcome(monkeypatch, capsys):
+def test_wait_summary_uses_collector_outcome(monkeypatch, capsys):
     def collect_synthetic(state, now):
         record = next(iter(state["records"].values()))
-        return [{"record": record, "outcome": "synthetic_outcome", "code": 0}]
+        return [{"record": record, "outcome": "shipped", "code": 0}]
 
     monkeypatch.setattr(wait, "_collect_boundary_outcomes", collect_synthetic)
 
@@ -2147,7 +2477,7 @@ def test_wait_summary_uses_synthetic_collector_outcome(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert rc == 0
-    assert captured.err == "hop wait: abc123 synthetic_outcome — exited 0\n"
+    assert captured.err == "hop wait: abc123 shipped — exited 0\n"
 
 
 def test_wait_summary_format_failure_preserves_exit_code(monkeypatch, capsys):
@@ -2160,7 +2490,7 @@ def test_wait_summary_format_failure_preserves_exit_code(monkeypatch, capsys):
         prior_count = len(state["resolved"])
         result = real_finish_boundary(state, outcomes, now)
         for item in state["resolved"][prior_count:]:
-            del item["outcome"]
+            del item["final_record"]["outcome"]
         return result
 
     monkeypatch.setattr(wait, "_finish_boundary", finish_with_malformed_resolved_item)
@@ -2170,3 +2500,596 @@ def test_wait_summary_format_failure_preserves_exit_code(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert rc == expected_rc == 0
     assert captured.err == ""
+
+
+FINAL_OUTCOME_CASES = [
+    ("shipped", 0, "shipping_completed"),
+    ("archived", 1, "archived_before_shipping"),
+    ("error", 1, "lode_error"),
+    ("inactive", 1, "runner_inactive"),
+    ("gated", 2, "gate_requires_review"),
+    ("stuck", 3, "progress_stalled"),
+    ("not_found", 1, "target_disappeared"),
+    ("action_blocked", 2, "durable_action_blocked"),
+    ("action_stalled", 2, "successor_adoption_stalled"),
+    ("startup_stalled", 1, "startup_registration_stalled"),
+    ("handoff_stalled", 1, "ready_handoff_stalled"),
+    ("reconnect_stalled", 1, "runner_reregistration_stalled"),
+    ("observer_unavailable", 4, "observer_freshness_expired"),
+    ("timeout", 4, "overall_timeout"),
+    ("target_absent", 1, "target_absent"),
+    ("target_ambiguous", 1, "target_ambiguous"),
+    ("status_unavailable", 4, "initial_status_unavailable"),
+    ("wait_aborted", 1, "sibling_nonzero"),
+    ("interrupted", 130, "user_interrupted"),
+]
+
+
+def _scenario_probe_rows(topology):
+    if topology == "local":
+        return [
+            {
+                "kind": "local",
+                "server": "test-host",
+                "route": "local",
+                "candidate_id": None,
+                "outcome": "found",
+                "detail": None,
+                "attempts": 1,
+                "observed_age_s": 0.0,
+            }
+        ]
+    if topology == "explicit":
+        return [
+            {
+                "kind": "explicit",
+                "server": "explicit.example",
+                "route": "explicit.example",
+                "candidate_id": None,
+                "outcome": "found",
+                "detail": None,
+                "attempts": 1,
+                "observed_age_s": 0.0,
+            }
+        ]
+    return [
+        {
+            "kind": "local",
+            "server": "test-host",
+            "route": "local",
+            "candidate_id": None,
+            "outcome": "absent",
+            "detail": None,
+            "attempts": 1,
+            "observed_age_s": 0.0,
+        },
+        {
+            "kind": "resident",
+            "server": "resident.example",
+            "route": "resident.example",
+            "candidate_id": "case1234",
+            "outcome": "found",
+            "detail": None,
+            "attempts": 1,
+            "observed_age_s": 0.0,
+        },
+        {
+            "kind": "pool",
+            "server": "pool.example",
+            "route": "pool.example",
+            "candidate_id": None,
+            "outcome": "not_attempted",
+            "detail": None,
+            "attempts": 0,
+            "observed_age_s": None,
+        },
+    ]
+
+
+@pytest.mark.parametrize(("outcome", "code", "reason_code"), FINAL_OUTCOME_CASES)
+@pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
+@pytest.mark.parametrize("topology", ["local", "resident", "explicit"])
+def test_closed_final_record_scenario_matrix(
+    monkeypatch,
+    capsys,
+    outcome,
+    code,
+    reason_code,
+    json_output,
+    topology,
+):
+    """Every renderer consumes one closed record for every outcome and topology."""
+    route = {
+        "local": "local",
+        "resident": "resident.example",
+        "explicit": "explicit.example",
+    }[topology]
+    probes = _scenario_probe_rows(topology)
+    if outcome in {"target_absent", "target_ambiguous", "status_unavailable"}:
+        resolution_outcome = {
+            "target_absent": "absent",
+            "target_ambiguous": "ambiguous",
+            "status_unavailable": "unavailable",
+        }[outcome]
+        result = {
+            "outcome": resolution_outcome,
+            "host": route if route != "local" else None,
+            "resident_owner": topology == "resident",
+            "probes": probes,
+            "match_tuples": (
+                [("one.example", "case1111"), (None, "case2222")]
+                if outcome == "target_ambiguous"
+                else []
+            ),
+        }
+        record = wait._resolution_failure_record("case", result, 0, 0.0)
+    else:
+        initial = snapshot(
+            lid="case1234",
+            tmux_pane="%7",
+            archived=outcome == "archived",
+        )
+        record = wait._new_record(
+            "case1234",
+            initial,
+            route,
+            0.0,
+            0,
+            probes=probes,
+        )
+    monkeypatch.setattr(
+        wait.remote,
+        "run_remote",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, "", ""),
+    )
+    monkeypatch.setattr(wait, "capture_pane", lambda *_args, **_kwargs: None)
+    deadline = make_deadline(60)
+    final_record = wait._final_record(
+        record,
+        outcome,
+        code,
+        0.0,
+        reason_code,
+        deadline=deadline,
+        child_control=remote.make_child_registry(),
+    )
+    wait._emit_outcome(
+        record,
+        outcome,
+        json_output,
+        0.0,
+        reason_code,
+        deadline=deadline,
+        final_record=final_record,
+    )
+    item = {
+        "record": record,
+        "outcome": outcome,
+        "code": code,
+        "reason": reason_code,
+        "final_record": final_record,
+    }
+    wait._emit_wait_summary({record["key"]: record}, [item], code)
+
+    captured = capsys.readouterr()
+    assert set(final_record) == wait.FINAL_RECORD_KEYS
+    assert final_record["reason_code"] == reason_code
+    if outcome == "shipped":
+        assert final_record["recovery"] is None
+    else:
+        assert isinstance(final_record["recovery"], str)
+    assert [row["kind"] for row in final_record["probes"]] == {
+        "local": ["local"],
+        "resident": ["local", "resident", "pool"],
+        "explicit": ["explicit"],
+    }[topology]
+    assert all(
+        set(row)
+        == {
+            "kind",
+            "server",
+            "route",
+            "candidate_id",
+            "outcome",
+            "detail",
+            "attempts",
+            "observed_age_s",
+        }
+        for row in final_record["probes"]
+    )
+    if outcome == "target_ambiguous":
+        assert final_record["matches"] == [
+            {"server": "one.example", "id": "case1111"},
+            {"server": None, "id": "case2222"},
+        ]
+    if outcome == "observer_unavailable":
+        assert final_record["tmux_pane"] is None
+        assert final_record["last_tmux_pane"] == "%7"
+    if json_output:
+        assert len(captured.out.splitlines()) == 1
+        assert json.loads(captured.out) == final_record
+    else:
+        assert captured.out
+        assert not captured.out.lstrip().startswith("{")
+    assert captured.err.endswith(f"hop wait: {final_record['id']} {outcome} — exited {code}\n")
+
+
+def test_all_query_resolution_schedules_by_utf8_and_deduplicates_aliases():
+    calls = []
+
+    def resolver(_socket_path, query, **_kwargs):
+        calls.append(query)
+        if query == "aa":
+            return {"outcome": "absent", "probes": []}
+        if query == "zz":
+            return {"outcome": "unavailable", "probes": []}
+        return {
+            "outcome": "found",
+            "lode": snapshot(lid="canonical1"),
+            "host": "local",
+            "canonical_id": "canonical1",
+            "probes": [],
+        }
+
+    records = wait._resolve_targets(
+        Path("server.sock"),
+        ["zz", "alias-two", "aa", "alias-one"],
+        False,
+        resolver,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+
+    assert calls == ["aa", "alias-one", "alias-two", "zz"]
+    assert list(records) == ["failure:aa", "canonical1", "failure:zz"]
+    assert [
+        record["id"] for record in sorted(records.values(), key=lambda item: item["order"])
+    ] == ["zz", "canonical1", "aa"]
+    assert records["canonical1"]["queries"] == ["alias-one", "alias-two"]
+
+
+@pytest.mark.parametrize(
+    "queries",
+    [["absent", "unavailable"], ["unavailable", "absent"]],
+)
+def test_resolution_failures_render_every_record_and_take_max_exit(monkeypatch, capsys, queries):
+    def resolver(_socket_path, query, **_kwargs):
+        return {"outcome": query, "probes": []}
+
+    monkeypatch.setattr(wait, "_monotonic", lambda: 0.0)
+    rc = wait.wait_for_lodes(
+        Path("server.sock"),
+        queries,
+        deadline=make_deadline(60),
+        json_output=True,
+        resolver=resolver,
+        probe_remote=lambda *_args, **_kwargs: (None, "unreadable"),
+    )
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.splitlines()]
+    assert rc == 4
+    assert [payload["outcome"] for payload in payloads] == [
+        "target_absent" if query == "absent" else "status_unavailable" for query in queries
+    ]
+    assert len(payloads) == 2
+    assert all(set(payload) == wait.FINAL_RECORD_KEYS for payload in payloads)
+    assert captured.err.endswith("hop wait: 2 of 2 lodes resolved — exited 4\n")
+
+
+def _final_sweep_state(clock, records, *, observer_timeout_s=300, probe_timeout_s=5):
+    return {
+        "condition": threading.Condition(),
+        "records": records,
+        "pending": set(records),
+        "resolved": [],
+        "observations": deque(),
+        "deadline": make_deadline(100, clock=clock),
+        "overall_deadline": 100.0,
+        "poll_s": 30.0,
+        "observer_timeout_s": observer_timeout_s,
+        "probe_timeout_s": probe_timeout_s,
+        "stop_event": threading.Event(),
+        "workers": {},
+        "connection": None,
+        "child_control": remote.make_child_registry(),
+        "shutdown": False,
+        "json_output": True,
+    }
+
+
+def test_final_sweep_is_a_barrier_with_mixed_local_remote_completion_order(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(wait, "_monotonic", clock)
+    error_record = wait._new_record(
+        "error1", snapshot(lid="error1", state="error"), "local", 0.0, 0
+    )
+    local_record = wait._new_record("local1", snapshot(lid="local1"), "local", 0.0, 1)
+    remote_record = wait._new_record("remote1", snapshot(lid="remote1"), "worker.example", 0.0, 2)
+    records = {record["key"]: record for record in (error_record, local_record, remote_record)}
+    state = _final_sweep_state(clock, records)
+    remote_completed = threading.Event()
+    completion_order = []
+
+    def local_read(*_args, **_kwargs):
+        assert remote_completed.wait(1)
+        completion_order.append("local")
+        return "found", snapshot(lid="local1", status="Fresh and running")
+
+    def remote_probe(*_args, **_kwargs):
+        completion_order.append("remote")
+        remote_completed.set()
+        return snapshot(lid="remote1", stage="shipped", active=False), "found"
+
+    monkeypatch.setattr(wait.client, "read_lode_snapshot", local_read)
+    established = [{"record": error_record, "outcome": "error", "code": 1, "reason": None}]
+    outcomes = wait._authoritative_final_sweep(
+        state,
+        established,
+        Path("server.sock"),
+        remote_probe,
+    )
+
+    assert completion_order == ["remote", "local"]
+    assert [(item["record"]["id"], item["outcome"], item["code"]) for item in outcomes] == [
+        ("error1", "error", 1),
+        ("local1", "wait_aborted", 1),
+        ("remote1", "shipped", 0),
+    ]
+    assert outcomes[1]["reason"] == "sibling_nonzero"
+
+
+@pytest.mark.parametrize(
+    ("start", "observer_timeout_s", "advance", "expected"),
+    [
+        (10.0, 10.0, 0.0, ("observer_unavailable", 4)),
+        (1.0, 10.0, 0.0, ("wait_aborted", 1)),
+        (0.0, 30.0, 5.0, ("timeout", 4)),
+    ],
+    ids=["expired-observer", "fresh-unreadable", "generation-budget"],
+)
+def test_final_sweep_unreadable_member_classification(
+    monkeypatch,
+    start,
+    observer_timeout_s,
+    advance,
+    expected,
+):
+    clock = FakeClock()
+    clock.now = start
+    monkeypatch.setattr(wait, "_monotonic", clock)
+    error_record = wait._new_record(
+        "error1", snapshot(lid="error1", state="error"), "local", 0.0, 0
+    )
+    member = wait._new_record("member1", snapshot(lid="member1"), "worker.example", 0.0, 1)
+    records = {record["key"]: record for record in (error_record, member)}
+    state = _final_sweep_state(
+        clock,
+        records,
+        observer_timeout_s=observer_timeout_s,
+        probe_timeout_s=5,
+    )
+
+    def unreadable(*_args, **_kwargs):
+        clock.advance(advance)
+        return None, "unreadable"
+
+    outcomes = wait._authoritative_final_sweep(
+        state,
+        [{"record": error_record, "outcome": "error", "code": 1, "reason": None}],
+        Path("server.sock"),
+        unreadable,
+    )
+
+    member_outcome = next(item for item in outcomes if item["record"] is member)
+    assert (member_outcome["outcome"], member_outcome["code"]) == expected
+    assert member["probes"][0]["outcome"] == "unreadable"
+    assert member["probes"][0]["attempts"] == 2
+
+
+def test_definitive_state_at_boundary_beats_observer_and_overall_deadlines():
+    record = wait._new_record(
+        "ship1",
+        snapshot(lid="ship1", stage="shipped", active=False),
+        "local",
+        0.0,
+        0,
+    )
+    clock = FakeClock()
+    clock.now = 10.0
+    state = _final_sweep_state(clock, {record["key"]: record}, observer_timeout_s=10)
+    state["overall_deadline"] = 10.0
+
+    outcomes = wait._collect_boundary_outcomes(state, 10.0)
+
+    assert [(item["outcome"], item["code"]) for item in outcomes] == [("shipped", 0)]
+
+
+def test_observer_deadline_wins_exact_tie_with_overall_deadline():
+    record = wait._new_record("run1", snapshot(lid="run1"), "local", 0.0, 0)
+    clock = FakeClock()
+    clock.now = 10.0
+    state = _final_sweep_state(clock, {record["key"]: record}, observer_timeout_s=10)
+    state["overall_deadline"] = 10.0
+
+    outcomes = wait._collect_boundary_outcomes(state, 10.0)
+
+    assert [(item["outcome"], item["code"]) for item in outcomes] == [("observer_unavailable", 4)]
+
+
+def test_final_enrichment_failures_degrade_fields_without_changing_outcome(monkeypatch):
+    record = wait._new_record(
+        "error1",
+        snapshot(lid="error1", state="error", tmux_pane="%7"),
+        "local",
+        0.0,
+        0,
+    )
+    monkeypatch.setattr(
+        wait.config,
+        "hostname",
+        lambda: (_ for _ in ()).throw(OSError("hostname unavailable")),
+    )
+    monkeypatch.setattr(
+        wait,
+        "lode_with_status_annotations",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("tmux unavailable")),
+    )
+    monkeypatch.setattr(
+        wait,
+        "resolve_worktree_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("path unavailable")),
+    )
+
+    final_record = wait._final_record(
+        record,
+        "error",
+        1,
+        0.0,
+        None,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+
+    assert final_record["outcome"] == "error"
+    assert final_record["exit_code"] == 1
+    assert final_record["server"] is None
+    assert final_record["probes"][0]["server"] is None
+    assert final_record["pane_liveness"] == "unknown"
+    assert final_record["worktree_path"] is None
+    assert final_record["worktree_path_basis"] == "unavailable"
+    assert final_record["worktree_exists"] is None
+
+
+def test_final_local_worktree_check_is_fresh_and_recorded_when_cleaned(tmp_path):
+    path = tmp_path / "worktrees" / "local123"
+    record = wait._new_record(
+        "local123",
+        snapshot(lid="local123", worktree_path=str(path), worktree_exists=True),
+        "local",
+        0.0,
+        0,
+    )
+
+    final_record = wait._final_record(
+        record,
+        "error",
+        1,
+        0.0,
+        None,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+
+    assert final_record["worktree_path"] == str(path)
+    assert final_record["worktree_path_basis"] == "recorded"
+    assert final_record["worktree_exists"] is False
+    assert final_record["worktree_exists_observed_age_s"] == 0.0
+
+
+def test_final_remote_worktree_check_uses_frozen_path_payload(monkeypatch):
+    path = "/srv/worktrees/remote123"
+    record = wait._new_record(
+        "remote123",
+        snapshot(lid="remote123", worktree_path=path, worktree_exists=True),
+        "owner.example",
+        0.0,
+        0,
+    )
+    remote_result = subprocess.CompletedProcess(
+        [],
+        0,
+        json.dumps(
+            {
+                "id": "remote123",
+                "host": "local",
+                "path": path,
+                "exists": False,
+            }
+        ),
+        "",
+    )
+    monkeypatch.setattr(wait.remote, "run_remote", MagicMock(return_value=remote_result))
+
+    final_record = wait._final_record(
+        record,
+        "error",
+        1,
+        0.0,
+        None,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+
+    assert final_record["worktree_path"] == path
+    assert final_record["worktree_path_basis"] == "recorded"
+    assert final_record["worktree_exists"] is False
+    assert final_record["worktree_exists_observed_age_s"] is not None
+    assert wait.remote.run_remote.call_args.args[:2] == (
+        "owner.example",
+        ["lode", "path", "remote123", "--json"],
+    )
+
+
+def test_probe_rows_update_in_place_instead_of_appending():
+    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0)
+
+    wait._apply_observation(
+        record,
+        {
+            "id": "abc123",
+            "kind": "unreadable",
+            "payload": None,
+            "detail": "first failure",
+            "failure_key": "first",
+            "observed_ts": 1.0,
+        },
+        30.0,
+    )
+    wait._apply_observation(
+        record,
+        {
+            "id": "abc123",
+            "kind": "found",
+            "payload": snapshot(status="Recovered"),
+            "detail": "",
+            "failure_key": "found",
+            "observed_ts": 2.0,
+        },
+        30.0,
+    )
+
+    assert len(record["probes"]) == 1
+    assert record["probes"][0]["outcome"] == "found"
+    assert record["probes"][0]["attempts"] == 3
+
+
+def test_interrupt_during_resolution_preserves_completed_terminal_record(monkeypatch, capsys):
+    monkeypatch.setattr(wait, "_monotonic", lambda: 0.0)
+
+    def resolver(_socket_path, query, **_kwargs):
+        if query == "ship":
+            return {
+                "outcome": "found",
+                "lode": snapshot(lid="ship1", stage="shipped", active=False),
+                "host": "local",
+                "canonical_id": "ship1",
+                "probes": [],
+            }
+        raise KeyboardInterrupt
+
+    rc = wait.wait_for_lodes(
+        Path("server.sock"),
+        ["ship", "zzz"],
+        deadline=make_deadline(60),
+        json_output=True,
+        resolver=resolver,
+        probe_remote=lambda *_args, **_kwargs: (None, "unreadable"),
+    )
+
+    payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert rc == 130
+    assert [(payload["id"], payload["outcome"]) for payload in payloads] == [
+        ("ship1", "shipped"),
+        ("zzz", "interrupted"),
+    ]

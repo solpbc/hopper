@@ -31,7 +31,7 @@ from hopper.git import (
     is_dirty,
     quarantine_dirty_repo,
 )
-from hopper.lodes import get_lode_dir, get_worktree_dir
+from hopper.lodes import get_lode_dir, get_worktree_dir, resolve_worktree_path
 from hopper.runner import BaseRunner, _descendant_pids, _sum_descendant_cpu_ms
 
 logger = logging.getLogger(__name__)
@@ -347,6 +347,7 @@ class ProcessRunner(BaseRunner):
         self.scope: str = ""
         self.stage: str = ""
         self.lode_branch: str = ""
+        self.worktree_path_basis: str = "unavailable"
 
     def _load_lode_data(self, lode_data: dict) -> None:
         self.stage = lode_data.get("stage", "")
@@ -394,6 +395,8 @@ class ProcessRunner(BaseRunner):
                     logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                     return False
                 self.lode_branch = branch
+            if not self._publish_established_worktree_path():
+                return False
             logger.debug(f"worktree reused lode={self.lode_id} path={self.worktree_path}")
             return True
 
@@ -428,8 +431,39 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return False
         self.lode_branch = branch
+        if not self._publish_established_worktree_path():
+            return False
         logger.debug(f"worktree created lode={self.lode_id} path={self.worktree_path}")
         return True
+
+    def _publish_established_worktree_path(self) -> bool:
+        """Publish a managed worktree path before allowing setup to proceed."""
+        if self.worktree_path is None:
+            self.worktree_path_basis = "unavailable"
+            return True
+        try:
+            canonical = self.worktree_path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            self.worktree_path_basis = "unavailable"
+            return True
+        resolution = resolve_worktree_path({"id": self.lode_id})
+        if resolution["basis"] != "existing" or resolution["path"] != canonical:
+            self.worktree_path_basis = "unavailable"
+            return True
+
+        result = self._publish_lode_worktree_path(str(canonical))
+        if result["accepted"]:
+            self.worktree_path_basis = "recorded"
+            return True
+        reason = result["reason"]
+        self._setup_error = (
+            f"Observed worktree publication failure for {canonical}: {reason}. "
+            f"Hopper did not proceed. Inspect with: hop lode status {self.lode_id}; "
+            f"retry with: hop lode restart {self.lode_id}"
+        )
+        print(self._setup_error)
+        logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+        return False
 
     def _setup_mill(self) -> int | None:
         if not self.project_dir:
@@ -574,6 +608,9 @@ class ProcessRunner(BaseRunner):
             self._setup_error = f"Worktree not found: {self.worktree_path}"
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+            return 1
+
+        if not self._publish_established_worktree_path():
             return 1
 
         # Activate worktree env if project has tooling (already installed by refine)

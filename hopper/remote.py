@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Iterator, Sequence
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Literal, TypeVar
 
 from hopper import config
+from hopper import deadline as deadline_utils
 from hopper.lodes import current_time_ms, is_canonical_lode_id
 
 REMOTE_CONFIG_PREFIX = "remote."
@@ -68,26 +70,137 @@ class LodeCacheError(Exception):
         super().__init__(f"resident-route cache at {path} is {reason}")
 
 
+class RemoteCommandUnavailable(OSError):
+    """A bounded remote command that could not start or finish."""
+
+
+def make_child_registry() -> dict:
+    """Return shared ownership state for wait-path SSH children."""
+    return {
+        "lock": threading.Lock(),
+        "children": set(),
+        "cancel_event": threading.Event(),
+    }
+
+
+_DEFAULT_CHILD_REGISTRY = make_child_registry()
+
+
+def _register_child(registry: dict | None, process: subprocess.Popen) -> bool:
+    if registry is None:
+        return True
+    with registry["lock"]:
+        if registry["cancel_event"].is_set():
+            return False
+        registry["children"].add(process)
+        return True
+
+
+def _unregister_child(registry: dict | None, process: subprocess.Popen) -> None:
+    if registry is None:
+        return
+    with registry["lock"]:
+        registry["children"].discard(process)
+
+
+def _owned_children(registry: dict) -> list[subprocess.Popen]:
+    with registry["lock"]:
+        return list(registry["children"])
+
+
+def _reap_owned_children(
+    processes: list[subprocess.Popen],
+    deadline: dict,
+    operation: str,
+) -> None:
+    """Reap as many signalled children as the common deadline permits."""
+    for process in processes:
+        if process.poll() is not None:
+            try:
+                process.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            continue
+        budget = deadline_utils.claim_call_budget(deadline, operation, cap_s=0.05)
+        if budget is None:
+            return
+        try:
+            process.wait(timeout=budget)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+def cancel_owned_children(registry: dict, deadline: dict) -> None:
+    """Cancel, terminate, kill, and reap registered children under one deadline."""
+    registry["cancel_event"].set()
+    children = _owned_children(registry)
+    for process in children:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    remaining = max(0.0, deadline_utils.remaining_seconds(deadline))
+    terminate_deadline = deadline_utils.shorten_deadline(
+        deadline,
+        deadline["clock"]() + min(1.0, remaining / 2.0),
+    )
+    _reap_owned_children(children, terminate_deadline, "remote.child_reap_after_terminate")
+
+    survivors = [process for process in children if process.poll() is None]
+    for process in survivors:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    _reap_owned_children(survivors, deadline, "remote.child_reap_after_kill")
+
+    for process in children:
+        if process.poll() is not None:
+            _unregister_child(registry, process)
+
+
 def run_remote(
     host: str,
     hop_args: list[str],
     stdin_text: str | None = None,
     stdin_bytes: bytes | None = None,
     timeout: float | None = None,
+    *,
+    deadline: dict | None = None,
+    child_control: dict | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hop on a remote host over ssh and return the completed process."""
     if stdin_text is not None and stdin_bytes is not None:
         raise ValueError("remote stdin must be either text or bytes")
     command = _remote_command(host, hop_args)
+    effective_timeout = timeout
+    if deadline is not None:
+        effective_timeout = deadline_utils.claim_call_budget(
+            deadline,
+            "remote.run_remote",
+            cap_s=timeout,
+        )
+        if effective_timeout is None:
+            raise RemoteCommandUnavailable("remote command deadline expired before spawn")
+    registry = _DEFAULT_CHILD_REGISTRY if child_control is None else child_control
+    if registry["cancel_event"].is_set():
+        raise RemoteCommandUnavailable("remote command cancelled before spawn")
+
+    text_mode = stdin_bytes is None
     kwargs: dict[str, object] = {
-        "capture_output": True,
-        "text": stdin_bytes is None,
-        "timeout": timeout,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": text_mode,
     }
+    input_data: str | bytes | None
     if stdin_bytes is not None:
-        kwargs["input"] = stdin_bytes
+        kwargs["stdin"] = subprocess.PIPE
+        input_data = stdin_bytes
     elif stdin_text is not None:
-        kwargs["input"] = stdin_text
+        kwargs["stdin"] = subprocess.PIPE
+        input_data = stdin_text
     else:
         # Without an explicit stdin payload, ssh otherwise inherits this
         # process's real stdin and forwards it to the remote command. A pooled
@@ -95,14 +208,55 @@ def run_remote(
         # create call reads the scope, and concurrent probes racing to drain
         # the same inherited pipe is what silently emptied it.
         kwargs["stdin"] = subprocess.DEVNULL
-    result = subprocess.run(command, **kwargs)
-    if stdin_bytes is None:
-        return result
+        input_data = None
+
+    process = subprocess.Popen(command, **kwargs)
+    if not _register_child(registry, process):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.kill()
+            process.wait(timeout=0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        raise RemoteCommandUnavailable("remote command cancelled during spawn")
+
+    try:
+        stdout, stderr = process.communicate(input=input_data, timeout=effective_timeout)
+    except BaseException:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        raise
+    finally:
+        if process.poll() is not None:
+            _unregister_child(registry, process)
+
+    if text_mode:
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
     return subprocess.CompletedProcess(
-        result.args,
-        result.returncode,
-        stdout=result.stdout.decode("utf-8", errors="replace"),
-        stderr=result.stderr.decode("utf-8", errors="replace"),
+        command,
+        process.returncode,
+        stdout=stdout.decode("utf-8", errors="replace"),
+        stderr=stderr.decode("utf-8", errors="replace"),
     )
 
 
@@ -200,9 +354,9 @@ def _remote_pools(cfg: dict[str, object]) -> dict[str, list[str]]:
     return registry
 
 
-def remote_registry() -> dict[str, list[str]]:
+def remote_registry(*, deadline: dict | None = None) -> dict[str, list[str]]:
     """Return configured host pools, migrating legacy scalar routes once."""
-    cfg = config.load_config()
+    cfg = config.load_config() if deadline is None else config.load_config(deadline=deadline)
     has_scalar = any(
         key.startswith(REMOTE_CONFIG_PREFIX) and isinstance(value, str)
         for key, value in cfg.items()
@@ -210,7 +364,12 @@ def remote_registry() -> dict[str, list[str]]:
     if not has_scalar:
         return _remote_pools(cfg)
 
-    with config.config_transaction() as locked:
+    transaction = (
+        config.config_transaction()
+        if deadline is None
+        else config.config_transaction(deadline=deadline)
+    )
+    with transaction as locked:
         for key, value in tuple(locked.items()):
             if key.startswith(REMOTE_CONFIG_PREFIX) and isinstance(value, str):
                 # Trimming is an intentional one-time legacy scalar migration;
@@ -576,22 +735,28 @@ def remote_lode_cache_lock_path() -> Path:
 
 
 @contextmanager
-def _lode_cache_lock() -> Iterator[None]:
+def _lode_cache_lock(*, deadline: dict | None = None) -> Iterator[None]:
     """Serialize cache transactions with a bounded persistent lock."""
     lock_path = remote_lode_cache_lock_path()
+    timeout = REMOTE_CACHE_LOCK_TIMEOUT_SEC
+    if deadline is not None:
+        budget = deadline_utils.claim_call_budget(deadline, "remote.cache_lock", cap_s=timeout)
+        if budget is None:
+            raise LodeCacheError(lock_path, "locked")
+        timeout = budget
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_file = open(lock_path, "a+")
     except OSError as error:
         raise LodeCacheError(lock_path, "unreadable") from error
     try:
-        deadline = time.monotonic() + REMOTE_CACHE_LOCK_TIMEOUT_SEC
+        lock_deadline = time.monotonic() + timeout
         while True:
             try:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError as error:
-                remaining = deadline - time.monotonic()
+                remaining = lock_deadline - time.monotonic()
                 if remaining <= 0:
                     raise LodeCacheError(lock_path, "locked") from error
                 time.sleep(min(REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC, remaining))
@@ -602,18 +767,28 @@ def _lode_cache_lock() -> Iterator[None]:
         lock_file.close()
 
 
-def load_lode_cache() -> dict[str, dict]:
+def load_lode_cache(*, deadline: dict | None = None) -> dict[str, dict]:
     """Load the resident-route cache strictly and migrate legacy timestamps."""
-    cache, needs_migration = _read_lode_cache()
+    if deadline is None:
+        cache, needs_migration = _read_lode_cache()
+    else:
+        cache, needs_migration = _read_lode_cache(deadline=deadline)
     if not needs_migration:
         return cache
 
-    with _lode_cache_lock():
-        cache, needs_migration = _read_lode_cache()
+    lock = _lode_cache_lock() if deadline is None else _lode_cache_lock(deadline=deadline)
+    with lock:
+        if deadline is None:
+            cache, needs_migration = _read_lode_cache()
+        else:
+            cache, needs_migration = _read_lode_cache(deadline=deadline)
         if needs_migration:
             migrated = _migrate_lode_cache(cache)
             try:
-                _save_lode_cache(migrated)
+                if deadline is None:
+                    _save_lode_cache(migrated)
+                else:
+                    _save_lode_cache(migrated, deadline=deadline)
             except OSError as error:
                 raise LodeCacheError(remote_lode_cache_path(), "unreadable") from error
             cache = migrated
@@ -624,9 +799,14 @@ def _valid_timestamp(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _read_lode_cache() -> tuple[dict[str, dict], bool]:
+def _read_lode_cache(*, deadline: dict | None = None) -> tuple[dict[str, dict], bool]:
     """Read and validate cache bytes without acquiring the transaction lock."""
     path = remote_lode_cache_path()
+    if (
+        deadline is not None
+        and deadline_utils.claim_call_budget(deadline, "remote.cache_read") is None
+    ):
+        raise LodeCacheError(path, "locked")
     try:
         text = path.read_text()
     except FileNotFoundError:
@@ -675,9 +855,14 @@ def _migrate_lode_cache(cache: dict[str, dict]) -> dict[str, dict]:
     return migrated
 
 
-def _save_lode_cache(cache: dict[str, dict]) -> None:
+def _save_lode_cache(cache: dict[str, dict], *, deadline: dict | None = None) -> None:
     """Publish the resident-route cache while its transaction lock is held."""
     data_dir = config.hopper_dir()
+    if (
+        deadline is not None
+        and deadline_utils.claim_call_budget(deadline, "remote.cache_write") is None
+    ):
+        raise LodeCacheError(remote_lode_cache_path(), "locked")
     data_dir.mkdir(parents=True, exist_ok=True)
     path = remote_lode_cache_path()
     fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=data_dir)
@@ -717,6 +902,8 @@ def remember_lode(
     host: str,
     project: str = "",
     created_ms: int | None = None,
+    *,
+    deadline: dict | None = None,
 ) -> None:
     """Remember where a remote lode lives."""
     now = current_time_ms()
@@ -728,15 +915,22 @@ def remember_lode(
         or not _valid_timestamp(created)
     ):
         raise LodeCacheError(remote_lode_cache_path(), "wrong_shape")
-    with _lode_cache_lock():
-        cache, _needs_migration = _read_lode_cache()
+    lock = _lode_cache_lock() if deadline is None else _lode_cache_lock(deadline=deadline)
+    with lock:
+        if deadline is None:
+            cache, _needs_migration = _read_lode_cache()
+        else:
+            cache, _needs_migration = _read_lode_cache(deadline=deadline)
         migrated = _migrate_lode_cache(cache)
         cache = prune_lode_cache(migrated, now)
         existing = cache.get(lode_id)
         if existing and existing.get("host") == host:
             existing["project"] = project
             existing["last_seen_ms"] = now
-            _save_lode_cache(cache)
+            if deadline is None:
+                _save_lode_cache(cache)
+            else:
+                _save_lode_cache(cache, deadline=deadline)
             return
 
         if existing and "created_ms" in existing:
@@ -747,18 +941,28 @@ def remember_lode(
             "created_ms": created,
             "last_seen_ms": now,
         }
-        _save_lode_cache(cache)
+        if deadline is None:
+            _save_lode_cache(cache)
+        else:
+            _save_lode_cache(cache, deadline=deadline)
 
 
-def forget_lode(lode_id: str) -> bool:
+def forget_lode(lode_id: str, *, deadline: dict | None = None) -> bool:
     """Forget one confirmed-stale resident route under the cache lock."""
     if not is_canonical_lode_id(lode_id):
         raise LodeCacheError(remote_lode_cache_path(), "wrong_shape")
-    with _lode_cache_lock():
-        cache, _needs_migration = _read_lode_cache()
+    lock = _lode_cache_lock() if deadline is None else _lode_cache_lock(deadline=deadline)
+    with lock:
+        if deadline is None:
+            cache, _needs_migration = _read_lode_cache()
+        else:
+            cache, _needs_migration = _read_lode_cache(deadline=deadline)
         cache = _migrate_lode_cache(cache)
         if lode_id not in cache:
             return False
         del cache[lode_id]
-        _save_lode_cache(cache)
+        if deadline is None:
+            _save_lode_cache(cache)
+        else:
+            _save_lode_cache(cache, deadline=deadline)
         return True

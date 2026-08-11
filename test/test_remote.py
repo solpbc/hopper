@@ -18,6 +18,7 @@ import pytest
 
 from hopper import config
 from hopper.cli import main
+from hopper.deadline import make_deadline, shorten_deadline
 from hopper.projects import Project
 from hopper.remote import (
     REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC,
@@ -27,8 +28,11 @@ from hopper.remote import (
     CandidateProbe,
     HostDiscovery,
     LodeCacheError,
+    RemoteCommandUnavailable,
+    cancel_owned_children,
     discover_lodes,
     load_lode_cache,
+    make_child_registry,
     probe_candidate,
     probe_candidates,
     remember_lode,
@@ -41,14 +45,48 @@ from hopper.remote import (
 )
 
 
-def test_run_remote_builds_ssh_command_and_passes_stdin(monkeypatch):
+def install_completed_popen(monkeypatch, responder):
+    """Install a synchronous Popen double driven by one completed-process responder."""
     calls = []
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            self.args = command
+            self.kwargs = kwargs
+            self.returncode = None
+            self._result = None
+            calls.append(self)
+
+        def communicate(self, input=None, timeout=None):
+            self.input = input
+            self.timeout = timeout
+            self._result = responder(self.args, self.kwargs, input, timeout)
+            self.returncode = self._result.returncode
+            return self._result.stdout, self._result.stderr
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr("hopper.remote.subprocess.Popen", FakeProcess)
+    return calls
+
+
+def test_run_remote_builds_ssh_command_and_passes_stdin(monkeypatch):
+    def respond(command, _kwargs, _input, _timeout):
         return subprocess.CompletedProcess(command, 7, stdout="out", stderr="err")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    calls = install_completed_popen(monkeypatch, respond)
 
     result = run_remote(
         "fedora.local",
@@ -58,7 +96,8 @@ def test_run_remote_builds_ssh_command_and_passes_stdin(monkeypatch):
     )
 
     assert result.returncode == 7
-    command, kwargs = calls[0]
+    process = calls[0]
+    command, kwargs = process.args, process.kwargs
     assert command[:7] == [
         "ssh",
         "-o",
@@ -73,10 +112,11 @@ def test_run_remote_builds_ssh_command_and_passes_stdin(monkeypatch):
     assert "$HOME" in remote_command
     assert "'abc 123'" in remote_command
     assert "'quote'\"'\"'arg'" in remote_command
-    assert kwargs["input"] == "scope text"
-    assert kwargs["capture_output"] is True
+    assert process.input == "scope text"
+    assert kwargs["stdout"] is subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.PIPE
     assert kwargs["text"] is True
-    assert kwargs["timeout"] == 12
+    assert process.timeout == 12
 
 
 def test_run_remote_devnulls_stdin_when_none(monkeypatch):
@@ -87,18 +127,16 @@ def test_run_remote_devnulls_stdin_when_none(monkeypatch):
     inherited the real stdin fd, it could drain the scope before the create
     call ever sees it.
     """
-    calls = []
 
-    def fake_run(command, **kwargs):
-        calls.append(kwargs)
+    def respond(command, _kwargs, _input, _timeout):
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    calls = install_completed_popen(monkeypatch, respond)
 
     run_remote("suze.local", ["ping"])
 
-    assert "input" not in calls[0]
-    assert calls[0]["stdin"] is subprocess.DEVNULL
+    assert calls[0].input is None
+    assert calls[0].kwargs["stdin"] is subprocess.DEVNULL
 
 
 @pytest.mark.parametrize(
@@ -107,7 +145,7 @@ def test_run_remote_devnulls_stdin_when_none(monkeypatch):
 )
 def test_run_remote_rejects_unsafe_host_before_spawning(host, monkeypatch):
     spawn = MagicMock()
-    monkeypatch.setattr(subprocess, "run", spawn)
+    monkeypatch.setattr("hopper.remote.subprocess.Popen", spawn)
 
     with pytest.raises(ValueError, match="invalid remote host"):
         run_remote(host, ["ping"])
@@ -116,18 +154,15 @@ def test_run_remote_rejects_unsafe_host_before_spawning(host, monkeypatch):
 
 
 def test_run_remote_preserves_arbitrary_binary_stdin(monkeypatch):
-    calls = []
-
-    def fake_run(command, **kwargs):
-        calls.append(kwargs)
+    def respond(command, _kwargs, _input, _timeout):
         return subprocess.CompletedProcess(command, 0, stdout=b"ok\n", stderr=b"")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    calls = install_completed_popen(monkeypatch, respond)
 
     result = run_remote("suze.local", ["lode", "repair-output"], stdin_bytes=b"\xff\x00\n")
 
-    assert calls[0]["input"] == b"\xff\x00\n"
-    assert calls[0]["text"] is False
+    assert calls[0].input == b"\xff\x00\n"
+    assert calls[0].kwargs["text"] is False
     assert result.stdout == "ok\n"
     assert result.stderr == ""
 
@@ -155,20 +190,126 @@ def test_run_remote_streaming_devnulls_stdin(monkeypatch):
 
 
 def test_run_remote_expands_preserved_tilde_on_remote(monkeypatch):
-    calls = []
-
-    def fake_run(command, **kwargs):
-        calls.append(command)
+    def respond(command, _kwargs, _input, _timeout):
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    calls = install_completed_popen(monkeypatch, respond)
 
     run_remote("fedora.local", ["project", "add", "~/src/my project"])
 
-    remote_command = calls[0][7]
+    remote_command = calls[0].args[7]
     assert '"$HOME"/' in remote_command
     assert "'src/my project'" in remote_command
     assert "~/src" not in remote_command
+
+
+def test_run_remote_registers_and_reaps_owned_child(monkeypatch):
+    child_control = make_child_registry()
+
+    def respond(command, _kwargs, _input, _timeout):
+        process = calls[0]
+        assert process in child_control["children"]
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    calls = install_completed_popen(monkeypatch, respond)
+    result = run_remote(
+        "worker.example",
+        ["ping"],
+        deadline=make_deadline(5),
+        child_control=child_control,
+    )
+
+    assert result.returncode == 0
+    assert calls[0].poll() == 0
+    assert child_control["children"] == set()
+
+
+def test_cancel_owned_children_terminates_then_kills_and_reaps_within_bound():
+    class FakeClock:
+        now = 3599.0
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    events = []
+
+    class StubbornChild:
+        def __init__(self, name):
+            self.name = name
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            events.append(("terminate", self.name))
+
+        def kill(self):
+            events.append(("kill", self.name))
+            self.returncode = -9
+
+        def wait(self, timeout):
+            events.append(("wait", self.name, timeout))
+            if self.returncode is None:
+                clock.advance(timeout)
+                raise subprocess.TimeoutExpired(self.name, timeout)
+            return self.returncode
+
+    original_deadline = {"expires_at": 3600.0, "clock": clock}
+    cleanup_deadline = shorten_deadline(original_deadline, clock() + 5.0)
+    control = make_child_registry()
+    children = [StubbornChild(str(index)) for index in range(3)]
+    control["children"].update(children)
+
+    cancel_owned_children(control, cleanup_deadline)
+
+    terminate_positions = [index for index, event in enumerate(events) if event[0] == "terminate"]
+    kill_positions = [index for index, event in enumerate(events) if event[0] == "kill"]
+    assert max(terminate_positions) < min(kill_positions)
+    assert all(child.poll() is not None for child in children)
+    assert control["children"] == set()
+    assert clock() <= min(original_deadline["expires_at"], 3599.0 + 5.0)
+
+
+def test_cancelled_child_registry_refuses_remote_spawn(monkeypatch):
+    child_control = make_child_registry()
+    child_control["cancel_event"].set()
+    popen = MagicMock()
+    monkeypatch.setattr("hopper.remote.subprocess.Popen", popen)
+
+    with pytest.raises(RemoteCommandUnavailable, match="cancelled before spawn"):
+        run_remote(
+            "worker.example",
+            ["ping"],
+            deadline=make_deadline(5),
+            child_control=child_control,
+        )
+
+    popen.assert_not_called()
+
+
+def test_explicit_host_wait_maps_ssh_255_to_availability_exit(monkeypatch):
+    def respond(command, _kwargs, _input, _timeout):
+        return subprocess.CompletedProcess(command, 255, stdout="", stderr="ssh unavailable")
+
+    calls = install_completed_popen(monkeypatch, respond)
+    streaming = MagicMock(side_effect=AssertionError("wait used streaming transport"))
+    monkeypatch.setattr("hopper.remote.run_remote_streaming", streaming)
+    monkeypatch.setattr("hopper.cli.require_not_inside_lode", lambda: None)
+    monkeypatch.setattr("hopper.cli._remote_disabled", lambda: False)
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "worker.example", "wait", "abc123"])
+
+    rc = main()
+
+    assert rc == 4
+    assert rc != 255
+    assert len(calls) == 1
+    assert calls[0].poll() == 255
+    streaming.assert_not_called()
 
 
 def test_remote_registry_set_remove():
@@ -607,20 +748,18 @@ def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
     stdin for those calls. Concurrent probes across a multi-member pool
     could drain the local scope before the one authoritative create call
     ever read it. This exercises the real
-    probe_candidates -> run_remote path end to end (only subprocess.run is
+    probe_candidates -> run_remote path end to end (only subprocess.Popen is
     mocked) with a two-host pool, which a test that stubs out pool selection
     entirely cannot see.
     """
     from io import StringIO
 
     scope_text = "this is a stdin scope that is long enough to pass the minimum length check"
+    monkeypatch.delenv("HOPPER_LID", raising=False)
     config_path = temp_config / "config.json"
     config_path.write_bytes(b'{"remote.journal": ["fedora.local", "suze.local"]}\n')
     monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal"])
     monkeypatch.setattr(sys, "stdin", StringIO(scope_text))
-
-    calls = []
-    calls_lock = threading.Lock()
 
     def hop_args_of(command):
         remote_command = command[7]
@@ -628,9 +767,7 @@ def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
         tail = remote_command[remote_command.index(marker) + len(marker) :].strip()
         return shlex.split(tail) if tail else []
 
-    def fake_run(command, **kwargs):
-        with calls_lock:
-            calls.append((command, kwargs))
+    def respond(command, _kwargs, _input, _timeout):
         host = command[6]
         hop_args = hop_args_of(command)
         if hop_args[:2] == ["project", "list"]:
@@ -663,29 +800,25 @@ def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(created), stderr="")
         raise AssertionError(f"unexpected remote hop invocation: {hop_args}")
 
-    with (
-        patch("subprocess.run", side_effect=fake_run),
-        patch("hopper.remote.remember_lode") as remember,
-    ):
+    calls = install_completed_popen(monkeypatch, respond)
+    with patch("hopper.remote.remember_lode") as remember:
         assert main() == 0
 
     # fedora.local carries one active lode (load 1), suze.local carries none
     # (load 0), so the least-loaded, uniquely-eligible host is suze.local.
     create_calls = [
-        (command, kwargs)
-        for command, kwargs in calls
-        if hop_args_of(command)[:2] == ["implement", "journal"]
+        process for process in calls if hop_args_of(process.args)[:2] == ["implement", "journal"]
     ]
     assert len(create_calls) == 1
-    probe_only_calls = [(c, k) for c, k in calls if (c, k) not in create_calls]
+    probe_only_calls = [process for process in calls if process not in create_calls]
     assert probe_only_calls, "expected at least one probe call across the two-host pool"
-    for _command, kwargs in probe_only_calls:
-        assert "input" not in kwargs
-        assert kwargs.get("stdin") is subprocess.DEVNULL
+    for process in probe_only_calls:
+        assert process.input is None
+        assert process.kwargs.get("stdin") is subprocess.DEVNULL
 
-    create_command, create_kwargs = create_calls[0]
-    assert create_command[6] == "suze.local"
-    assert create_kwargs["input"] == scope_text
+    create_process = create_calls[0]
+    assert create_process.args[6] == "suze.local"
+    assert create_process.input == scope_text
 
     remember.assert_called_once_with("abcdefgh", "suze.local", "journal")
     assert capsys.readouterr().out == "Created lode abcdefgh (journal) on suze.local\n"

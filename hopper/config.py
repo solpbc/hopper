@@ -6,6 +6,7 @@
 import fcntl
 import json
 import os
+import socket
 import tempfile
 import time
 from collections.abc import Iterator
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Literal
 
 from platformdirs import user_data_dir
+
+from hopper import deadline as deadline_utils
 
 CONFIG_LOCK_TIMEOUT_SEC = 5.0
 CONFIG_LOCK_POLL_INTERVAL_SEC = 0.05
@@ -51,6 +54,11 @@ def worktree_root() -> Path:
     return Path.home() / ".hopper" / "worktrees"
 
 
+def hostname() -> str:
+    """Return this machine's hostname through an injectable accessor."""
+    return socket.gethostname()
+
+
 def config_path() -> Path:
     """Return the user config file path."""
     return hopper_dir() / "config.json"
@@ -61,9 +69,11 @@ def config_lock_path() -> Path:
     return hopper_dir() / "config.lock"
 
 
-def load_config() -> dict[str, object]:
+def load_config(*, deadline: dict | None = None) -> dict[str, object]:
     """Load the user config strictly, treating only absence as empty."""
     path = config_path()
+    if deadline is not None and deadline_utils.claim_call_budget(deadline, "config.read") is None:
+        raise ConfigError(path, "locked")
     try:
         text = path.read_text()
     except FileNotFoundError:
@@ -80,14 +90,20 @@ def load_config() -> dict[str, object]:
     return loaded
 
 
-def _acquire_config_lock(lock_file, path: Path) -> None:
-    deadline = time.monotonic() + CONFIG_LOCK_TIMEOUT_SEC
+def _acquire_config_lock(lock_file, path: Path, *, deadline: dict | None = None) -> None:
+    timeout = CONFIG_LOCK_TIMEOUT_SEC
+    if deadline is not None:
+        budget = deadline_utils.claim_call_budget(deadline, "config.lock", cap_s=timeout)
+        if budget is None:
+            raise ConfigError(path, "locked")
+        timeout = budget
+    lock_deadline = time.monotonic() + timeout
     while True:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         except BlockingIOError as exc:
-            remaining = deadline - time.monotonic()
+            remaining = lock_deadline - time.monotonic()
             if remaining <= 0:
                 raise ConfigError(path, "locked") from exc
             time.sleep(min(CONFIG_LOCK_POLL_INTERVAL_SEC, remaining))
@@ -95,10 +111,20 @@ def _acquire_config_lock(lock_file, path: Path) -> None:
             raise ConfigError(path, "unreadable") from exc
 
 
-def _publish_config(data: dict[str, object], path: Path) -> None:
+def _publish_config(
+    data: dict[str, object],
+    path: Path,
+    *,
+    deadline: dict | None = None,
+) -> None:
     fd = -1
     tmp: Path | None = None
     try:
+        if (
+            deadline is not None
+            and deadline_utils.claim_call_budget(deadline, "config.write") is None
+        ):
+            raise ConfigError(path, "locked")
         fd, tmp_name = tempfile.mkstemp(
             prefix=f"{path.name}.",
             suffix=".tmp",
@@ -133,7 +159,7 @@ def _publish_config(data: dict[str, object], path: Path) -> None:
 
 
 @contextmanager
-def config_transaction() -> Iterator[dict[str, object]]:
+def config_transaction(*, deadline: dict | None = None) -> Iterator[dict[str, object]]:
     """Serialize a strict read-modify-write and publish changes atomically.
 
     The lock covers the entire read-modify-write operation. An unchanged
@@ -142,6 +168,11 @@ def config_transaction() -> Iterator[dict[str, object]]:
     """
     data_dir = hopper_dir()
     path = config_path()
+    if (
+        deadline is not None
+        and deadline_utils.claim_call_budget(deadline, "config.transaction") is None
+    ):
+        raise ConfigError(path, "locked")
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         lock_file = open(config_lock_path(), "a+")
@@ -149,11 +180,18 @@ def config_transaction() -> Iterator[dict[str, object]]:
         raise ConfigError(path, "unreadable") from exc
 
     try:
-        _acquire_config_lock(lock_file, path)
-        data = load_config()
+        if deadline is None:
+            _acquire_config_lock(lock_file, path)
+            data = load_config()
+        else:
+            _acquire_config_lock(lock_file, path, deadline=deadline)
+            data = load_config(deadline=deadline)
         original = deepcopy(data)
         yield data
         if data != original:
-            _publish_config(data, path)
+            if deadline is None:
+                _publish_config(data, path)
+            else:
+                _publish_config(data, path, deadline=deadline)
     finally:
         lock_file.close()

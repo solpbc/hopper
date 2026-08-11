@@ -14,6 +14,7 @@ Lodes are plain dicts with these fields:
 - status: str - human-readable status text (default "")
 - title: str - short human-readable label (default "")
 - branch: str - git branch name for this lode's worktree (default "")
+- worktree_path: str | None - durably published managed worktree path (default None)
 - active: bool - whether a runner client is connected (default False)
 - tmux_pane: str | None - tmux pane ID (default None)
 - pid: int | None - process ID of active runner (default None)
@@ -207,6 +208,56 @@ def get_worktree_dir(lode_id: str) -> Path:
     return config.worktree_root() / lode_id
 
 
+def resolve_worktree_path(lode: dict) -> dict:
+    """Resolve durable or discoverable worktree provenance for a lode."""
+    lode_id = lode.get("id")
+    if not isinstance(lode_id, str) or not lode_id:
+        return {"path": None, "basis": "unavailable", "reason": "invalid_lode_id"}
+
+    try:
+        root = config.worktree_root().resolve(strict=False)
+        managed_candidate = root / lode_id
+        managed = managed_candidate.resolve(strict=False)
+        legacy = (get_lode_dir(lode_id) / "worktree").resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return {"path": None, "basis": "unavailable", "reason": "discovery_error"}
+
+    recorded = lode.get("worktree_path")
+    if recorded is not None:
+        if not isinstance(recorded, str) or not recorded or "\x00" in recorded:
+            return {"path": None, "basis": "unavailable", "reason": "invalid_recorded_path"}
+        recorded_path = Path(recorded)
+        if not recorded_path.is_absolute():
+            return {"path": None, "basis": "unavailable", "reason": "recorded_not_absolute"}
+        try:
+            canonical = recorded_path.resolve(strict=False)
+            canonical.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return {"path": None, "basis": "unavailable", "reason": "recorded_outside_root"}
+        if canonical != managed_candidate:
+            return {"path": None, "basis": "unavailable", "reason": "recorded_identity_mismatch"}
+        return {"path": canonical, "basis": "recorded", "reason": None}
+
+    try:
+        legacy_exists = legacy.is_dir()
+        managed_exists = managed.is_dir()
+    except OSError:
+        return {"path": None, "basis": "unavailable", "reason": "discovery_error"}
+    if legacy_exists and managed_exists:
+        return {"path": None, "basis": "unavailable", "reason": "ambiguous_candidates"}
+    if managed_exists:
+        if managed != managed_candidate:
+            return {
+                "path": None,
+                "basis": "unavailable",
+                "reason": "managed_identity_mismatch",
+            }
+        return {"path": managed, "basis": "existing", "reason": None}
+    if legacy_exists:
+        return {"path": legacy, "basis": "unavailable", "reason": "legacy_outside_root"}
+    return {"path": None, "basis": "unavailable", "reason": "no_existing_candidate"}
+
+
 def parse_diff_numstat_totals(text: str) -> tuple[int, int]:
     """Parse git numstat output and return (total_additions, total_deletions)."""
     total_additions = 0
@@ -393,6 +444,7 @@ def create_lode(
         "status": "Ready to start",
         "title": "",
         "branch": "",
+        "worktree_path": None,
         "active": False,
         "tmux_pane": None,
         "pid": None,
@@ -582,6 +634,11 @@ def update_lode_branch(lodes: list[dict], lode_id: str, branch: str) -> dict | N
     return _update_lode_field(lodes, lode_id, "branch", branch)
 
 
+def update_lode_worktree_path(lodes: list[dict], lode_id: str, worktree_path: str) -> dict | None:
+    """Update durable worktree provenance. Returns the updated lode or None."""
+    return _update_lode_field(lodes, lode_id, "worktree_path", worktree_path)
+
+
 def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: str) -> dict | None:
     """Update the codex thread ID on a lode."""
     return _update_lode_field(lodes, lode_id, "codex_thread_id", codex_thread_id)
@@ -682,7 +739,11 @@ def format_terminal_failure_status(failure_kind: str, lode_id: str) -> str:
     return template.format(lode_id=lode_id)
 
 
-def _lode_status_and_liveness(lode: dict) -> tuple[str, Liveness | None]:
+def _lode_status_and_liveness(
+    lode: dict,
+    *,
+    pane_timeout: float | None = None,
+) -> tuple[str, Liveness | None]:
     """Return display status and current local pane evidence, if probed."""
     status = lode.get("status", "")
     if not status:
@@ -706,7 +767,11 @@ def _lode_status_and_liveness(lode: dict) -> tuple[str, Liveness | None]:
         liveness = Liveness.GONE
     else:
         try:
-            liveness = pane_liveness(pane)
+            liveness = (
+                pane_liveness(pane)
+                if pane_timeout is None
+                else pane_liveness(pane, timeout=pane_timeout)
+            )
         except Exception:
             liveness = Liveness.UNKNOWN
 
@@ -720,15 +785,15 @@ def _lode_status_and_liveness(lode: dict) -> tuple[str, Liveness | None]:
         return status + PARK_LIVENESS_UNVERIFIED_SUFFIX, liveness
 
 
-def lode_status_for_display(lode: dict) -> str:
+def lode_status_for_display(lode: dict, *, pane_timeout: float | None = None) -> str:
     """Return a lode's human-readable status with current local pane evidence."""
-    status, _liveness = _lode_status_and_liveness(lode)
+    status, _liveness = _lode_status_and_liveness(lode, pane_timeout=pane_timeout)
     return status
 
 
-def lode_with_status_annotations(lode: dict) -> dict:
+def lode_with_status_annotations(lode: dict, *, pane_timeout: float | None = None) -> dict:
     """Return a copied lode with additive display status and pane liveness."""
-    status, liveness = _lode_status_and_liveness(lode)
+    status, liveness = _lode_status_and_liveness(lode, pane_timeout=pane_timeout)
     annotated = dict(lode)
     annotated["status_display"] = status
     annotated["pane_liveness"] = (

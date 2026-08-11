@@ -65,15 +65,14 @@ def get_tmux_sessions() -> list[str]:
         return []
 
 
-def pane_liveness(pane_id: str) -> Liveness:
+def pane_liveness(pane_id: str, *, timeout: float | None = None) -> Liveness:
     """Return whether a pane is alive, gone, or uncheckable."""
     try:
-        result = subprocess.run(
-            ["tmux", "has-session", "-t", pane_id],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
+        kwargs: dict[str, object] = {"capture_output": True, "text": True}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        result = subprocess.run(["tmux", "has-session", "-t", pane_id], **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
         return Liveness.UNKNOWN
 
     if result.returncode == 0:
@@ -530,7 +529,12 @@ def send_keys(target: str, keys: str) -> bool:
         return False
 
 
-def capture_pane(target: str, plain: bool = False) -> str | None:
+def capture_pane(
+    target: str,
+    plain: bool = False,
+    *,
+    timeout: float | None = None,
+) -> str | None:
     """Capture the contents of a tmux pane.
 
     Args:
@@ -545,15 +549,14 @@ def capture_pane(target: str, plain: bool = False) -> str | None:
         cmd.append("-e")
     cmd.extend(["-p", "-t", target])
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-        )
+        kwargs: dict[str, object] = {"capture_output": True, "text": True}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        result = subprocess.run(cmd, **kwargs)
         if result.returncode != 0:
             return None
         return result.stdout
-    except FileNotFoundError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 

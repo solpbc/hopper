@@ -49,6 +49,7 @@ from hopper.lodes import (
     lode_status_for_display,
     lode_with_status_annotations,
     reset_lode_claude_stage,
+    resolve_worktree_path,
     save_archived_lodes,
     save_lodes,
     set_lode_claude_started,
@@ -59,6 +60,7 @@ from hopper.lodes import (
     update_lode_stage,
     update_lode_state,
     update_lode_title,
+    update_lode_worktree_path,
 )
 from hopper.tmux import Liveness
 
@@ -195,6 +197,7 @@ def test_create_lode(temp_config):
     assert lode["stage"] == "mill"
     assert lode["project"] == "test-project"
     assert lode["branch"] == ""
+    assert lode["worktree_path"] is None
     assert lode["last_progress_at"] is None
     assert lode["last_progress_summary"] == ""
     assert lode["last_pane_activity_at"] is None
@@ -592,6 +595,95 @@ def test_worktree_dir_resolves_legacy_worktree_in_place(tmp_path):
 
     legacy_path.rmdir()
     assert get_worktree_dir(lode_id) == config.worktree_root() / lode_id
+
+
+def test_resolve_worktree_path_uses_recorded_provenance_when_cleaned(make_lode):
+    managed = config.worktree_root() / "testid11"
+    lode = make_lode(worktree_path=str(managed))
+
+    assert resolve_worktree_path(lode) == {
+        "path": managed,
+        "basis": "recorded",
+        "reason": None,
+    }
+
+
+def test_resolve_worktree_path_discovers_one_managed_candidate(make_lode):
+    managed = config.worktree_root() / "testid11"
+    managed.mkdir(parents=True)
+
+    assert resolve_worktree_path(make_lode()) == {
+        "path": managed,
+        "basis": "existing",
+        "reason": None,
+    }
+
+
+def test_resolve_worktree_path_keeps_legacy_usable_without_provenance(make_lode):
+    legacy = get_lode_dir("testid11") / "worktree"
+    legacy.mkdir(parents=True)
+
+    assert resolve_worktree_path(make_lode()) == {
+        "path": legacy,
+        "basis": "unavailable",
+        "reason": "legacy_outside_root",
+    }
+
+
+def test_resolve_worktree_path_refuses_ambiguous_candidates(make_lode):
+    (get_lode_dir("testid11") / "worktree").mkdir(parents=True)
+    (config.worktree_root() / "testid11").mkdir(parents=True)
+
+    assert resolve_worktree_path(make_lode()) == {
+        "path": None,
+        "basis": "unavailable",
+        "reason": "ambiguous_candidates",
+    }
+
+
+def test_resolve_worktree_path_does_not_guess_cleaned_legacy_candidate(make_lode):
+    assert resolve_worktree_path(make_lode()) == {
+        "path": None,
+        "basis": "unavailable",
+        "reason": "no_existing_candidate",
+    }
+
+
+@pytest.mark.parametrize(
+    ("recorded", "reason"),
+    [
+        ("relative/worktree", "recorded_not_absolute"),
+        ("/outside/testid11", "recorded_outside_root"),
+    ],
+)
+def test_resolve_worktree_path_rejects_invalid_recorded_provenance(make_lode, recorded, reason):
+    assert resolve_worktree_path(make_lode(worktree_path=recorded)) == {
+        "path": None,
+        "basis": "unavailable",
+        "reason": reason,
+    }
+
+
+def test_update_and_archive_preserve_worktree_path(make_lode):
+    lodes = [make_lode()]
+    managed = config.worktree_root() / "testid11"
+
+    updated = update_lode_worktree_path(lodes, "testid11", str(managed))
+    archived = archive_lode(lodes, "testid11")
+
+    assert updated is not None
+    assert archived is not None
+    assert archived["worktree_path"] == str(managed)
+    assert load_archived_lodes()[0]["worktree_path"] == str(managed)
+
+
+def test_archive_does_not_eagerly_add_worktree_provenance():
+    lodes = [{"id": "testid11", "stage": "mill", "created_at": 1}]
+
+    archived = archive_lode(lodes, "testid11")
+
+    assert archived is not None
+    assert "worktree_path" not in archived
 
 
 def test_create_worktree_at_resolved_whitespace_free_path(tmp_path, monkeypatch):

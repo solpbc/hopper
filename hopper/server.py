@@ -60,6 +60,7 @@ from hopper.lodes import (
     load_lodes,
     reserve_lode_id,
     reset_lode_claude_stage,
+    resolve_worktree_path,
     save_archived_lodes,
     save_lodes,
     set_lode_claude_started,
@@ -72,6 +73,7 @@ from hopper.lodes import (
     update_lode_state,
     update_lode_status,
     update_lode_title,
+    update_lode_worktree_path,
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
@@ -120,6 +122,45 @@ _FEEDBACK_ACCEPTANCE_POLL_COUNT = 12
 _FEEDBACK_IDLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_IDLE_POLL_COUNT
 _FEEDBACK_SETTLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_SETTLE_POLL_COUNT
 _FEEDBACK_ACCEPTANCE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_ACCEPTANCE_POLL_COUNT
+
+
+def _validate_worktree_path_publication(lode: dict, message: dict) -> tuple[str | None, str | None]:
+    """Validate runner-owned durable worktree provenance."""
+    project = message.get("project")
+    if not isinstance(project, str) or not project:
+        return "invalid_project", None
+    if project != lode.get("project"):
+        return "project_mismatch", None
+
+    raw_path = message.get("worktree_path")
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        return "invalid_worktree_path", None
+    requested = Path(raw_path)
+    if not requested.is_absolute():
+        return "worktree_not_absolute", None
+    try:
+        canonical = requested.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return "worktree_missing", None
+    if not canonical.is_dir():
+        return "worktree_missing", None
+
+    try:
+        root = config.worktree_root().resolve(strict=False)
+        canonical.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return "worktree_outside_root", None
+    try:
+        expected = root / lode["id"]
+    except (OSError, RuntimeError, ValueError, KeyError):
+        return "worktree_identity_mismatch", None
+    if canonical != expected:
+        return "worktree_identity_mismatch", None
+
+    recorded = lode.get("worktree_path")
+    if recorded is not None and recorded != "" and recorded != str(canonical):
+        return "worktree_provenance_conflict", None
+    return None, str(canonical)
 
 
 def _collapse_lode_snapshot_matches(
@@ -4638,8 +4679,9 @@ class Server:
     def _cleanup_worktree(self, lode: dict) -> None:
         """Remove git worktree and branch for an archived lode."""
         lode_id = lode["id"]
-        worktree_path = get_worktree_dir(lode_id)
-        if not worktree_path.is_dir():
+        resolution = resolve_worktree_path(lode)
+        worktree_path = resolution["path"]
+        if worktree_path is None or not worktree_path.is_dir():
             return
         project_name = lode.get("project", "")
         if not project_name:
@@ -4962,6 +5004,12 @@ class Server:
             if msg_type in HELD_RUNNER_MUTATION_TYPES and _lifecycle_grace_pending(lode):
                 acknowledge_mutation(False, "lifecycle_grace_pending")
                 return
+            if msg_type == "lode_set_worktree_path":
+                reason, canonical_path = _validate_worktree_path_publication(lode, message)
+                if reason:
+                    acknowledge_mutation(False, reason)
+                    return
+                message["worktree_path"] = canonical_path
             if msg_type not in {"lode_register", "lode_supervisor_register", "lode_set_state"}:
                 acknowledge_mutation(True, "accepted")
 
@@ -5295,6 +5343,15 @@ class Server:
                 lode = update_lode_branch(self.lodes, lode_id, branch)
                 if lode:
                     logger.info(f"Lode {lode_id} branch={branch}")
+                    self.broadcast({"type": "lode_updated", "lode": lode})
+
+        elif msg_type == "lode_set_worktree_path":
+            lode_id = message.get("lode_id")
+            worktree_path = message.get("worktree_path")
+            if lode_id and isinstance(worktree_path, str):
+                lode = update_lode_worktree_path(self.lodes, lode_id, worktree_path)
+                if lode:
+                    logger.info(f"Lode {lode_id} worktree_path={worktree_path}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_codex_thread":

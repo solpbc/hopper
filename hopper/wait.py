@@ -5,21 +5,26 @@
 
 import json
 import logging
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from pathlib import Path
 
 import hopper.client as client
 import hopper.remote as remote
+from hopper import config
+from hopper import deadline as deadline_utils
 from hopper.actions import PHASES
 from hopper.lodes import (
     STATUS_ERROR,
     STATUS_SHIPPED,
-    lode_status_for_display,
     lode_with_status_annotations,
+    resolve_worktree_path,
 )
 from hopper.tmux import capture_pane
 
@@ -27,7 +32,6 @@ STUCK_GRACE_MS = 120_000
 MIN_POLL_S = 10.0
 WAIT_SUMMARY_ONE = "hop wait: {lode_id} {outcome} — exited {code}"
 WAIT_SUMMARY_ITEM = "  {lode_id}: {outcome}"
-WAIT_SUMMARY_UNRESOLVED = "  {lode_id}: not resolved — wait returned first"
 WAIT_SUMMARY_MANY = "hop wait: {resolved} of {requested} lodes resolved — exited {code}"
 WAIT_SUMMARY_INTERRUPT = "hop wait: interrupted — exited 130"
 WAIT_SUMMARY_NO_TARGET = "hop wait: could not resolve target — exited 1"
@@ -36,6 +40,55 @@ WAIT_SUMMARY_STATUS_UNAVAILABLE = "hop wait: status_unavailable — exited 4"
 _monotonic = time.monotonic
 
 logger = logging.getLogger(__name__)
+
+REASON_CODES = {
+    "shipped": "shipping_completed",
+    "archived": "archived_before_shipping",
+    "error": "lode_error",
+    "inactive": "runner_inactive",
+    "gated": "gate_requires_review",
+    "stuck": "progress_stalled",
+    "not_found": "target_disappeared",
+    "action_blocked": "durable_action_blocked",
+    "action_stalled": "successor_adoption_stalled",
+    "startup_stalled": "startup_registration_stalled",
+    "handoff_stalled": "ready_handoff_stalled",
+    "reconnect_stalled": "runner_reregistration_stalled",
+    "observer_unavailable": "observer_freshness_expired",
+    "timeout": "overall_timeout",
+    "target_absent": "target_absent",
+    "target_ambiguous": "target_ambiguous",
+    "status_unavailable": "initial_status_unavailable",
+    "interrupted": "user_interrupted",
+}
+
+FINAL_RECORD_KEYS = {
+    "id",
+    "outcome",
+    "exit_code",
+    "reason_code",
+    "recovery",
+    "stage",
+    "state",
+    "status",
+    "status_display",
+    "failure_kind",
+    "active",
+    "archived",
+    "archived_at",
+    "server",
+    "route",
+    "probes",
+    "matches",
+    "observed_age_s",
+    "pane_liveness",
+    "tmux_pane",
+    "last_tmux_pane",
+    "worktree_path",
+    "worktree_path_basis",
+    "worktree_exists",
+    "worktree_exists_observed_age_s",
+}
 
 
 def validate_snapshot(raw, expected_lid: str) -> dict | None:
@@ -107,15 +160,52 @@ def _new_grace(kind: str | None, origin_ts: float) -> dict | None:
     }
 
 
-def _new_record(lid: str, snapshot: dict, source: str, observed_ts: float, order: int) -> dict:
+def _default_probe_row(route: str, outcome: str = "found") -> dict:
+    """Build fallback evidence for injected resolvers that predate probe rows."""
+    try:
+        server = config.hostname() if route == "local" else route
+    except Exception:
+        server = None
+    return {
+        "kind": "local" if route == "local" else "routed",
+        "server": server,
+        "route": route,
+        "candidate_id": None,
+        "outcome": outcome,
+        "detail": None,
+        "attempts": 1,
+        "observed_age_s": 0.0,
+    }
+
+
+def _new_record(
+    lid: str,
+    snapshot: dict,
+    route: str,
+    observed_ts: float,
+    order: int,
+    *,
+    probes: list[dict] | None = None,
+) -> dict:
     """Create one plain supervisor record from an initial valid snapshot."""
-    remote_source = source != "local"
+    remote_source = route != "local"
+    probe_rows = [dict(probe) for probe in probes] if probes else [_default_probe_row(route)]
+    for probe in probe_rows:
+        if probe.get("attempts", 0):
+            probe["_observed_ts"] = observed_ts
     return {
         "id": lid,
+        "key": lid,
+        "query": lid,
         "order": order,
-        "source": source,
-        "host": source if remote_source else None,
+        "route": route,
+        "server": route if remote_source else None,
         "remote": remote_source,
+        "probes": probe_rows,
+        "matches": [],
+        "preset_outcome": None,
+        "preset_code": None,
+        "preset_reason": None,
         "latest_snapshot": snapshot,
         "latest_snapshot_ts": observed_ts,
         "last_valid_ts": observed_ts,
@@ -125,12 +215,61 @@ def _new_record(lid: str, snapshot: dict, source: str, observed_ts: float, order
         "consecutive_failures": 0,
         "warned_failure_key": None,
         "not_found_count": 0,
+        "generation_timed_out": False,
     }
 
 
-def _initial_error(message: str, json_output: bool) -> None:
-    """Keep JSON stdout clean while preserving human lookup errors."""
-    print(message, file=sys.stderr if json_output else sys.stdout)
+def _resolution_failure_record(query: str, result: dict, order: int, now: float) -> dict:
+    """Build a supervisor record for one completed resolution failure."""
+    result_outcome = result.get("outcome")
+    outcome, code, reason = {
+        "absent": ("target_absent", 1, "target_absent"),
+        "ambiguous": ("target_ambiguous", 1, "target_ambiguous"),
+        "unavailable": ("status_unavailable", 4, "initial_status_unavailable"),
+    }.get(result_outcome, ("status_unavailable", 4, "initial_status_unavailable"))
+    route = result.get("host") if isinstance(result.get("host"), str) else None
+    probes = result.get("probes")
+    if not isinstance(probes, list) or not probes:
+        probes = [_default_probe_row(route or "local", str(result_outcome or "unavailable"))]
+    probe_rows = [dict(probe) for probe in probes]
+    for probe in probe_rows:
+        if probe.get("attempts", 0):
+            probe["_observed_ts"] = now
+    matches = []
+    for match in result.get("match_tuples", []):
+        if not isinstance(match, (list, tuple)) or len(match) != 2:
+            continue
+        server, lode_id = match
+        if isinstance(lode_id, str) and (server is None or isinstance(server, str)):
+            matches.append({"server": server, "id": lode_id})
+    return {
+        "id": query,
+        "key": f"failure:{query}",
+        "query": query,
+        "order": order,
+        "route": route,
+        "server": (
+            route
+            if outcome == "status_unavailable" and route and result.get("resident_owner") is True
+            else None
+        ),
+        "remote": route not in {None, "local"},
+        "probes": probe_rows,
+        "matches": matches,
+        "preset_outcome": outcome,
+        "preset_code": code,
+        "preset_reason": reason,
+        "latest_snapshot": None,
+        "latest_snapshot_ts": now,
+        "last_valid_ts": now,
+        "next_reconcile_ts": now,
+        "reconcile_requested": False,
+        "grace": None,
+        "consecutive_failures": 0,
+        "warned_failure_key": None,
+        "not_found_count": 0,
+        "generation_timed_out": False,
+    }
 
 
 def _resolve_targets(
@@ -138,44 +277,127 @@ def _resolve_targets(
     raw_ids: list[str],
     json_output: bool,
     resolver: Callable,
-) -> dict[str, dict] | int:
-    """Resolve all requested IDs to validated canonical local or remote snapshots."""
-    records: dict[str, dict] = {}
-    for order, raw_id in enumerate(raw_ids):
-        result = resolver(socket_path, raw_id)
+    *,
+    deadline: dict,
+    child_control: dict,
+    records: dict[str, dict] | None = None,
+) -> dict[str, dict]:
+    """Resolve every query under deterministic scheduling without early abort."""
+    del json_output
+    if records is None:
+        records = {}
+    probe_template: list[dict] = []
+    scheduled = sorted(enumerate(raw_ids), key=lambda item: (item[1].encode("utf-8"), item[0]))
+    for order, raw_id in scheduled:
+        if deadline_utils.claim_call_budget(deadline, "wait.resolve_target") is None:
+            result = {
+                "outcome": "unavailable",
+                "host": None,
+                "match_tuples": [],
+                "probes": [
+                    {
+                        **probe,
+                        "outcome": "not_attempted",
+                        "detail": "deadline expired",
+                        "attempts": 0,
+                        "observed_age_s": None,
+                    }
+                    for probe in probe_template
+                ]
+                or [
+                    {
+                        **_default_probe_row("local"),
+                        "outcome": "not_attempted",
+                        "detail": "deadline expired",
+                        "attempts": 0,
+                        "observed_age_s": None,
+                    }
+                ],
+            }
+        else:
+            result = resolver(
+                socket_path,
+                raw_id,
+                deadline=deadline,
+                child_control=child_control,
+            )
+            if isinstance(result.get("probes"), list) and result["probes"]:
+                probe_template = [dict(probe) for probe in result["probes"]]
         if result.get("outcome") != "found":
-            _initial_error(result.get("error", f"Lode '{raw_id}' not found."), json_output)
-            if result.get("outcome") == "unavailable":
-                return 4
-            return result.get("exit_code", 1)
+            key = f"failure:{raw_id}"
+            if key not in records:
+                records[key] = _resolution_failure_record(raw_id, result, order, _monotonic())
+                records[key]["queries"] = [raw_id]
+            else:
+                records[key]["order"] = min(records[key]["order"], order)
+                records[key]["queries"].append(raw_id)
+            continue
         lode = result.get("lode")
 
         lid = lode.get("id") if isinstance(lode, dict) else None
         if not isinstance(lid, str):
-            _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return 4
+            key = f"failure:{raw_id}"
+            records[key] = _resolution_failure_record(
+                raw_id,
+                {"outcome": "unavailable", "probes": result.get("probes", [])},
+                order,
+                _monotonic(),
+            )
+            records[key]["queries"] = [raw_id]
+            continue
         snapshot = validate_snapshot(lode, lid)
         if snapshot is None:
-            _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return 4
-        if lid in records:
+            key = f"failure:{raw_id}"
+            records[key] = _resolution_failure_record(
+                raw_id,
+                {"outcome": "unavailable", "probes": result.get("probes", [])},
+                order,
+                _monotonic(),
+            )
+            records[key]["queries"] = [raw_id]
             continue
-        source = result.get("host")
-        if not isinstance(source, str):
-            _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return 4
+        if lid in records:
+            records[lid]["order"] = min(records[lid]["order"], order)
+            records[lid]["queries"].append(raw_id)
+            continue
+        route = result.get("host")
+        if not isinstance(route, str):
+            records[f"failure:{raw_id}"] = _resolution_failure_record(
+                raw_id,
+                {"outcome": "unavailable", "probes": result.get("probes", [])},
+                order,
+                _monotonic(),
+            )
+            records[f"failure:{raw_id}"]["queries"] = [raw_id]
+            continue
         observed_ts = _monotonic()
-        records[lid] = _new_record(lid, snapshot, source, observed_ts, order)
+        records[lid] = _new_record(
+            lid,
+            snapshot,
+            route,
+            observed_ts,
+            order,
+            probes=result.get("probes"),
+        )
+        records[lid]["query"] = raw_id
+        records[lid]["queries"] = [raw_id]
+        records[lid]["query"] = raw_id
     return records
 
 
-def _publish_resident_routes(records: dict[str, dict]) -> None:
+def _publish_resident_routes(records: dict[str, dict], *, deadline: dict) -> None:
     """Publish only new or changed initial resident routes, warning once on failure."""
-    remote_records = [record for record in records.values() if record["remote"]]
+    remote_records = [
+        record
+        for record in records.values()
+        if record["remote"] and isinstance(record.get("latest_snapshot"), dict)
+    ]
     if not remote_records:
         return
+    if deadline_utils.claim_call_budget(deadline, "wait.route_cache_load") is None:
+        return
     try:
-        cache = remote.load_lode_cache()
+        cache = remote.load_lode_cache(deadline=deadline)
     except Exception as error:
         print(f"warning: could not read remote lode cache: {error}", file=sys.stderr)
         return
@@ -183,14 +405,17 @@ def _publish_resident_routes(records: dict[str, dict]) -> None:
     warned = False
     for record in remote_records:
         lid = record["id"]
-        host = record["host"]
+        host = record["route"]
         if cache.get(lid, {}).get("host") == host:
             continue
+        if deadline_utils.claim_call_budget(deadline, "wait.route_cache_remember") is None:
+            return
         try:
             remote.remember_lode(
                 lid,
                 host,
                 record["latest_snapshot"].get("project", ""),
+                deadline=deadline,
             )
             cache[lid] = {"host": host}
         except Exception as error:
@@ -223,12 +448,27 @@ def _request_local_reconcile(state: dict, lid: str | None = None) -> None:
 def _probe_remote_observation(
     lid: str,
     host: str,
-    probe_timeout_s: float,
+    probe_deadline: dict,
     probe_remote: Callable,
+    child_control: dict,
 ) -> dict:
     """Return one normalized remote observation without mutating supervisor state."""
+    if deadline_utils.claim_call_budget(probe_deadline, "wait.remote_probe") is None:
+        return {
+            "id": lid,
+            "kind": "unreadable",
+            "payload": None,
+            "detail": "remote probe deadline expired",
+            "failure_key": "deadline_expired",
+            "observed_ts": _monotonic(),
+        }
     try:
-        snapshot, probe_state = probe_remote(host, lid, timeout=probe_timeout_s)
+        snapshot, probe_state = probe_remote(
+            host,
+            lid,
+            deadline=probe_deadline,
+            child_control=child_control,
+        )
         if probe_state == "found":
             kind = "found"
             detail = ""
@@ -263,7 +503,6 @@ def _remote_worker(
     lid: str,
     host: str,
     interval_s: float,
-    probe_timeout_s: float,
     probe_remote: Callable,
 ) -> None:
     """Post every bounded remote probe result for one lode."""
@@ -271,11 +510,33 @@ def _remote_worker(
         with state["condition"]:
             if state["shutdown"] or lid not in state["pending"]:
                 return
+        budget = deadline_utils.claim_call_budget(
+            state["deadline"],
+            "wait.remote_probe_generation",
+            cap_s=state["probe_timeout_s"],
+        )
+        if budget is None:
+            return
+        probe_deadline = deadline_utils.shorten_deadline(
+            state["deadline"],
+            state["deadline"]["clock"]() + budget,
+        )
         _post_observation(
             state,
-            _probe_remote_observation(lid, host, probe_timeout_s, probe_remote),
+            _probe_remote_observation(
+                lid,
+                host,
+                probe_deadline,
+                probe_remote,
+                state["child_control"],
+            ),
         )
-        if state["stop_event"].wait(interval_s):
+        wait_budget = deadline_utils.claim_call_budget(
+            state["deadline"],
+            "wait.remote_worker_poll",
+            cap_s=interval_s,
+        )
+        if wait_budget is None or state["stop_event"].wait(wait_budget):
             return
 
 
@@ -283,7 +544,6 @@ def _remote_worker_group(
     state: dict,
     assignments: list[tuple[str, str]],
     interval_s: float,
-    probe_timeout_s: float,
     probe_remote: Callable,
 ) -> None:
     """Observe a bounded shard of remote lodes from one reusable worker."""
@@ -297,18 +557,40 @@ def _remote_worker_group(
             if not pending:
                 continue
             any_pending = True
+            budget = deadline_utils.claim_call_budget(
+                state["deadline"],
+                "wait.remote_probe_generation",
+                cap_s=state["probe_timeout_s"],
+            )
+            if budget is None:
+                return
+            probe_deadline = deadline_utils.shorten_deadline(
+                state["deadline"],
+                state["deadline"]["clock"]() + budget,
+            )
             _post_observation(
                 state,
-                _probe_remote_observation(lid, host, probe_timeout_s, probe_remote),
+                _probe_remote_observation(
+                    lid,
+                    host,
+                    probe_deadline,
+                    probe_remote,
+                    state["child_control"],
+                ),
             )
-        if not any_pending or state["stop_event"].wait(interval_s):
+        wait_budget = deadline_utils.claim_call_budget(
+            state["deadline"],
+            "wait.remote_worker_poll",
+            cap_s=interval_s,
+        )
+        if not any_pending or wait_budget is None or state["stop_event"].wait(wait_budget):
             return
 
 
 def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
     """Start a fixed-size set of daemon observers for pending remote lodes."""
     assignments = [
-        (lid, state["records"][lid]["host"])
+        (lid, state["records"][lid]["route"])
         for lid in state["pending"]
         if state["records"][lid]["remote"]
     ]
@@ -319,13 +601,20 @@ def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
     for index, assignment in enumerate(assignments):
         shards[index % worker_count].append(assignment)
     for index, shard in enumerate(shards):
+        if (
+            deadline_utils.claim_call_budget(
+                state["deadline"],
+                "wait.remote_worker_start",
+            )
+            is None
+        ):
+            return
         thread = threading.Thread(
             target=_remote_worker_group,
             args=(
                 state,
                 shard,
                 state["poll_s"],
-                state["probe_timeout_s"],
                 probe_remote,
             ),
             daemon=True,
@@ -336,12 +625,8 @@ def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
 
 
 def _stop_remote_workers(state: dict) -> None:
-    """Interrupt and bounded-join every remote observer."""
+    """Cancel remote observers without serially joining daemon workers."""
     state["stop_event"].set()
-    for lid, thread in state["workers"].items():
-        thread.join(timeout=state["probe_timeout_s"] + 1.0)
-        if thread.is_alive():
-            logger.warning("Remote wait observer for %s did not stop before join timeout", lid)
 
 
 def _record_observer_failure(record: dict, kind: str, detail: str, failure_key: str) -> str | None:
@@ -352,8 +637,32 @@ def _record_observer_failure(record: dict, kind: str, detail: str, failure_key: 
         return None
     record["warned_failure_key"] = failure_key
     return (
-        f"warning: status observer for {record['id']} ({record['source']}) failed: {detail or kind}"
+        f"warning: status observer for {record['id']} ({record['route']}) failed: {detail or kind}"
     )
+
+
+def _update_record_probe(record: dict, outcome: str, detail: object, observed_ts: float) -> None:
+    """Update the selected configured-source row in place."""
+    selected = None
+    for probe in record["probes"]:
+        if probe.get("route") == record["route"] and probe.get("outcome") == "found":
+            selected = probe
+            break
+    if selected is None:
+        selected = next(
+            (probe for probe in record["probes"] if probe.get("route") == record["route"]),
+            record["probes"][0],
+        )
+    selected["outcome"] = outcome
+    if isinstance(detail, (list, tuple)):
+        selected["detail"] = [str(item) for item in detail]
+    elif detail is None:
+        selected["detail"] = None
+    else:
+        selected["detail"] = " ".join(str(detail).split())
+    selected["attempts"] = int(selected.get("attempts", 0)) + 1
+    selected["observed_age_s"] = 0.0
+    selected["_observed_ts"] = observed_ts
 
 
 def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | None:
@@ -364,6 +673,7 @@ def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | 
     if kind == "found":
         snapshot = validate_snapshot(observation.get("payload"), record["id"])
         if snapshot is None:
+            _update_record_probe(record, "malformed", "malformed status snapshot", observed_ts)
             return _record_observer_failure(
                 record,
                 "malformed",
@@ -376,6 +686,7 @@ def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | 
         record["consecutive_failures"] = 0
         record["warned_failure_key"] = None
         record["not_found_count"] = 0
+        _update_record_probe(record, "found", None, observed_ts)
         grace_kind = _snapshot_grace_kind(snapshot)
         grace = record["grace"]
         if grace_kind is None:
@@ -392,8 +703,10 @@ def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | 
         record["consecutive_failures"] = 0
         record["warned_failure_key"] = None
         record["not_found_count"] += 1
+        _update_record_probe(record, "absent", None, observed_ts)
         return None
 
+    _update_record_probe(record, kind, observation.get("detail"), observed_ts)
     return _record_observer_failure(
         record,
         kind,
@@ -408,7 +721,7 @@ def _drain_observations(state: dict) -> list[str]:
     while state["observations"]:
         observation = state["observations"].popleft()
         record = state["records"].get(observation.get("id"))
-        if not record or record["id"] not in state["pending"]:
+        if not record or record["key"] not in state["pending"]:
             continue
         warning = _apply_observation(record, observation, state["poll_s"])
         if warning:
@@ -445,50 +758,13 @@ def _read_due_locals(state: dict, socket_path: Path, now: float) -> None:
                 due.append(lid)
 
     for lid in due:
-        try:
-            kind, payload = client.read_lode_snapshot(socket_path, lid)
-            if kind == "found":
-                detail = ""
-                failure_key = kind
-            elif kind == "ambiguous":
-                match_ids = payload if isinstance(payload, list) else []
-                matches = ", ".join(match_ids) or "<invalid match list>"
-                detail = f"local status ambiguous: {matches}"
-                failure_key = f"ambiguous:{matches}"
-                payload = None
-            elif kind == "unavailable":
-                detail = f"local status unavailable: {payload}"
-                failure_key = f"unavailable:{payload}"
-                payload = None
-            else:
-                detail = f"local status {kind}"
-                failure_key = kind
-            observation = {
-                "id": lid,
-                "kind": kind,
-                "payload": payload,
-                "detail": detail,
-                "failure_key": failure_key,
-                "observed_ts": _monotonic(),
-            }
-        except Exception as error:
-            logger.debug("Unexpected local observer error for %s", lid, exc_info=True)
-            observation = {
-                "id": lid,
-                "kind": "observer_error",
-                "payload": None,
-                "detail": f"unexpected {type(error).__name__}",
-                "failure_key": f"observer_error:{type(error).__name__}",
-                "observed_ts": _monotonic(),
-            }
+        observation = _local_probe_observation(socket_path, lid, state["deadline"])
         _post_observation(state, observation)
 
 
 def _next_deadline(state: dict) -> float:
     """Return the earliest active supervisor deadline."""
-    deadlines = []
-    if state["overall_deadline"] is not None:
-        deadlines.append(state["overall_deadline"])
+    deadlines = [state["overall_deadline"]]
     for lid in state["pending"]:
         record = state["records"][lid]
         deadlines.append(record["next_reconcile_ts"])
@@ -505,6 +781,18 @@ def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
     outcomes = []
     for lid in sorted(state["pending"], key=lambda item: state["records"][item]["order"]):
         record = state["records"][lid]
+        if record["preset_outcome"] is not None:
+            outcomes.append(
+                {
+                    "record": record,
+                    "outcome": record["preset_outcome"],
+                    "code": record["preset_code"],
+                    "reason": record["preset_reason"],
+                }
+            )
+            continue
+        if not isinstance(record.get("latest_snapshot"), dict):
+            continue
         terminal = classify(record["latest_snapshot"])
         if terminal and terminal[0] != "stuck":
             outcome, code, reason = terminal
@@ -532,8 +820,9 @@ def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
                         None,
                     )
                 )
-            if state["overall_deadline"] is not None:
-                timed.append((state["overall_deadline"], 1, "timeout", 4, None))
+            timed.append((state["overall_deadline"], 1, "timeout", 4, None))
+            if record["generation_timed_out"]:
+                timed.append((now, 1, "timeout", 4, "overall_timeout"))
             grace = record["grace"]
             if grace is not None and grace["confirmed"]:
                 grace_outcomes = {
@@ -559,6 +848,209 @@ def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
     return outcomes
 
 
+def _local_probe_observation(
+    socket_path: Path,
+    lid: str,
+    probe_deadline: dict,
+) -> dict:
+    """Return one normalized authoritative local observation."""
+    budget = deadline_utils.claim_call_budget(
+        probe_deadline,
+        "wait.local_snapshot",
+        cap_s=2.0,
+    )
+    if budget is None:
+        return {
+            "id": lid,
+            "kind": "unreadable",
+            "payload": None,
+            "detail": "local probe deadline expired",
+            "failure_key": "deadline_expired",
+            "observed_ts": _monotonic(),
+        }
+    try:
+        kind, payload = client.read_lode_snapshot(
+            socket_path,
+            lid,
+            timeout=budget,
+            deadline=probe_deadline,
+        )
+        if kind == "found":
+            detail = ""
+            failure_key = kind
+        elif kind == "ambiguous":
+            match_ids = payload if isinstance(payload, list) else []
+            matches = ", ".join(match_ids) or "<invalid match list>"
+            detail = f"local status ambiguous: {matches}"
+            failure_key = f"ambiguous:{matches}"
+            payload = None
+        elif kind == "unavailable":
+            detail = f"local status unavailable: {payload}"
+            failure_key = f"unavailable:{payload}"
+            payload = None
+        else:
+            detail = f"local status {kind}"
+            failure_key = kind
+        return {
+            "id": lid,
+            "kind": kind,
+            "payload": payload,
+            "detail": detail,
+            "failure_key": failure_key,
+            "observed_ts": _monotonic(),
+        }
+    except Exception as error:
+        logger.debug("Unexpected local observer error for %s", lid, exc_info=True)
+        return {
+            "id": lid,
+            "kind": "observer_error",
+            "payload": None,
+            "detail": f"unexpected {type(error).__name__}",
+            "failure_key": f"observer_error:{type(error).__name__}",
+            "observed_ts": _monotonic(),
+        }
+
+
+def _probe_final_sweep_member(
+    state: dict,
+    socket_path: Path,
+    lid: str,
+    generation_deadline: dict,
+    probe_remote: Callable,
+) -> dict:
+    """Probe one sweep member without classifying or mutating shared records."""
+    record = state["records"][lid]
+    if record["remote"]:
+        return _probe_remote_observation(
+            lid,
+            record["route"],
+            generation_deadline,
+            probe_remote,
+            state["child_control"],
+        )
+    return _local_probe_observation(socket_path, lid, generation_deadline)
+
+
+def _authoritative_final_sweep(
+    state: dict,
+    established: list[dict],
+    socket_path: Path,
+    probe_remote: Callable,
+) -> list[dict]:
+    """Probe every unresolved sibling once, then classify at one barrier."""
+    established_ids = {item["record"]["key"] for item in established}
+    member_ids = [
+        lid
+        for lid in sorted(state["pending"], key=lambda item: state["records"][item]["order"])
+        if lid not in established_ids
+    ]
+    if not member_ids:
+        return established
+
+    budget = deadline_utils.claim_call_budget(
+        state["deadline"],
+        "wait.final_sweep",
+        cap_s=state["probe_timeout_s"],
+    )
+    if budget is None:
+        for lid in member_ids:
+            state["records"][lid]["generation_timed_out"] = True
+    else:
+        generation_deadline = deadline_utils.shorten_deadline(
+            state["deadline"],
+            state["deadline"]["clock"]() + budget,
+        )
+        executor = ThreadPoolExecutor(max_workers=min(remote.REMOTE_MAX_WORKERS, len(member_ids)))
+        futures = {}
+        try:
+            for lid in member_ids:
+                future = executor.submit(
+                    _probe_final_sweep_member,
+                    state,
+                    socket_path,
+                    lid,
+                    generation_deadline,
+                    probe_remote,
+                )
+                futures[future] = lid
+            barrier_budget = deadline_utils.claim_call_budget(
+                generation_deadline,
+                "wait.final_sweep_barrier",
+            )
+            if barrier_budget is None:
+                done = {future for future in futures if future.done()}
+                pending = set(futures) - done
+            else:
+                done, pending = wait_futures(futures, timeout=barrier_budget)
+            observations = {}
+            for future in done:
+                lid = futures[future]
+                try:
+                    observations[lid] = future.result()
+                except Exception as error:
+                    observations[lid] = {
+                        "id": lid,
+                        "kind": "observer_error",
+                        "payload": None,
+                        "detail": f"unexpected {type(error).__name__}",
+                        "failure_key": f"observer_error:{type(error).__name__}",
+                        "observed_ts": _monotonic(),
+                    }
+            for future in pending:
+                lid = futures[future]
+                state["records"][lid]["generation_timed_out"] = True
+                future.cancel()
+            for lid in member_ids:
+                observation = observations.get(lid)
+                if observation is not None:
+                    if observation["observed_ts"] >= generation_deadline["expires_at"]:
+                        state["records"][lid]["generation_timed_out"] = True
+                    warning = _apply_observation(
+                        state["records"][lid], observation, state["poll_s"]
+                    )
+                    if warning:
+                        print(warning, file=sys.stderr)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    now = _monotonic()
+    classified = {
+        item["record"]["key"]: item
+        for item in _collect_boundary_outcomes(state, now)
+        if item["record"]["key"] in member_ids
+    }
+    completed = list(established)
+    for lid in member_ids:
+        item = classified.get(lid)
+        if item is None:
+            item = {
+                "record": state["records"][lid],
+                "outcome": "wait_aborted",
+                "code": 1,
+                "reason": "sibling_nonzero",
+            }
+        completed.append(item)
+    return sorted(completed, key=lambda item: item["record"]["order"])
+
+
+def _resolution_failure_barrier(state: dict, established: list[dict]) -> list[dict]:
+    """Abort unresolved siblings after all query resolutions have completed."""
+    established_keys = {item["record"]["key"] for item in established}
+    completed = list(established)
+    for key in sorted(state["pending"], key=lambda item: state["records"][item]["order"]):
+        if key in established_keys:
+            continue
+        completed.append(
+            {
+                "record": state["records"][key],
+                "outcome": "wait_aborted",
+                "code": 1,
+                "reason": "resolution_failed",
+            }
+        )
+    return sorted(completed, key=lambda item: item["record"]["order"])
+
+
 def _action_is_blocked(snapshot: dict) -> bool:
     """Return whether a structured pending-action projection requires attention."""
     pending_action = snapshot.get("pending_action")
@@ -574,49 +1066,299 @@ def _observed_age(record: dict, now: float) -> float:
     return round(max(0.0, now - record["latest_snapshot_ts"]), 3)
 
 
-def _json_event(record: dict, outcome: str, now: float, reason: str | None = None) -> dict:
-    """Build one additive, compatibility-preserving JSONL terminal record."""
-    snapshot = record["latest_snapshot"]
-    annotated = lode_with_status_annotations({**snapshot, "host": record["host"]})
-    event = {
+def _recovery_for(record: dict, outcome: str) -> str | None:
+    """Return one prescriptive recovery sentence for a final outcome."""
+    if outcome == "shipped":
+        return None
+    lid = record["id"]
+    route = record.get("route")
+    hop = f"hop -H {route}" if route not in {None, "local"} else "hop"
+    snapshot = record.get("latest_snapshot")
+    pending_action = snapshot.get("pending_action") if isinstance(snapshot, dict) else None
+    pending_recovery = pending_action.get("recovery") if isinstance(pending_action, dict) else None
+    pending_command = (
+        pending_recovery.get("command") if isinstance(pending_recovery, dict) else None
+    )
+    commands = {
+        "archived": f"{hop} lode unarchive {lid}",
+        "error": f"{hop} lode restart {lid}",
+        "inactive": f"{hop} lode resume {lid}",
+        "gated": f"{hop} gate show {lid}",
+        "stuck": f"{hop} lode peek {lid}",
+        "not_found": f"{hop} lode status {lid}",
+        "action_blocked": f"{hop} lode status {lid}",
+        "action_stalled": f"{hop} lode status {lid}",
+        "startup_stalled": f"{hop} lode restart {lid}",
+        "handoff_stalled": f"{hop} lode restart {lid}",
+        "reconnect_stalled": f"{hop} lode restart {lid}",
+        "observer_unavailable": f"{hop} wait {lid}",
+        "timeout": f"{hop} wait {lid}",
+        "target_absent": "hop lode list --all-hosts --json",
+        "target_ambiguous": "hop lode list --all-hosts --json",
+        "status_unavailable": f"{hop} lode list --json",
+        "wait_aborted": f"{hop} wait {lid}",
+        "interrupted": f"{hop} wait {lid}",
+    }
+    command = (
+        pending_command
+        if outcome in {"action_blocked", "action_stalled"}
+        and isinstance(pending_command, str)
+        and pending_command
+        else commands[outcome]
+    )
+    recovery = (
+        f"Observed outcome {outcome} for '{lid}'. Hopper did not proceed. Recover with: {command}."
+    )
+    if outcome in {"action_blocked", "action_stalled"} and isinstance(pending_action, dict):
+        if pending_action.get("action_type") == "invalid":
+            recovery += " Repair or drain the malformed pending action before upgrading this host."
+        elif pending_action.get("action_type") == "legacy-v1":
+            recovery += " Drain the legacy pending action before upgrading this host."
+    return recovery
+
+
+def _final_probe_rows(record: dict, now: float, local_server: str | None) -> list[dict]:
+    """Return closed configured-source evidence with current observation ages."""
+    rows = []
+    for raw in record["probes"]:
+        observed_at = raw.get("_observed_ts")
+        attempts = int(raw.get("attempts", 0))
+        age = (
+            round(max(0.0, now - observed_at), 3)
+            if attempts and isinstance(observed_at, (int, float))
+            else raw.get("observed_age_s")
+            if attempts
+            else None
+        )
+        server = raw.get("server")
+        if raw.get("route") == "local":
+            server = local_server
+        rows.append(
+            {
+                "kind": raw.get("kind"),
+                "server": server,
+                "route": raw.get("route"),
+                "candidate_id": raw.get("candidate_id"),
+                "outcome": raw.get("outcome", "not_attempted"),
+                "detail": raw.get("detail"),
+                "attempts": attempts,
+                "observed_age_s": age,
+            }
+        )
+    return rows
+
+
+def _fresh_worktree_enrichment(record: dict, deadline: dict, child_control: dict) -> dict:
+    """Observe worktree provenance and existence once at finalization."""
+    snapshot = record.get("latest_snapshot")
+    if not isinstance(snapshot, dict):
+        return {
+            "worktree_path": None,
+            "worktree_path_basis": "unavailable",
+            "worktree_exists": None,
+            "worktree_exists_observed_age_s": None,
+        }
+    if record["route"] == "local":
+        if deadline_utils.claim_call_budget(deadline, "wait.worktree_path") is None:
+            return {
+                "worktree_path": None,
+                "worktree_path_basis": "unavailable",
+                "worktree_exists": None,
+                "worktree_exists_observed_age_s": None,
+            }
+        resolution = resolve_worktree_path(snapshot)
+        path = resolution["path"]
+        if path is None:
+            return {
+                "worktree_path": None,
+                "worktree_path_basis": resolution["basis"],
+                "worktree_exists": None,
+                "worktree_exists_observed_age_s": None,
+            }
+        if deadline_utils.claim_call_budget(deadline, "wait.worktree_exists") is None:
+            exists = None
+            age = None
+        else:
+            observed_at = _monotonic()
+            try:
+                exists = path.is_dir()
+            except OSError:
+                exists = None
+            age = round(max(0.0, _monotonic() - observed_at), 3) if exists is not None else None
+        return {
+            "worktree_path": str(path),
+            "worktree_path_basis": resolution["basis"],
+            "worktree_exists": exists,
+            "worktree_exists_observed_age_s": age,
+        }
+
+    budget = deadline_utils.claim_call_budget(
+        deadline,
+        "wait.remote_worktree_path",
+        cap_s=8.0,
+    )
+    if budget is None:
+        return {
+            "worktree_path": None,
+            "worktree_path_basis": "unavailable",
+            "worktree_exists": None,
+            "worktree_exists_observed_age_s": None,
+        }
+    observed_at = _monotonic()
+    try:
+        result = remote.run_remote(
+            record["route"],
+            ["lode", "path", record["id"], "--json"],
+            timeout=budget,
+            deadline=deadline,
+            child_control=child_control,
+        )
+        payload = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"id", "host", "path", "exists"}
+        or payload.get("id") != record["id"]
+        or not isinstance(payload.get("path"), str)
+        or not Path(payload["path"]).is_absolute()
+        or not isinstance(payload.get("exists"), bool)
+    ):
+        return {
+            "worktree_path": None,
+            "worktree_path_basis": "unavailable",
+            "worktree_exists": None,
+            "worktree_exists_observed_age_s": None,
+        }
+    recorded_path = snapshot.get("worktree_path")
+    if isinstance(recorded_path, str) and recorded_path:
+        if payload["path"] != recorded_path:
+            return {
+                "worktree_path": None,
+                "worktree_path_basis": "unavailable",
+                "worktree_exists": None,
+                "worktree_exists_observed_age_s": None,
+            }
+        basis = "recorded"
+    elif payload["exists"]:
+        basis = "existing"
+    else:
+        return {
+            "worktree_path": None,
+            "worktree_path_basis": "unavailable",
+            "worktree_exists": None,
+            "worktree_exists_observed_age_s": None,
+        }
+    return {
+        "worktree_path": payload["path"],
+        "worktree_path_basis": basis,
+        "worktree_exists": payload["exists"],
+        "worktree_exists_observed_age_s": round(max(0.0, _monotonic() - observed_at), 3),
+    }
+
+
+def _final_record(
+    record: dict,
+    outcome: str,
+    exit_code: int,
+    now: float,
+    reason_code: str | None = None,
+    *,
+    deadline: dict,
+    child_control: dict,
+) -> dict:
+    """Build the one closed final record consumed by every renderer."""
+    snapshot = record.get("latest_snapshot")
+    local_server = None
+    if record.get("route") == "local" and isinstance(snapshot, dict):
+        try:
+            local_server = config.hostname()
+        except Exception:
+            pass
+    if not isinstance(snapshot, dict):
+        annotated = {
+            "status_display": None,
+            "pane_liveness": "not_probed",
+        }
+    else:
+        pane_budget = deadline_utils.claim_call_budget(deadline, "wait.pane_liveness")
+        if pane_budget is None:
+            annotated = {
+                "status_display": snapshot["status"],
+                "pane_liveness": "not_probed",
+            }
+        else:
+            try:
+                annotated = lode_with_status_annotations(
+                    snapshot,
+                    pane_timeout=pane_budget,
+                )
+            except Exception:
+                annotated = {
+                    "status_display": snapshot["status"],
+                    "pane_liveness": "unknown",
+                }
+    try:
+        worktree = _fresh_worktree_enrichment(record, deadline, child_control)
+    except Exception:
+        logger.debug("Could not enrich worktree details for %s", record["id"], exc_info=True)
+        worktree = {
+            "worktree_path": None,
+            "worktree_path_basis": "unavailable",
+            "worktree_exists": None,
+            "worktree_exists_observed_age_s": None,
+        }
+    stale_pane = snapshot.get("tmux_pane") if isinstance(snapshot, dict) else None
+    current_pane = None if outcome == "observer_unavailable" else stale_pane
+    server = record.get("server")
+    if isinstance(snapshot, dict):
+        server = local_server if record.get("route") == "local" else record.get("route")
+    final = {
         "id": record["id"],
         "outcome": outcome,
-        "stage": snapshot["stage"],
-        "state": snapshot["state"],
-        "status": snapshot["status"],
-        "failure_kind": snapshot.get("failure_kind"),
-        "active": snapshot["active"],
-        "archived": snapshot["archived"],
-        "reason": reason,
-        "source": record["source"],
-        "observed_age_s": _observed_age(record, now),
+        "exit_code": exit_code,
+        "reason_code": reason_code or REASON_CODES[outcome],
+        "recovery": _recovery_for(record, outcome),
+        "stage": snapshot.get("stage") if isinstance(snapshot, dict) else None,
+        "state": snapshot.get("state") if isinstance(snapshot, dict) else None,
+        "status": snapshot.get("status") if isinstance(snapshot, dict) else None,
         "status_display": annotated["status_display"],
+        "failure_kind": snapshot.get("failure_kind") if isinstance(snapshot, dict) else None,
+        "active": snapshot.get("active") if isinstance(snapshot, dict) else None,
+        "archived": snapshot.get("archived") if isinstance(snapshot, dict) else None,
+        "archived_at": snapshot.get("archived_at") if isinstance(snapshot, dict) else None,
+        "server": server,
+        "route": record.get("route"),
+        "probes": _final_probe_rows(record, now, local_server),
+        "matches": [dict(match) for match in record["matches"]],
+        "observed_age_s": (_observed_age(record, now) if isinstance(snapshot, dict) else None),
         "pane_liveness": annotated["pane_liveness"],
+        "tmux_pane": current_pane,
+        "last_tmux_pane": stale_pane,
+        **worktree,
     }
-    if record["host"]:
-        event["host"] = record["host"]
-    return event
+    assert set(final) == FINAL_RECORD_KEYS
+    return final
 
 
-def _stuck_diagnostic(record: dict, now: float) -> str:
+def _stuck_diagnostic(final_record: dict, *, deadline: dict) -> str:
     """Format a stuck record with source-appropriate inspection guidance."""
-    snapshot = record["latest_snapshot"]
-    lid = record["id"]
-    status = snapshot["status"]
+    lid = final_record["id"]
+    status = final_record["status"]
     lines = [f"{STATUS_ERROR} {lid} stuck: {status}" if status else f"{STATUS_ERROR} {lid} stuck"]
-    lines.append(f"  {_snapshot_summary(record, now)}")
-    tmux_pane = snapshot.get("tmux_pane")
-    if record["remote"]:
-        lines.append(f"  host: {record['host']}")
+    lines.append(f"  {_snapshot_summary(final_record)}")
+    tmux_pane = final_record["tmux_pane"]
+    if final_record["route"] != "local":
+        lines.append(f"  host: {final_record['route']}")
         lines.append(f"  pane: {tmux_pane or '<unknown>'}")
-        lines.append(f"Inspect with: hop -H {record['host']} lode peek {lid}")
         return "\n".join(lines)
     if not tmux_pane:
         lines.append("  pane: <unknown>")
         return "\n".join(lines)
     lines.append(f"  pane: {tmux_pane}")
     lines.append("  --- last 50 lines of pane ---")
-    pane_capture = capture_pane(tmux_pane)
+    pane_budget = deadline_utils.claim_call_budget(deadline, "wait.capture_pane")
+    pane_capture = capture_pane(tmux_pane, timeout=pane_budget) if pane_budget is not None else None
     if pane_capture:
         lines.extend(f"  {line}" for line in pane_capture.split("\n")[-50:])
     else:
@@ -625,12 +1367,13 @@ def _stuck_diagnostic(record: dict, now: float) -> str:
     return "\n".join(lines)
 
 
-def _snapshot_summary(record: dict, now: float) -> str:
-    snapshot = record["latest_snapshot"]
+def _snapshot_summary(final_record: dict) -> str:
+    """Format only fields from the closed final record."""
     return (
-        f"stage={snapshot['stage']} state={snapshot['state']} active={snapshot['active']} "
-        f"status={snapshot['status']} source={record['source']} "
-        f"observed_age_s={_observed_age(record, now):.3f}"
+        f"stage={final_record['stage']} state={final_record['state']} "
+        f"active={final_record['active']} status={final_record['status_display']} "
+        f"route={final_record['route']} "
+        f"observed_age_s={final_record['observed_age_s']:.3f}"
     )
 
 
@@ -640,128 +1383,111 @@ def _emit_outcome(
     json_output: bool,
     now: float,
     reason: str | None = None,
+    *,
+    deadline: dict,
+    final_record: dict,
 ) -> None:
     """Emit one non-timeout terminal outcome from the latest valid snapshot."""
-    snapshot = record["latest_snapshot"]
-    lid = record["id"]
+    lid = final_record["id"]
     if json_output:
-        print(json.dumps(_json_event(record, outcome, now, reason)))
+        print(json.dumps(final_record))
         if outcome == "stuck":
-            print(_stuck_diagnostic(record, now), file=sys.stderr)
+            print(
+                _stuck_diagnostic(final_record, deadline=deadline),
+                file=sys.stderr,
+            )
+        return
+    if outcome in {
+        "target_absent",
+        "target_ambiguous",
+        "status_unavailable",
+        "wait_aborted",
+        "interrupted",
+    }:
+        print(f"{STATUS_ERROR} {lid} {outcome}")
+        if final_record["recovery"]:
+            print(final_record["recovery"])
+        return
+    if outcome == "timeout":
+        print(f"Timed out waiting for lode(s): {lid}")
+        print(f"  {_snapshot_summary(final_record)}")
+        print(final_record["recovery"])
         return
     if outcome == "shipped":
-        title = snapshot.get("title", "")
-        suffix = f" ({title})" if title else ""
-        print(f"{STATUS_SHIPPED} {lid} shipped{suffix}")
+        print(f"{STATUS_SHIPPED} {lid} shipped")
     elif outcome == "archived":
-        status = f": {snapshot['status']}" if snapshot["status"] else ""
+        status = f": {final_record['status']}" if final_record["status"] else ""
         print(f"{STATUS_ERROR} {lid} archived before shipping{status}")
-        print(f"  {_snapshot_summary(record, now)}")
-        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
-        print(f"Inspect with: {hop} lode status {lid}")
-        print(f"Recover with: {hop} lode unarchive {lid}")
+        print(f"  {_snapshot_summary(final_record)}")
+        print(final_record["recovery"])
     elif outcome in {"startup_stalled", "handoff_stalled", "reconnect_stalled"}:
         label = {
             "startup_stalled": "startup registration stalled",
             "handoff_stalled": "ready handoff stalled",
             "reconnect_stalled": "runner reregistration stalled",
         }[outcome]
-        print(f"{STATUS_ERROR} {lid} {label}: {snapshot['status']}")
-        print(f"  {_snapshot_summary(record, now)}")
-        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
-        print(f"Inspect with: {hop} lode status {lid}")
-        if snapshot.get("tmux_pane"):
-            print(f"Inspect pane with: {hop} lode peek {lid}")
-        print("Do not start another runner until pane absence is proved.")
+        print(f"{STATUS_ERROR} {lid} {label}: {final_record['status']}")
+        print(f"  {_snapshot_summary(final_record)}")
+        print(final_record["recovery"])
     elif outcome in {"action_blocked", "action_stalled"}:
-        pending_action = snapshot.get("pending_action")
-        action_status = (
-            pending_action.get("status")
-            if isinstance(pending_action, dict) and isinstance(pending_action.get("status"), str)
-            else snapshot["status"]
-        )
         label = "action blocked" if outcome == "action_blocked" else "successor adoption stalled"
-        print(f"{STATUS_ERROR} {lid} {label}: {action_status}")
-        print(f"  {_snapshot_summary(record, now)}")
-        recovery = pending_action.get("recovery") if isinstance(pending_action, dict) else None
-        command = recovery.get("command") if isinstance(recovery, dict) else None
-        if isinstance(command, str) and command:
-            print(f"Recover with: {command}")
-        elif isinstance(pending_action, dict) and pending_action.get("action_type") == "invalid":
-            print("Repair or drain the malformed pending action before upgrading this host.")
-        elif isinstance(pending_action, dict) and pending_action.get("action_type") == "legacy-v1":
-            print("Drain the legacy pending action before upgrading this host.")
-        else:
-            hop = f"hop -H {record['host']}" if record["remote"] else "hop"
-            print(f"Inspect with: {hop} lode status {lid}")
-            if snapshot.get("tmux_pane"):
-                print(f"Inspect pane with: {hop} lode peek {lid}")
-            print("Do not start another runner while the durable action remains pending.")
+        print(f"{STATUS_ERROR} {lid} {label}: {final_record['status']}")
+        print(f"  {_snapshot_summary(final_record)}")
+        print(final_record["recovery"])
     elif outcome == "error":
-        print(f"{STATUS_ERROR} {lid} error: {snapshot['status']}")
-        print(f"  {_snapshot_summary(record, now)}")
-        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
-        print(f"Inspect with: {hop} lode status {lid}")
+        print(f"{STATUS_ERROR} {lid} error: {final_record['status']}")
+        print(f"  {_snapshot_summary(final_record)}")
+        print(final_record["recovery"])
     elif outcome == "gated":
-        display_status = lode_status_for_display({**snapshot, "host": record["host"]})
-        display_snapshot = {**snapshot, "status": display_status}
-        display_record = {**record, "latest_snapshot": display_snapshot}
-        spawn_disposition = snapshot.get("spawn_disposition")
-        if spawn_disposition in {"already_live", "unknown"}:
-            print(f"Lode {lid} is gated pending runner inspection.")
-        else:
-            print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
-        print(f"  {_snapshot_summary(display_record, now)}")
-        if spawn_disposition in {"already_live", "unknown"}:
-            hop = f"hop -H {record['host']}" if record["remote"] else "hop"
-            print(f"Inspect with: {hop} lode status {lid}")
-            if snapshot.get("tmux_pane"):
-                print(f"Inspect pane with: {hop} lode peek {lid}")
-            print("Do not start another runner until pane absence is proved.")
+        print(f"Lode {lid} is gated.")
+        print(f"  {_snapshot_summary(final_record)}")
+        print(final_record["recovery"])
     elif outcome == "inactive":
-        print(f"Lode '{lid}' is not active ({_snapshot_summary(record, now)})")
-        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
-        print(f"Inspect with: {hop} lode status {lid}")
-        print("Do not start another runner until pane absence is proved.")
+        print(f"Lode '{lid}' is not active ({_snapshot_summary(final_record)})")
+        print(final_record["recovery"])
     elif outcome == "stuck":
-        print(_stuck_diagnostic(record, now))
+        print(_stuck_diagnostic(final_record, deadline=deadline))
+        print(final_record["recovery"])
     elif outcome == "not_found":
-        print(f"Lode '{lid}' not found ({_snapshot_summary(record, now)})")
-        print(f"Inspect with: hop lode status {lid}")
+        print(f"Lode '{lid}' not found ({_snapshot_summary(final_record)})")
+        print(final_record["recovery"])
     elif outcome == "observer_unavailable":
-        print(f"Status observer unavailable for {lid} ({_snapshot_summary(record, now)})")
-        print(f"Check status with: hop lode status {lid}")
-        print(f"Retry with: hop wait {lid}")
+        print(f"Status observer unavailable for {lid} ({_snapshot_summary(final_record)})")
+        print(final_record["recovery"])
 
 
 def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | None:
-    """Report a boundary, remove successes, and return its nonzero result."""
-    timeout_items = [item for item in outcomes if item["outcome"] == "timeout"]
-    if timeout_items and not state["json_output"]:
-        ids = ", ".join(item["record"]["id"] for item in timeout_items)
-        print(f"Timed out waiting for lode(s): {ids}")
-        for item in timeout_items:
-            print(f"  {item['record']['id']}: {_snapshot_summary(item['record'], now)}")
-
+    """Finalize and render every outcome at one boundary."""
+    if not outcomes:
+        return None
     result = 0
     for item in outcomes:
         record = item["record"]
         outcome = item["outcome"]
-        if outcome == "timeout" and not state["json_output"]:
-            pass
-        else:
-            _emit_outcome(
-                record,
-                outcome,
-                state["json_output"],
-                now,
-                item.get("reason"),
-            )
+        final_record = _final_record(
+            record,
+            outcome,
+            item["code"],
+            now,
+            item.get("reason"),
+            deadline=state["deadline"],
+            child_control=state["child_control"],
+        )
+        item["final_record"] = final_record
+        _emit_outcome(
+            record,
+            outcome,
+            state["json_output"],
+            now,
+            item.get("reason"),
+            deadline=state["deadline"],
+            final_record=final_record,
+        )
         with state["condition"]:
-            state["pending"].discard(record["id"])
+            state["pending"].discard(record["key"])
         state["resolved"].append(item)
         result = max(result, item["code"])
-    return result if result else None
+    return result
 
 
 def _emit_wait_summary(records: dict[str, dict], resolved: list[dict], code: int) -> None:
@@ -769,27 +1495,26 @@ def _emit_wait_summary(records: dict[str, dict], resolved: list[dict], code: int
     try:
         requested = len(records)
         if requested == 1:
-            record = next(iter(records.values()))
             item = resolved[0]
+            final_record = item["final_record"]
             lines = [
                 WAIT_SUMMARY_ONE.format(
-                    lode_id=record["id"],
-                    outcome=item["outcome"],
+                    lode_id=final_record["id"],
+                    outcome=final_record["outcome"],
                     code=code,
                 )
             ]
         else:
-            resolved_by_id = {item["record"]["id"]: item for item in resolved}
+            resolved_by_id = {item["record"]["key"]: item for item in resolved}
             lines = []
             for record in sorted(records.values(), key=lambda record: record["order"]):
-                item = resolved_by_id.get(record["id"])
-                if item is None:
-                    lines.append(WAIT_SUMMARY_UNRESOLVED.format(lode_id=record["id"]))
-                else:
+                item = resolved_by_id.get(record["key"])
+                if item is not None:
+                    final_record = item["final_record"]
                     lines.append(
                         WAIT_SUMMARY_ITEM.format(
-                            lode_id=record["id"],
-                            outcome=item["outcome"],
+                            lode_id=final_record["id"],
+                            outcome=final_record["outcome"],
                         )
                     )
             lines.append(
@@ -805,16 +1530,68 @@ def _emit_wait_summary(records: dict[str, dict], resolved: list[dict], code: int
         logger.debug("Could not render wait summary", exc_info=True)
 
 
-def _condition_wait(condition: threading.Condition, timeout_s: float) -> None:
-    """Wait on the supervisor condition; monkeypatched by deterministic tests."""
-    condition.wait(timeout=timeout_s)
+def _condition_wait(condition: threading.Condition, deadline: dict, wake_at: float) -> None:
+    """Wait only when the shared deadline authorizes the blocking call."""
+    timeout_s = max(0.0, wake_at - deadline["clock"]())
+    budget = deadline_utils.claim_call_budget(
+        deadline,
+        "wait.condition_wait",
+        cap_s=timeout_s,
+    )
+    if budget is not None:
+        condition.wait(timeout=budget)
+
+
+def _synthesize_interrupted_records(state: dict) -> None:
+    """Finalize established truth and interrupt every remaining record."""
+    now = _monotonic()
+    established = _collect_boundary_outcomes(state, now)
+    established_ids = {item["record"]["key"] for item in established}
+    outcomes = list(established)
+    for lid in sorted(state["pending"], key=lambda item: state["records"][item]["order"]):
+        if lid in established_ids:
+            continue
+        outcomes.append(
+            {
+                "record": state["records"][lid],
+                "outcome": "interrupted",
+                "code": 130,
+                "reason": "user_interrupted",
+            }
+        )
+    outcomes.sort(key=lambda item: item["record"]["order"])
+    _finish_boundary(state, outcomes, now)
+    _emit_wait_summary(state["records"], state["resolved"], 130)
+
+
+def _interrupt_cleanup_deadline(deadline: dict) -> dict:
+    """Bound interrupt cleanup by both the original deadline and five seconds."""
+    interrupt_at = deadline["clock"]()
+    return deadline_utils.shorten_deadline(deadline, interrupt_at + 5.0)
+
+
+def _interrupt_wait(cleanup_deadline: dict, child_control: dict, state: dict | None) -> int:
+    """Cancel owned work within the interrupt bound and return the shell exit."""
+    child_control["cancel_event"].set()
+    if state is not None:
+        state["stop_event"].set()
+        state["shutdown"] = True
+        state["deadline"] = cleanup_deadline
+    remote.cancel_owned_children(child_control, cleanup_deadline)
+    if state is not None and state.get("connection") is not None:
+        state["connection"].stop(deadline=cleanup_deadline)
+    if state is not None:
+        _synthesize_interrupted_records(state)
+    else:
+        print(WAIT_SUMMARY_INTERRUPT, file=sys.stderr)
+    return 130
 
 
 def wait_for_lodes(
     socket_path: Path,
     lode_ids: list[str],
     *,
-    timeout_s: float = 0,
+    deadline: dict,
     poll_s: float = 30,
     observer_timeout_s: float = 300,
     json_output: bool = False,
@@ -822,16 +1599,26 @@ def wait_for_lodes(
     probe_remote: Callable,
 ) -> int:
     """Wait for lodes using one main-thread authoritative supervisor."""
+    child_control = remote.make_child_registry()
+    state: dict | None = None
+    condition: threading.Condition | None = None
+    cleanup_deadline = deadline
+    records: dict[str, dict] = {}
     try:
         poll_s = max(MIN_POLL_S, float(poll_s or 30))
-        records = _resolve_targets(socket_path, lode_ids, json_output, resolver)
-        if not isinstance(records, dict):
-            summary = WAIT_SUMMARY_STATUS_UNAVAILABLE if records == 4 else WAIT_SUMMARY_NO_TARGET
-            print(summary, file=sys.stderr)
-            return records if isinstance(records, int) else 1
-        _publish_resident_routes(records)
+        resolved_records = _resolve_targets(
+            socket_path,
+            lode_ids,
+            json_output,
+            resolver,
+            deadline=deadline,
+            child_control=child_control,
+            records=records,
+        )
+        if resolved_records is not records:
+            records = resolved_records
+        _publish_resident_routes(records, deadline=deadline)
 
-        start_ts = min(record["last_valid_ts"] for record in records.values())
         condition = threading.Condition()
         state = {
             "condition": condition,
@@ -839,13 +1626,15 @@ def wait_for_lodes(
             "pending": set(records),
             "resolved": [],
             "observations": deque(),
-            "overall_deadline": start_ts + timeout_s if timeout_s > 0 else None,
+            "deadline": deadline,
+            "overall_deadline": deadline["expires_at"],
             "poll_s": poll_s,
             "observer_timeout_s": max(0.0, observer_timeout_s),
             "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
             "stop_event": threading.Event(),
             "workers": {},
             "connection": None,
+            "child_control": child_control,
             "shutdown": False,
             "json_output": json_output,
         }
@@ -854,16 +1643,30 @@ def wait_for_lodes(
         for record in records.values():
             record["next_reconcile_ts"] = initial_now + poll_s
         initial_outcomes = _collect_boundary_outcomes(state, initial_now)
-        initial_result = _finish_boundary(state, initial_outcomes, initial_now)
-        if initial_result is not None or not state["pending"]:
-            code = initial_result or 0
+        has_resolution_failure = any(
+            record["preset_outcome"] is not None for record in records.values()
+        )
+        if has_resolution_failure:
+            completed = _resolution_failure_barrier(state, initial_outcomes)
+            code = _finish_boundary(state, completed, initial_now) or 0
             _emit_wait_summary(records, state["resolved"], code)
             return code
-    except KeyboardInterrupt:
-        print(WAIT_SUMMARY_INTERRUPT, file=sys.stderr)
-        return 130
-
-    try:
+        if any(item["code"] > 0 for item in initial_outcomes):
+            state["stop_event"].set()
+            completed = _authoritative_final_sweep(
+                state,
+                initial_outcomes,
+                socket_path,
+                probe_remote,
+            )
+            code = _finish_boundary(state, completed, _monotonic()) or 0
+            _emit_wait_summary(records, state["resolved"], code)
+            return code
+        if initial_outcomes:
+            _finish_boundary(state, initial_outcomes, initial_now)
+        if not state["pending"]:
+            _emit_wait_summary(records, state["resolved"], 0)
+            return 0
         local_pending = any(not records[lid]["remote"] for lid in state["pending"])
         if local_pending:
             connection = client.HopperConnection(socket_path)
@@ -880,6 +1683,7 @@ def wait_for_lodes(
             connection.start(
                 callback=on_message,
                 on_connect=lambda: _request_local_reconcile(state),
+                deadline=deadline,
             )
         _start_remote_workers(state, probe_remote)
 
@@ -895,24 +1699,78 @@ def wait_for_lodes(
                 outcomes = _collect_boundary_outcomes(state, now)
             for warning in warnings:
                 print(warning, file=sys.stderr)
-            result = _finish_boundary(state, outcomes, now)
-            if result is not None:
+            if any(item["code"] > 0 for item in outcomes):
+                state["stop_event"].set()
+                completed = _authoritative_final_sweep(
+                    state,
+                    outcomes,
+                    socket_path,
+                    probe_remote,
+                )
+                result = _finish_boundary(state, completed, _monotonic()) or 0
                 _emit_wait_summary(records, state["resolved"], result)
                 return result
+            if outcomes:
+                _finish_boundary(state, outcomes, now)
             if not state["pending"]:
                 _emit_wait_summary(records, state["resolved"], 0)
                 return 0
             with condition:
-                deadline = _next_deadline(state)
-                _condition_wait(condition, max(0.0, deadline - _monotonic()))
+                wake_at = _next_deadline(state)
+                _condition_wait(condition, deadline, wake_at)
     except KeyboardInterrupt:
-        print(WAIT_SUMMARY_INTERRUPT, file=sys.stderr)
-        return 130
+        cleanup_deadline = _interrupt_cleanup_deadline(deadline)
+        if state is None:
+            interrupted_records = records
+            processed_queries = {
+                query
+                for record in interrupted_records.values()
+                for query in record.get("queries", [record.get("query")])
+                if isinstance(query, str)
+            }
+            for order, query in enumerate(lode_ids):
+                if query in processed_queries:
+                    continue
+                key = f"failure:{query}"
+                if key in interrupted_records:
+                    continue
+                record = _resolution_failure_record(
+                    query,
+                    {"outcome": "unavailable", "probes": []},
+                    order,
+                    _monotonic(),
+                )
+                record["preset_outcome"] = None
+                record["preset_code"] = None
+                record["preset_reason"] = None
+                record["queries"] = [query]
+                interrupted_records[key] = record
+            condition = threading.Condition()
+            state = {
+                "condition": condition,
+                "records": interrupted_records,
+                "pending": set(interrupted_records),
+                "resolved": [],
+                "observations": deque(),
+                "deadline": deadline,
+                "overall_deadline": deadline["expires_at"],
+                "poll_s": poll_s,
+                "observer_timeout_s": max(0.0, observer_timeout_s),
+                "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
+                "stop_event": threading.Event(),
+                "workers": {},
+                "connection": None,
+                "child_control": child_control,
+                "shutdown": False,
+                "json_output": json_output,
+            }
+        return _interrupt_wait(cleanup_deadline, child_control, state)
     finally:
-        with condition:
-            state["shutdown"] = True
-            condition.notify_all()
-        if state["connection"] is not None:
-            state["connection"].stop()
-        state["stop_event"].set()
-        _stop_remote_workers(state)
+        if state is not None and condition is not None:
+            with condition:
+                state["shutdown"] = True
+                condition.notify_all()
+            _stop_remote_workers(state)
+            if state["connection"] is not None:
+                state["connection"].stop(deadline=cleanup_deadline)
+        remote.cancel_owned_children(child_control, cleanup_deadline)

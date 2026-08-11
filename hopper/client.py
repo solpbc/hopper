@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from hopper import deadline as deadline_utils
 from hopper.lodes import current_time_ms
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ RUNNER_MUTATION_TYPES = frozenset(
         "lode_set_status",
         "lode_set_title",
         "lode_set_branch",
+        "lode_set_worktree_path",
         "lode_set_codex_thread",
         "lode_set_claude_started",
     }
@@ -64,11 +66,14 @@ class HopperConnection:
         self.on_connect: Callable[[], Any] | None = None
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.deadline: dict | None = None
 
     def start(
         self,
         callback: Callable[[dict[str, Any]], Any] | None = None,
         on_connect: Callable[[], Any] | None = None,
+        *,
+        deadline: dict | None = None,
     ) -> None:
         """Start background thread for sending and receiving.
 
@@ -85,7 +90,13 @@ class HopperConnection:
 
         self.callback = callback
         self.on_connect = on_connect
+        self.deadline = deadline
         self.stop_event.clear()
+        if (
+            deadline is not None
+            and deadline_utils.claim_call_budget(deadline, "client.connection_start") is None
+        ):
+            return
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
@@ -100,6 +111,15 @@ class HopperConnection:
             if not sock and time.time() - last_connect_attempt > 1.0:
                 try:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    if self.deadline is not None:
+                        budget = deadline_utils.claim_call_budget(
+                            self.deadline,
+                            "client.connection_connect",
+                        )
+                        if budget is None:
+                            sock.close()
+                            break
+                        sock.settimeout(budget)
                     sock.connect(str(self.socket_path))
                     sock.settimeout(0.1)  # Short timeout for responsive queue draining
                     logger.debug(f"Connected to {self.socket_path}")
@@ -119,10 +139,29 @@ class HopperConnection:
                     last_connect_attempt = time.time()
 
             # ALWAYS drain queue (send if connected, drop if not)
+            queue_timeout = 0.1
+            if self.deadline is not None:
+                budget = deadline_utils.claim_call_budget(
+                    self.deadline,
+                    "client.connection_queue_wait",
+                    cap_s=queue_timeout,
+                )
+                if budget is None:
+                    break
+                queue_timeout = budget
             try:
-                msg = self.send_queue.get(timeout=0.1)
+                msg = self.send_queue.get(timeout=queue_timeout)
                 if sock:
                     try:
+                        if self.deadline is not None:
+                            budget = deadline_utils.claim_call_budget(
+                                self.deadline,
+                                "client.connection_send",
+                                cap_s=0.1,
+                            )
+                            if budget is None:
+                                break
+                            sock.settimeout(budget)
                         line = json.dumps(msg) + "\n"
                         sock.sendall(line.encode("utf-8"))
                     except Exception as e:
@@ -144,6 +183,15 @@ class HopperConnection:
             # Receive incoming messages (only if connected)
             if sock:
                 try:
+                    if self.deadline is not None:
+                        budget = deadline_utils.claim_call_budget(
+                            self.deadline,
+                            "client.connection_receive",
+                            cap_s=0.1,
+                        )
+                        if budget is None:
+                            break
+                        sock.settimeout(budget)
                     data = sock.recv(4096)
                     if not data:
                         # Connection closed by server
@@ -211,13 +259,23 @@ class HopperConnection:
             logger.warning(f"Queue full, dropping emit: {msg_type}")
             return False
 
-    def stop(self) -> None:
+    def stop(self, *, deadline: dict | None = None) -> None:
         """Stop background thread gracefully, draining queue first."""
         if not self.thread:
             return
 
         self.stop_event.set()
-        self.thread.join(timeout=0.5)
+        timeout = 0.5
+        if deadline is not None:
+            budget = deadline_utils.claim_call_budget(
+                deadline,
+                "client.connection_stop",
+                cap_s=timeout,
+            )
+            if budget is None:
+                return
+            timeout = budget
+        self.thread.join(timeout=timeout)
 
         if self.thread.is_alive():
             logger.warning("Background thread did not stop cleanly")
@@ -408,8 +466,23 @@ def get_lode(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
     return response.get("lode")
 
 
-def read_lode_snapshot(socket_path: Path, prefix: str, timeout: float = 2.0) -> tuple[str, object]:
+def read_lode_snapshot(
+    socket_path: Path,
+    prefix: str,
+    timeout: float = 2.0,
+    *,
+    deadline: dict | None = None,
+) -> tuple[str, object]:
     """Resolve an active or archived lode prefix without collapsing failures."""
+    if deadline is not None:
+        budget = deadline_utils.claim_call_budget(
+            deadline,
+            "client.read_lode_snapshot",
+            cap_s=timeout,
+        )
+        if budget is None:
+            return "unavailable", "shared deadline expired before server exchange"
+        timeout = budget
     try:
         response = _exchange_message(
             socket_path,

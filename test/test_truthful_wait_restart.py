@@ -12,6 +12,7 @@ import pytest
 
 from hopper import actions, wait
 from hopper.client import read_lode_snapshot
+from hopper.deadline import make_deadline
 from hopper.lodes import load_lodes, save_lodes, touch
 from hopper.server import Server
 from hopper.tmux import Liveness
@@ -34,7 +35,7 @@ def restart_harness(tmp_path, monkeypatch, make_lode, release_server_lock):
     real_read_snapshot = read_lode_snapshot
 
     class ObservedWaitConnection(real_connection):
-        def start(self, callback=None, on_connect=None):
+        def start(self, callback=None, on_connect=None, *, deadline=None):
             def observed_connect():
                 nonlocal wait_connections
                 with wait_connection_condition:
@@ -43,10 +44,10 @@ def restart_harness(tmp_path, monkeypatch, make_lode, release_server_lock):
                 if on_connect:
                     on_connect()
 
-            super().start(callback=callback, on_connect=observed_connect)
+            super().start(callback=callback, on_connect=observed_connect, deadline=deadline)
 
-    def observed_read(path, prefix, timeout=2.0):
-        result = real_read_snapshot(path, prefix, timeout)
+    def observed_read(path, prefix, timeout=2.0, *, deadline=None):
+        result = real_read_snapshot(path, prefix, timeout, deadline=deadline)
         if (
             result[0] == "found"
             and isinstance(result[1], dict)
@@ -211,7 +212,7 @@ def restart_harness(tmp_path, monkeypatch, make_lode, release_server_lock):
         def start_wait(self, lode_id: str) -> dict:
             run = {"done": threading.Event(), "resolved": threading.Event(), "result": None}
 
-            def resolver(path: Path, prefix: str) -> dict:
+            def resolver(path: Path, prefix: str, **_kwargs) -> dict:
                 status, payload = real_read_snapshot(path, prefix)
                 run["resolved"].set()
                 if status == "found":
@@ -232,12 +233,12 @@ def restart_harness(tmp_path, monkeypatch, make_lode, release_server_lock):
                 run["result"] = wait.wait_for_lodes(
                     socket_path,
                     [lode_id],
-                    timeout_s=5,
+                    deadline=make_deadline(5),
                     poll_s=30,
                     observer_timeout_s=5,
                     json_output=True,
                     resolver=resolver,
-                    probe_remote=lambda *args: (None, "unreadable"),
+                    probe_remote=lambda *args, **kwargs: (None, "unreadable"),
                 )
                 run["done"].set()
 
