@@ -19,9 +19,13 @@ from hopper import config
 from hopper.cli import main
 from hopper.projects import Project
 from hopper.remote import (
-    REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
-    REMOTE_POOL_PROBE_TIMEOUT_SECONDS,
+    REMOTE_CACHE_LOCK_TIMEOUT_SEC,
+    REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
+    REMOTE_POOL_PROBE_TIMEOUT_SEC,
     CandidateProbe,
+    HostDiscovery,
+    LodeCacheError,
+    discover_lodes,
     load_lode_cache,
     probe_candidate,
     probe_candidates,
@@ -265,12 +269,12 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
         (
             "ready.example",
             ["project", "list", "--json"],
-            REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+            REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
         ),
         (
             "ready.example",
             ["lode", "list", "--json"],
-            REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+            REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
         ),
     ]
 
@@ -331,7 +335,7 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
 def test_probe_candidate_refuses_invalid_project_contract(project_payload, reason):
     def runner(_host, args, *, timeout):
         assert args == ["project", "list", "--json"]
-        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
         return subprocess.CompletedProcess([], 0, stdout=json.dumps(project_payload), stderr="")
 
     probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
@@ -359,7 +363,7 @@ def test_probe_candidate_refuses_invalid_inventory_contract(
     reason,
 ):
     def runner(_host, args, *, timeout):
-        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
         stdout = emitted_project_json if args[0] == "project" else json.dumps(inventory)
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
@@ -404,7 +408,7 @@ def test_probe_candidate_classifies_every_command_failure(
         "timeout": "timed out",
     }[failure]
     assert expected in probe.reason
-    assert calls[-1][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+    assert calls[-1][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
 
 
 def test_probe_candidate_shares_deadline_between_both_calls(emitted_project_json):
@@ -419,13 +423,13 @@ def test_probe_candidate_shares_deadline_between_both_calls(emitted_project_json
     probe = probe_candidate("slow.example", "journal", runner, monotonic=lambda: next(clock))
 
     assert probe.eligible is True
-    assert calls[0][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+    assert calls[0][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
     assert calls[1][1] == 0.5
 
 
 def test_probe_candidate_refuses_when_first_call_exhausts_shared_deadline(emitted_project_json):
     calls = []
-    clock = iter([0.0, REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS])
+    clock = iter([0.0, REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC])
 
     def runner(_host, args, *, timeout):
         calls.append((args, timeout))
@@ -435,7 +439,7 @@ def test_probe_candidate_refuses_when_first_call_exhausts_shared_deadline(emitte
 
     assert probe.eligible is False
     assert "deadline expired before lode inventory" in probe.reason
-    assert calls == [(["project", "list", "--json"], REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS)]
+    assert calls == [(["project", "list", "--json"], REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC)]
 
 
 def test_probe_candidates_runs_large_pool_concurrently(
@@ -447,11 +451,11 @@ def test_probe_candidates_runs_large_pool_concurrently(
 
     def runner(_host, args, *, timeout):
         if args[0] == "project":
-            assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+            assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
             barrier.wait(timeout=2)
             stdout = emitted_project_json
         else:
-            assert 0 < timeout <= REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS
+            assert 0 < timeout <= REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
             stdout = emitted_lode_inventory_json
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
@@ -492,7 +496,7 @@ def test_probe_candidates_pins_aggregate_deadline(monkeypatch):
         monotonic=lambda: 0.0,
     )
 
-    assert observed[0][1] == REMOTE_POOL_PROBE_TIMEOUT_SECONDS
+    assert observed[0][1] == REMOTE_POOL_PROBE_TIMEOUT_SEC
     assert [probe.eligible for probe in probes] == [False, False]
 
 
@@ -509,6 +513,94 @@ def test_select_candidate_uses_minimum_load_and_injected_tie_break():
 
     assert [probe.host for probe in choices] == ["first.example", "second.example"]
     assert selected.host == "second.example"
+
+
+def test_discover_lodes_preserves_rows_and_every_unavailable_reason():
+    hosts = ["ready.example", "timeout.example", "failed.example", "malformed.example"]
+    calls = []
+
+    def runner(host, args, *, timeout):
+        calls.append((host, args, timeout))
+        if host == "timeout.example":
+            raise subprocess.TimeoutExpired(["ssh", host], timeout)
+        if host == "failed.example":
+            return subprocess.CompletedProcess([], 7, stdout="", stderr="server failed")
+        if host == "malformed.example":
+            return subprocess.CompletedProcess([], 0, stdout="{", stderr="")
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"lodes": [{"id": "abc23456", "active": true}]}',
+            stderr="",
+        )
+
+    discoveries = discover_lodes(hosts, ["lode", "list", "--json"], runner)
+
+    assert discoveries == [
+        HostDiscovery(
+            "ready.example",
+            ({"id": "abc23456", "active": True},),
+            None,
+        ),
+        HostDiscovery("timeout.example", (), "lode listing timed out"),
+        HostDiscovery("failed.example", (), "lode listing exited 7: server failed"),
+        HostDiscovery("malformed.example", (), "lode listing returned malformed JSON"),
+    ]
+    assert len(calls) == len(hosts)
+    assert all(call[2] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC for call in calls)
+
+
+def test_discover_lodes_runs_large_host_union_concurrently():
+    hosts = [f"host-{index}.example" for index in range(24)]
+    barrier = threading.Barrier(len(hosts))
+
+    def runner(_host, _args, *, timeout):
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
+        barrier.wait(timeout=2)
+        return subprocess.CompletedProcess([], 0, stdout='{"lodes": []}', stderr="")
+
+    discoveries = discover_lodes(hosts, ["lode", "list", "--json"], runner)
+
+    assert [result.host for result in discoveries] == hosts
+    assert all(result.reason is None for result in discoveries)
+
+
+def test_discover_lodes_pins_the_aggregate_deadline(monkeypatch):
+    observed = []
+
+    class Pending:
+        def cancel(self):
+            return True
+
+    class Executor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def submit(self, *_args, **_kwargs):
+            return Pending()
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    def fake_wait(futures, *, timeout):
+        observed.append(timeout)
+        return set(), set(futures)
+
+    monkeypatch.setattr("hopper.remote.ThreadPoolExecutor", Executor)
+    monkeypatch.setattr("hopper.remote.wait", fake_wait)
+
+    discoveries = discover_lodes(
+        ["one.example", "two.example"],
+        ["lode", "list", "--json"],
+        lambda *_args, **_kwargs: None,
+        monotonic=lambda: 0.0,
+    )
+
+    assert observed == [REMOTE_POOL_PROBE_TIMEOUT_SEC]
+    assert [result.reason for result in discoveries] == [
+        "aggregate discovery deadline expired",
+        "aggregate discovery deadline expired",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -676,21 +768,21 @@ def test_remember_lode_prunes_old_entries(temp_config):
     fresh = 30 * 24 * 60 * 60 * 1000
     config.hopper_dir().mkdir(parents=True, exist_ok=True)
     (temp_config / "remote-lodes.json").write_text(
-        '{"oldid": {"host": "old.local", "created_ms": 1}}\n'
+        '{"oldid234": {"host": "old.local", "project": "old", "created_ms": 1}}\n'
     )
 
-    remember_lode("newid", "fedora.local", "solstone", created_ms=fresh)
+    remember_lode("newid234", "fedora.local", "solstone", created_ms=fresh)
 
     cache = load_lode_cache()
-    assert "oldid" not in cache
-    assert cache["newid"]["host"] == "fedora.local"
-    assert cache["newid"]["project"] == "solstone"
+    assert "oldid234" not in cache
+    assert cache["newid234"]["host"] == "fedora.local"
+    assert cache["newid234"]["project"] == "solstone"
     assert old < fresh
 
 
 def test_remember_lode_same_host_does_not_publish(temp_config, monkeypatch):
     existing = {
-        "knownid": {
+        "knownid2": {
             "host": "fedora.local",
             "project": "journal",
             "created_ms": 100,
@@ -703,8 +795,8 @@ def test_remember_lode_same_host_does_not_publish(temp_config, monkeypatch):
     monkeypatch.setattr("hopper.remote.current_time_ms", lambda: next(times))
     monkeypatch.setattr("hopper.remote.save_lode_cache", lambda cache: published.append(cache))
 
-    remember_lode("knownid", "fedora.local", "renamed-project")
-    remember_lode("knownid", "fedora.local", "another-project")
+    remember_lode("knownid2", "fedora.local", "renamed-project")
+    remember_lode("knownid2", "fedora.local", "another-project")
 
     assert published == []
     assert load_lode_cache() == existing
@@ -712,7 +804,7 @@ def test_remember_lode_same_host_does_not_publish(temp_config, monkeypatch):
 
 def test_remember_lode_host_change_preserves_created_ms(temp_config, monkeypatch):
     existing = {
-        "knownid": {
+        "knownid2": {
             "host": "old.local",
             "project": "journal",
             "created_ms": 100,
@@ -722,9 +814,9 @@ def test_remember_lode_host_change_preserves_created_ms(temp_config, monkeypatch
     (temp_config / "remote-lodes.json").write_text(json.dumps(existing) + "\n")
     monkeypatch.setattr("hopper.remote.current_time_ms", lambda: 200)
 
-    remember_lode("knownid", "new.local", "journal")
+    remember_lode("knownid2", "new.local", "journal")
 
-    entry = load_lode_cache()["knownid"]
+    entry = load_lode_cache()["knownid2"]
     assert entry == {
         "host": "new.local",
         "project": "journal",
@@ -739,10 +831,155 @@ def test_remember_lode_rejects_corrupt_cache_without_rewriting(temp_config):
     corrupt = '{"existing": '
     cache_path.write_text(corrupt)
 
-    with pytest.raises(ValueError):
-        remember_lode("newid", "fedora.local", "journal")
+    with pytest.raises(LodeCacheError, match="malformed"):
+        remember_lode("newid234", "fedora.local", "journal")
 
     assert cache_path.read_text() == corrupt
+
+
+@pytest.mark.parametrize(
+    ("contents", "reason"),
+    [
+        ("{", "malformed"),
+        ("[]\n", "wrong_shape"),
+    ],
+)
+def test_load_lode_cache_refuses_invalid_file_without_rewriting(
+    temp_config,
+    contents,
+    reason,
+):
+    cache_path = temp_config / "remote-lodes.json"
+    cache_path.write_text(contents)
+    original = cache_path.read_bytes()
+
+    with pytest.raises(LodeCacheError) as raised:
+        load_lode_cache()
+
+    assert raised.value.path == cache_path
+    assert raised.value.reason == reason
+    assert cache_path.read_bytes() == original
+
+
+def test_load_lode_cache_reports_read_error(temp_config, monkeypatch):
+    cache_path = temp_config / "remote-lodes.json"
+    cache_path.write_text("{}\n")
+    original = cache_path.read_bytes()
+    original_read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == cache_path:
+            raise PermissionError("denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    with pytest.raises(LodeCacheError) as raised:
+        load_lode_cache()
+
+    assert raised.value.path == cache_path
+    assert raised.value.reason == "unreadable"
+    assert cache_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "cache",
+    [
+        {"short": {"host": "a", "project": "p", "created_ms": 1}},
+        {"abc23456": {"host": "", "project": "p", "created_ms": 1}},
+        {"abc23456": {"host": " a ", "project": "p", "created_ms": 1}},
+        {"abc23456": {"host": "a", "project": 1, "created_ms": 1}},
+        {"abc23456": {"host": "a", "project": "p"}},
+        {"abc23456": {"host": "a", "project": "p", "created_ms": True}},
+        {"abc23456": {"host": "a", "project": "p", "created_ms": -1}},
+        {
+            "abc23456": {
+                "host": "a",
+                "project": "p",
+                "created_ms": 1,
+                "created_at": 1,
+            }
+        },
+        {
+            "abc23456": {
+                "host": "a",
+                "project": "p",
+                "created_ms": 1,
+                "last_seen_ms": False,
+            }
+        },
+    ],
+)
+def test_load_lode_cache_refuses_invalid_entry_fields(temp_config, cache):
+    cache_path = temp_config / "remote-lodes.json"
+    cache_path.write_text(json.dumps(cache) + "\n")
+
+    with pytest.raises(LodeCacheError) as raised:
+        load_lode_cache()
+
+    assert raised.value.reason == "wrong_shape"
+
+
+def test_load_lode_cache_migrates_legacy_created_at_under_lock(temp_config):
+    cache_path = temp_config / "remote-lodes.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "abc23456": {
+                    "host": "resident.example",
+                    "project": "journal",
+                    "created_at": 123,
+                    "last_seen_ms": 456,
+                }
+            }
+        )
+        + "\n"
+    )
+
+    cache = load_lode_cache()
+
+    assert cache == {
+        "abc23456": {
+            "host": "resident.example",
+            "project": "journal",
+            "created_ms": 123,
+            "last_seen_ms": 456,
+        }
+    }
+    assert json.loads(cache_path.read_text()) == cache
+
+
+def test_legacy_cache_migration_failure_preserves_original_bytes(temp_config, monkeypatch):
+    cache_path = temp_config / "remote-lodes.json"
+    cache_path.write_text(
+        '{"abc23456":{"host":"resident.example","project":"journal","created_at":123}}\n'
+    )
+    original = cache_path.read_bytes()
+    monkeypatch.setattr(os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("no")))
+
+    with pytest.raises(LodeCacheError) as raised:
+        load_lode_cache()
+
+    assert raised.value.reason == "unreadable"
+    assert cache_path.read_bytes() == original
+
+
+def test_lode_cache_lock_deadline_is_bounded_without_sleep(temp_config, monkeypatch):
+    clock = iter([0.0, REMOTE_CACHE_LOCK_TIMEOUT_SEC])
+    monkeypatch.setattr("hopper.remote.time.monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        "hopper.remote.fcntl.flock",
+        lambda *_args: (_ for _ in ()).throw(BlockingIOError()),
+    )
+    monkeypatch.setattr(
+        "hopper.remote.time.sleep",
+        lambda *_args: pytest.fail("deadline should expire before sleeping"),
+    )
+
+    with pytest.raises(LodeCacheError) as raised:
+        remember_lode("abc23456", "resident.example", "journal")
+
+    assert raised.value.reason == "locked"
 
 
 def test_concurrent_remember_lode_processes_preserve_complete_cache(tmp_path):
@@ -779,12 +1016,12 @@ control_file.write(f"DONE {role}\n".encode())
     data_dir = xdg_home / "hopper"
     data_dir.mkdir(parents=True)
     existing = {
-        "existing-a": {
+        "aaaaaaaa": {
             "host": "one.local",
             "project": "one",
             "created_ms": 4_000_000_000_000,
         },
-        "existing-b": {
+        "bbbbbbbb": {
             "host": "two.local",
             "project": "two",
             "created_ms": 4_000_000_000_001,
@@ -805,8 +1042,8 @@ control_file.write(f"DONE {role}\n".encode())
         part for part in [repo_root, env.get("PYTHONPATH", "")] if part
     )
     child_args = [
-        ("A", "writer-a", "alpha.local"),
-        ("B", "writer-b", "beta.local"),
+        ("A", "cccccccc", "alpha.local"),
+        ("B", "dddddddd", "beta.local"),
     ]
     processes = [
         subprocess.Popen(
@@ -835,7 +1072,7 @@ control_file.write(f"DONE {role}\n".encode())
         files["A"].write(b"GO\n")
         publish, role, payload = files["A"].readline().decode().strip().split(" ", 2)
         assert (publish, role) == ("PUBLISH_READY", "A")
-        assert set(json.loads(payload)) == {*existing, "writer-a"}
+        assert set(json.loads(payload)) == {*existing, "cccccccc"}
 
         lock_path = data_dir / "remote-lodes.lock"
         held_probe = open(lock_path, "a+")
@@ -856,7 +1093,7 @@ control_file.write(f"DONE {role}\n".encode())
 
         publish, role, payload = files["B"].readline().decode().strip().split(" ", 2)
         assert (publish, role) == ("PUBLISH_READY", "B")
-        assert set(json.loads(payload)) == {*existing, "writer-a", "writer-b"}
+        assert set(json.loads(payload)) == {*existing, "cccccccc", "dddddddd"}
         files["B"].write(b"RELEASE\n")
         assert files["B"].readline() == b"DONE B\n"
 
@@ -874,8 +1111,8 @@ control_file.write(f"DONE {role}\n".encode())
                 process.communicate()
 
     cache = json.loads(cache_path.read_text())
-    assert cache["existing-a"] == existing["existing-a"]
-    assert cache["existing-b"] == existing["existing-b"]
-    assert cache["writer-a"]["host"] == "alpha.local"
-    assert cache["writer-b"]["host"] == "beta.local"
+    assert cache["aaaaaaaa"] == existing["aaaaaaaa"]
+    assert cache["bbbbbbbb"] == existing["bbbbbbbb"]
+    assert cache["cccccccc"]["host"] == "alpha.local"
+    assert cache["dddddddd"]["host"] == "beta.local"
     assert not list(data_dir.glob("remote-lodes*.tmp"))

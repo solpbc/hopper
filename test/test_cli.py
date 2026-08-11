@@ -73,7 +73,11 @@ from hopper.lodes import (
     save_lodes,
 )
 from hopper.projects import Project, load_projects, save_projects
-from hopper.remote import REMOTE_CREATE_TIMEOUT_SECONDS, CandidateProbe
+from hopper.remote import (
+    REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
+    REMOTE_CREATE_TIMEOUT_SEC,
+    CandidateProbe,
+)
 from hopper.server import Server
 from hopper.tmux import Liveness
 
@@ -944,6 +948,15 @@ def test_lode_help(capsys):
     assert out.count(HELP_SKILL_REMINDER) == 1
 
 
+def test_lode_list_help_documents_partial_all_host_results(capsys):
+    assert cmd_lode(["list", "--help"]) == 0
+
+    out = capsys.readouterr().out
+    assert "every pool host" in out
+    assert "unavailable_hosts" in out
+    assert "exit 2" in out
+
+
 def test_lode_no_server(capsys):
     """All actions fail gracefully when server is not running."""
     with patch("hopper.cli.require_server", return_value=1):
@@ -1469,7 +1482,7 @@ def test_lode_restart_happy(capsys):
     """Restart sends correct message and prints confirmation."""
     lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
                 return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
@@ -1494,7 +1507,7 @@ def test_lode_restart_rejects_inside_lode(monkeypatch, capsys):
 def test_lode_restart_not_found(capsys):
     """Restart with unknown lode ID prints error."""
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=None):
+        with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
             assert cmd_lode(["restart", "bad_id"]) == 1
     out = capsys.readouterr().out
     assert "not found" in out.lower()
@@ -1504,7 +1517,7 @@ def test_lode_restart_active(capsys):
     """Restart of active lode prints error."""
     lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             assert cmd_lode(["restart", "test1234"]) == 1
     out = capsys.readouterr().out
     assert "registered runner" in out.lower()
@@ -1515,7 +1528,7 @@ def test_lode_restart_unknown_ack_gives_status_next_step(capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
     with (
         patch("hopper.cli.require_server", return_value=None),
-        patch("hopper.client.get_lode", return_value=lode),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
         patch("hopper.client.restart_lode", return_value=None),
     ):
         assert cmd_lode(["restart", "test1234", "--force"]) == 1
@@ -1544,7 +1557,7 @@ def test_lode_restart_refusal_names_operator_next_steps(reason, next_steps, caps
     lode = {"id": "test1234", "stage": "mill", "state": "new", "active": False}
     with (
         patch("hopper.cli.require_server", return_value=None),
-        patch("hopper.client.get_lode", return_value=lode),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
         patch(
             "hopper.client.restart_lode",
             return_value={"type": "mutation_ack", "accepted": False, "reason": reason},
@@ -1561,7 +1574,7 @@ def test_lode_restart_shipped(capsys):
     """Restart of shipped lode prints error."""
     lode = {"id": "test1234", "stage": "shipped", "state": "shipped", "active": False}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             assert cmd_lode(["restart", "test1234"]) == 1
     out = capsys.readouterr().out
     assert "shipped" in out.lower()
@@ -1584,7 +1597,7 @@ def test_lode_restart_refuses_when_started(capsys):
         "claude": {"mill": {"started": True}},
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch("hopper.client.restart_lode") as mock_restart:
                 result = cmd_lode(["restart", "test1234"])
     assert result == 1
@@ -1607,7 +1620,7 @@ def test_lode_restart_force_proceeds_when_started(capsys):
         "claude": {"mill": {"started": True}},
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
                 return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
@@ -1628,7 +1641,7 @@ def test_lode_restart_error_proceeds_when_started_without_force(capsys):
         "claude": {"mill": {"started": True}},
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
                 return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
@@ -1639,7 +1652,11 @@ def test_lode_restart_error_proceeds_when_started_without_force(capsys):
     assert "Restarting mill for test1234" in capsys.readouterr().out
 
 
-def test_lode_log_happy(temp_config, capsys):
+def test_lode_log_happy(temp_config, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hopper.client.read_lode_snapshot",
+        lambda _socket, prefix: ("found", {"id": prefix}),
+    )
     log_file = temp_config / "activity.log"
     log_file.write_text(
         "\n".join(
@@ -1665,7 +1682,11 @@ def test_lode_log_happy(temp_config, capsys):
     assert "other999" not in out
 
 
-def test_lode_log_json(temp_config, capsys):
+def test_lode_log_json(temp_config, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hopper.client.read_lode_snapshot",
+        lambda _socket, prefix: ("found", {"id": prefix}),
+    )
     log_file = temp_config / "activity.log"
     log_file.write_text(
         "2026-01-01 12:00:00.123 hopper.server INFO Lode test1234 created project=myproj\n"
@@ -1682,7 +1703,11 @@ def test_lode_log_json(temp_config, capsys):
     assert "Lode test1234 created project=myproj" in entries[0]["message"]
 
 
-def test_lode_log_tail(temp_config, capsys):
+def test_lode_log_tail(temp_config, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hopper.client.read_lode_snapshot",
+        lambda _socket, prefix: ("found", {"id": prefix}),
+    )
     log_file = temp_config / "activity.log"
     log_file.write_text(
         "\n".join(
@@ -1703,7 +1728,11 @@ def test_lode_log_tail(temp_config, capsys):
     assert "step=9" in lines[-1]
 
 
-def test_lode_log_no_matches(temp_config, capsys):
+def test_lode_log_no_matches(temp_config, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hopper.client.read_lode_snapshot",
+        lambda _socket, prefix: ("found", {"id": prefix}),
+    )
     (temp_config / "activity.log").write_text(
         "2026-01-01 12:00:00.123 hopper.server INFO Lode other999 created\n"
     )
@@ -1715,7 +1744,11 @@ def test_lode_log_no_matches(temp_config, capsys):
     assert "No log entries found for lode test1234" in out
 
 
-def test_lode_log_no_file(capsys):
+def test_lode_log_no_file(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hopper.client.read_lode_snapshot",
+        lambda _socket, prefix: ("found", {"id": prefix}),
+    )
     rc = cmd_lode(["log", "test1234"])
 
     assert rc == 1
@@ -1732,7 +1765,7 @@ def test_lode_log_missing_id(capsys):
 def test_lode_kill_happy(capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch("hopper.client.kill_lode", return_value=True) as mock_kill:
                 rc = cmd_lode(["kill", "test1234"])
 
@@ -1746,7 +1779,7 @@ def test_lode_kill_happy(capsys):
 def test_lode_kill_reports_delivery_failure(capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch("hopper.client.kill_lode", return_value=False):
                 rc = cmd_lode(["kill", "test1234"])
 
@@ -1781,7 +1814,7 @@ def test_lode_pause_resume(verb, client_name, response_type, output, capsys):
 def test_lode_kill_shipped(capsys):
     lode = {"id": "test1234", "stage": "shipped", "state": "shipped", "active": False}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch("hopper.client.kill_lode") as mock_kill:
                 rc = cmd_lode(["kill", "test1234"])
 
@@ -1792,9 +1825,17 @@ def test_lode_kill_shipped(capsys):
 
 
 def test_lode_kill_archived(capsys):
-    archived = [{"id": "test1234", "stage": "mill", "state": "error", "active": False}]
+    archived = [
+        {
+            "id": "test1234",
+            "stage": "mill",
+            "state": "error",
+            "active": False,
+            "archived_at": 1,
+        }
+    ]
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=None):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", archived[0])):
             with patch("hopper.client.list_archived_lodes", return_value=archived):
                 rc = cmd_lode(["kill", "test1234"])
 
@@ -1805,13 +1846,13 @@ def test_lode_kill_archived(capsys):
 
 def test_lode_kill_not_found(capsys):
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=None):
+        with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
             with patch("hopper.client.list_archived_lodes", return_value=[]):
                 rc = cmd_lode(["kill", "missing"])
 
     assert rc == 1
     out = capsys.readouterr().out
-    assert "Lode not found: missing" in out
+    assert "Lode 'missing' not found." in out
 
 
 def test_lode_kill_missing_id(capsys):
@@ -1856,7 +1897,7 @@ def test_lode_watch_post_subscribe_reconcile_observes_shipped(capsys):
     }
     shipped = {**lode, "stage": "shipped", "status": "Done", "active": False}
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)),
         patch(
             "hopper.cli._read_watch_snapshot",
             return_value=("found", shipped, "local=found abc123"),
@@ -1894,7 +1935,7 @@ def test_lode_watch_on_connect_reconciles_before_interval(monkeypatch, capsys):
 
     monkeypatch.setattr("hopper.cli._watch_condition_wait", condition_wait)
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(initial)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(initial)),
         patch(
             "hopper.cli._read_watch_snapshot",
             side_effect=[
@@ -1944,7 +1985,7 @@ def test_lode_watch_error_exit(capsys):
     }
     failed = {**lode, "state": "error", "status": "Failed", "active": False}
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)),
         patch(
             "hopper.cli._read_watch_snapshot",
             return_value=("found", failed, "local=found abc123"),
@@ -1969,7 +2010,7 @@ def test_lode_watch_archived_exit(capsys):
         "archived_at": 1234,
     }
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)),
         patch("hopper.client.HopperConnection") as connection,
     ):
         result = cmd_lode(["watch", "abc123"])
@@ -1989,7 +2030,7 @@ def test_lode_watch_not_found(capsys):
         "probe_summary": "local=absent",
         "exit_code": 1,
     }
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=resolution):
+    with patch("hopper.cli._resolve_lode", return_value=resolution):
         result = cmd_lode(["watch", "bogus"])
     assert result == 1
     assert capsys.readouterr().out == "Lode 'bogus' not found. Probes: local=absent.\n"
@@ -1998,7 +2039,7 @@ def test_lode_watch_not_found(capsys):
 def test_lode_watch_not_active(capsys):
     """watch fails when lode is not active."""
     lode = {"id": "abc123", "active": False, "stage": "mill", "state": "new", "status": ""}
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)):
+    with patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)):
         result = cmd_lode(["watch", "abc123"])
     assert result == 1
     assert capsys.readouterr().out == (
@@ -2014,7 +2055,7 @@ def test_lode_watch_error_state_at_start(capsys):
         "state": "error",
         "status": "Something failed",
     }
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)):
+    with patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)):
         result = cmd_lode(["watch", "abc123"])
     assert result == 1
     out = capsys.readouterr().out
@@ -2033,7 +2074,7 @@ def test_lode_watch_initial_state(capsys):
     }
     shipped = {**lode, "stage": "shipped", "status": "Done", "active": False}
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)),
         patch(
             "hopper.cli._read_watch_snapshot",
             return_value=("found", shipped, "local=found abc123"),
@@ -2066,7 +2107,7 @@ def test_watch_prints_banner_on_gate_in_and_out(capsys):
     ]
     shipped = {**lode, "stage": "shipped", "status": "Done", "active": False}
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)),
         patch(
             "hopper.cli._read_watch_snapshot",
             return_value=("found", shipped, "local=found abc123"),
@@ -2094,7 +2135,7 @@ def test_lode_wait_shipped(capsys):
     }
     shipped = {**lode, "stage": "shipped", "status": "Done", "title": "Done task"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2130,7 +2171,7 @@ def test_lode_wait_shipped_no_title(capsys):
     }
     shipped = {**lode, "stage": "shipped"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2160,7 +2201,7 @@ def test_lode_wait_already_shipped(capsys):
         "updated_at": 2000,
     }
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             result = cmd_lode(["wait", "abc123"])
     assert result == 0
     out = capsys.readouterr().out
@@ -2181,9 +2222,8 @@ def test_lode_wait_archived_lode(capsys):
         "updated_at": 2000,
     }
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=None):
-            with patch("hopper.client.read_lode_snapshot", return_value=("found", archived)):
-                result = cmd_lode(["wait", "arc12345"])
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", archived)):
+            result = cmd_lode(["wait", "arc12345"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ arc12345 shipped (Archive task)" in out
@@ -2200,27 +2240,26 @@ def test_lode_wait_prefix_match(capsys):
     }
     shipped = {**lode, "stage": "shipped", "status": "Done", "title": "Prefix task"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=None):
-            with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-                mock_conn = MagicMock()
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+            mock_conn = MagicMock()
 
-                def fake_start(callback, on_connect=None):
-                    callback(
-                        {
-                            "type": "lode_updated",
-                            "lode": {
-                                **lode,
-                                "stage": "shipped",
-                                "status": "Done",
-                                "title": "Prefix task",
-                            },
-                        }
-                    )
+            def fake_start(callback, on_connect=None):
+                callback(
+                    {
+                        "type": "lode_updated",
+                        "lode": {
+                            **lode,
+                            "stage": "shipped",
+                            "status": "Done",
+                            "title": "Prefix task",
+                        },
+                    }
+                )
 
-                mock_conn.start = fake_start
-                with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
-                    with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                        result = cmd_lode(["wait", "abc"])
+            mock_conn.start = fake_start
+            with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
+                with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                    result = cmd_lode(["wait", "abc"])
     assert result == 0
     assert "✓ abc12345 shipped (Prefix task)" in capsys.readouterr().out
 
@@ -2235,9 +2274,8 @@ def test_lode_wait_prefix_not_active(capsys):
         "active": False,
     }
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=None):
-            with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
-                result = cmd_lode(["wait", "abc"])
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+            result = cmd_lode(["wait", "abc"])
     assert result == 1
     assert "not active" in capsys.readouterr().out
 
@@ -2253,7 +2291,7 @@ def test_lode_wait_error(capsys):
     }
     failed = {**lode, "state": "error", "status": "Failed"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2284,7 +2322,7 @@ def test_wait_exits_2_on_gate_transition(capsys):
     }
     gated = {**lode, "state": "gated", "status": "Gate"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2310,7 +2348,7 @@ def test_lode_wait_error_state_at_start(capsys):
     }
     with patch("hopper.cli.require_not_inside_lode", return_value=None):
         with patch("hopper.cli.require_server", return_value=None):
-            with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
                 result = cmd_lode(["wait", "abc123"])
     assert result == 1
     out = capsys.readouterr().out
@@ -2324,8 +2362,9 @@ def _run_scripted_cli_wait(monkeypatch, initial_by_id, observations_by_id, args)
     latest = dict(initial_by_id)
     connection = MagicMock()
 
-    def get_lode(socket_path, lid, timeout=2.0):
-        return initial_by_id.get(lid)
+    def resolve_initial(socket_path, lid, timeout=2.0):
+        lode = initial_by_id.get(lid)
+        return ("found", lode) if lode is not None else ("absent", None)
 
     def read_snapshot(socket_path, lid):
         if queues.get(lid):
@@ -2340,7 +2379,7 @@ def _run_scripted_cli_wait(monkeypatch, initial_by_id, observations_by_id, args)
         now[0] += timeout
 
     connection.start = start
-    monkeypatch.setattr("hopper.client.get_lode", get_lode)
+    monkeypatch.setattr("hopper.client.read_lode_snapshot", resolve_initial)
     monkeypatch.setattr("hopper.client.HopperConnection", lambda socket_path: connection)
     monkeypatch.setattr("hopper.wait.read_local_snapshot", read_snapshot)
     monkeypatch.setattr("hopper.wait._monotonic", lambda: now[0])
@@ -2607,11 +2646,15 @@ def test_wait_timeout_shorter_than_grace(monkeypatch, capsys):
 
 def test_lode_wait_not_found(capsys):
     """wait fails when lode not found."""
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=None):
-            with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
-                with patch("hopper.cli._find_remote_lode", return_value=(None, "")):
-                    result = cmd_lode(["wait", "bogus"])
+    with patch(
+        "hopper.cli._resolve_lode",
+        return_value={
+            "outcome": "absent",
+            "error": "Lode 'bogus' not found.",
+            "exit_code": 1,
+        },
+    ):
+        result = cmd_lode(["wait", "bogus"])
     assert result == 1
     assert "not found" in capsys.readouterr().out
 
@@ -2620,7 +2663,7 @@ def test_lode_wait_not_active(capsys):
     """wait fails when lode is not active."""
     lode = {"id": "abc123", "active": False, "stage": "mill", "state": "new", "status": ""}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             result = cmd_lode(["wait", "abc123"])
     assert result == 1
     assert "not active" in capsys.readouterr().out
@@ -2636,7 +2679,7 @@ def test_lode_wait_timeout(capsys):
         "active": True,
     }
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2668,12 +2711,12 @@ def test_lode_wait_multi_all_ship(capsys):
         "title": "Second",
     }
 
-    def fake_get_lode(socket_path, lode_id, timeout=2.0):
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
         if lode_id == "aaa111":
-            return lode1
+            return "found", lode1
         if lode_id == "bbb222":
-            return lode2
-        return None
+            return "found", lode2
+        return "absent", None
 
     shipped = {
         "aaa111": {**lode1, "stage": "shipped", "title": "First"},
@@ -2681,7 +2724,7 @@ def test_lode_wait_multi_all_ship(capsys):
     }
 
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", side_effect=fake_get_lode):
+        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2728,12 +2771,12 @@ def test_lode_wait_multi_one_errors(capsys):
         "active": True,
     }
 
-    def fake_get_lode(socket_path, lode_id, timeout=2.0):
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
         if lode_id == "aaa111":
-            return lode1
+            return "found", lode1
         if lode_id == "bbb222":
-            return lode2
-        return None
+            return "found", lode2
+        return "absent", None
 
     current = {
         "aaa111": {**lode1, "state": "error", "status": "Crashed"},
@@ -2741,7 +2784,7 @@ def test_lode_wait_multi_one_errors(capsys):
     }
 
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", side_effect=fake_get_lode):
+        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2783,12 +2826,12 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
         "title": "Still going",
     }
 
-    def fake_get_lode(socket_path, lode_id, timeout=2.0):
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
         if lode_id == "aaa111":
-            return shipped_lode
+            return "found", shipped_lode
         if lode_id == "bbb222":
-            return pending_lode
-        return None
+            return "found", pending_lode
+        return "absent", None
 
     finished_pending = {
         **pending_lode,
@@ -2797,7 +2840,7 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
     }
 
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", side_effect=fake_get_lode):
+        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2835,15 +2878,15 @@ def test_lode_wait_multi_timeout(capsys):
         "active": True,
     }
 
-    def fake_get_lode(socket_path, lode_id, timeout=2.0):
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
         if lode_id == "aaa111":
-            return lode1
+            return "found", lode1
         if lode_id == "bbb222":
-            return lode2
-        return None
+            return "found", lode2
+        return "absent", None
 
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.get_lode", side_effect=fake_get_lode):
+        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
             mock_conn = MagicMock()
             mock_conn.start = MagicMock()
             with patch("hopper.client.HopperConnection", return_value=mock_conn):
@@ -2863,15 +2906,16 @@ def test_lode_wait_multi_one_not_found(capsys):
         "active": True,
     }
 
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch(
-            "hopper.client.get_lode",
-            side_effect=lambda sp, lid, timeout=2.0: lode1 if lid == "aaa111" else None,
-        ):
-            with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
-                with patch("hopper.cli._find_remote_lode", return_value=(None, "")):
-                    with patch("hopper.client.HopperConnection") as mock_conn_cls:
-                        result = cmd_lode(["wait", "aaa111", "bogus"])
+    def resolve(socket_path, lode_id):
+        if lode_id == "aaa111":
+            return _watch_resolution(lode1)
+        return {"outcome": "absent", "error": "Lode 'bogus' not found.", "exit_code": 1}
+
+    with (
+        patch("hopper.cli._resolve_lode", side_effect=resolve),
+        patch("hopper.client.HopperConnection") as mock_conn_cls,
+    ):
+        result = cmd_lode(["wait", "aaa111", "bogus"])
     assert result == 1
     assert "not found" in capsys.readouterr().out
     mock_conn_cls.assert_not_called()
@@ -2888,20 +2932,22 @@ def test_lode_wait_remote_poll_json_shipped(capsys):
         "host": "fedora.local",
     }
     shipped = {**initial, "stage": "shipped", "state": "ready", "status": "Done"}
-    with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=None):
-            with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
-                with patch("hopper.cli._find_remote_lode", return_value=(initial, "fedora.local")):
-                    with patch(
-                        "hopper.remote.run_remote",
-                        return_value=subprocess.CompletedProcess(
-                            [],
-                            0,
-                            stdout=json.dumps(shipped) + "\n",
-                            stderr="",
-                        ),
-                    ):
-                        result = cmd_lode(["wait", "remote123", "--json", "--timeout", "1"])
+    with (
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution(initial, "fedora.local"),
+        ),
+        patch(
+            "hopper.remote.run_remote",
+            return_value=subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(shipped) + "\n",
+                stderr="",
+            ),
+        ),
+    ):
+        result = cmd_lode(["wait", "remote123", "--json", "--timeout", "1"])
 
     assert result == 0
     payload = json.loads(capsys.readouterr().out)
@@ -3280,6 +3326,15 @@ def test_project_help(capsys):
     assert result == 0
     captured = capsys.readouterr()
     assert "usage: hop project" in captured.out
+    assert "name, path, disabled, and disabled_reason" in " ".join(captured.out.split())
+
+
+def test_remote_help_documents_pool_syntax_and_json_shape(capsys):
+    assert cmd_remote(["--help"]) == 0
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "hop remote set <project> <host> [host ...]" in out
+    assert "hosts for the complete pool" in out
 
 
 def test_project_list_empty(tmp_path, monkeypatch, capsys):
@@ -3662,6 +3717,10 @@ def test_processed_help(capsys):
     assert result == 0
     captured = capsys.readouterr()
     assert "usage: hop processed" in captured.out
+    help_text = " ".join(captured.out.split())
+    assert "canonical worktree is clean" in help_text
+    assert "freshly fetched upstream main or master" in help_text
+    assert "never merges, rebases, commits, or pushes" in help_text
 
 
 def test_processed_no_server(capsys):
@@ -4143,8 +4202,12 @@ def test_gate_show_prints_verbatim_format(capsys):
         "gate": "# Design Review\nLooks good",
     }
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_gate", return_value=gate_data):
-            result = cmd_gate(["show", "gate1234"])
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            return_value=("found", gate_data["lode"]),
+        ):
+            with patch("hopper.client.get_gate", return_value=gate_data):
+                result = cmd_gate(["show", "gate1234"])
     assert result == 0
     assert (
         capsys.readouterr().out == "Lode: gate1234\n"
@@ -4158,12 +4221,36 @@ def test_gate_show_prints_verbatim_format(capsys):
     )
 
 
+def test_gate_show_reports_when_no_gate_is_set(capsys):
+    """gate show distinguishes a missing gate from an unavailable lode."""
+    resolution = {
+        "outcome": "found",
+        "host": "local",
+        "canonical_id": "gate1234",
+        "lode": {"id": "gate1234"},
+        "error": None,
+        "probe_summary": [],
+        "exit_code": 0,
+    }
+    with (
+        patch("hopper.cli._resolve_lode", return_value=resolution),
+        patch("hopper.client.get_gate", return_value=None),
+    ):
+        assert cmd_gate(["show", "gate1234"]) == 1
+
+    assert capsys.readouterr().out == "Error: no gate is set for lode gate1234.\n"
+
+
 def test_gate_feedback_with_text_arg_calls_client(capsys):
     """gate feedback sends inline feedback text to the client helper."""
     response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
-            result = cmd_gate(["feedback", "gate1234", "Needs work"])
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            return_value=("found", {"id": "gate1234"}),
+        ):
+            with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+                result = cmd_gate(["feedback", "gate1234", "Needs work"])
     assert result == 0
     mock_send.assert_called_once()
     assert mock_send.call_args.args[1:] == ("gate1234", "Needs work")
@@ -4176,9 +4263,13 @@ def test_gate_feedback_reads_stdin_when_no_text_arg(capsys):
 
     response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
-            with patch("sys.stdin", StringIO("Needs more tests")):
-                result = cmd_gate(["feedback", "gate1234"])
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            return_value=("found", {"id": "gate1234"}),
+        ):
+            with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+                with patch("sys.stdin", StringIO("Needs more tests")):
+                    result = cmd_gate(["feedback", "gate1234"])
     assert result == 0
     mock_send.assert_called_once()
     assert mock_send.call_args.args[1:] == ("gate1234", "Needs more tests")
@@ -4190,9 +4281,13 @@ def test_gate_feedback_treats_dash_as_stdin_sentinel(capsys):
 
     response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
-            with patch("sys.stdin", StringIO("approved, ship it")):
-                result = cmd_gate(["feedback", "gate1234", "-"])
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            return_value=("found", {"id": "gate1234"}),
+        ):
+            with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+                with patch("sys.stdin", StringIO("approved, ship it")):
+                    result = cmd_gate(["feedback", "gate1234", "-"])
     assert result == 0
     mock_send.assert_called_once()
     assert mock_send.call_args.args[1:] == ("gate1234", "approved, ship it")
@@ -4210,7 +4305,10 @@ def test_feedback_alias_treats_dash_as_stdin_sentinel(capsys):
     from io import StringIO
 
     response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}
-    with patch("hopper.cli.require_server", return_value=None):
+    with patch(
+        "hopper.cli._resolve_lode",
+        return_value=_watch_resolution({"id": "gate1234"}),
+    ):
         with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
             with patch("sys.stdin", StringIO("approved, ship it")):
                 result = cmd_feedback(["gate1234", "-"])
@@ -4219,17 +4317,14 @@ def test_feedback_alias_treats_dash_as_stdin_sentinel(capsys):
     assert mock_send.call_args.args[1:] == ("gate1234", "approved, ship it")
 
 
-def test_gate_feedback_unknown_lode_may_fall_back_remote():
-    response = {
-        "type": "error",
-        "outcome": "unknown_lode",
-        "error": "Lode gate1234 was not found on this server.",
-    }
+def test_gate_feedback_resident_route_bypasses_local_mutation():
     remote = {"id": "gate1234", "host": "remote.example"}
     with (
-        patch("hopper.cli.require_server", return_value=None),
-        patch("hopper.client.send_gate_feedback", return_value=response),
-        patch("hopper.cli._find_remote_lode", return_value=(remote, "remote.example")),
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution(remote, "remote.example"),
+        ),
+        patch("hopper.client.send_gate_feedback") as local_feedback,
         patch("hopper.cli._run_remote_cli", return_value=0) as mock_remote,
     ):
         assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 0
@@ -4240,19 +4335,21 @@ def test_gate_feedback_unknown_lode_may_fall_back_remote():
         reason="lode gate1234",
         stdin_text="Needs work",
     )
+    local_feedback.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["pane_unavailable", "busy", "not_sent", "unverified"])
 def test_gate_feedback_local_delivery_failure_never_probes_remote(outcome, capsys):
     response = {"type": "error", "outcome": outcome, "error": "Safe local recovery."}
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution({"id": "gate1234"}),
+        ),
         patch("hopper.client.send_gate_feedback", return_value=response),
-        patch("hopper.cli._find_remote_lode") as mock_find_remote,
     ):
         assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
 
-    mock_find_remote.assert_not_called()
     assert capsys.readouterr().err == "Safe local recovery.\n"
 
 
@@ -4264,7 +4361,10 @@ def test_gate_feedback_unverified_prints_framed_pane_tail(capsys):
         "tail": "first pane line\nlast pane line",
     }
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution({"id": "gate1234"}),
+        ),
         patch("hopper.client.send_gate_feedback", return_value=response),
     ):
         assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
@@ -4286,7 +4386,10 @@ def test_gate_feedback_not_sent_does_not_print_pane_tail(capsys):
         "tail": "staged pane content",
     }
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution({"id": "gate1234"}),
+        ),
         patch("hopper.client.send_gate_feedback", return_value=response),
     ):
         assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
@@ -4296,13 +4399,15 @@ def test_gate_feedback_not_sent_does_not_print_pane_tail(capsys):
 
 def test_gate_feedback_missing_response_never_probes_remote(capsys):
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch(
+            "hopper.cli._resolve_lode",
+            return_value=_watch_resolution({"id": "gate1234"}),
+        ) as resolver,
         patch("hopper.client.send_gate_feedback", return_value=None),
-        patch("hopper.cli._find_remote_lode") as mock_find_remote,
     ):
         assert cmd_gate(["feedback", "gate1234", "Needs work"]) == 1
 
-    mock_find_remote.assert_not_called()
+    resolver.assert_called_once()
     error = capsys.readouterr().err
     assert "delivery outcome is unknown" in error
     assert "hop lode peek gate1234" in error
@@ -4793,7 +4898,7 @@ def test_restart_delegates_to_lode_restart(capsys):
     }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.cli.require_not_inside_lode", return_value=None):
-            with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
                 with patch(
                     "hopper.client.restart_lode",
                     return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
@@ -4817,7 +4922,7 @@ def test_wait_delegates_to_lode_wait(capsys):
     }
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.cli.require_not_inside_lode", return_value=None):
-            with patch("hopper.client.get_lode", return_value=lode):
+            with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
                 result = cmd_wait(["abc123"])
     assert result == 0
     out = capsys.readouterr().out
@@ -5028,7 +5133,7 @@ def test_lode_status_not_found(capsys):
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
         patch("hopper.cli._remote_hosts", return_value=["fedora.local"]),
-        patch("hopper.cli._cached_lode_host", return_value=None),
+        patch("hopper.remote.load_lode_cache", return_value={}),
         patch("hopper.cli._remote_lode_status", return_value=(None, "absent")),
     ):
         result = cmd_lode(["status", "bad_id"])
@@ -5046,7 +5151,7 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
     ):
         with (
             patch("hopper.cli._remote_hosts", return_value=["fedora.local"]),
-            patch("hopper.cli._cached_lode_host", return_value=None),
+            patch("hopper.remote.load_lode_cache", return_value={}),
             patch("hopper.cli._remote_lode_status", return_value=(None, "unreadable")),
         ):
             result = cmd_lode(["status", "busy-id"])
@@ -5062,146 +5167,6 @@ def test_lode_status_remote_unreadable_has_distinct_exit(capsys):
     assert captured.err == ""
 
 
-@pytest.mark.parametrize(
-    (
-        "local_result",
-        "remote_result",
-        "expected_lode",
-        "expected_outcome",
-        "expected_exit_code",
-        "expected_error",
-    ),
-    [
-        (("absent", None), ("found", "fedora.local"), "remote123", "found", 0, None),
-        (
-            ("absent", None),
-            ("absent", "fedora.local"),
-            None,
-            "absent",
-            1,
-            "Lode 'abc' not found. Checked remote hosts: fedora.local.",
-        ),
-        (
-            ("absent", None),
-            ("unreadable", "fedora.local [unreadable: fedora.local]"),
-            None,
-            "unavailable",
-            2,
-            "Lode status unavailable for 'abc'. Remote probes: "
-            "fedora.local [unreadable: fedora.local].",
-        ),
-        (
-            ("absent", None),
-            ("no-hosts", ""),
-            None,
-            "absent",
-            1,
-            "Lode 'abc' not found. No remote hosts configured.",
-        ),
-        (
-            ("ambiguous", ["abc111", "abc999"]),
-            ("found", "fedora.local"),
-            None,
-            "ambiguous",
-            1,
-            "Ambiguous prefix 'abc', matches: abc111, abc999",
-        ),
-        (
-            ("ambiguous", ["abc111", "abc999"]),
-            ("absent", "fedora.local"),
-            None,
-            "ambiguous",
-            1,
-            "Ambiguous prefix 'abc', matches: abc111, abc999",
-        ),
-        (
-            ("ambiguous", ["abc111", "abc999"]),
-            ("unreadable", "fedora.local [unreadable: fedora.local]"),
-            None,
-            "ambiguous",
-            1,
-            "Ambiguous prefix 'abc', matches: abc111, abc999",
-        ),
-        (
-            ("ambiguous", ["abc111", "abc999"]),
-            ("no-hosts", ""),
-            None,
-            "ambiguous",
-            1,
-            "Ambiguous prefix 'abc', matches: abc111, abc999",
-        ),
-        (
-            ("unavailable", "server not running at sock"),
-            ("found", "fedora.local"),
-            "remote123",
-            "found",
-            0,
-            None,
-        ),
-        (
-            ("unavailable", "server not running at sock"),
-            ("absent", "fedora.local"),
-            None,
-            "unavailable",
-            2,
-            "Lode status unavailable for 'abc': server not running at sock. "
-            "Checked remote hosts: fedora.local.",
-        ),
-        (
-            ("unavailable", "server not running at sock"),
-            ("unreadable", "fedora.local [unreadable: fedora.local]"),
-            None,
-            "unavailable",
-            2,
-            "Lode status unavailable for 'abc': server not running at sock. Remote probes: "
-            "fedora.local [unreadable: fedora.local].",
-        ),
-        (
-            ("unavailable", "server not running at sock"),
-            ("no-hosts", ""),
-            None,
-            "unavailable",
-            2,
-            "Lode status unavailable for 'abc': server not running at sock. "
-            "No remote hosts configured.",
-        ),
-    ],
-)
-def test_lookup_lode_with_remote_outcome_matrix(
-    local_result,
-    remote_result,
-    expected_lode,
-    expected_outcome,
-    expected_exit_code,
-    expected_error,
-):
-    from hopper.cli import _lookup_lode_with_remote, _RemoteProbeSummary
-
-    remote_lode = {"id": "remote123", "host": "fedora.local"}
-    remote_value = remote_lode if remote_result[0] == "found" else None
-    remote_summary = _RemoteProbeSummary(
-        remote_result[1],
-        unavailable=remote_result[0] == "unreadable",
-    )
-    with (
-        patch("hopper.client.read_lode_snapshot", return_value=local_result),
-        patch(
-            "hopper.cli._find_remote_lode",
-            return_value=(remote_value, remote_summary),
-        ) as find_remote,
-    ):
-        result = _lookup_lode_with_remote(Path("sock"), "abc")
-
-    assert (result["lode"]["id"] if result["lode"] else None) == expected_lode
-    assert result["outcome"] == expected_outcome
-    assert result["error"] == expected_error
-    assert result["exit_code"] == expected_exit_code
-    if local_result[0] == "ambiguous":
-        find_remote.assert_not_called()
-    else:
-        find_remote.assert_called_once_with("abc")
-
-
 def test_lode_status_local_unavailable_remote_absent_exits_2(capsys):
     with (
         patch(
@@ -5209,7 +5174,7 @@ def test_lode_status_local_unavailable_remote_absent_exits_2(capsys):
             return_value=("unavailable", "server not running at /tmp/server.sock"),
         ),
         patch("hopper.cli._remote_hosts", return_value=["fedora.local"]),
-        patch("hopper.cli._cached_lode_host", return_value=None),
+        patch("hopper.remote.load_lode_cache", return_value={}),
         patch("hopper.cli._remote_lode_status", return_value=(None, "absent")),
     ):
         result = cmd_lode(["status", "abc"])
@@ -5308,44 +5273,6 @@ def test_remote_lode_probe_rejects_malformed_ambiguity_as_unreadable():
     assert lode is None
     assert state == "unreadable"
     assert state.matches == ()
-
-
-def test_find_remote_lode_can_skip_cache_publish():
-    from hopper.cli import _find_remote_lode
-
-    lode = {
-        "id": "remote123",
-        "host": "fedora.local",
-        "project": "journal",
-    }
-    with patch("hopper.remote.load_lode_cache", return_value={}):
-        with patch("hopper.remote.remote_registry", return_value={"journal": ["fedora.local"]}):
-            with patch("hopper.cli._remote_lode_status", return_value=(lode, "found")):
-                with patch("hopper.remote.remember_lode") as remember:
-                    found, _ = _find_remote_lode("remote123", remember_result=False)
-
-    assert found == lode
-    remember.assert_not_called()
-
-
-@pytest.mark.parametrize("cached", [True, False], ids=["cache-hit", "fan-out"])
-def test_find_remote_lode_survives_cache_publish_failure(cached, caplog):
-    from hopper.cli import _find_remote_lode
-
-    lode = {
-        "id": "remote123",
-        "host": "fedora.local",
-        "project": "journal",
-    }
-    cache = {"remote123": {"host": "fedora.local"}} if cached else {}
-    with patch("hopper.remote.load_lode_cache", return_value=cache):
-        with patch("hopper.remote.remote_registry", return_value={"journal": ["fedora.local"]}):
-            with patch("hopper.cli._remote_lode_status", return_value=(lode, "found")):
-                with patch("hopper.remote.remember_lode", side_effect=ValueError("bad cache")):
-                    found, _ = _find_remote_lode("remote123")
-
-    assert found == lode
-    assert "Could not update remote lode cache for remote123 on fedora.local" in caplog.text
 
 
 def test_backlog_ls_alias(capsys):
@@ -5531,7 +5458,7 @@ def test_lode_list_all_hosts_probes_stamped_local_parked_lode(capsys, make_lode)
     )
 
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.probe_server", return_value="up"),
         patch("hopper.client.list_lodes", return_value=[lode]),
         patch("hopper.remote.remote_registry", return_value={}),
         patch("hopper.lodes.pane_liveness", return_value=Liveness.GONE) as mock_liveness,
@@ -5563,7 +5490,7 @@ def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(ca
     )
 
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.probe_server", return_value="up"),
         patch("hopper.client.list_lodes", return_value=[]),
         patch("hopper.remote.remote_registry", return_value={"proj": ["builder.example"]}),
         patch("hopper.remote.run_remote", return_value=remote_result),
@@ -5589,7 +5516,7 @@ def test_lode_list_all_hosts_uses_unique_union_of_pool_members(capsys):
         stderr="",
     )
     with (
-        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.probe_server", return_value="up"),
         patch("hopper.client.list_lodes", return_value=[]),
         patch(
             "hopper.remote.remote_registry",
@@ -5602,12 +5529,118 @@ def test_lode_list_all_hosts_uses_unique_union_of_pool_members(capsys):
     ):
         assert cmd_lode(["list", "--all-hosts", "--json"]) == 0
 
-    assert [call.args[0] for call in remote.call_args_list] == [
+    assert sorted(call.args[0] for call in remote.call_args_list) == [
         "one.example",
         "shared.example",
         "two.example",
     ]
-    assert json.loads(capsys.readouterr().out) == {"lodes": []}
+    assert json.loads(capsys.readouterr().out) == {
+        "lodes": [],
+        "unavailable_hosts": [],
+    }
+
+
+def test_remote_hosts_is_unique_first_seen_pool_union():
+    from hopper.cli import _remote_hosts
+
+    with patch(
+        "hopper.remote.remote_registry",
+        return_value={
+            "one": ["shared.example", "one.example"],
+            "two": ["two.example", "shared.example"],
+        },
+    ):
+        assert _remote_hosts() == ["shared.example", "one.example", "two.example"]
+
+
+def test_lode_list_all_hosts_json_preserves_rows_and_reports_partial_sources(
+    capsys,
+    make_lode,
+):
+    proven = make_lode(id="abc23456", project="project")
+
+    def run_remote(host, args, *, timeout):
+        assert args == ["lode", "list", "--json"]
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
+        if host == "timeout.example":
+            raise subprocess.TimeoutExpired(["ssh", host], timeout)
+        if host == "failed.example":
+            return subprocess.CompletedProcess([], 9, stdout="", stderr="server failed")
+        if host == "malformed.example":
+            return subprocess.CompletedProcess([], 0, stdout="{", stderr="")
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"lodes": [proven]}),
+            stderr="",
+        )
+
+    with (
+        patch("hopper.client.probe_server", return_value="down"),
+        patch(
+            "hopper.remote.remote_registry",
+            return_value={
+                "project": [
+                    "ready.example",
+                    "timeout.example",
+                    "failed.example",
+                    "malformed.example",
+                ]
+            },
+        ),
+        patch("hopper.remote.run_remote", side_effect=run_remote),
+    ):
+        assert cmd_lode(["list", "--all-hosts", "--json"]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [(lode["id"], lode["host"]) for lode in payload["lodes"]] == [
+        ("abc23456", "ready.example")
+    ]
+    assert payload["unavailable_hosts"] == [
+        {
+            "host": "local",
+            "reason": "lode listing exited 1: server not running; start it with: hop up",
+        },
+        {"host": "timeout.example", "reason": "lode listing timed out"},
+        {"host": "failed.example", "reason": "lode listing exited 9: server failed"},
+        {"host": "malformed.example", "reason": "lode listing returned malformed JSON"},
+    ]
+
+
+def test_lode_list_all_hosts_human_reports_partial_sources(capsys, make_lode):
+    proven = make_lode(id="abc23456", project="project")
+
+    def run_remote(host, _args, *, timeout):
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
+        if host == "down.example":
+            raise OSError("network down")
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"lodes": [proven]}),
+            stderr="",
+        )
+
+    with (
+        patch("hopper.client.probe_server", return_value="unresponsive"),
+        patch(
+            "hopper.remote.remote_registry",
+            return_value={"project": ["ready.example", "down.example"]},
+        ),
+        patch("hopper.remote.run_remote", side_effect=run_remote),
+    ):
+        assert cmd_lode(["list", "--all-hosts"]) == 2
+
+    captured = capsys.readouterr()
+    assert "abc23456" in captured.out
+    assert "ready.example" in captured.out
+    assert (
+        "Unavailable host local: lode listing exited 1: server did not answer within 2s"
+        in captured.err
+    )
+    assert (
+        "Unavailable host down.example: lode listing transport failed: network down" in captured.err
+    )
 
 
 def test_rendering_parked_gone_does_not_mutate_memory_or_files(temp_config, make_lode):
@@ -6127,7 +6160,7 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
     create.assert_called_once()
     assert create.call_args.args[0] == "ready.example"
     assert create.call_args.args[1][-1] == "--json"
-    assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SECONDS
+    assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SEC
     remember.assert_called_once_with("abcdefgh", "ready.example", "journal")
     captured = capsys.readouterr()
     if json_output:
@@ -6247,7 +6280,7 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
     elif case == "transport":
         outcome = OSError("connection reset")
     else:
-        outcome = subprocess.TimeoutExpired(["ssh"], REMOTE_CREATE_TIMEOUT_SECONDS)
+        outcome = subprocess.TimeoutExpired(["ssh"], REMOTE_CREATE_TIMEOUT_SEC)
 
     runner_patch = (
         patch("hopper.remote.run_remote", side_effect=outcome)
@@ -6269,7 +6302,7 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
         )
 
     create.assert_called_once()
-    assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SECONDS
+    assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SEC
     remember.assert_not_called()
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -6362,7 +6395,7 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
 
     assert rc == 0
     assert mock_remote.call_args.args[:2] == ("fedora.local", ["implement", "journal", "--json"])
-    assert mock_remote.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SECONDS
+    assert mock_remote.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SEC
     assert json.loads(capsys.readouterr().out)["host"] == "fedora.local"
 
 
@@ -6410,7 +6443,7 @@ def test_lode_status_json_remote(capsys):
     }
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value={
                 "outcome": "found",
                 "lode": remote_lode,
@@ -6582,7 +6615,7 @@ def test_lode_pane_input_missing_response_is_unknown(capsys):
 def test_lode_restart_force_requests_server_side_termination(capsys):
     lode = {"id": "abc123", "stage": "mill", "state": "running", "active": True, "tmux_pane": "%9"}
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.get_lode", return_value=lode):
+        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
                 "hopper.client.restart_lode",
                 return_value={"type": "mutation_ack", "accepted": True, "reason": "spawned"},
@@ -6599,7 +6632,7 @@ def test_lode_restart_force_requests_server_side_termination(capsys):
 
 
 def test_resolver_remote_probe_does_not_cascade(monkeypatch):
-    from hopper.cli import _resolve_lode_all_sources
+    from hopper.cli import _resolve_lode
 
     monkeypatch.setenv("HOP_NO_ROUTE", "1")
     with (
@@ -6608,7 +6641,7 @@ def test_resolver_remote_probe_does_not_cascade(monkeypatch):
         patch("hopper.remote.load_lode_cache") as cache,
         patch("hopper.cli._remote_lode_status") as remote_probe,
     ):
-        result = _resolve_lode_all_sources(Path("sock"), "abc")
+        result = _resolve_lode(Path("sock"), "abc")
 
     assert result["outcome"] == "absent"
     assert result["probe_summary"] == "local=absent"
@@ -6617,56 +6650,255 @@ def test_resolver_remote_probe_does_not_cascade(monkeypatch):
     remote_probe.assert_not_called()
 
 
-def test_find_remote_lode_uses_the_same_no_route_guard(monkeypatch):
-    from hopper.cli import _find_remote_lode
+def test_resolver_routes_exact_id_to_unregistered_resident_host():
+    from hopper.cli import _resolve_lode
 
-    monkeypatch.setenv("HOP_NO_ROUTE", "1")
-    with (
-        patch("hopper.remote.remote_registry") as registry,
-        patch("hopper.remote.load_lode_cache") as cache,
-        patch("hopper.cli._remote_lode_status") as remote_probe,
-    ):
-        assert _find_remote_lode("abc") == (None, "")
-
-    registry.assert_not_called()
-    cache.assert_not_called()
-    remote_probe.assert_not_called()
-
-
-def test_resolver_ignores_unregistered_cached_host():
-    from hopper.cli import _resolve_lode_all_sources
-
+    resident = {
+        "abc23456": {
+            "host": "resident.example",
+            "project": "project",
+            "created_ms": 4_000_000_000_000,
+        }
+    }
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
-        patch("hopper.remote.remote_registry", return_value={"project": ["current.example"]}),
+        patch("hopper.remote.load_lode_cache", return_value=resident),
+        patch("hopper.remote.remote_registry") as registry,
         patch(
-            "hopper.remote.load_lode_cache",
-            return_value={"abc": {"host": "stale.example"}},
+            "hopper.cli._remote_lode_status",
+            return_value=({"id": "abc23456", "project": "project"}, "found"),
+        ) as probe,
+        patch("hopper.cli._remember_lode_route"),
+    ):
+        result = _resolve_lode(Path("sock"), "abc23456")
+
+    assert result["outcome"] == "found"
+    assert result["host"] == "resident.example"
+    probe.assert_called_once_with("resident.example", "abc23456")
+    registry.assert_not_called()
+
+
+def test_resolver_routes_unique_prefix_to_unregistered_resident_host():
+    from hopper.cli import _resolve_lode
+
+    resident = {
+        "abc23456": {
+            "host": "resident.example",
+            "project": "project",
+            "created_ms": 4_000_000_000_000,
+        }
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value=resident),
+        patch("hopper.remote.remote_registry") as registry,
+        patch(
+            "hopper.cli._remote_lode_status",
+            return_value=({"id": "abc23456", "project": "project"}, "found"),
+        ) as probe,
+        patch("hopper.cli._remember_lode_route"),
+    ):
+        result = _resolve_lode(Path("sock"), "abc")
+
+    assert result["outcome"] == "found"
+    assert result["canonical_id"] == "abc23456"
+    probe.assert_called_once_with("resident.example", "abc23456")
+    registry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("surface", "command", "args"),
+    [
+        ("status", cmd_lode, ["status", "abc"]),
+        ("show", cmd_lode, ["show", "abc"]),
+        ("path", cmd_lode, ["path", "abc"]),
+        ("log", cmd_lode, ["log", "abc"]),
+        ("pause", cmd_lode, ["pause", "abc"]),
+        ("resume", cmd_lode, ["resume", "abc"]),
+        ("restart", cmd_lode, ["restart", "abc"]),
+        ("kill", cmd_lode, ["kill", "abc"]),
+        ("peek", cmd_lode, ["peek", "abc"]),
+        ("nudge", cmd_lode, ["nudge", "abc"]),
+        ("answer", cmd_lode, ["answer", "abc", "1"]),
+        ("watch", cmd_lode, ["watch", "abc"]),
+        ("wait", cmd_lode, ["wait", "abc"]),
+        ("gate-show", cmd_gate, ["show", "abc"]),
+        ("gate-feedback", cmd_gate, ["feedback", "abc", "review"]),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_lode_id_surfaces_use_the_single_resolver(surface, command, args):
+    unavailable = {
+        "outcome": "unavailable",
+        "error": "resident route unavailable",
+        "exit_code": 2,
+    }
+    with patch(
+        "hopper.cli._resolve_lode",
+        return_value=unavailable,
+    ) as resolver:
+        assert command(args) == 2, surface
+
+    resolver.assert_called_once_with(config.server_socket_path(), "abc")
+
+
+def test_resident_prefix_ambiguity_refuses_without_probing():
+    from hopper.cli import _resolve_lode
+
+    cache = {
+        lode_id: {
+            "host": host,
+            "project": "project",
+            "created_ms": 4_000_000_000_000,
+        }
+        for lode_id, host in (
+            ("abc23456", "one.example"),
+            ("abc34567", "two.example"),
+        )
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value=cache),
+        patch("hopper.cli._remote_lode_status") as probe,
+        patch("hopper.cli._remote_hosts") as hosts,
+    ):
+        result = _resolve_lode(Path("sock"), "abc")
+
+    assert result["outcome"] == "ambiguous"
+    assert result["exit_code"] == 1
+    probe.assert_not_called()
+    hosts.assert_not_called()
+
+
+def test_local_and_resident_prefix_matches_are_ambiguous():
+    from hopper.cli import _resolve_lode
+
+    local = {"id": "abc23456", "project": "local"}
+    cache = {
+        "abc34567": {
+            "host": "resident.example",
+            "project": "remote",
+            "created_ms": 4_000_000_000_000,
+        }
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", local)),
+        patch("hopper.remote.load_lode_cache", return_value=cache),
+        patch(
+            "hopper.cli._remote_lode_status",
+            return_value=({"id": "abc34567", "project": "remote"}, "found"),
         ),
+        patch("hopper.cli._remember_lode_route") as remember,
+    ):
+        result = _resolve_lode(Path("sock"), "abc")
+
+    assert result["outcome"] == "ambiguous"
+    assert "local:abc23456" in result["error"]
+    assert "resident.example:abc34567" in result["error"]
+    remember.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["absent", "unreadable"])
+def test_resident_route_failure_never_fans_out(state):
+    from hopper.cli import _resolve_lode
+
+    cache = {
+        "abc23456": {
+            "host": "resident.example",
+            "project": "project",
+            "created_ms": 4_000_000_000_000,
+        }
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value=cache),
+        patch("hopper.cli._remote_lode_status", return_value=(None, state)) as probe,
+        patch("hopper.cli._remote_hosts") as hosts,
+    ):
+        result = _resolve_lode(Path("sock"), "abc")
+
+    assert result["outcome"] == state.replace("unreadable", "unavailable")
+    assert "hop -H resident.example lode status abc23456 --json" in result["error"]
+    probe.assert_called_once_with("resident.example", "abc23456")
+    hosts.assert_not_called()
+
+
+def test_expired_resident_route_is_not_authoritative():
+    from hopper.cli import _resolve_lode
+    from hopper.remote import REMOTE_LODE_CACHE_MAX_AGE_MS
+
+    cache = {
+        "abc23456": {
+            "host": "former.example",
+            "project": "project",
+            "created_ms": 1,
+        }
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value=cache),
+        patch(
+            "hopper.remote.current_time_ms",
+            return_value=REMOTE_LODE_CACHE_MAX_AGE_MS + 1,
+        ),
+        patch("hopper.cli._remote_hosts", return_value=["current.example"]),
         patch("hopper.cli._remote_lode_status", return_value=(None, "absent")) as probe,
     ):
-        result = _resolve_lode_all_sources(Path("sock"), "abc")
+        result = _resolve_lode(Path("sock"), "abc")
 
     assert result["outcome"] == "absent"
     probe.assert_called_once_with("current.example", "abc")
 
 
-def test_find_remote_lode_ignores_unregistered_cached_host():
-    from hopper.cli import _find_remote_lode
+@pytest.mark.parametrize(
+    "reason",
+    ["malformed", "wrong_shape", "unreadable", "locked"],
+)
+def test_resident_cache_failure_is_unavailable_and_names_recovery(
+    temp_config,
+    reason,
+):
+    from hopper.cli import _resolve_lode
+    from hopper.remote import LodeCacheError, remote_lode_cache_path
 
+    cache_path = remote_lode_cache_path()
     with (
-        patch("hopper.remote.remote_registry", return_value={"project": ["current.example"]}),
+        patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
         patch(
             "hopper.remote.load_lode_cache",
-            return_value={"abc": {"host": "stale.example"}},
+            side_effect=LodeCacheError(cache_path, reason),
         ),
-        patch("hopper.cli._remote_lode_status", return_value=(None, "absent")) as probe,
+        patch("hopper.cli._remote_hosts") as hosts,
+        patch("hopper.cli._remote_lode_status") as probe,
     ):
-        found, checked = _find_remote_lode("abc")
+        result = _resolve_lode(Path("sock"), "abc")
 
-    assert found is None
-    assert checked == "current.example"
-    probe.assert_called_once_with("current.example", "abc")
+    assert result["outcome"] == "unavailable"
+    assert result["exit_code"] == 2
+    assert str(cache_path) in result["error"]
+    assert reason in result["error"]
+    assert "Hopper did NOT treat the route as absent or fan out" in result["error"]
+    assert "hop -H" in result["error"]
+    hosts.assert_not_called()
+    probe.assert_not_called()
+
+
+def test_explicit_host_bypasses_unavailable_resident_cache(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "known.example", "status", "abc"])
+    with (
+        patch("hopper.remote.load_lode_cache") as cache,
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+    ):
+        assert main() == 0
+
+    cache.assert_not_called()
+    run_remote.assert_called_once_with(
+        "known.example",
+        ["status", "abc"],
+        reason="-H known.example",
+        stdin_text=None,
+        annotate_json=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -6684,8 +6916,8 @@ def test_resolver_two_host_prefix_is_ambiguous_without_mutation(verb, mutation, 
 
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value={}),
         patch("hopper.cli._remote_hosts", return_value=sorted(lodes)),
-        patch("hopper.cli._cached_lode_host", return_value=None),
         patch("hopper.cli._remote_lode_status", side_effect=probe),
         patch(f"hopper.client.{mutation}") as mutate,
         patch("hopper.cli._run_remote_cli") as run_remote,
@@ -6701,11 +6933,9 @@ def test_resolver_two_host_prefix_is_ambiguous_without_mutation(verb, mutation, 
     ("verb", "mutation"),
     [("pause", "pause_lode"), ("resume", "resume_lode")],
 )
-@pytest.mark.parametrize("cached_host", [None, "one.example"], ids=["uncached", "cached"])
 def test_resolver_one_remote_host_ambiguity_refuses_without_mutation(
     verb,
     mutation,
-    cached_host,
     capsys,
 ):
     result = subprocess.CompletedProcess(
@@ -6719,8 +6949,8 @@ def test_resolver_one_remote_host_ambiguity_refuses_without_mutation(
     )
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value={}),
         patch("hopper.cli._remote_hosts", return_value=["one.example"]),
-        patch("hopper.cli._cached_lode_host", return_value=cached_host),
         patch("hopper.remote.run_remote", return_value=result),
         patch(f"hopper.client.{mutation}") as mutate,
         patch("hopper.cli._run_remote_cli") as run_remote,
@@ -6746,8 +6976,8 @@ def test_resolver_match_plus_unavailable_is_unavailable_without_mutation(verb, m
 
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value={}),
         patch("hopper.cli._remote_hosts", return_value=["one.example", "two.example"]),
-        patch("hopper.cli._cached_lode_host", return_value=None),
         patch("hopper.cli._remote_lode_status", side_effect=probe),
         patch(f"hopper.client.{mutation}") as mutate,
         patch("hopper.cli._run_remote_cli") as run_remote,
@@ -6760,7 +6990,7 @@ def test_resolver_match_plus_unavailable_is_unavailable_without_mutation(verb, m
 
 
 def test_resolver_exact_full_id_ignores_unrelated_unavailable():
-    from hopper.cli import _resolve_lode_all_sources
+    from hopper.cli import _resolve_lode
 
     def probe(host, prefix):
         if host == "one.example":
@@ -6769,12 +6999,12 @@ def test_resolver_exact_full_id_ignores_unrelated_unavailable():
 
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("absent", None)),
+        patch("hopper.remote.load_lode_cache", return_value={}),
         patch("hopper.cli._remote_hosts", return_value=["one.example", "two.example"]),
-        patch("hopper.cli._cached_lode_host", return_value=None),
         patch("hopper.cli._remote_lode_status", side_effect=probe),
         patch("hopper.cli._remember_lode_route"),
     ):
-        result = _resolve_lode_all_sources(Path("sock"), "abc12345")
+        result = _resolve_lode(Path("sock"), "abc12345")
 
     assert result["outcome"] == "found"
     assert result["canonical_id"] == "abc12345"
@@ -6794,7 +7024,7 @@ def test_lode_pause_resume_routes_canonical_full_id(verb):
     }
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(remote_lode, "resident.example"),
         ),
         patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
@@ -6817,7 +7047,7 @@ def test_lode_watch_unavailable_at_start(capsys):
         "probe_summary": "local=unavailable (server down)",
         "exit_code": 2,
     }
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=resolution):
+    with patch("hopper.cli._resolve_lode", return_value=resolution):
         assert cmd_lode(["watch", "abc"]) == 2
 
     assert capsys.readouterr().out == f"{resolution['error']}\n"
@@ -6833,7 +7063,7 @@ def test_lode_watch_routes_to_streaming_runner_without_stdout_banner(capsys):
     }
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(lode, "resident.example"),
         ),
         patch("hopper.remote.run_remote_streaming", return_value=7) as stream,
@@ -6876,7 +7106,7 @@ def test_lode_watch_archived_error_uses_existing_detail(capsys):
         "active": False,
         "archived_at": 1234,
     }
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)):
+    with patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)):
         assert cmd_lode(["watch", "abc123"]) == 1
 
     assert capsys.readouterr().out == (
@@ -6898,7 +7128,7 @@ def test_lode_watch_archived_non_shipped_is_terminal(capsys):
         "active": False,
         "archived_at": 1234,
     }
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(lode)):
+    with patch("hopper.cli._resolve_lode", return_value=_watch_resolution(lode)):
         assert cmd_lode(["watch", "abc123"]) == 1
 
     assert capsys.readouterr().out == (
@@ -6924,7 +7154,7 @@ def test_lode_watch_post_subscribe_reconcile_observes_archived_error(capsys):
         "archived_at": 2345,
     }
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(initial)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(initial)),
         patch(
             "hopper.cli._read_watch_snapshot",
             return_value=("found", archived, "local=found abc123"),
@@ -6955,7 +7185,7 @@ def test_lode_watch_observer_loss_exits_after_300_seconds(monkeypatch, capsys):
 
     monkeypatch.setattr("hopper.cli._watch_condition_wait", condition_wait)
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(initial)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(initial)),
         patch(
             "hopper.cli._read_watch_snapshot",
             return_value=(
@@ -7001,7 +7231,7 @@ def test_lode_watch_observer_timeout_starts_after_successful_read(monkeypatch):
 
     monkeypatch.setattr("hopper.cli._watch_condition_wait", condition_wait)
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=_watch_resolution(initial)),
+        patch("hopper.cli._resolve_lode", return_value=_watch_resolution(initial)),
         patch("hopper.cli._read_watch_snapshot", side_effect=read_snapshot),
         patch("hopper.client.HopperConnection", return_value=_watch_connection()),
     ):
@@ -7083,7 +7313,7 @@ def test_lode_path_remote_plain(capsys):
     }
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(lode, "resident.example"),
         ),
         patch(
@@ -7119,7 +7349,7 @@ def test_lode_path_remote_json_uses_resident_host(capsys):
     }
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(lode, "resident.example"),
         ),
         patch(
@@ -7196,7 +7426,7 @@ def test_lode_path_json_resolution_errors_have_no_stdout(outcome, error, exit_co
         "exit_code": exit_code,
     }
     with (
-        patch("hopper.cli._resolve_lode_all_sources", return_value=resolution),
+        patch("hopper.cli._resolve_lode", return_value=resolution),
         patch("hopper.remote.run_remote") as run_remote,
     ):
         assert cmd_lode(["path", "abc", "--json"]) == exit_code
@@ -7219,7 +7449,7 @@ def test_lode_path_remote_spawn_failure_has_no_stdout(failure, capsys):
     lode = {"id": "abc12345", "host": "resident.example"}
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(lode, "resident.example"),
         ),
         patch("hopper.remote.run_remote", side_effect=failure),
@@ -7277,7 +7507,7 @@ def test_lode_path_remote_nonzero_has_no_stdout(
     )
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(lode, "resident.example"),
         ),
         patch("hopper.remote.run_remote", return_value=result),
@@ -7326,7 +7556,7 @@ def test_lode_path_rejects_invalid_remote_json_without_path_output(stdout, capsy
     result = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
     with (
         patch(
-            "hopper.cli._resolve_lode_all_sources",
+            "hopper.cli._resolve_lode",
             return_value=_watch_resolution(lode, "resident.example"),
         ),
         patch("hopper.remote.run_remote", return_value=result),
@@ -7377,8 +7607,7 @@ def test_lode_nudge_remote_preserves_adversarial_payload():
         "exit_code": 0,
     }
     with (
-        patch("hopper.cli.require_server", return_value=None),
-        patch("hopper.cli._lookup_lode_with_remote", return_value=resolution),
+        patch("hopper.cli._resolve_lode", return_value=resolution),
         patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
     ):
         assert cmd_lode(["nudge", "abc", "--", payload]) == 0
@@ -7393,14 +7622,14 @@ def test_lode_nudge_rejects_positional_and_flag_before_lookup(capsys):
     with (
         patch("hopper.cli.require_server") as require,
         patch("hopper.client.read_lode_snapshot") as snapshot,
-        patch("hopper.cli._find_remote_lode") as remote_probe,
+        patch("hopper.cli._resolve_lode") as resolver,
         patch("hopper.client.send_pane_input") as send,
     ):
         assert cmd_lode(["nudge", "abc", "one", "--text", "two"]) == 1
 
     require.assert_not_called()
     snapshot.assert_not_called()
-    remote_probe.assert_not_called()
+    resolver.assert_not_called()
     send.assert_not_called()
     out = capsys.readouterr().out
     assert "positional text and --text cannot be used together" in out
@@ -7441,7 +7670,7 @@ def test_top_status_matches_lode_status_json(host, capsys):
         "updated_at": 1000,
     }
     resolution = _watch_resolution(lode, host)
-    with patch("hopper.cli._resolve_lode_all_sources", return_value=resolution):
+    with patch("hopper.cli._resolve_lode", return_value=resolution):
         assert cmd_status(["abc12345", "--json"]) == 0
         top = json.loads(capsys.readouterr().out)
         assert cmd_lode(["status", "abc12345", "--json"]) == 0
@@ -7953,7 +8182,7 @@ def _kill(lode_id, extra=None):
     }
     with (
         patch("hopper.cli.require_server", return_value=None),
-        patch("hopper.client.get_lode", return_value=lode),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
         patch("hopper.client.kill_lode", return_value=True) as mock_kill,
     ):
         rc = cmd_lode(["kill", lode_id, *(extra or [])])

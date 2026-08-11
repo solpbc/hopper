@@ -120,47 +120,31 @@ def _resolve_targets(
     socket_path: Path,
     raw_ids: list[str],
     json_output: bool,
-    lookup_local: Callable,
-    find_remote: Callable,
-) -> dict[str, dict] | None:
+    resolver: Callable,
+) -> dict[str, dict] | int:
     """Resolve all requested IDs to validated canonical local or remote snapshots."""
     records: dict[str, dict] = {}
     for order, raw_id in enumerate(raw_ids):
-        lode = client.get_lode(socket_path, raw_id)
-        error = None
-        local_unavailable = None
-        if not lode:
-            lode, error = lookup_local(socket_path, raw_id)
-            if error and error.startswith("Lode status unavailable"):
-                local_unavailable = error
-            elif error and not error.startswith("Lode '"):
-                _initial_error(error, json_output)
-                return None
-        if not lode:
-            lode, checked = find_remote(raw_id)
-            if not lode:
-                if local_unavailable:
-                    _initial_error(local_unavailable, json_output)
-                    return None
-                suffix = (
-                    f" Checked remote hosts: {checked}."
-                    if checked
-                    else " No remote hosts configured."
-                )
-                _initial_error(f"Lode '{raw_id}' not found.{suffix}", json_output)
-                return None
+        result = resolver(socket_path, raw_id)
+        if result.get("outcome") != "found":
+            _initial_error(result.get("error", f"Lode '{raw_id}' not found."), json_output)
+            return result.get("exit_code", 1)
+        lode = result.get("lode")
 
         lid = lode.get("id") if isinstance(lode, dict) else None
         if not isinstance(lid, str):
             _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return None
+            return 2
         snapshot = validate_snapshot(lode, lid)
         if snapshot is None:
             _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return None
+            return 2
         if lid in records:
             continue
-        source = lode.get("host") if isinstance(lode.get("host"), str) else "local"
+        source = result.get("host")
+        if not isinstance(source, str):
+            _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
+            return 2
         observed_ts = _monotonic()
         records[lid] = _new_record(lid, snapshot, source, observed_ts, order)
     return records
@@ -637,17 +621,16 @@ def wait_for_lodes(
     poll_s: float = 30,
     observer_timeout_s: float = 300,
     json_output: bool = False,
-    lookup_local: Callable,
-    find_remote: Callable,
+    resolver: Callable,
     probe_remote: Callable,
 ) -> int:
     """Wait for lodes using one main-thread authoritative supervisor."""
     try:
         poll_s = max(MIN_POLL_S, float(poll_s or 30))
-        records = _resolve_targets(socket_path, lode_ids, json_output, lookup_local, find_remote)
-        if records is None:
+        records = _resolve_targets(socket_path, lode_ids, json_output, resolver)
+        if not isinstance(records, dict):
             print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
-            return 1
+            return records if isinstance(records, int) else 1
         _publish_remote_mappings(records)
 
         start_ts = min(record["last_valid_ts"] for record in records.values())

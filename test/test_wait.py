@@ -101,8 +101,13 @@ def run_local_wait(
         poll_s=30,
         observer_timeout_s=observer_timeout_s,
         json_output=json_output,
-        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
-        find_remote=lambda lid: (None, ""),
+        resolver=lambda socket_path, lid: {
+            "outcome": "found",
+            "lode": dict(initial),
+            "host": "local",
+            "canonical_id": initial["id"],
+            "exit_code": 0,
+        },
         probe_remote=lambda *args, **kwargs: (None, "unreadable"),
     )
     return rc, clock, connection
@@ -169,9 +174,15 @@ def run_remote_wait(
     if not publish:
         monkeypatch.setattr(wait, "_publish_remote_mappings", lambda records: None)
 
-    def find_remote(lid):
+    def resolver(socket_path, lid):
         lode = initials[lid]
-        return dict(lode), lode["host"]
+        return {
+            "outcome": "found",
+            "lode": dict(lode),
+            "host": lode["host"],
+            "canonical_id": lode["id"],
+            "exit_code": 0,
+        }
 
     queues = {lid: deque(items) for lid, items in probes.items()}
     last = {}
@@ -193,8 +204,7 @@ def run_remote_wait(
         poll_s=30,
         observer_timeout_s=observer_timeout_s,
         json_output=json_output,
-        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
-        find_remote=find_remote,
+        resolver=resolver,
         probe_remote=probe_remote,
     )
     return rc, clock
@@ -302,17 +312,18 @@ def test_read_local_snapshot_distinguishes_absent_from_unreadable(
 
 def test_initial_local_unavailable_can_resolve_remotely(monkeypatch):
     remote_snapshot = snapshot(host="fedora.local")
-    monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
 
     records = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
         False,
-        lookup_local=lambda socket_path, lid: (
-            None,
-            f"Lode status unavailable for '{lid}': server not running",
-        ),
-        find_remote=lambda lid: (remote_snapshot, "fedora.local"),
+        resolver=lambda socket_path, lid: {
+            "outcome": "found",
+            "lode": remote_snapshot,
+            "host": "fedora.local",
+            "canonical_id": "abc123",
+            "exit_code": 0,
+        },
     )
 
     assert records["abc123"]["remote"] is True
@@ -320,18 +331,20 @@ def test_initial_local_unavailable_can_resolve_remotely(monkeypatch):
 
 
 def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
-    monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
     error = "Lode status unavailable for 'abc123': server not running"
 
     records = wait._resolve_targets(
         Path("server.sock"),
         ["abc123"],
         False,
-        lookup_local=lambda socket_path, lid: (None, error),
-        find_remote=lambda lid: (None, "fedora.local"),
+        resolver=lambda socket_path, lid: {
+            "outcome": "unavailable",
+            "error": error,
+            "exit_code": 2,
+        },
     )
 
-    assert records is None
+    assert records == 2
     assert capsys.readouterr().out == f"{error}\n"
 
 
@@ -1174,8 +1187,13 @@ def test_keyboard_interrupt_returns_130_and_joins_remote_workers(monkeypatch):
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         ["abc123"],
-        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
-        find_remote=lambda lid: (initial, "fedora.local"),
+        resolver=lambda socket_path, lid: {
+            "outcome": "found",
+            "lode": initial,
+            "host": "fedora.local",
+            "canonical_id": "abc123",
+            "exit_code": 0,
+        },
         probe_remote=lambda host, lid, timeout: (initial, "found"),
     )
 
@@ -1194,8 +1212,14 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
     monkeypatch.setattr(wait, "_publish_remote_mappings", lambda records: None)
 
-    def find_remote(lid):
-        return initials[lid], initials[lid]["host"]
+    def resolver(socket_path, lid):
+        return {
+            "outcome": "found",
+            "lode": initials[lid],
+            "host": initials[lid]["host"],
+            "canonical_id": lid,
+            "exit_code": 0,
+        }
 
     def probe_remote(host, lid, timeout):
         if lid == "ship123":
@@ -1208,8 +1232,7 @@ def test_multi_lode_shipped_sibling_then_observer_failure_stops_all_workers(monk
         timeout_s=1,
         poll_s=30,
         observer_timeout_s=0.05,
-        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
-        find_remote=find_remote,
+        resolver=resolver,
         probe_remote=probe_remote,
     )
 
@@ -1233,8 +1256,13 @@ def test_jsonl_multi_lode_boundary_emits_independently_parseable_lines(monkeypat
         Path("server.sock"),
         list(initials),
         json_output=True,
-        lookup_local=lambda socket_path, lid: (None, f"Lode '{lid}' not found."),
-        find_remote=lambda lid: (None, ""),
+        resolver=lambda socket_path, lid: {
+            "outcome": "found",
+            "lode": dict(initials[lid]),
+            "host": "local",
+            "canonical_id": lid,
+            "exit_code": 0,
+        },
         probe_remote=lambda *args, **kwargs: (None, "unreadable"),
     )
 
@@ -1343,8 +1371,13 @@ def test_wait_summary_uses_canonical_dedup_for_requested_count(monkeypatch, caps
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         ["abc", "abc123"],
-        lookup_local=lambda *args, **kwargs: pytest.fail("unexpected local lookup"),
-        find_remote=lambda *args, **kwargs: pytest.fail("unexpected remote lookup"),
+        resolver=lambda socket_path, lid: {
+            "outcome": "found",
+            "lode": dict(canonical),
+            "host": "local",
+            "canonical_id": "abc123",
+            "exit_code": 0,
+        },
         probe_remote=lambda *args, **kwargs: pytest.fail("unexpected remote probe"),
     )
 

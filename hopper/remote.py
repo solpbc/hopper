@@ -17,15 +17,18 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from hopper import config
-from hopper.lodes import current_time_ms
+from hopper.lodes import ID_ALPHABET, ID_LEN, current_time_ms
 
 REMOTE_CONFIG_PREFIX = "remote."
 REMOTE_LODE_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
-REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS = 8.0
-REMOTE_POOL_PROBE_TIMEOUT_SECONDS = 10.0
-REMOTE_CREATE_TIMEOUT_SECONDS = 180.0
+REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC = 8.0
+REMOTE_POOL_PROBE_TIMEOUT_SEC = 10.0
+REMOTE_CREATE_TIMEOUT_SEC = 180.0
+REMOTE_CACHE_LOCK_TIMEOUT_SEC = 5.0
+REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC = 0.05
 
 RemoteRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -38,6 +41,27 @@ class CandidateProbe:
     eligible: bool
     load: int | None
     reason: str | None
+
+
+@dataclass(frozen=True)
+class HostDiscovery:
+    """Lodes proven by one host, or why that host was unavailable."""
+
+    host: str
+    lodes: tuple[dict, ...]
+    reason: str | None
+
+
+LodeCacheErrorReason = Literal["malformed", "wrong_shape", "unreadable", "locked"]
+
+
+class LodeCacheError(Exception):
+    """A resident-route cache that cannot safely be treated as absent."""
+
+    def __init__(self, path: Path, reason: LodeCacheErrorReason):
+        self.path = path
+        self.reason = reason
+        super().__init__(f"resident-route cache at {path} is {reason}")
 
 
 def run_remote(
@@ -290,7 +314,7 @@ def probe_candidate(
         host,
         project_args,
         label="project listing",
-        timeout=REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+        timeout=REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
         runner=runner,
     )
     if failure is not None:
@@ -299,7 +323,7 @@ def probe_candidate(
     if failure := _validate_project_readiness(host, project, payload):
         return failure
 
-    remaining = REMOTE_CANDIDATE_PROBE_TIMEOUT_SECONDS - (monotonic() - started)
+    remaining = REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC - (monotonic() - started)
     inventory_args = ["lode", "list", "--json"]
     if remaining <= 0:
         return _unavailable(
@@ -336,7 +360,7 @@ def probe_candidates(
     if not ordered_hosts:
         return []
 
-    deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SECONDS
+    deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SEC
     executor = ThreadPoolExecutor(max_workers=len(ordered_hosts))
     futures = {
         executor.submit(probe_candidate, host, project, runner): host for host in ordered_hosts
@@ -381,6 +405,80 @@ def select_candidate(
     return chooser(tied)
 
 
+def _discover_host(
+    host: str,
+    args: list[str],
+    runner: RemoteRunner,
+) -> HostDiscovery:
+    """Read and validate one remote lode-list response."""
+    try:
+        result = runner(host, args, timeout=REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return HostDiscovery(host, (), "lode listing timed out")
+    except OSError as error:
+        return HostDiscovery(host, (), f"lode listing transport failed: {error}")
+
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout or "").strip()
+        detail = diagnostic.splitlines()[0] if diagnostic else "no diagnostic"
+        return HostDiscovery(
+            host,
+            (),
+            f"lode listing exited {result.returncode}: {detail}",
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return HostDiscovery(host, (), "lode listing returned malformed JSON")
+    if not isinstance(payload, dict) or set(payload) != {"lodes"}:
+        return HostDiscovery(host, (), "lode listing violated its JSON contract")
+    rows = payload["lodes"]
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return HostDiscovery(host, (), "lode listing contained a malformed lode")
+    return HostDiscovery(host, tuple(dict(row) for row in rows), None)
+
+
+def discover_lodes(
+    hosts: Sequence[str],
+    args: list[str],
+    runner: RemoteRunner,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> list[HostDiscovery]:
+    """Discover lodes concurrently under one pool-wide deadline."""
+    ordered_hosts = list(dict.fromkeys(hosts))
+    if not ordered_hosts:
+        return []
+
+    deadline = monotonic() + REMOTE_POOL_PROBE_TIMEOUT_SEC
+    executor = ThreadPoolExecutor(max_workers=len(ordered_hosts))
+    futures = {executor.submit(_discover_host, host, args, runner): host for host in ordered_hosts}
+    try:
+        done, pending = wait(futures, timeout=max(0.0, deadline - monotonic()))
+        results: dict[str, HostDiscovery] = {}
+        for future in done:
+            host = futures[future]
+            try:
+                results[host] = future.result()
+            except Exception as error:
+                results[host] = HostDiscovery(
+                    host,
+                    (),
+                    f"lode listing failed unexpectedly: {error}",
+                )
+        for future in pending:
+            host = futures[future]
+            future.cancel()
+            results[host] = HostDiscovery(
+                host,
+                (),
+                "aggregate discovery deadline expired",
+            )
+        return [results[host] for host in ordered_hosts]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def remote_lode_cache_path() -> Path:
     """Return the remote lode cache path."""
     return config.hopper_dir() / "remote-lodes.json"
@@ -393,41 +491,114 @@ def remote_lode_cache_lock_path() -> Path:
 
 @contextmanager
 def _lode_cache_lock() -> Iterator[None]:
-    """Serialize short remote lode cache transactions across processes."""
+    """Serialize cache transactions with a bounded persistent lock."""
     lock_path = remote_lode_cache_lock_path()
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(lock_path, "a+")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+")
+    except OSError as error:
+        raise LodeCacheError(lock_path, "unreadable") from error
+    try:
+        deadline = time.monotonic() + REMOTE_CACHE_LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LodeCacheError(lock_path, "locked") from error
+                time.sleep(min(REMOTE_CACHE_LOCK_POLL_INTERVAL_SEC, remaining))
+            except OSError as error:
+                raise LodeCacheError(lock_path, "unreadable") from error
         yield
     finally:
         lock_file.close()
 
 
 def load_lode_cache() -> dict[str, dict]:
-    """Load lode id -> host cache."""
-    path = remote_lode_cache_path()
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    """Load the resident-route cache strictly and migrate legacy timestamps."""
+    cache, needs_migration = _read_lode_cache()
+    if not needs_migration:
+        return cache
+
+    with _lode_cache_lock():
+        cache, needs_migration = _read_lode_cache()
+        if needs_migration:
+            migrated = _migrate_lode_cache(cache)
+            try:
+                save_lode_cache(migrated)
+            except OSError as error:
+                raise LodeCacheError(remote_lode_cache_path(), "unreadable") from error
+            cache = migrated
+    return cache
 
 
-def _load_lode_cache_strict() -> dict[str, dict]:
-    """Load the cache for mutation, preserving failures instead of hiding them."""
+def _valid_lode_id(lode_id: object) -> bool:
+    return (
+        isinstance(lode_id, str)
+        and len(lode_id) == ID_LEN
+        and all(character in ID_ALPHABET for character in lode_id)
+    )
+
+
+def _valid_timestamp(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _read_lode_cache() -> tuple[dict[str, dict], bool]:
+    """Read and validate cache bytes without acquiring the transaction lock."""
     path = remote_lode_cache_path()
     try:
-        raw = json.loads(path.read_text())
+        text = path.read_text()
     except FileNotFoundError:
-        return {}
+        return {}, False
+    except OSError as error:
+        raise LodeCacheError(path, "unreadable") from error
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise LodeCacheError(path, "malformed") from error
     if not isinstance(raw, dict):
-        raise ValueError(f"Remote lode cache at {path} is not a JSON object")
-    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+        raise LodeCacheError(path, "wrong_shape")
+
+    cache: dict[str, dict] = {}
+    needs_migration = False
+    for lode_id, entry in raw.items():
+        if not _valid_lode_id(lode_id) or not isinstance(entry, dict):
+            raise LodeCacheError(path, "wrong_shape")
+        host = entry.get("host")
+        project = entry.get("project")
+        if (
+            not isinstance(host, str)
+            or not host.strip()
+            or host != host.strip()
+            or not isinstance(project, str)
+        ):
+            raise LodeCacheError(path, "wrong_shape")
+        has_created_ms = "created_ms" in entry
+        has_created_at = "created_at" in entry
+        if has_created_ms == has_created_at:
+            raise LodeCacheError(path, "wrong_shape")
+        created = entry.get("created_ms") if has_created_ms else entry.get("created_at")
+        if not _valid_timestamp(created):
+            raise LodeCacheError(path, "wrong_shape")
+        if "last_seen_ms" in entry and not _valid_timestamp(entry["last_seen_ms"]):
+            raise LodeCacheError(path, "wrong_shape")
+        needs_migration = needs_migration or has_created_at
+        cache[lode_id] = dict(entry)
+    return cache, needs_migration
+
+
+def _migrate_lode_cache(cache: dict[str, dict]) -> dict[str, dict]:
+    """Return a copy with legacy created_at fields converted to created_ms."""
+    migrated: dict[str, dict] = {}
+    for lode_id, entry in cache.items():
+        migrated_entry = dict(entry)
+        if "created_at" in migrated_entry:
+            migrated_entry["created_ms"] = migrated_entry.pop("created_at")
+        migrated[lode_id] = migrated_entry
+    return migrated
 
 
 def save_lode_cache(cache: dict[str, dict]) -> None:
@@ -455,10 +626,8 @@ def prune_lode_cache(cache: dict[str, dict], now_ms: int | None = None) -> dict[
     now = current_time_ms() if now_ms is None else now_ms
     pruned: dict[str, dict] = {}
     for lode_id, entry in cache.items():
-        created = entry.get("created_ms", entry.get("created_at", now))
-        if not isinstance(created, int | float):
-            created = now
-        if now - int(created) < REMOTE_LODE_CACHE_MAX_AGE_MS:
+        created = entry["created_ms"]
+        if now - created < REMOTE_LODE_CACHE_MAX_AGE_MS:
             pruned[lode_id] = entry
     return pruned
 
@@ -471,18 +640,29 @@ def remember_lode(
 ) -> None:
     """Remember where a remote lode lives."""
     now = current_time_ms()
+    created = now if created_ms is None else created_ms
+    if (
+        not _valid_lode_id(lode_id)
+        or not isinstance(host, str)
+        or not host.strip()
+        or host != host.strip()
+        or not isinstance(project, str)
+        or not _valid_timestamp(created)
+    ):
+        raise LodeCacheError(remote_lode_cache_path(), "wrong_shape")
     with _lode_cache_lock():
-        cache = prune_lode_cache(_load_lode_cache_strict(), now)
+        cache, needs_migration = _read_lode_cache()
+        migrated = _migrate_lode_cache(cache)
+        cache = prune_lode_cache(migrated, now)
+        changed = needs_migration or cache != migrated
         existing = cache.get(lode_id)
         if existing and existing.get("host") == host:
+            if changed:
+                save_lode_cache(cache)
             return
 
         if existing and "created_ms" in existing:
             created = existing["created_ms"]
-        elif existing and "created_at" in existing:
-            created = existing["created_at"]
-        else:
-            created = created_ms if created_ms is not None else now
         cache[lode_id] = {
             "host": host,
             "project": project,

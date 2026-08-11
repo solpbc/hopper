@@ -26,7 +26,6 @@ from hopper.lodes import (
     ID_ALPHABET,
     ID_LEN,
     current_time_ms,
-    find_lode_by_prefix,
     format_age,
     get_lode_dir,
     get_worktree_dir,
@@ -442,7 +441,7 @@ def _run_authoritative_remote_create(
     unavailable_hosts: list[dict[str, str]],
 ) -> int:
     """Run, validate, cache, and only then render one remote create."""
-    from hopper.remote import REMOTE_CREATE_TIMEOUT_SECONDS, run_remote
+    from hopper.remote import REMOTE_CREATE_TIMEOUT_SEC, run_remote
 
     remote_args = list(hop_args)
     if "--json" not in remote_args:
@@ -453,7 +452,7 @@ def _run_authoritative_remote_create(
             host,
             remote_args,
             stdin_text=stdin_text,
-            timeout=REMOTE_CREATE_TIMEOUT_SECONDS,
+            timeout=REMOTE_CREATE_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
         return _remote_create_refusal(host, project, "timed out before a response was verified")
@@ -765,7 +764,8 @@ def cmd_project(args: list[str]) -> int:
 
     parser = make_parser(
         "project",
-        "Manage projects. Projects are git directories where lodes run.",
+        "Manage projects. Projects are Git directories where lodes run. "
+        "Project list JSON contains name, path, disabled, and disabled_reason.",
     )
     parser.add_argument(
         "action",
@@ -777,7 +777,12 @@ def cmd_project(args: list[str]) -> int:
     parser.add_argument("path", nargs="?", help="Path (for add) or name (for remove/rename)")
     parser.add_argument("new_name", nargs="?", help="New name (for rename)")
     parser.add_argument("reason", nargs="*", help="Reason (for disable)")
-    parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="For list, output the complete project record as JSON",
+    )
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -1020,23 +1025,36 @@ def cmd_config(args: list[str]) -> int:
     return 0
 
 
-@command("remote", "Manage remote hopper hosts")
+@command("remote", "Manage ordered remote host pools")
 def cmd_remote(args: list[str]) -> int:
-    """Manage project -> remote hopper host mappings."""
+    """Manage project -> ordered remote host pools."""
     from hopper.projects import find_project
     from hopper.remote import remote_registry, remove_remote, run_remote, set_remote
 
-    parser = make_parser("remote", "Manage project -> remote hopper host mappings.")
+    parser = make_parser(
+        "remote",
+        "Manage ordered project host pools. Set with: hop remote set <project> "
+        "<host> [host ...]. JSON list rows use hosts for the complete pool.",
+    )
     subs = parser.add_subparsers(dest="subcommand")
-    list_p = subs.add_parser("list", aliases=["ls"], help="List remotes", exit_on_error=False)
+    list_p = subs.add_parser(
+        "list",
+        aliases=["ls"],
+        help="List project pools",
+        exit_on_error=False,
+    )
     list_p.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
-    set_p = subs.add_parser("set", help="Set a project remote", exit_on_error=False)
+    set_p = subs.add_parser(
+        "set",
+        help="Replace a project's ordered host pool",
+        exit_on_error=False,
+    )
     set_p.add_argument("project", help="Project name")
     set_p.add_argument("hosts", nargs="+", help="Ordered remote host pool")
     rm_p = subs.add_parser(
         "rm",
         aliases=["remove"],
-        help="Remove a project remote",
+        help="Remove a project host pool",
         exit_on_error=False,
     )
     rm_p.add_argument("project", help="Project name")
@@ -1227,6 +1245,9 @@ def cmd_processed(args: list[str]) -> int:
     parser = make_parser(
         "processed",
         "Read stage output from stdin, save it, and signal completion. "
+        "During ship, completion is refused unless the canonical worktree is clean and "
+        "HEAD is contained in a freshly fetched upstream main or master. The CLI verifies "
+        "the landing; it never merges, rebases, commits, or pushes. "
         "Usage: hop processed <<'EOF'\n<output>\nEOF",
     )
     try:
@@ -1352,27 +1373,20 @@ def _cmd_gate_show(args: list[str]) -> int:
         parser.print_usage()
         return 1
 
-    if err := require_server():
-        remote_lode, _checked = _find_remote_lode(parsed.lode_id)
-        if remote_lode:
-            return _run_remote_cli(
-                remote_lode["host"],
-                ["gate", "show", parsed.lode_id],
-                reason=f"lode {remote_lode['id']}",
-            )
-        return err
+    resolved = _resolve_lode(_socket(), parsed.lode_id)
+    if resolved["outcome"] != "found":
+        print(resolved["error"])
+        return resolved["exit_code"]
+    if resolved["host"] != "local":
+        return _run_remote_cli(
+            resolved["host"],
+            ["gate", "show", resolved["canonical_id"]],
+            reason=f"lode {resolved['canonical_id']}",
+        )
 
-    gate_data = client.get_gate(_socket(), parsed.lode_id)
+    gate_data = client.get_gate(_socket(), resolved["canonical_id"])
     if not gate_data:
-        remote_lode, checked = _find_remote_lode(parsed.lode_id)
-        if remote_lode:
-            return _run_remote_cli(
-                remote_lode["host"],
-                ["gate", "show", parsed.lode_id],
-                reason=f"lode {remote_lode['id']}",
-            )
-        suffix = f" Checked remote hosts: {checked}." if checked else ""
-        print(f"Error: lode {parsed.lode_id} not found.{suffix}")
+        print(f"Error: no gate is set for lode {resolved['canonical_id']}.")
         return 1
 
     lode = gate_data["lode"]
@@ -1418,18 +1432,19 @@ def _cmd_gate_feedback(args: list[str]) -> int:
         )
         return 1
 
-    if err := require_server():
-        remote_lode, _checked = _find_remote_lode(parsed.lode_id)
-        if remote_lode:
-            return _run_remote_cli(
-                remote_lode["host"],
-                ["gate", "feedback", parsed.lode_id, "-"],
-                reason=f"lode {remote_lode['id']}",
-                stdin_text=text,
-            )
-        return err
+    resolved = _resolve_lode(_socket(), parsed.lode_id)
+    if resolved["outcome"] != "found":
+        print(resolved["error"], file=sys.stderr)
+        return resolved["exit_code"]
+    if resolved["host"] != "local":
+        return _run_remote_cli(
+            resolved["host"],
+            ["gate", "feedback", resolved["canonical_id"], "-"],
+            reason=f"lode {resolved['canonical_id']}",
+            stdin_text=text,
+        )
 
-    response = client.send_gate_feedback(_socket(), parsed.lode_id, text)
+    response = client.send_gate_feedback(_socket(), resolved["canonical_id"], text)
     if response and response.get("type") == "feedback_sent":
         print(f"Feedback sent to {parsed.lode_id} (pane {response.get('tmux_pane', '')})")
         return 0
@@ -1443,17 +1458,6 @@ def _cmd_gate_feedback(args: list[str]) -> int:
         )
     else:
         error = response.get("error", "Feedback failed without a recovery message.")
-        if response.get("outcome") == "unknown_lode":
-            remote_lode, checked = _find_remote_lode(parsed.lode_id)
-            if remote_lode:
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    ["gate", "feedback", parsed.lode_id, "-"],
-                    reason=f"lode {remote_lode['id']}",
-                    stdin_text=text,
-                )
-            if checked:
-                error = f"{error} Checked remote hosts: {checked}."
     print(error, file=sys.stderr)
     if response and response.get("outcome") == "unverified" and response.get("tail"):
         print("--- pane tail ---", file=sys.stderr)
@@ -1967,7 +1971,7 @@ def format_lode_detail(lode: dict) -> str:
 
 def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) -> int:
     """Resolve and render one local or remote lode through the shared status path."""
-    result = _resolve_lode_all_sources(socket_path, lode_ref)
+    result = _resolve_lode(socket_path, lode_ref)
     if result["outcome"] != "found":
         print(result["error"])
         return result["exit_code"]
@@ -1988,20 +1992,6 @@ def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) ->
     else:
         print(format_lode_detail(display_lode))
     return 0
-
-
-def _lookup_lode(socket_path, prefix: str) -> tuple[dict | None, str | None]:
-    """Look up a lode by ID prefix across active and archived lodes."""
-    import hopper.client as client
-
-    result, payload = client.read_lode_snapshot(socket_path, prefix)
-    if result == "found":
-        return payload, None
-    if result == "ambiguous":
-        return None, f"Ambiguous prefix '{prefix}', matches: {', '.join(payload)}"
-    if result == "absent":
-        return None, f"Lode '{prefix}' not found."
-    return None, f"Lode status unavailable for '{prefix}': {payload}"
 
 
 class _RemoteLodeProbeState(str):
@@ -2076,104 +2066,7 @@ def _remote_hosts() -> list[str]:
         return []
     from hopper.remote import remote_registry
 
-    return sorted({host for hosts in remote_registry().values() for host in hosts})
-
-
-def _cached_lode_host(key: str, hosts: list[str]) -> str | None:
-    """Return a cached route only while its host remains configured."""
-    from hopper.remote import load_lode_cache
-
-    entry = load_lode_cache().get(key)
-    host = entry.get("host") if isinstance(entry, dict) else None
-    return host if isinstance(host, str) and host in hosts else None
-
-
-class _RemoteProbeSummary(str):
-    """Human-readable first-match probe evidence with a structured availability flag."""
-
-    unavailable: bool
-
-    def __new__(cls, value: str, *, unavailable: bool):
-        summary = super().__new__(cls, value)
-        summary.unavailable = unavailable
-        return summary
-
-
-def _find_remote_lode(
-    prefix: str,
-    *,
-    remember_result: bool = True,
-) -> tuple[dict | None, _RemoteProbeSummary]:
-    """Use cached-first, first-match lookup for pane and lifecycle commands.
-
-    Authoritative all-source callers must use _resolve_lode_all_sources.
-    """
-    hosts = _remote_hosts()
-    if not hosts:
-        return None, _RemoteProbeSummary("", unavailable=False)
-    checked: list[str] = []
-    unreadable: set[str] = set()
-
-    cached_host = _cached_lode_host(prefix, hosts)
-    if cached_host:
-        host = cached_host
-        checked.append(host)
-        lode, probe_state = _remote_lode_status(host, prefix)
-        if probe_state in ("ambiguous", "unreadable"):
-            unreadable.add(host)
-        if lode:
-            if remember_result:
-                _remember_lode_route(lode["id"], host, lode.get("project", ""))
-            return lode, _RemoteProbeSummary(
-                ", ".join(checked),
-                unavailable=bool(unreadable),
-            )
-
-    remaining_hosts = [host for host in hosts if host not in checked]
-    if not remaining_hosts:
-        summary = ", ".join(checked)
-        if unreadable:
-            summary += f" [unreadable: {', '.join(sorted(unreadable))}]"
-        return None, _RemoteProbeSummary(summary, unavailable=bool(unreadable))
-
-    lock = threading.Lock()
-    found: list[dict] = []
-
-    def check_host(host: str) -> None:
-        lode, probe_state = _remote_lode_status(host, prefix)
-        with lock:
-            checked.append(host)
-            if probe_state in ("ambiguous", "unreadable"):
-                unreadable.add(host)
-            if lode and not found:
-                found.append(lode)
-
-    threads = [
-        threading.Thread(target=check_host, args=(host,), daemon=True) for host in remaining_hosts
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5.5)
-    with lock:
-        for host, thread in zip(remaining_hosts, threads):
-            if thread.is_alive():
-                if host not in checked:
-                    checked.append(host)
-                unreadable.add(host)
-
-    if found:
-        lode = found[0]
-        if remember_result:
-            _remember_lode_route(lode["id"], lode["host"], lode.get("project", ""))
-        return lode, _RemoteProbeSummary(
-            ", ".join(sorted(set(checked))),
-            unavailable=bool(unreadable),
-        )
-    summary = ", ".join(sorted(set(checked)))
-    if unreadable:
-        summary += f" [unreadable: {', '.join(sorted(unreadable))}]"
-    return None, _RemoteProbeSummary(summary, unavailable=bool(unreadable))
+    return list(dict.fromkeys(host for hosts in remote_registry().values() for host in hosts))
 
 
 def _resolution_result(
@@ -2255,9 +2148,15 @@ def _failed_resolution(
     )
 
 
-def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
-    """Resolve a lode authoritatively across local and configured remote sources."""
+def _resolve_lode(socket_path: Path, prefix: str) -> dict:
+    """Resolve one local, resident, or pooled lode without false fan-out."""
     import hopper.client as client
+    from hopper.remote import (
+        LodeCacheError,
+        load_lode_cache,
+        prune_lode_cache,
+        remote_lode_cache_path,
+    )
 
     local_outcome, local_payload = client.read_lode_snapshot(socket_path, prefix)
     probes = [
@@ -2285,6 +2184,76 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
         local_matches = [("local", lode_id) for lode_id in local_payload]
         return _failed_resolution("ambiguous", prefix, probes, local_matches)
 
+    if _remote_disabled():
+        if unavailable:
+            return _failed_resolution("unavailable", prefix, probes, unreadable=["local"])
+        if matches:
+            return _found_resolution(matches[0][1], "local", probes)
+        return _failed_resolution("absent", prefix, probes)
+
+    try:
+        cache = prune_lode_cache(load_lode_cache())
+    except LodeCacheError as error:
+        probes.append(_probe_summary_entry(str(error.path), "unavailable", error.reason))
+        recovery = shlex.join(["hop", "-H", "<resident-host>", "lode", "status", prefix, "--json"])
+        message = (
+            f"Resident route unavailable for '{prefix}': cache {error.path} is "
+            f"{error.reason}. Hopper did NOT treat the route as absent or fan out to a pool. "
+            f"Recover with: {recovery}."
+        )
+        return _resolution_result(
+            "unavailable",
+            error=message,
+            probe_summary="; ".join(probes),
+        )
+
+    resident_ids = [prefix] if prefix in cache else [key for key in cache if key.startswith(prefix)]
+    if len(resident_ids) > 1:
+        resident_matches = [(cache[lode_id]["host"], lode_id) for lode_id in resident_ids]
+        probes.append(_probe_summary_entry("resident-cache", "ambiguous", resident_ids))
+        return _failed_resolution("ambiguous", prefix, probes, resident_matches)
+    if resident_ids:
+        resident_id = resident_ids[0]
+        resident_host = cache[resident_id]["host"]
+        lode, state = _remote_lode_status(resident_host, resident_id)
+        probes.append(_probe_summary_entry(resident_host, state))
+        recovery = shlex.join(["hop", "-H", resident_host, "lode", "status", resident_id, "--json"])
+        if lode is not None and lode.get("id") == resident_id:
+            if matches:
+                found_ids = [
+                    *[(host, match["id"]) for host, match in matches],
+                    (resident_host, resident_id),
+                ]
+                return _failed_resolution("ambiguous", prefix, probes, found_ids)
+            _remember_lode_route(
+                resident_id,
+                resident_host,
+                lode.get("project", cache[resident_id]["project"]),
+            )
+            return _found_resolution(lode, resident_host, probes)
+        if state == "absent":
+            message = (
+                f"Lode '{resident_id}' was absent on resident host {resident_host}. "
+                "Hopper did NOT fan out to another pool member. "
+                f"Recover with: {recovery}."
+            )
+            return _resolution_result(
+                "absent",
+                error=message,
+                probe_summary="; ".join(probes),
+            )
+        message = (
+            f"Resident route unavailable for '{resident_id}': host {resident_host} from "
+            f"cache {remote_lode_cache_path()} could not return the cached lode. "
+            "Hopper did NOT fan out to another pool member. "
+            f"Recover with: {recovery}."
+        )
+        return _resolution_result(
+            "unavailable",
+            error=message,
+            probe_summary="; ".join(probes),
+        )
+
     hosts = _remote_hosts()
     if not hosts:
         if unavailable:
@@ -2292,28 +2261,6 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
         if matches:
             return _found_resolution(matches[0][1], matches[0][0], probes)
         return _failed_resolution("absent", prefix, probes)
-
-    cached_host = _cached_lode_host(prefix, hosts)
-    remaining_hosts = list(hosts)
-    if cached_host:
-        remaining_hosts.remove(cached_host)
-        lode, state = _remote_lode_status(cached_host, prefix)
-        ambiguity_matches = getattr(state, "matches", ())
-        probes.append(_probe_summary_entry(cached_host, state, ambiguity_matches))
-        if lode and lode["id"] == prefix:
-            _remember_lode_route(lode["id"], cached_host, lode.get("project", ""))
-            return _found_resolution(lode, cached_host, probes)
-        if lode:
-            matches.append((cached_host, lode))
-        elif state == "ambiguous":
-            found_ids = [
-                *[(host, match["id"]) for host, match in matches],
-                *[(cached_host, lode_id) for lode_id in ambiguity_matches],
-            ]
-            return _failed_resolution("ambiguous", prefix, probes, found_ids)
-        elif state == "unreadable":
-            unreadable_sources.append(cached_host)
-            unavailable = True
 
     lock = threading.Lock()
     remote_results: dict[str, tuple[dict | None, str]] = {}
@@ -2323,16 +2270,14 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
         with lock:
             remote_results[host] = result
 
-    threads = [
-        threading.Thread(target=probe, args=(host,), daemon=True) for host in remaining_hosts
-    ]
+    threads = [threading.Thread(target=probe, args=(host,), daemon=True) for host in hosts]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=5.5)
 
     exact_matches: list[tuple[str, dict]] = []
-    for host, thread in zip(remaining_hosts, threads):
+    for host, thread in zip(hosts, threads):
         lode, state = remote_results.get(host, (None, "unreadable"))
         ambiguity_matches = getattr(state, "matches", ())
         probes.append(_probe_summary_entry(host, state, ambiguity_matches))
@@ -2362,55 +2307,6 @@ def _resolve_lode_all_sources(socket_path: Path, prefix: str) -> dict:
             _remember_lode_route(lode["id"], host, lode.get("project", ""))
         return _found_resolution(lode, host, probes)
     return _failed_resolution("absent", prefix, probes)
-
-
-def _lookup_lode_with_remote(socket_path, prefix: str) -> dict:
-    """Use local-then-first-remote lookup for pane commands.
-
-    Authoritative all-source callers must use _resolve_lode_all_sources.
-    """
-    import hopper.client as client
-
-    local_outcome, local_payload = client.read_lode_snapshot(socket_path, prefix)
-    if local_outcome == "found":
-        return _resolution_result(
-            "found",
-            lode=local_payload,
-            canonical_id=local_payload["id"],
-        )
-    if local_outcome == "ambiguous":
-        return _resolution_result(
-            "ambiguous",
-            error=f"Ambiguous prefix '{prefix}', matches: {', '.join(local_payload)}",
-        )
-
-    remote_lode, checked = _find_remote_lode(prefix)
-    if remote_lode:
-        return _resolution_result(
-            "found",
-            lode=remote_lode,
-            host=remote_lode.get("host"),
-            canonical_id=remote_lode["id"],
-        )
-    if local_outcome == "unavailable":
-        local_error = f"Lode status unavailable for '{prefix}': {local_payload}"
-        if checked.unavailable:
-            message = f"{local_error}. Remote probes: {checked}."
-        elif checked:
-            message = f"{local_error}. Checked remote hosts: {checked}."
-        else:
-            message = f"{local_error}. No remote hosts configured."
-        return _resolution_result("unavailable", error=message)
-    if checked.unavailable:
-        return _resolution_result(
-            "unavailable",
-            error=f"Lode status unavailable for '{prefix}'. Remote probes: {checked}.",
-        )
-    suffix = f" Checked remote hosts: {checked}." if checked else " No remote hosts configured."
-    return _resolution_result(
-        "absent",
-        error=f"Lode '{prefix}' not found.{suffix}",
-    )
 
 
 def _format_watch_line(lode: dict) -> str:
@@ -2626,7 +2522,10 @@ def cmd_lode(args: list[str]) -> int:
     list_p.add_argument(
         "--all-hosts",
         action="store_true",
-        help="Aggregate local and configured remote hopper hosts",
+        help=(
+            "Concurrently aggregate local and every pool host; partial results report "
+            "unavailable_hosts and exit 2"
+        ),
     )
 
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
@@ -2724,15 +2623,13 @@ def cmd_lode(args: list[str]) -> int:
     socket_path = _socket()
 
     if subcommand in ("list", "ls"):
-        err = require_server()
-        if err and not getattr(parsed, "all_hosts", False):
+        all_hosts = getattr(parsed, "all_hosts", False)
+        if not all_hosts and (err := require_server()):
             return err
         archived = getattr(parsed, "archived", False)
         project_filter = getattr(parsed, "project", None)
 
         def local_lodes() -> list[dict]:
-            if err:
-                return []
             if archived:
                 rows = client.list_archived_lodes(socket_path)
                 rows.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
@@ -2744,43 +2641,73 @@ def cmd_lode(args: list[str]) -> int:
                 rows = [lode for lode in rows if lode.get("project") == project_filter]
             return rows
 
-        lodes = local_lodes()
-        if getattr(parsed, "all_hosts", False):
-            from hopper.remote import remote_registry, run_remote
+        lodes = [] if all_hosts else [dict(lode) for lode in local_lodes()]
+        unavailable_hosts: list[dict[str, str]] = []
+        if all_hosts:
+            from hopper.remote import discover_lodes, run_remote
 
-            for lode in lodes:
-                lode["host"] = "local"
             remote_args = ["lode", "list", "--json"]
             if archived:
                 remote_args.append("--archived")
             if project_filter:
                 remote_args.extend(["--project", project_filter])
-            hosts = {host for pool in remote_registry().values() for host in pool}
-            for host in sorted(hosts):
-                try:
-                    result = run_remote(host, remote_args, timeout=8)
-                except (OSError, subprocess.TimeoutExpired):
+            hosts = _remote_hosts()
+
+            def discovery_runner(host, args, *, timeout):
+                if host != "local":
+                    return run_remote(host, args, timeout=timeout)
+                local_status = client.probe_server(socket_path, timeout=min(timeout, 2.0))
+                if local_status == "down":
+                    return subprocess.CompletedProcess(
+                        [],
+                        1,
+                        stdout="",
+                        stderr="server not running; start it with: hop up",
+                    )
+                if local_status == "unresponsive":
+                    return subprocess.CompletedProcess(
+                        [],
+                        1,
+                        stdout="",
+                        stderr="server did not answer within 2s; retry or stop it if wedged",
+                    )
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps({"lodes": local_lodes()}),
+                    stderr="",
+                )
+
+            for discovery in discover_lodes(
+                ["local", *hosts],
+                remote_args,
+                discovery_runner,
+            ):
+                if discovery.reason is not None:
+                    unavailable_hosts.append({"host": discovery.host, "reason": discovery.reason})
                     continue
-                if result.returncode != 0:
-                    continue
-                try:
-                    payload = json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    continue
-                for lode in payload.get("lodes", []) if isinstance(payload, dict) else []:
-                    if isinstance(lode, dict):
-                        lode["host"] = host
-                        lodes.append(lode)
+                for remote_lode in discovery.lodes:
+                    stamped = dict(remote_lode)
+                    stamped["host"] = discovery.host
+                    lodes.append(stamped)
         if getattr(parsed, "json_output", False):
             lodes = [lode_with_status_annotations(lode) for lode in lodes]
-            print(json.dumps({"lodes": lodes}, indent=2))
-            return 0
+            payload = {"lodes": lodes}
+            if all_hosts:
+                payload["unavailable_hosts"] = unavailable_hosts
+            print(json.dumps(payload, indent=2))
+            return 2 if unavailable_hosts else 0
         if not lodes:
             print("No archived lodes" if archived else "No active lodes")
-            return 0
-        for lode in lodes:
-            print(format_lode_line(lode))
-        return 0
+        else:
+            for lode in lodes:
+                print(format_lode_line(lode))
+        for unavailable_host in unavailable_hosts:
+            print(
+                f"Unavailable host {unavailable_host['host']}: {unavailable_host['reason']}",
+                file=sys.stderr,
+            )
+        return 2 if unavailable_hosts else 0
 
     if subcommand == "create":
         if (rc := require_not_inside_lode()) is not None:
@@ -2841,7 +2768,7 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand in ("pause", "resume"):
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        resolved = _resolve_lode_all_sources(socket_path, parsed.lode_id)
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
         if resolved["outcome"] != "found":
             print(resolved["error"])
             return resolved["exit_code"]
@@ -2870,7 +2797,7 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     if subcommand == "path":
-        resolved = _resolve_lode_all_sources(socket_path, parsed.lode_id)
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
         if resolved["outcome"] != "found":
             print(
                 resolved["error"],
@@ -2961,22 +2888,18 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand == "restart":
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        lode_id = parsed.lode_id
-        err = require_server()
-        if err:
-            return err
-        lode = client.get_lode(socket_path, lode_id)
-        if not lode:
-            remote_lode, checked = _find_remote_lode(lode_id)
-            if remote_lode:
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    ["lode", "restart", lode_id, *(["--force"] if parsed.force else [])],
-                    reason=f"lode {remote_lode['id']}",
-                )
-            suffix = f" Checked remote hosts: {checked}." if checked else ""
-            print(f"Lode not found: {lode_id}.{suffix}")
-            return 1
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        if resolved["host"] != "local":
+            return _run_remote_cli(
+                resolved["host"],
+                ["lode", "restart", lode_id, *(["--force"] if parsed.force else [])],
+                reason=f"lode {lode_id}",
+            )
+        lode = resolved["lode"]
         if lode.get("active") and not parsed.force:
             print(f"Cannot restart: lode {lode_id} has a registered runner.")
             print(f"Attach to it, or retry with: hop lode restart {lode_id} --force")
@@ -3064,7 +2987,7 @@ def cmd_lode(args: list[str]) -> int:
     if subcommand == "watch":
         if (rc := require_not_inside_lode()) is not None:
             return rc
-        resolved = _resolve_lode_all_sources(socket_path, parsed.lode_id)
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
         if resolved["outcome"] != "found":
             print(resolved["error"])
             return resolved["exit_code"]
@@ -3099,8 +3022,7 @@ def cmd_lode(args: list[str]) -> int:
             poll_s=parsed.poll,
             observer_timeout_s=parsed.observer_timeout,
             json_output=parsed.json_output,
-            lookup_local=_lookup_lode,
-            find_remote=lambda prefix: _find_remote_lode(prefix, remember_result=False),
+            resolver=_resolve_lode,
             probe_remote=_remote_lode_status,
         )
 
@@ -3109,24 +3031,25 @@ def cmd_lode(args: list[str]) -> int:
 
         from hopper.config import hopper_dir
 
-        lode_id = parsed.lode_id
-        if client.ping(socket_path):
-            local_lode, local_error = _lookup_lode(socket_path, lode_id)
-        else:
-            local_lode, local_error = None, "local server unavailable"
-        if not local_lode and local_error:
-            remote_lode, _checked = _find_remote_lode(lode_id)
-            if remote_lode:
-                remote_args = ["lode", "log", lode_id]
-                if parsed.tail:
-                    remote_args.extend(["-n", str(parsed.tail)])
-                if parsed.json_output:
-                    remote_args.append("--json")
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    remote_args,
-                    reason=f"lode {remote_lode['id']}",
-                )
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(
+                resolved["error"],
+                file=sys.stderr if parsed.json_output else sys.stdout,
+            )
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        if resolved["host"] != "local":
+            remote_args = ["lode", "log", lode_id]
+            if parsed.tail:
+                remote_args.extend(["-n", str(parsed.tail)])
+            if parsed.json_output:
+                remote_args.append("--json")
+            return _run_remote_cli(
+                resolved["host"],
+                remote_args,
+                reason=f"lode {lode_id}",
+            )
         log_file = hopper_dir() / "activity.log"
         if not log_file.exists():
             print("No activity log found.")
@@ -3167,35 +3090,21 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     if subcommand == "kill":
-        err = require_server()
-        if err:
-            remote_lode, _checked = _find_remote_lode(parsed.lode_id)
-            if remote_lode:
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    ["lode", "kill", parsed.lode_id, *(["--force"] if parsed.force else [])],
-                    reason=f"lode {remote_lode['id']}",
-                )
-            return err
-        lode_id = parsed.lode_id
-        lode = client.get_lode(socket_path, lode_id)
-        if not lode:
-            archived = client.list_archived_lodes(socket_path)
-            found = find_lode_by_prefix(archived, lode_id)
-            if found:
-                print(f"Lode {found['id']} is already archived.")
-                return 0
-            remote_lode, checked = _find_remote_lode(lode_id)
-            if remote_lode:
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    ["lode", "kill", lode_id, *(["--force"] if parsed.force else [])],
-                    reason=f"lode {remote_lode['id']}",
-                )
-            print(f"Lode not found: {lode_id}")
-            if checked:
-                print(f"Checked remote hosts: {checked}.")
-            return 1
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        if resolved["host"] != "local":
+            return _run_remote_cli(
+                resolved["host"],
+                ["lode", "kill", lode_id, *(["--force"] if parsed.force else [])],
+                reason=f"lode {lode_id}",
+            )
+        lode = resolved["lode"]
+        if isinstance(lode.get("archived_at"), int):
+            print(f"Lode {lode_id} is already archived.")
+            return 0
         if lode.get("stage") == "shipped":
             print(f"Lode {lode['id']} has already shipped.")
             return 0
@@ -3211,29 +3120,12 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     if subcommand in ("peek", "nudge", "answer"):
-        err = require_server()
-        if err:
-            remote_lode, _checked = _find_remote_lode(parsed.lode_id)
-            if remote_lode:
-                remote_args = ["lode", subcommand, remote_lode["id"]]
-                if subcommand == "peek":
-                    remote_args.extend(["-n", str(parsed.lines)])
-                elif subcommand == "nudge":
-                    remote_args.extend(["--", parsed.nudge_text])
-                else:
-                    remote_args.append(parsed.choice)
-                return _run_remote_cli(
-                    remote_lode["host"],
-                    remote_args,
-                    reason=f"lode {remote_lode['id']}",
-                )
-            return err
-        resolved = _lookup_lode_with_remote(socket_path, parsed.lode_id)
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
         if resolved["outcome"] != "found":
             print(resolved["error"])
             return resolved["exit_code"]
         lode = resolved["lode"]
-        if resolved["host"]:
+        if resolved["host"] != "local":
             remote_args = ["lode", subcommand, resolved["canonical_id"]]
             if subcommand == "peek":
                 remote_args.extend(["-n", str(parsed.lines)])
