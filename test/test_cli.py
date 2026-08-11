@@ -64,6 +64,8 @@ from hopper.cli import (
 from hopper.client import RUN_GENERATION_ENV
 from hopper.lodes import (
     PARK_PANE_GONE_STATUS,
+    STATUS_DISCONNECTED,
+    STATUS_NEW,
     current_time_ms,
     format_age,
     format_park_status,
@@ -2470,10 +2472,14 @@ def test_lode_wait_shipped(capsys):
         "state": "running",
         "status": "Working...",
         "active": True,
+        "archived": False,
     }
     shipped = {**lode, "stage": "shipped", "status": "Done", "title": "Done task"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            side_effect=[("found", lode), ("found", shipped)],
+        ):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2490,9 +2496,8 @@ def test_lode_wait_shipped(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
     assert result == 0
     assert "✓ abc123 shipped (Done task)" in capsys.readouterr().out
 
@@ -2505,20 +2510,23 @@ def test_lode_wait_shipped_no_title(capsys):
         "state": "running",
         "status": "Working...",
         "active": True,
+        "archived": False,
         "title": "",
     }
     shipped = {**lode, "stage": "shipped"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            side_effect=[("found", lode), ("found", shipped)],
+        ):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
                 callback({"type": "lode_updated", "lode": {**lode, "stage": "shipped"}})
 
             mock_conn.start = fake_start
-            with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ abc123 shipped" in out
@@ -2533,6 +2541,7 @@ def test_lode_wait_already_shipped(capsys):
         "state": "ready",
         "status": "Shipped",
         "active": False,
+        "archived": False,
         "project": "proj",
         "title": "Done",
         "created_at": 1000,
@@ -2554,6 +2563,7 @@ def test_lode_wait_archived_lode(capsys):
         "state": "ready",
         "status": "Done",
         "active": False,
+        "archived": True,
         "project": "proj",
         "title": "Archive task",
         "created_at": 1000,
@@ -2575,10 +2585,14 @@ def test_lode_wait_prefix_match(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
     shipped = {**lode, "stage": "shipped", "status": "Done", "title": "Prefix task"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            side_effect=[("found", lode), ("found", shipped)],
+        ):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2595,9 +2609,8 @@ def test_lode_wait_prefix_match(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.wait.read_local_snapshot", return_value=("found", shipped)):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc"])
     assert result == 0
     assert "✓ abc12345 shipped (Prefix task)" in capsys.readouterr().out
 
@@ -2607,9 +2620,10 @@ def test_lode_wait_prefix_not_active(capsys):
     lode = {
         "id": "abc12345",
         "stage": "refine",
-        "state": "new",
+        "state": "paused",
         "status": "",
         "active": False,
+        "archived": False,
     }
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
@@ -2626,10 +2640,14 @@ def test_lode_wait_error(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
     failed = {**lode, "state": "error", "status": "Failed"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            side_effect=[("found", lode), ("found", failed)],
+        ):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2638,15 +2656,15 @@ def test_lode_wait_error(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.wait.read_local_snapshot", return_value=("found", failed)):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
     assert result == 1
     out = capsys.readouterr().out
     assert "✗ abc123 error: Failed" in out
     assert "stage=mill state=error active=True status=Failed source=local" in out
     assert "observed_age_s=" in out
-    assert "Restart with: hop lode restart abc123" in out
+    assert "Inspect with: hop lode status abc123" in out
+    assert "restart" not in out.lower()
 
 
 def test_wait_exits_2_on_gate_transition(capsys):
@@ -2657,10 +2675,14 @@ def test_wait_exits_2_on_gate_transition(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
     gated = {**lode, "state": "gated", "status": "Gate"}
     with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            side_effect=[("found", lode), ("found", gated)],
+        ):
             mock_conn = MagicMock()
 
             def fake_start(callback, on_connect=None):
@@ -2669,9 +2691,8 @@ def test_wait_exits_2_on_gate_transition(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.wait.read_local_snapshot", return_value=("found", gated)):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "abc123"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "abc123"])
     assert result == 2
     assert "Lode abc123 is gated. Review with: hop gate show abc123" in capsys.readouterr().out
 
@@ -2683,6 +2704,7 @@ def test_lode_wait_error_state_at_start(capsys):
         "stage": "mill",
         "state": "error",
         "status": "Something failed",
+        "archived": False,
     }
     with patch("hopper.cli.require_not_inside_lode", return_value=None):
         with patch("hopper.cli.require_server", return_value=None):
@@ -2690,24 +2712,32 @@ def test_lode_wait_error_state_at_start(capsys):
                 result = cmd_lode(["wait", "abc123"])
     assert result == 1
     out = capsys.readouterr().out
-    assert "error state" in out
-    assert "hop lode restart abc123" in out
+    assert "✗ abc123 error: Something failed" in out
+    assert "Inspect with: hop lode status abc123" in out
+    assert "restart" not in out.lower()
 
 
 def _run_scripted_cli_wait(monkeypatch, initial_by_id, observations_by_id, args):
     now = [0.0]
-    queues = {lid: list(items) for lid, items in observations_by_id.items()}
+    initial_by_id = {
+        lid: {**lode, "archived": lode.get("archived", False)}
+        for lid, lode in initial_by_id.items()
+    }
+    queues = {
+        lid: [{**lode, "archived": lode.get("archived", False)} for lode in items]
+        for lid, items in observations_by_id.items()
+    }
     latest = dict(initial_by_id)
+    initial_reads = set(initial_by_id)
     connection = MagicMock()
 
-    def resolve_initial(socket_path, lid, timeout=2.0):
-        lode = initial_by_id.get(lid)
-        return ("found", lode) if lode is not None else ("absent", None)
-
-    def read_snapshot(socket_path, lid):
+    def read_snapshot(socket_path, lid, timeout=2.0):
+        if lid in initial_reads:
+            initial_reads.remove(lid)
+            return "found", initial_by_id[lid]
         if queues.get(lid):
             latest[lid] = queues[lid].pop(0)
-        return "found", latest[lid]
+        return ("found", latest[lid]) if lid in latest else ("absent", None)
 
     def start(callback, on_connect=None):
         if on_connect:
@@ -2717,9 +2747,8 @@ def _run_scripted_cli_wait(monkeypatch, initial_by_id, observations_by_id, args)
         now[0] += timeout
 
     connection.start = start
-    monkeypatch.setattr("hopper.client.read_lode_snapshot", resolve_initial)
+    monkeypatch.setattr("hopper.client.read_lode_snapshot", read_snapshot)
     monkeypatch.setattr("hopper.client.HopperConnection", lambda socket_path: connection)
-    monkeypatch.setattr("hopper.wait.read_local_snapshot", read_snapshot)
     monkeypatch.setattr("hopper.wait._monotonic", lambda: now[0])
     monkeypatch.setattr("hopper.wait._condition_wait", condition_wait)
     return cmd_lode(["wait", *args]), now[0]
@@ -2999,7 +3028,14 @@ def test_lode_wait_not_found(capsys):
 
 def test_lode_wait_not_active(capsys):
     """wait fails when lode is not active."""
-    lode = {"id": "abc123", "active": False, "stage": "mill", "state": "new", "status": ""}
+    lode = {
+        "id": "abc123",
+        "active": False,
+        "archived": False,
+        "stage": "mill",
+        "state": "paused",
+        "status": "",
+    }
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             result = cmd_lode(["wait", "abc123"])
@@ -3015,6 +3051,7 @@ def test_lode_wait_timeout(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
@@ -3038,6 +3075,7 @@ def test_lode_wait_multi_all_ship(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
         "title": "First",
     }
     lode2 = {
@@ -3046,20 +3084,22 @@ def test_lode_wait_multi_all_ship(capsys):
         "state": "running",
         "status": "Starting",
         "active": True,
+        "archived": False,
         "title": "Second",
     }
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0):
-        if lode_id == "aaa111":
-            return "found", lode1
-        if lode_id == "bbb222":
-            return "found", lode2
-        return "absent", None
 
     shipped = {
         "aaa111": {**lode1, "stage": "shipped", "title": "First"},
         "bbb222": {**lode2, "stage": "shipped", "title": "Second"},
     }
+    initial = {"aaa111": lode1, "bbb222": lode2}
+    initial_reads = set(initial)
+
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
+        if lode_id in initial_reads:
+            initial_reads.remove(lode_id)
+            return "found", initial[lode_id]
+        return ("found", shipped[lode_id]) if lode_id in shipped else ("absent", None)
 
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
@@ -3080,12 +3120,8 @@ def test_lode_wait_multi_all_ship(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch(
-                "hopper.wait.read_local_snapshot",
-                side_effect=lambda socket_path, lid: ("found", shipped[lid]),
-            ):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "aaa111", "bbb222"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "aaa111", "bbb222"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ aaa111 shipped (First)" in out
@@ -3100,6 +3136,7 @@ def test_lode_wait_multi_one_errors(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
     lode2 = {
         "id": "bbb222",
@@ -3107,19 +3144,21 @@ def test_lode_wait_multi_one_errors(capsys):
         "state": "running",
         "status": "Starting",
         "active": True,
+        "archived": False,
     }
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0):
-        if lode_id == "aaa111":
-            return "found", lode1
-        if lode_id == "bbb222":
-            return "found", lode2
-        return "absent", None
 
     current = {
         "aaa111": {**lode1, "state": "error", "status": "Crashed"},
         "bbb222": lode2,
     }
+    initial = {"aaa111": lode1, "bbb222": lode2}
+    initial_reads = set(initial)
+
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
+        if lode_id in initial_reads:
+            initial_reads.remove(lode_id)
+            return "found", initial[lode_id]
+        return ("found", current[lode_id]) if lode_id in current else ("absent", None)
 
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
@@ -3134,12 +3173,8 @@ def test_lode_wait_multi_one_errors(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch(
-                "hopper.wait.read_local_snapshot",
-                side_effect=lambda socket_path, lid: ("found", current[lid]),
-            ):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "aaa111", "bbb222"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "aaa111", "bbb222"])
     assert result == 1
     out = capsys.readouterr().out
     assert "✗ aaa111 error: Crashed" in out
@@ -3153,6 +3188,7 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
         "state": "shipped",
         "status": "Done",
         "active": False,
+        "archived": False,
         "title": "Already done",
     }
     pending_lode = {
@@ -3161,21 +3197,25 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
         "title": "Still going",
     }
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0):
-        if lode_id == "aaa111":
-            return "found", shipped_lode
-        if lode_id == "bbb222":
-            return "found", pending_lode
-        return "absent", None
 
     finished_pending = {
         **pending_lode,
         "stage": "shipped",
         "title": "Still going",
     }
+    initial = {"aaa111": shipped_lode, "bbb222": pending_lode}
+    initial_reads = set(initial)
+
+    def fake_snapshot(socket_path, lode_id, timeout=2.0):
+        if lode_id in initial_reads:
+            initial_reads.remove(lode_id)
+            return "found", initial[lode_id]
+        if lode_id == "bbb222":
+            return "found", finished_pending
+        return "absent", None
 
     with patch("hopper.cli.require_server", return_value=0):
         with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
@@ -3190,9 +3230,8 @@ def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
                 )
 
             mock_conn.start = fake_start
-            with patch("hopper.wait.read_local_snapshot", return_value=("found", finished_pending)):
-                with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                    result = cmd_lode(["wait", "aaa111", "bbb222"])
+            with patch("hopper.client.HopperConnection", return_value=mock_conn):
+                result = cmd_lode(["wait", "aaa111", "bbb222"])
     assert result == 0
     out = capsys.readouterr().out
     assert "✓ aaa111 shipped (Already done)" in out
@@ -3207,6 +3246,7 @@ def test_lode_wait_multi_timeout(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
     lode2 = {
         "id": "bbb222",
@@ -3214,6 +3254,7 @@ def test_lode_wait_multi_timeout(capsys):
         "state": "running",
         "status": "Starting",
         "active": True,
+        "archived": False,
     }
 
     def fake_snapshot(socket_path, lode_id, timeout=2.0):
@@ -3242,6 +3283,7 @@ def test_lode_wait_multi_one_not_found(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
     }
 
     def resolve(socket_path, lode_id):
@@ -3266,6 +3308,7 @@ def test_lode_wait_remote_poll_json_shipped(capsys):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
         "project": "journal",
         "host": "fedora.local",
     }
@@ -5315,6 +5358,7 @@ def test_show_delegates_to_lode_show(capsys):
         "project": "p",
         "title": "t",
         "status": "s",
+        "archived": False,
     }
     with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
         result = cmd_show(["abc123"])
@@ -5392,6 +5436,7 @@ def test_wait_delegates_to_lode_wait(capsys):
         "stage": "shipped",
         "state": "shipped",
         "active": False,
+        "archived": False,
         "project": "p",
         "title": "t",
         "status": "s",
@@ -5945,6 +5990,29 @@ def test_format_lode_line_shows_spawn_refusal():
     }
 
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)
+
+
+def test_format_lode_reconnecting_is_pending_with_prior_diagnostics(make_lode):
+    status = "Runner pane %8 survived server replacement; waiting for registration"
+    lode = make_lode(
+        id="abc12345",
+        stage="refine",
+        state="reconnecting",
+        active=False,
+        status=status,
+        reconnect_prior_state="running",
+        reconnect_prior_status="Working",
+    )
+
+    line = format_lode_line(lode)
+    detail = format_lode_detail(lode)
+
+    assert STATUS_NEW in line
+    assert STATUS_DISCONNECTED not in line
+    assert line.endswith(status)
+    assert "  state:    reconnecting" in detail
+    assert "  reconnect prior state:  running" in detail
+    assert "  reconnect prior status: Working" in detail
 
 
 def test_format_lode_detail_expands_pending_action_recovery(make_lode):
@@ -7464,7 +7532,7 @@ def test_lode_id_surfaces_use_the_single_resolver(surface, command, args):
         "hopper.cli._resolve_lode",
         return_value=unavailable,
     ) as resolver:
-        assert command(args) == 2, surface
+        assert command(args) == (4 if surface == "wait" else 2), surface
 
     resolver.assert_called_once_with(config.server_socket_path(), "abc")
 

@@ -229,8 +229,12 @@ def test_read_archived_lodes_rejects_malformed_response(socket_path, response):
     ("response", "expected"),
     [
         (
-            {"type": "lode_snapshot", "result": "found", "lode": {"id": "abc123"}},
-            ("found", {"id": "abc123"}),
+            {
+                "type": "lode_snapshot",
+                "result": "found",
+                "lode": {"id": "abc123", "archived": True},
+            },
+            ("found", {"id": "abc123", "archived": True}),
         ),
         ({"type": "lode_snapshot", "result": "absent"}, ("absent", None)),
         (

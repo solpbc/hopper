@@ -26,6 +26,7 @@ from hopper.lodes import (
     PARK_LIVENESS_UNVERIFIED_SUFFIX,
     PARK_PANE_GONE_STATUS,
     RUNNER_EXIT_UNVERIFIED_STATUS,
+    STATUS_NEW,
     STATUS_TEARDOWN,
     archive_lode,
     archive_lode_for_action,
@@ -69,6 +70,10 @@ def test_teardown_icon_is_not_disconnected(active):
 
 def test_shipped_teardown_icon_remains_pending():
     assert lode_icon({"stage": "shipped", "state": "teardown", "active": False}) == STATUS_TEARDOWN
+
+
+def test_reconnecting_icon_is_pending_not_disconnected():
+    assert lode_icon({"stage": "refine", "state": "reconnecting", "active": False}) == STATUS_NEW
 
 
 def test_lode_dict_json_roundtrip():
@@ -197,6 +202,7 @@ def test_create_lode(temp_config):
     assert lode["run_generation"] is None
     assert lode["oom_scope"] is None
     assert lode["failure_kind"] is None
+    assert lode["spawn_disposition"] is None
     assert lode["archive_action_id"] is None
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
@@ -749,7 +755,14 @@ def test_update_lode_stage_touches(temp_config):
 def test_update_lode_state(temp_config):
     """update_lode_state changes state and message, touches timestamp."""
     lodes_list = [
-        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
+        {
+            "id": "testid11",
+            "stage": "mill",
+            "created_at": 1000,
+            "updated_at": 1000,
+            "state": "gated",
+            "spawn_disposition": "unknown",
+        }
     ]
     save_lodes(lodes_list)
 
@@ -758,12 +771,14 @@ def test_update_lode_state(temp_config):
     assert updated is not None
     assert updated["state"] == "running"
     assert updated["status"] == "Claude running"
+    assert updated["spawn_disposition"] is None
     assert updated["updated_at"] > 1000
 
     # Verify persistence
     loaded = load_lodes()
     assert loaded[0]["state"] == "running"
     assert loaded[0]["status"] == "Claude running"
+    assert loaded[0]["spawn_disposition"] is None
 
 
 def test_update_lode_state_not_found(temp_config):
@@ -1387,6 +1402,17 @@ def test_lode_with_status_annotations_reports_alive_parked_lode(make_lode):
         "observed_at": 40_000,
     }
     mock_liveness.assert_called_once_with("%10")
+
+
+def test_lode_with_status_annotations_preserves_archived_storage_identity(make_lode):
+    lode = make_lode(state="ready", stage="shipped", archived=True)
+    before = dict(lode)
+
+    annotated = lode_with_status_annotations(lode)
+
+    assert annotated["archived"] is True
+    assert annotated is not lode
+    assert lode == before
 
 
 @pytest.mark.parametrize(

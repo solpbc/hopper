@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 import signal
 import socket
@@ -77,6 +78,7 @@ from hopper.projects import Project, disabled_project_message, find_project, get
 from hopper.tmux import (
     Liveness,
     PanePhase,
+    WindowSpawnOutcome,
     capture_pane,
     classify_pane_phase,
     completion_action_panes,
@@ -94,10 +96,14 @@ logger = logging.getLogger(__name__)
 
 _CURRENT_EXCHANGE = object()
 
-PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "teardown", "error"})
+PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "reconnecting", "teardown", "error"})
 SUPPORTED_LODE_STATES = frozenset(
     {"new", "running", "stuck", "error", "gated", "ready", "mill", "refine", "ship", "teardown"}
 )
+HELD_RUNNER_MUTATION_TYPES = RUNNER_MUTATION_TYPES - {
+    "lode_register",
+    "lode_supervisor_register",
+}
 LISTEN_BACKLOG = 64
 PAUSE_TERM_GRACE_SEC = 0.75
 PAUSE_KILL_GRACE_SEC = 0.5
@@ -114,6 +120,18 @@ _FEEDBACK_ACCEPTANCE_POLL_COUNT = 12
 _FEEDBACK_IDLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_IDLE_POLL_COUNT
 _FEEDBACK_SETTLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_SETTLE_POLL_COUNT
 _FEEDBACK_ACCEPTANCE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_ACCEPTANCE_POLL_COUNT
+
+
+def _collapse_lode_snapshot_matches(
+    matches: list[tuple[dict, bool]],
+) -> list[tuple[dict, bool]]:
+    """Collapse same-ID storage twins, preferring archived identity."""
+    grouped: dict[str, tuple[dict, bool]] = {}
+    for lode, archived in matches:
+        lode_id = lode["id"]
+        if lode_id not in grouped or archived:
+            grouped[lode_id] = lode, archived
+    return list(grouped.values())
 
 
 def _is_verified_ordinary_exit(unit_result: str | None, worker_returncode: int | None) -> bool:
@@ -555,8 +573,9 @@ class SpawnOutcome(Enum):
 
     SPAWNED = "spawned"
     ALREADY_LIVE = "already_live"
-    REFUSED_UNKNOWN = "refused_unknown"
-    FAILED = "failed"
+    PROJECT_MISSING = "project_missing"
+    PROVEN_NO_PANE = "proven_no_pane"
+    UNKNOWN = "unknown"
 
 
 def _process_group_has_live_members(process_group: int) -> bool | None:
@@ -678,13 +697,25 @@ def _set_spawn_refusal(lode: dict, message: str) -> bool:
     return True
 
 
-def _clear_spawn_refusal(lode: dict) -> bool:
+def _clear_spawn_refusal(lode: dict, *, clear_status: bool = True) -> bool:
     """Clear a refusal or failure after live runner evidence supersedes it."""
+    changed = lode.get("spawn_disposition") is not None
+    lode["spawn_disposition"] = None
     status = lode.get("status", "")
-    if not status.startswith(REFUSAL_STATUS_PREFIXES[:2]):
-        return False
+    if not clear_status or not status.startswith(REFUSAL_STATUS_PREFIXES[:2]):
+        return changed
     lode["status"] = ""
     return True
+
+
+def _lifecycle_grace_pending(lode: dict | None) -> bool:
+    """Return whether worker mutations are held for registration authority."""
+    return bool(
+        lode
+        and lode.get("active") is False
+        and lode.get("pending_action") is None
+        and lode.get("state") in {"new", "ready", "reconnecting"}
+    )
 
 
 def _render_observed_title(title: str | None) -> str:
@@ -1840,6 +1871,25 @@ class Server:
                 conn, outcome="refused", reason="invalid_action", detail=str(error)
             )
             return
+        lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
+        if lode and generation == lode.get("run_generation") and _lifecycle_grace_pending(lode):
+            if is_terminal_failure_kind(lode.get("failure_kind")):
+                self._send_action_ack(
+                    conn,
+                    outcome="refused",
+                    reason="terminal_failure",
+                    action_id=action_id,
+                    action_type=action_type,
+                )
+                return
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="lifecycle_grace_pending",
+                action_id=action_id,
+                action_type=action_type,
+            )
+            return
         if action_type != "completion":
             self._handle_manual_lode_action(message, conn, binding)
             return
@@ -1856,7 +1906,6 @@ class Server:
                 action_type=action_type,
             )
             return
-        lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
         if not lode:
             result = self._open_lode_action(
                 action_type=action_type, message=message, prepared={"ok": False}
@@ -2425,6 +2474,8 @@ class Server:
         if target is None:
             return {"error": "completion spawn target is absent"}
         project = find_project(target.get("project", ""))
+        if project is None:
+            return {"error": "completion successor project is unavailable"}
         return {
             "target": copy.deepcopy(target),
             "project_path": project.path if project else None,
@@ -2551,15 +2602,20 @@ class Server:
             "target_lode_id": target["id"],
             "target_generation": spawn["target_generation"],
         }
-        pane_id = spawn_claude(
+        window_outcome, pane_id = spawn_claude(
             target["id"],
             context.get("project_path"),
             foreground=False,
             env=pane_env,
             spawn_receipt=receipt_facts,
         )
-        if not pane_id:
-            return {"ok": False, "error": "tmux could not create the completion runner pane"}
+        if window_outcome is WindowSpawnOutcome.PROVEN_NO_PANE:
+            return {"ok": False, "error": "tmux declined the completion runner pane"}
+        if window_outcome is WindowSpawnOutcome.UNKNOWN:
+            return {
+                "ok": False,
+                "error": ("completion runner pane creation is unverified and a pane may be live"),
+            }
         try:
             receipt = actions.load_spawn_receipt(record["lode_id"], record["action_id"])
         except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -4020,56 +4076,87 @@ class Server:
                 self._socket_bound = False
 
     def _reconcile_startup_lodes(self) -> None:
-        """Reconcile recorded runner identity against tmux without guessing."""
+        """Reconcile stale ownership against authoritative tmux evidence."""
         changed = False
         for lode in self.lodes:
+            before = copy.deepcopy(lode)
             generation = lode.get("run_generation")
-            if _pending_action_file_exists(lode["id"]):
-                continue
-            if generation and (lode["id"], generation) in self.pending_disconnects:
-                continue
-            if is_terminal_failure_kind(lode.get("failure_kind")):
-                if lode.get("active") or lode.get("tmux_pane") or lode.get("pid"):
-                    lode["active"] = False
-                    lode["tmux_pane"] = None
-                    lode["pid"] = None
-                    changed = True
-                continue
             pane = lode.get("tmux_pane")
-            if pane:
+            lode["active"] = False
+
+            action_owned = lode.get("pending_action") is not None or _pending_action_file_exists(
+                lode["id"]
+            )
+            stronger_state = (
+                lode.get("stage") == "shipped"
+                or lode.get("state") in {"error", "gated", "stuck", "paused", "teardown"}
+                or is_terminal_failure_kind(lode.get("failure_kind"))
+                or action_owned
+            )
+            if generation and (lode["id"], generation) in self.pending_disconnects:
+                pass
+            elif stronger_state:
+                pass
+            elif isinstance(pane, str) and re.fullmatch(r"%[0-9]+", pane):
                 liveness = pane_liveness(pane)
                 if liveness is Liveness.ALIVE:
-                    changed = _clear_spawn_refusal(lode) or changed
+                    if lode.get("state") not in {"new", "ready"}:
+                        if generation:
+                            if lode.get("state") != "reconnecting":
+                                lode["reconnect_prior_state"] = lode.get("state")
+                                lode["reconnect_prior_status"] = lode.get("status", "")
+                            lode["state"] = "reconnecting"
+                            lode["status"] = (
+                                f"Runner pane {pane} survived server replacement; "
+                                "waiting for registration"
+                            )
+                            lode["spawn_disposition"] = None
+                        else:
+                            self._gate_unknown_startup_lode(lode)
                 elif liveness is Liveness.GONE:
-                    if lode.get("active") or lode.get("tmux_pane") or lode.get("pid"):
-                        lode["active"] = False
-                        lode["tmux_pane"] = None
-                        lode["pid"] = None
-                        changed = True
-                    changed = _clear_spawn_refusal(lode) or changed
-                else:
-                    changed = (
-                        _set_spawn_refusal(
-                            lode,
-                            "tmux unreachable — verify tmux is running, then retry",
-                        )
-                        or changed
-                    )
-                    logger.warning(
-                        "lode %s: tmux liveness unknown for pane %s; preserving runner identity",
-                        lode["id"],
-                        pane,
-                    )
-            else:
-                if lode.get("active") or lode.get("pid"):
-                    lode["active"] = False
                     lode["tmux_pane"] = None
                     lode["pid"] = None
-                    changed = True
-                changed = _clear_spawn_refusal(lode) or changed
+                    lode["oom_scope"] = None
+                    lode["spawn_disposition"] = None
+                    if lode.get("state") == "ready":
+                        lode["status"] = (
+                            f"Recorded handoff pane {pane} is gone; "
+                            "waiting for a deliberate handoff"
+                        )
+                    else:
+                        lode["state"] = "error"
+                        lode["status"] = (
+                            f"Recorded runner pane {pane} is gone after server replacement; "
+                            f"inspect with: hop lode status {lode['id']} before starting "
+                            "another runner"
+                        )
+                else:
+                    self._gate_unknown_startup_lode(lode)
+            else:
+                no_runner_identity = not generation and pane is None and lode.get("pid") is None
+                intentionally_new = lode.get("state") == "new" and no_runner_identity
+                bounded_ready = lode.get("state") == "ready" and no_runner_identity
+                if not intentionally_new and not bounded_ready:
+                    self._gate_unknown_startup_lode(lode)
+                if pane is None and not generation:
+                    lode["pid"] = None
+
+            if lode != before:
+                touch(lode)
+                changed = True
 
         if changed:
             save_lodes(self.lodes)
+
+    @staticmethod
+    def _gate_unknown_startup_lode(lode: dict) -> None:
+        """Persist inspection-only authority when pane liveness is unknowable."""
+        lode["state"] = "gated"
+        lode["spawn_disposition"] = "unknown"
+        lode["status"] = (
+            "Runner pane liveness is unverified after server replacement; inspect with: "
+            f"tmux list-panes -a and hop lode status {lode['id']}. Do not restart."
+        )
 
     def _consume_failed_oom_units(self) -> None:
         """Consume retained failed scope evidence before startup reconciliation."""
@@ -4124,26 +4211,86 @@ class Server:
         lode: dict,
         project_path: str | None,
         *,
+        pending_state: str | None = None,
         foreground: bool = False,
         spawn_updates: dict | None = None,
         pre_spawn: Callable[[], None] | None = None,
         allow_terminal_recovery: bool = False,
     ) -> tuple[SpawnOutcome, str | None]:
-        """Spawn a runner only when its recorded pane is absent or gone."""
+        """Spawn only from authoritative pane evidence and persist its disposition."""
+        if pending_state is None:
+            pending_state = "new" if lode.get("state") == "new" else "ready"
+        if pending_state not in {"new", "ready"}:
+            raise ValueError("ordinary spawn pending state must be new or ready")
+
+        def persist_outcome(outcome: SpawnOutcome, pane_id: str | None = None) -> None:
+            lode["active"] = False
+            lode["spawn_disposition"] = outcome.value
+            if outcome is SpawnOutcome.SPAWNED:
+                if not terminal_recovery:
+                    lode["state"] = pending_state
+                    if pending_state == "new":
+                        lode["status"] = (
+                            f"Runner pane {pane_id} created; waiting for startup registration"
+                        )
+                    else:
+                        lode["status"] = (
+                            f"Runner pane {pane_id} created; waiting for handoff registration"
+                        )
+                lode["tmux_pane"] = pane_id
+            elif outcome is SpawnOutcome.PROJECT_MISSING:
+                project = lode.get("project", "")
+                lode["state"] = "error"
+                lode["status"] = (
+                    f"Project '{project}' is unavailable; restore its registration/path, "
+                    f"then run: hop lode restart {lode['id']}."
+                )
+            elif outcome is SpawnOutcome.ALREADY_LIVE:
+                lode["state"] = "gated"
+                lode["status"] = (
+                    f"Runner pane {pane_id} is already live; attach with: "
+                    f"hop lode peek {lode['id']}. No new pane was started."
+                )
+            elif outcome is SpawnOutcome.PROVEN_NO_PANE:
+                lode["state"] = "error"
+                lode["status"] = (
+                    "tmux did not create a runner pane; repair or start tmux, then run: "
+                    f"hop lode restart {lode['id']}."
+                )
+                lode["run_generation"] = None
+                lode["oom_scope"] = None
+                lode["tmux_pane"] = None
+                lode["pid"] = None
+            else:
+                lode["state"] = "gated"
+                lode["status"] = (
+                    "Runner pane creation is unverified and a pane may be live; inspect with: "
+                    f"tmux list-panes -a and hop lode status {lode['id']}. "
+                    "Do not launch another runner."
+                )
+            touch(lode)
+            save_lodes(self.lodes)
+            _log_state_change(lode["id"], lode["state"], lode["status"], "spawn")
+            self.broadcast({"type": "lode_updated", "lode": lode})
+
         generation = lode.get("run_generation")
         if self._lode_has_pending_action(lode["id"]):
             logger.warning("lode %s: spawn suppressed by accepted action", lode["id"])
-            return SpawnOutcome.FAILED, None
+            return SpawnOutcome.UNKNOWN, None
         if generation and (lode["id"], generation) in self.pending_disconnects:
             logger.warning("lode %s: spawn suppressed while scope result is pending", lode["id"])
-            return SpawnOutcome.FAILED, None
+            return SpawnOutcome.UNKNOWN, None
         terminal_recovery = is_terminal_failure_kind(lode.get("failure_kind"))
         if terminal_recovery and not allow_terminal_recovery:
             logger.warning("lode %s: automatic spawn suppressed by terminal failure", lode["id"])
-            return SpawnOutcome.FAILED, None
+            return SpawnOutcome.UNKNOWN, None
 
         pane = lode.get("tmux_pane")
         if pane:
+            if re.fullmatch(r"%[0-9]+", pane) is None:
+                logger.warning("lode %s: recorded pane identity is malformed", lode["id"])
+                persist_outcome(SpawnOutcome.UNKNOWN, pane)
+                return SpawnOutcome.UNKNOWN, None
             liveness = pane_liveness(pane)
             if liveness is Liveness.ALIVE:
                 logger.warning(
@@ -4151,12 +4298,7 @@ class Server:
                     lode["id"],
                     pane,
                 )
-                if _set_spawn_refusal(
-                    lode,
-                    f"runner already live in pane {pane} — attach instead",
-                ):
-                    save_lodes(self.lodes)
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                persist_outcome(SpawnOutcome.ALREADY_LIVE, pane)
                 return SpawnOutcome.ALREADY_LIVE, None
             if liveness is Liveness.UNKNOWN:
                 logger.warning(
@@ -4164,27 +4306,32 @@ class Server:
                     lode["id"],
                     pane,
                 )
-                if _set_spawn_refusal(
-                    lode,
-                    "tmux unreachable — verify tmux is running, then retry",
-                ):
-                    save_lodes(self.lodes)
-                    self.broadcast({"type": "lode_updated", "lode": lode})
-                return SpawnOutcome.REFUSED_UNKNOWN, None
+                persist_outcome(SpawnOutcome.UNKNOWN, pane)
+                return SpawnOutcome.UNKNOWN, None
+            lode["run_generation"] = None
+            lode["oom_scope"] = None
+            lode["tmux_pane"] = None
+            lode["pid"] = None
+        elif generation and terminal_recovery and allow_terminal_recovery:
+            lode["run_generation"] = None
+            lode["oom_scope"] = None
+        elif generation:
+            logger.warning("lode %s: generation exists without a pane identity", lode["id"])
+            persist_outcome(SpawnOutcome.UNKNOWN)
+            return SpawnOutcome.UNKNOWN, None
 
-        prior_lode = copy.deepcopy(lode)
+        if project_path is None:
+            persist_outcome(SpawnOutcome.PROJECT_MISSING)
+            return SpawnOutcome.PROJECT_MISSING, None
+
         lode["active"] = False
         lode["tmux_pane"] = None
         lode["pid"] = None
         _clear_spawn_refusal(lode)
         if spawn_updates:
-            updates = dict(spawn_updates)
-            if terminal_recovery:
-                for field in ("state", "status", "failure_kind"):
-                    updates.pop(field, None)
-            lode.update(updates)
-            if "state" in updates:
-                _log_state_change(lode["id"], updates["state"], updates.get("status", ""), "spawn")
+            lode.update(spawn_updates)
+        if not terminal_recovery:
+            lode["state"] = pending_state
         run_generation = uuid.uuid4().hex
         lode["run_generation"] = run_generation
         lode["oom_scope"] = (
@@ -4195,44 +4342,23 @@ class Server:
         if pre_spawn:
             pre_spawn()
 
-        launch_error = None
-        try:
-            pane_env = {RUN_GENERATION_ENV: run_generation}
-            if lode.get("oom_scope"):
-                pane_env[OOM_SCOPE_ENV] = lode["oom_scope"]
-            pane_id = spawn_claude(
-                lode["id"],
-                project_path,
-                foreground=foreground,
-                env=pane_env,
-            )
-        except OSError as error:
-            logger.error("lode %s: failed to create tmux runner pane: %s", lode["id"], error)
-            launch_error = error
-            pane_id = None
-        if not pane_id:
-            if launch_error is None:
-                logger.error("lode %s: failed to create tmux runner pane", lode["id"])
-            lode.clear()
-            lode.update(prior_lode)
-            lode["active"] = False
-            lode["tmux_pane"] = None
-            lode["pid"] = None
-            if not terminal_recovery:
-                lode["status"] = format_refusal_status(
-                    "spawn_failed",
-                    "tmux could not create a runner pane — verify tmux is running, then retry",
-                )
-            touch(lode)
-            save_lodes(self.lodes)
-            self.broadcast({"type": "lode_updated", "lode": lode})
-            return SpawnOutcome.FAILED, None
-
-        lode["tmux_pane"] = pane_id
-        touch(lode)
-        save_lodes(self.lodes)
-        self.broadcast({"type": "lode_updated", "lode": lode})
-        return SpawnOutcome.SPAWNED, pane_id
+        pane_env = {RUN_GENERATION_ENV: run_generation}
+        if lode.get("oom_scope"):
+            pane_env[OOM_SCOPE_ENV] = lode["oom_scope"]
+        window_outcome, pane_id = spawn_claude(
+            lode["id"],
+            project_path,
+            foreground=foreground,
+            env=pane_env,
+        )
+        if window_outcome is WindowSpawnOutcome.SPAWNED:
+            outcome = SpawnOutcome.SPAWNED
+        elif window_outcome is WindowSpawnOutcome.PROVEN_NO_PANE:
+            outcome = SpawnOutcome.PROVEN_NO_PANE
+        else:
+            outcome = SpawnOutcome.UNKNOWN
+        persist_outcome(outcome, pane_id)
+        return outcome, pane_id if outcome is SpawnOutcome.SPAWNED else None
 
     def start(self) -> None:
         """Start the server (blocking)."""
@@ -4559,6 +4685,11 @@ class Server:
         lode = self._find_lode(lode_id)
         if not lode or run_generation != lode.get("run_generation"):
             return False
+        registration_grace = (
+            lode.get("active") is False
+            and lode.get("pending_action") is None
+            and lode.get("state") in {"new", "ready", "reconnecting"}
+        )
         terminal_recovery = is_terminal_failure_kind(lode.get("failure_kind"))
         if terminal_recovery and (not tmux_pane or tmux_pane != lode.get("tmux_pane")):
             return False
@@ -4597,18 +4728,26 @@ class Server:
         self.client_lodes[conn] = lode_id
         self.client_generations[conn] = run_generation
 
-        # Set active on the lode
-        lode["active"] = True
         if tmux_pane:
             lode["tmux_pane"] = tmux_pane
         if pid:
             lode["pid"] = pid
-        _clear_spawn_refusal(lode)
-        if terminal_recovery:
-            lode["failure_kind"] = None
+        _clear_spawn_refusal(
+            lode,
+            clear_status=registration_grace or terminal_recovery,
+        )
+        lode.pop("reconnect_prior_state", None)
+        lode.pop("reconnect_prior_status", None)
+        if terminal_recovery or registration_grace:
+            if terminal_recovery:
+                lode["failure_kind"] = None
             lode["state"] = "running"
             lode["status"] = f"Starting {lode.get('stage', '')}"
-            _log_state_change(lode_id, "running", lode["status"], "register_recovery")
+            cause = "register_recovery" if terminal_recovery else "register_grace"
+            _log_state_change(lode_id, "running", lode["status"], cause)
+        # Write active only after any eligible state transition, so new/active=True
+        # and ready/active=True cannot be observed even through shared references.
+        lode["active"] = True
         touch(lode)
         save_lodes(self.lodes)
         self.broadcast({"type": "lode_updated", "lode": lode})
@@ -4667,7 +4806,7 @@ class Server:
         remove_backlog_item(self.backlog, item.id)
         self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
         project_path = proj.path if proj else None
-        self._gated_spawn(lode, project_path, foreground=False)
+        self._gated_spawn(lode, project_path, pending_state="new", foreground=False)
         return lode
 
     def _handle_lode_run_result(self, message: dict, conn: socket.socket | None) -> None:
@@ -4778,14 +4917,6 @@ class Server:
                 )
 
         lode_id = message.get("lode_id")
-        if (
-            msg_type == "lode_set_state"
-            and message.get("state") == "teardown"
-            and (not isinstance(lode_id, str) or not _pending_action_file_exists(lode_id))
-        ):
-            logger.warning("Refusing teardown projection without pending action lode=%s", lode_id)
-            acknowledge_mutation(False, "teardown_requires_pending_completion")
-            return
         if msg_type in RUNNER_MUTATION_TYPES and msg_type != "lode_action":
             lode = self._find_lode(lode_id) if lode_id else None
             if not self._runner_generation_matches(lode, message):
@@ -4841,6 +4972,9 @@ class Server:
                 )
                 acknowledge_mutation(False, "terminal_failure")
                 return
+            if msg_type in HELD_RUNNER_MUTATION_TYPES and _lifecycle_grace_pending(lode):
+                acknowledge_mutation(False, "lifecycle_grace_pending")
+                return
             if msg_type not in {"lode_register", "lode_supervisor_register", "lode_set_state"}:
                 acknowledge_mutation(True, "accepted")
 
@@ -4874,20 +5008,26 @@ class Server:
                     )
                 return
 
-            matches = find_lodes_by_prefix(self.lodes + self.archived_lodes, prefix)
+            matches = _collapse_lode_snapshot_matches(
+                [(lode, False) for lode in find_lodes_by_prefix(self.lodes, prefix)]
+                + [(lode, True) for lode in find_lodes_by_prefix(self.archived_lodes, prefix)]
+            )
             if not matches:
                 response = {"type": "lode_snapshot", "result": "absent"}
             elif len(matches) == 1:
+                lode, archived = matches[0]
+                snapshot = dict(lode)
+                snapshot["archived"] = archived
                 response = {
                     "type": "lode_snapshot",
                     "result": "found",
-                    "lode": dict(matches[0]),
+                    "lode": snapshot,
                 }
             else:
                 response = {
                     "type": "lode_snapshot",
                     "result": "ambiguous",
-                    "matches": [match["id"] for match in matches],
+                    "matches": [lode["id"] for lode, _archived in matches],
                 }
             if conn:
                 self._send_response(conn, response)
@@ -4965,7 +5105,7 @@ class Server:
             # Auto-spawn if requested
             if message.get("spawn"):
                 project_path = proj.path if proj else None
-                self._gated_spawn(lode, project_path, foreground=False)
+                self._gated_spawn(lode, project_path, pending_state="new", foreground=False)
 
         elif msg_type == "lode_set_stage":
             lode_id = message.get("lode_id")
@@ -5008,39 +5148,18 @@ class Server:
                     )
                 return
             project = find_project(lode.get("project", ""))
-            if not project:
-                if conn:
-                    self._send_response(
-                        conn,
-                        {
-                            "type": "error",
-                            "error": f"project {lode.get('project', '')} not found",
-                        },
-                    )
-                return
             outcome, pane_id = self._gated_spawn(
                 lode,
-                project.path,
+                project.path if project else None,
+                pending_state="ready",
                 foreground=False,
-                spawn_updates={"state": "running", "status": f"Resuming {stage}"},
                 allow_terminal_recovery=True,
             )
             if outcome is not SpawnOutcome.SPAWNED:
                 if conn:
-                    if outcome is SpawnOutcome.ALREADY_LIVE:
-                        error = (
-                            f"lode {lode_id} already has a live runner; attach instead of spawning"
-                        )
-                    elif outcome is SpawnOutcome.REFUSED_UNKNOWN:
-                        error = (
-                            f"lode {lode_id} spawn refused because tmux is unreachable; "
-                            "verify tmux is running, then retry"
-                        )
-                    else:
-                        error = "failed to resume claude pane; verify tmux is running, then retry"
                     self._send_response(
                         conn,
-                        {"type": "error", "error": error},
+                        {"type": "error", "error": lode.get("status", "spawn unavailable")},
                     )
                 return
             if conn:
@@ -5078,6 +5197,7 @@ class Server:
                         self._gated_spawn(
                             lode,
                             project_path,
+                            pending_state=("new" if lode.get("state") == "new" else "ready"),
                             foreground=message.get("foreground", False),
                         )
 
@@ -5090,6 +5210,7 @@ class Server:
                 self._gated_spawn(
                     lode,
                     project_path,
+                    pending_state=("new" if lode.get("state") == "new" else "ready"),
                     foreground=message.get("foreground", False),
                 )
 
@@ -5097,6 +5218,14 @@ class Server:
             lode_id = message.get("lode_id")
             state = message.get("state")
             status = message.get("status", "")
+            if state == "teardown" and (
+                not isinstance(lode_id, str) or not _pending_action_file_exists(lode_id)
+            ):
+                logger.warning(
+                    "Refusing teardown projection without pending action lode=%s", lode_id
+                )
+                acknowledge_mutation(False, "teardown_requires_pending_completion")
+                return
             if state not in SUPPORTED_LODE_STATES:
                 logger.warning("Refusing unsupported lode state lode=%s state=%r", lode_id, state)
                 acknowledge_mutation(False, "unsupported_state")
@@ -5217,11 +5346,10 @@ class Server:
                     outcome, _ = self._gated_spawn(
                         lode,
                         project_path,
+                        pending_state="ready",
                         foreground=False,
                         spawn_updates={
                             "stage": "refine",
-                            "state": "running",
-                            "status": "Resuming refine",
                         },
                     )
                     if outcome is SpawnOutcome.SPAWNED:

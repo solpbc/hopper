@@ -3,6 +3,7 @@
 
 """Tests for tmux interaction utilities."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +12,7 @@ from hopper import actions
 from hopper.tmux import (
     Liveness,
     PanePhase,
+    WindowSpawnOutcome,
     bootstrap_spawn_receipt,
     capture_pane,
     classify_pane_phase,
@@ -22,6 +24,7 @@ from hopper.tmux import (
     is_inside_tmux,
     is_tmux_server_running,
     kill_pane,
+    new_window,
     pane_answer_choices,
     pane_identity,
     pane_liveness,
@@ -32,6 +35,127 @@ from hopper.tmux import (
     rename_window,
     send_keys,
 )
+
+
+def _tmux_result(returncode=0, stdout="", stderr=""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (_tmux_result(stdout="%17\n"), (WindowSpawnOutcome.SPAWNED, "%17")),
+        (_tmux_result(stdout=""), (WindowSpawnOutcome.UNKNOWN, None)),
+        (_tmux_result(stdout="pane-17\n"), (WindowSpawnOutcome.UNKNOWN, None)),
+        (_tmux_result(stdout="%17 extra\n"), (WindowSpawnOutcome.UNKNOWN, None)),
+        (_tmux_result(returncode=1, stderr="no server"), (WindowSpawnOutcome.PROVEN_NO_PANE, None)),
+        (FileNotFoundError("tmux"), (WindowSpawnOutcome.PROVEN_NO_PANE, None)),
+        (PermissionError("tmux"), (WindowSpawnOutcome.UNKNOWN, None)),
+    ],
+    ids=[
+        "well-formed-pane",
+        "empty-identity",
+        "malformed-identity",
+        "multiple-fields",
+        "tmux-refused",
+        "tmux-absent",
+        "execution-unknown",
+    ],
+)
+def test_new_window_ordinary_tri_state_matrix(result, expected):
+    with patch("hopper.tmux.subprocess.run", side_effect=[result]):
+        assert new_window("hop process abc12345", background=True) == expected
+
+
+def test_new_window_lost_identity_never_proves_live_pane_absent():
+    pane_created = False
+
+    def create_without_reporting_identity(*args, **kwargs):
+        nonlocal pane_created
+        pane_created = True
+        return _tmux_result(stdout="")
+
+    with patch("hopper.tmux.subprocess.run", side_effect=create_without_reporting_identity):
+        outcome = new_window("hop process abc12345", background=True)
+
+    assert pane_created is True
+    assert outcome == (WindowSpawnOutcome.UNKNOWN, None)
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        (
+            [_tmux_result(returncode=1, stderr="lock refused")],
+            (WindowSpawnOutcome.UNKNOWN, None),
+        ),
+        ([FileNotFoundError("tmux")], (WindowSpawnOutcome.UNKNOWN, None)),
+        (
+            [_tmux_result(), _tmux_result(returncode=1), _tmux_result()],
+            (WindowSpawnOutcome.PROVEN_NO_PANE, None),
+        ),
+        (
+            [_tmux_result(), _tmux_result(stdout=""), _tmux_result()],
+            (WindowSpawnOutcome.UNKNOWN, None),
+        ),
+        (
+            [
+                _tmux_result(),
+                _tmux_result(stdout="%9\n"),
+                _tmux_result(returncode=1, stderr="wait failed"),
+                _tmux_result(),
+            ],
+            (WindowSpawnOutcome.UNKNOWN, None),
+        ),
+        (
+            [
+                _tmux_result(),
+                _tmux_result(stdout="%9\n"),
+                OSError("wait broke"),
+                _tmux_result(),
+            ],
+            (WindowSpawnOutcome.UNKNOWN, None),
+        ),
+        (
+            [
+                _tmux_result(),
+                _tmux_result(stdout="%9\n"),
+                _tmux_result(),
+                _tmux_result(returncode=1, stderr="unlock failed"),
+            ],
+            (WindowSpawnOutcome.UNKNOWN, None),
+        ),
+        (
+            [
+                _tmux_result(),
+                _tmux_result(stdout="%9\n"),
+                _tmux_result(),
+                _tmux_result(),
+            ],
+            (WindowSpawnOutcome.SPAWNED, "%9"),
+        ),
+    ],
+    ids=[
+        "lock-refused",
+        "lock-command-absent",
+        "new-window-refused",
+        "identity-lost",
+        "wait-refused",
+        "wait-oserror",
+        "unlock-refused",
+        "receipt-complete",
+    ],
+)
+def test_new_window_receipt_tri_state_matrix(tmp_path, results, expected):
+    receipt = {
+        "path": str(tmp_path / "receipt.json"),
+        "action_id": "a" * 32,
+        "source_lode_id": "abcd2345",
+        "target_lode_id": "bcde2345",
+        "target_generation": "b" * 32,
+    }
+    with patch("hopper.tmux.subprocess.run", side_effect=results):
+        assert new_window("hop process bcde2345", spawn_receipt=receipt) == expected
 
 
 def test_spawn_bootstrap_tags_exact_pane_before_durable_receipt(tmp_path, monkeypatch):

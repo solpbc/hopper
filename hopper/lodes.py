@@ -399,6 +399,7 @@ def create_lode(
         "run_generation": None,
         "oom_scope": None,
         "failure_kind": None,
+        "spawn_disposition": None,
         "archive_action_id": None,
         "codex_thread_id": None,
         "last_progress_at": None,
@@ -531,6 +532,7 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
         if lode["id"] == lode_id:
             lode["state"] = state
             lode["status"] = status
+            lode["spawn_disposition"] = None
             # Record run timing
             stage = lode.get("stage", "")
             if stage in ("mill", "refine", "ship"):
@@ -755,7 +757,7 @@ def lode_icon(lode: dict) -> str:
         icon = STATUS_TEARDOWN
     elif stage == "shipped":
         icon = STATUS_SHIPPED
-    elif state == "new":
+    elif state in {"new", "reconnecting"}:
         icon = STATUS_NEW
     elif state == "error":
         icon = STATUS_ERROR
@@ -765,6 +767,15 @@ def lode_icon(lode: dict) -> str:
         icon = STATUS_STUCK
     else:
         icon = STATUS_RUNNING
-    if not lode.get("active", False) and stage != "shipped" and state not in {"gated", "teardown"}:
+    if (
+        not lode.get("active", False)
+        and stage != "shipped"
+        and state
+        not in {
+            "gated",
+            "reconnecting",
+            "teardown",
+        }
+    ):
         icon = STATUS_DISCONNECTED
     return icon

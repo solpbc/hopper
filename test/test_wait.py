@@ -8,11 +8,12 @@ import json
 import threading
 from collections import deque
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import hopper.wait as wait
+from hopper import actions
 from hopper.lodes import PARK_PANE_GONE_STATUS, format_park_status, format_terminal_failure_status
 from hopper.tmux import Liveness
 
@@ -51,9 +52,32 @@ def snapshot(lid="abc123", **overrides):
         "state": "running",
         "status": "Working",
         "active": True,
+        "archived": False,
         "title": "",
         **overrides,
     }
+
+
+def pending_action_projection(phase: str, *, recovery_command: str | None = None) -> dict:
+    record = actions.new_pending_action(
+        lode_id="abcd2345",
+        stage="mill",
+        expected_generation=None,
+        action_type="restart",
+        target_disposition="replacement_spawned",
+        force_consent=True,
+        action_id="a" * 32,
+        accepted_ms=1_000,
+        already_empty=True,
+    )
+    record["phase"] = phase
+    if recovery_command is not None:
+        record["recovery"] = {
+            "kind": "spawn",
+            "message": "durable action requires attention",
+            "command": recovery_command,
+        }
+    return actions.pending_action_projection(record)
 
 
 def run_local_wait(
@@ -93,7 +117,7 @@ def run_local_wait(
             last = current
         return last
 
-    monkeypatch.setattr(wait, "read_local_snapshot", read_snapshot)
+    monkeypatch.setattr(wait.client, "read_lode_snapshot", read_snapshot)
     rc = wait.wait_for_lodes(
         Path("server.sock"),
         [initial["id"]],
@@ -213,11 +237,12 @@ def run_remote_wait(
 @pytest.mark.parametrize(
     ("changes", "expected"),
     [
-        ({"state": "error"}, ("error", 1)),
-        ({"state": "gated"}, ("gated", 2)),
-        ({"state": "stuck"}, ("stuck", 3)),
-        ({"stage": "shipped", "active": False}, ("shipped", 0)),
-        ({"active": False}, ("inactive", 1)),
+        ({"state": "error"}, ("error", 1, None)),
+        ({"state": "gated"}, ("gated", 2, None)),
+        ({"state": "stuck"}, ("stuck", 3, None)),
+        ({"stage": "shipped", "active": False}, ("shipped", 0, None)),
+        ({"active": False}, ("inactive", 1, None)),
+        ({"state": "new", "active": False}, None),
         ({"state": "ready", "active": False}, None),
         ({"state": "design"}, None),
         ({"state": "completed", "stage": "refine"}, None),
@@ -252,6 +277,8 @@ def test_json_terminal_records_have_stable_and_additive_fields(
         "status": initial["status"],
         "failure_kind": initial.get("failure_kind"),
         "active": initial["active"],
+        "archived": initial["archived"],
+        "reason": None,
         "source": "local",
         "observed_age_s": 0.0,
         "status_display": initial["status"],
@@ -268,46 +295,197 @@ def test_json_terminal_records_have_stable_and_additive_fields(
         {"id": "abc123", "state": "running", "status": "", "active": True},
         {"id": "abc123", "stage": 1, "state": "running", "status": "", "active": True},
         {"id": "abc123", "stage": "mill", "state": "running", "status": "", "active": 1},
+        {
+            "id": "abc123",
+            "stage": "mill",
+            "state": "running",
+            "status": "",
+            "active": True,
+            "archived": "false",
+        },
     ],
 )
 def test_validate_snapshot_rejects_malformed_or_wrong_lode(raw):
     assert wait.validate_snapshot(raw, "abc123") is None
 
 
-def test_read_local_snapshot_returns_active_lode(monkeypatch):
-    lode = snapshot()
+@pytest.mark.parametrize(
+    ("result", "expected_kind", "expected_payload", "expected_detail"),
+    [
+        (("found", snapshot()), "found", snapshot(), ""),
+        (("absent", None), "absent", None, "local status absent"),
+        (
+            ("unavailable", "server timed out"),
+            "unavailable",
+            None,
+            "local status unavailable: server timed out",
+        ),
+        (
+            ("ambiguous", ["abc123", "abc999"]),
+            "ambiguous",
+            None,
+            "local status ambiguous: abc123, abc999",
+        ),
+    ],
+)
+def test_read_due_locals_uses_one_bounded_snapshot(
+    monkeypatch, result, expected_kind, expected_payload, expected_detail
+):
+    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0)
+    record["reconcile_requested"] = True
+    state = {
+        "condition": threading.Condition(),
+        "records": {"abc123": record},
+        "pending": {"abc123"},
+        "observations": deque(),
+        "poll_s": 30.0,
+        "shutdown": False,
+    }
+    monkeypatch.setattr(wait, "_monotonic", lambda: 12.5)
+    read_snapshot = MagicMock(return_value=result)
+    monkeypatch.setattr(wait.client, "read_lode_snapshot", read_snapshot)
     monkeypatch.setattr(
         wait.client,
-        "connect",
-        lambda *args, **kwargs: {"lode_found": True, "lode": lode},
+        "read_archived_lodes",
+        MagicMock(side_effect=AssertionError("wait must not scan archived lodes")),
+    )
+    monkeypatch.setattr(
+        wait.client,
+        "list_archived_lodes",
+        MagicMock(side_effect=AssertionError("wait must not list archived lodes")),
     )
 
-    assert wait.read_local_snapshot(Path("server.sock"), "abc123") == ("found", lode)
+    wait._read_due_locals(state, Path("server.sock"), 0.0)
 
-
-def test_read_local_snapshot_falls_back_to_archived(monkeypatch):
-    archived = snapshot(stage="shipped", active=False)
-    monkeypatch.setattr(wait.client, "connect", lambda *args, **kwargs: {"lode_found": False})
-    monkeypatch.setattr(wait.client, "read_archived_lodes", lambda *args, **kwargs: [archived])
-
-    assert wait.read_local_snapshot(Path("server.sock"), "abc123") == ("found", archived)
+    read_snapshot.assert_called_once_with(Path("server.sock"), "abc123")
+    observation = state["observations"].popleft()
+    assert observation["kind"] == expected_kind
+    assert observation["payload"] == expected_payload
+    assert observation["detail"] == expected_detail
 
 
 @pytest.mark.parametrize(
-    ("connected", "archived", "expected"),
-    [
-        ({"lode_found": False}, [], "absent"),
-        ({"lode_found": False}, None, "unreadable"),
-        (None, [], "unreadable"),
-    ],
+    "archived",
+    [None, "false", 0, 1],
+    ids=["missing", "string", "zero", "one"],
 )
-def test_read_local_snapshot_distinguishes_absent_from_unreadable(
-    monkeypatch, connected, archived, expected
-):
-    monkeypatch.setattr(wait.client, "connect", lambda *args, **kwargs: connected)
-    monkeypatch.setattr(wait.client, "read_archived_lodes", lambda *args, **kwargs: archived)
+def test_validate_snapshot_requires_boolean_archived(archived):
+    raw = snapshot()
+    if archived is None:
+        raw.pop("archived")
+    else:
+        raw["archived"] = archived
 
-    assert wait.read_local_snapshot(Path("server.sock"), "abc123") == (expected, None)
+    assert wait.validate_snapshot(raw, "abc123") is None
+
+
+@pytest.mark.parametrize("archived", [None, "false"], ids=["missing", "wrong-type"])
+def test_initial_snapshot_with_invalid_archived_is_unavailable(archived, capsys):
+    raw = snapshot()
+    if archived is None:
+        raw.pop("archived")
+    else:
+        raw["archived"] = archived
+
+    result = wait._resolve_targets(
+        Path("server.sock"),
+        ["abc123"],
+        False,
+        resolver=lambda socket_path, lid: {
+            "outcome": "found",
+            "lode": raw,
+            "host": "local",
+            "canonical_id": "abc123",
+            "exit_code": 0,
+        },
+    )
+
+    assert result == 4
+    assert capsys.readouterr().out == "Lode status unavailable for 'abc123'.\n"
+
+
+def test_ambiguous_local_observation_never_reaches_snapshot_validation(monkeypatch):
+    record = wait._new_record("abc123", snapshot(), "local", 0.0, 0)
+    state = {
+        "condition": threading.Condition(),
+        "records": {"abc123": record},
+        "pending": {"abc123"},
+        "observations": deque(
+            [
+                {
+                    "id": "abc123",
+                    "kind": "ambiguous",
+                    "payload": None,
+                    "detail": "local status ambiguous: abc123, abc999",
+                    "failure_key": "ambiguous:abc123, abc999",
+                    "observed_ts": 1.0,
+                }
+            ]
+        ),
+        "poll_s": 30.0,
+    }
+    monkeypatch.setattr(
+        wait,
+        "validate_snapshot",
+        MagicMock(side_effect=AssertionError("ambiguous IDs are diagnostics, not a snapshot")),
+    )
+
+    assert wait._drain_observations(state) == []
+    assert record["consecutive_failures"] == 1
+    assert record["not_found_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["new", "running", "ready", "teardown", "paused", "gated", "stuck", "error", "legacy"],
+)
+def test_archived_non_shipped_state_is_terminal_before_underlying_state(state):
+    archived = snapshot(state=state, active=True, archived=True, status=f"preserved {state}")
+
+    assert wait.classify(archived) == ("archived", 1, "archived_before_shipping")
+
+
+@pytest.mark.parametrize("state", ["error", "gated", "stuck"])
+def test_archived_shipped_state_is_success_before_underlying_state(state):
+    archived = snapshot(stage="shipped", state=state, active=True, archived=True)
+
+    assert wait.classify(archived) == ("shipped", 0, None)
+
+
+def test_archived_before_shipping_renders_preserved_diagnostics(monkeypatch, capsys):
+    archived = snapshot(
+        state="legacy",
+        status="Preserved legacy diagnostic",
+        active=True,
+        archived=True,
+    )
+
+    rc, _, _ = run_local_wait(monkeypatch, archived)
+
+    assert rc == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "✗ abc123 archived before shipping: Preserved legacy diagnostic",
+        (
+            "  stage=mill state=legacy active=True status=Preserved legacy diagnostic "
+            "source=local observed_age_s=0.000"
+        ),
+        "Inspect with: hop lode status abc123",
+        "Recover with: hop lode unarchive abc123",
+    ]
+
+
+def test_archived_before_shipping_json_has_fixed_reason(monkeypatch, capsys):
+    archived = snapshot(state="error", status="Preserved error", archived=True)
+
+    rc, _, _ = run_local_wait(monkeypatch, archived, json_output=True)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "archived"
+    assert payload["reason"] == "archived_before_shipping"
+    assert payload["archived"] is True
+    assert payload["state"] == "error"
+    assert payload["status"] == "Preserved error"
 
 
 def test_initial_local_unavailable_can_resolve_remotely(monkeypatch):
@@ -344,8 +522,38 @@ def test_initial_local_unavailable_surfaces_original_error(monkeypatch, capsys):
         },
     )
 
-    assert records == 2
+    assert records == 4
     assert capsys.readouterr().out == f"{error}\n"
+
+
+def test_initial_unavailable_has_wait_only_status_outcome(monkeypatch, capsys):
+    monkeypatch.setattr(wait, "_resolve_targets", lambda *args, **kwargs: 4)
+
+    rc, _, _ = run_local_wait(monkeypatch, snapshot())
+
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert captured.err == "hop wait: status_unavailable — exited 4\n"
+
+
+def test_initial_unavailable_json_keeps_stdout_clean(capsys):
+    error = "Lode status unavailable for 'abc123'."
+
+    result = wait._resolve_targets(
+        Path("server.sock"),
+        ["abc123"],
+        True,
+        resolver=lambda socket_path, lid: {
+            "outcome": "unavailable",
+            "error": error,
+            "exit_code": 2,
+        },
+    )
+
+    captured = capsys.readouterr()
+    assert result == 4
+    assert captured.out == ""
+    assert captured.err == f"{error}\n"
 
 
 def test_local_event_is_only_a_reconciliation_hint(monkeypatch, capsys):
@@ -403,14 +611,16 @@ def test_reconnect_requests_immediate_authoritative_read(monkeypatch, capsys):
     assert "Recovered ship" not in capsys.readouterr().out
 
 
-def test_later_inactive_snapshot_exits_with_recovery_guidance(monkeypatch, capsys):
+def test_later_inactive_snapshot_requires_inspection_before_runner_launch(monkeypatch, capsys):
     inactive = snapshot(state="paused", status="Stopped", active=False)
     rc, _, _ = run_local_wait(monkeypatch, snapshot(), [("found", inactive)])
 
     assert rc == 1
     out = capsys.readouterr().out
     assert "state=paused active=False status=Stopped" in out
-    assert "hop lode resume abc123 or hop lode restart abc123" in out
+    assert "Inspect with: hop lode status abc123" in out
+    assert "Do not start another runner until pane absence is proved." in out
+    assert "restart" not in out.lower()
 
 
 def test_initial_ready_inactive_handoff_waits_for_shipped(monkeypatch, capsys):
@@ -516,6 +726,8 @@ def test_not_found_streak_resets_on_observer_failure(monkeypatch, capsys):
         ({"id": "abc123"}, "found"),
         (snapshot(stage=1), "found"),
         (snapshot(active="yes"), "found"),
+        ({key: value for key, value in snapshot().items() if key != "archived"}, "found"),
+        (snapshot(archived="false"), "found"),
         (snapshot(lid="wrong"), "found"),
         RuntimeError("injected observer failure"),
     ],
@@ -526,6 +738,8 @@ def test_not_found_streak_resets_on_observer_failure(monkeypatch, capsys):
         "missing-fields",
         "wrong-string-type",
         "wrong-bool-type",
+        "missing-archived",
+        "wrong-archived-type",
         "wrong-id",
         "unexpected-exception",
     ],
@@ -589,7 +803,7 @@ def test_healthy_snapshots_outlive_observer_timeout(monkeypatch, capsys):
 
 
 def test_observer_timeout_precedes_unlimited_overall_timeout(monkeypatch, capsys):
-    failure = ("unreadable", None)
+    failure = ("unavailable", "server timed out")
     rc, clock, _ = run_local_wait(
         monkeypatch,
         snapshot(),
@@ -607,7 +821,7 @@ def test_shorter_overall_timeout_wins_observer_timeout(monkeypatch, capsys):
     rc, clock, _ = run_local_wait(
         monkeypatch,
         snapshot(),
-        [("unreadable", None)],
+        [("unavailable", "server timed out")],
         timeout_s=5,
         observer_timeout_s=45,
         json_output=True,
@@ -619,7 +833,7 @@ def test_shorter_overall_timeout_wins_observer_timeout(monkeypatch, capsys):
 
 
 def test_disabled_observer_timeout_retries_until_overall_timeout(monkeypatch, capsys):
-    failure = ("unreadable", None)
+    failure = ("unavailable", "server timed out")
     rc, clock, _ = run_local_wait(
         monkeypatch,
         snapshot(),
@@ -642,6 +856,355 @@ def test_initial_stuck_uses_grace_and_authoritative_confirmation(monkeypatch, ca
     assert rc == 3
     assert clock.now == 120
     assert "abc123 stuck: No output" in capsys.readouterr().out
+
+
+def test_initial_new_uses_shared_grace_and_authoritative_confirmation(monkeypatch, capsys):
+    starting = snapshot(state="new", active=False, status="Waiting for registration")
+    rc, clock, _ = run_local_wait(
+        monkeypatch,
+        starting,
+        [("found", starting), ("found", starting)],
+    )
+
+    assert rc == 1
+    assert clock.now == 120
+    captured = capsys.readouterr()
+    assert "startup registration stalled" in captured.out
+    assert "hop wait: abc123 startup_stalled — exited 1" in captured.err
+
+
+def test_reconnecting_uses_shared_grace_and_authoritative_confirmation(monkeypatch, capsys):
+    reconnecting = snapshot(
+        state="reconnecting",
+        active=False,
+        status="Waiting for runner registration",
+    )
+    rc, clock, _ = run_local_wait(
+        monkeypatch,
+        reconnecting,
+        [("found", reconnecting), ("found", reconnecting)],
+        json_output=True,
+    )
+
+    assert rc == 1
+    assert clock.now == 120
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "reconnect_stalled"
+    assert payload["reason"] == "runner_reregistration_stalled"
+
+
+def test_reconnect_stalled_human_output_is_inspection_only(monkeypatch, capsys):
+    reconnecting = snapshot(
+        state="reconnecting",
+        active=False,
+        status="Runner pane %8 survived server replacement; waiting for registration",
+        tmux_pane="%8",
+    )
+
+    rc, _, _ = run_local_wait(
+        monkeypatch,
+        reconnecting,
+        [("found", reconnecting), ("found", reconnecting)],
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "runner reregistration stalled" in output
+    assert "Inspect with: hop lode status abc123" in output
+    assert "Inspect pane with: hop lode peek abc123" in output
+    assert "Do not start another runner until pane absence is proved." in output
+    assert "restart" not in output.lower()
+
+
+def test_shared_grace_away_and_back_gets_fresh_origin(monkeypatch, capsys):
+    starting = snapshot(state="new", active=False, status="Waiting for registration")
+    running = snapshot(state="running", active=True, status="Connected")
+    rc, clock, _ = run_local_wait(
+        monkeypatch,
+        starting,
+        [
+            ("found", running),
+            ("found", starting),
+            ("found", starting),
+            ("found", starting),
+            ("found", starting),
+            ("found", starting),
+        ],
+    )
+
+    assert rc == 1
+    assert clock.now == 150
+    assert "startup registration stalled" in capsys.readouterr().out
+
+
+def test_confirmed_stuck_still_beats_expired_observer_deadline():
+    record = wait._new_record("abc123", snapshot(state="stuck"), "local", 0, 0)
+    record["grace"].update(recheck_pending=True, confirmed=True)
+    state = {
+        "pending": {"abc123"},
+        "records": {"abc123": record},
+        "observer_timeout_s": 45,
+        "overall_deadline": None,
+    }
+
+    outcomes = wait._collect_boundary_outcomes(state, 120)
+
+    assert [(item["outcome"], item["code"]) for item in outcomes] == [("stuck", 3)]
+
+
+def test_inactive_ready_uses_handoff_grace(monkeypatch, capsys):
+    ready = snapshot(state="ready", active=False, status="Waiting for successor")
+    rc, clock, _ = run_local_wait(monkeypatch, ready, [("found", ready), ("found", ready)])
+
+    assert rc == 1
+    assert clock.now == 120
+    captured = capsys.readouterr()
+    assert "ready handoff stalled" in captured.out
+    assert "hop wait: abc123 handoff_stalled — exited 1" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("phase", "category"),
+    [
+        (
+            phase,
+            "blocked"
+            if phase.endswith("_blocked")
+            else "spawning"
+            if phase == "spawning"
+            else "pending",
+        )
+        for phase in sorted(actions.PHASES)
+    ],
+)
+def test_every_valid_action_phase_has_one_wait_boundary(phase, category):
+    pending_action = pending_action_projection(
+        phase,
+        recovery_command="hop lode restart abcd2345" if category == "blocked" else None,
+    )
+    current = snapshot(
+        lid="abcd2345",
+        state="teardown",
+        active=False,
+        pending_action=pending_action,
+    )
+    record = wait._new_record("abcd2345", current, "local", 0, 0)
+    state = {
+        "pending": {"abcd2345"},
+        "records": {"abcd2345": record},
+        "observer_timeout_s": 300,
+        "overall_deadline": None,
+    }
+
+    outcomes = wait._collect_boundary_outcomes(state, 0)
+
+    assert wait.classify(current) is None
+    if category == "blocked":
+        assert [(item["outcome"], item["code"]) for item in outcomes] == [("action_blocked", 2)]
+        assert record["grace"] is None
+    elif category == "spawning":
+        assert outcomes == []
+        assert record["grace"]["kind"] == "action_spawn"
+    else:
+        assert outcomes == []
+        assert record["grace"] is None
+
+
+@pytest.mark.parametrize("action_type", ["invalid", "legacy-v1"])
+def test_structured_startup_action_projection_is_blocked(action_type):
+    current = snapshot(
+        state="teardown",
+        active=False,
+        pending_action={"phase": "blocked", "action_type": action_type, "status": "Blocked"},
+    )
+    record = wait._new_record("abc123", current, "local", 0, 0)
+    state = {
+        "pending": {"abc123"},
+        "records": {"abc123": record},
+        "observer_timeout_s": 300,
+        "overall_deadline": None,
+    }
+
+    outcomes = wait._collect_boundary_outcomes(state, 0)
+
+    assert [(item["outcome"], item["code"], item["reason"]) for item in outcomes] == [
+        ("action_blocked", 2, "durable_action_blocked")
+    ]
+
+
+def test_any_pending_action_excludes_handoff_and_generic_inactive():
+    current = snapshot(
+        state="paused",
+        active=False,
+        pending_action=pending_action_projection("accepted"),
+    )
+
+    assert wait.classify(current) is None
+    assert wait._snapshot_grace_kind(current) is None
+
+
+def test_action_spawn_grace_origin_ignores_projection_churn(monkeypatch, capsys):
+    first = pending_action_projection("spawning")
+    second = copy.deepcopy(first)
+    second.update(status="pane reported", containment={"state": "proven"})
+    third = copy.deepcopy(second)
+    third.update(
+        status="worker registration observed",
+        recovery={"kind": "spawn", "message": "still adopting", "command": "inspect"},
+    )
+    initial = snapshot(lid="abcd2345", state="teardown", active=False, pending_action=first)
+    observed = snapshot(lid="abcd2345", state="teardown", active=False, pending_action=second)
+    confirmed = snapshot(lid="abcd2345", state="teardown", active=False, pending_action=third)
+
+    rc, clock, _ = run_local_wait(
+        monkeypatch,
+        initial,
+        [("found", observed), ("found", confirmed)],
+        json_output=True,
+    )
+
+    assert rc == 2
+    assert clock.now == 120
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "action_stalled"
+    assert payload["reason"] == "successor_adoption_stalled"
+
+
+def test_action_spawn_grace_leaving_and_reentering_gets_fresh_origin(monkeypatch, capsys):
+    spawning = snapshot(
+        lid="abcd2345",
+        state="teardown",
+        active=False,
+        pending_action=pending_action_projection("spawning"),
+    )
+    publishing = snapshot(
+        lid="abcd2345",
+        state="teardown",
+        active=False,
+        pending_action=pending_action_projection("publishing_terminal"),
+    )
+
+    rc, clock, _ = run_local_wait(
+        monkeypatch,
+        spawning,
+        [
+            ("found", publishing),
+            ("found", spawning),
+            ("found", spawning),
+            ("found", spawning),
+            ("found", spawning),
+            ("found", spawning),
+        ],
+        json_output=True,
+    )
+
+    assert rc == 2
+    assert clock.now == 150
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "action_stalled"
+    assert payload["reason"] == "successor_adoption_stalled"
+
+
+def test_action_blocked_uses_structured_recovery_command(monkeypatch, capsys):
+    command = "hop lode restart abcd2345 --force"
+    blocked = snapshot(
+        lid="abcd2345",
+        state="teardown",
+        active=False,
+        pending_action=pending_action_projection("cleanup_blocked", recovery_command=command),
+    )
+
+    rc, _, _ = run_local_wait(monkeypatch, blocked)
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "action blocked" in captured.out
+    assert f"Recover with: {command}" in captured.out
+    assert "hop wait: abcd2345 action_blocked — exited 2" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"archived": True}, ("archived", 1)),
+        ({"state": "error"}, ("error", 1)),
+        ({"state": "gated"}, ("gated", 2)),
+    ],
+)
+def test_storage_error_and_gate_precede_action_attention(changes, expected):
+    current = snapshot(
+        **{
+            "state": "teardown",
+            "active": False,
+            "pending_action": pending_action_projection(
+                "cleanup_blocked", recovery_command="hop lode restart abcd2345"
+            ),
+            **changes,
+        }
+    )
+    record = wait._new_record("abc123", current, "local", 0, 0)
+    state = {
+        "pending": {"abc123"},
+        "records": {"abc123": record},
+        "observer_timeout_s": 300,
+        "overall_deadline": None,
+    }
+
+    outcomes = wait._collect_boundary_outcomes(state, 0)
+
+    assert [(item["outcome"], item["code"]) for item in outcomes] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("observer_timeout_s", "overall_deadline", "expected"),
+    [
+        (45, None, "observer_unavailable"),
+        (0, 30, "timeout"),
+    ],
+)
+def test_shorter_deadline_precedes_confirmed_action_spawn_grace(
+    observer_timeout_s, overall_deadline, expected
+):
+    current = snapshot(
+        state="teardown",
+        active=False,
+        pending_action=pending_action_projection("spawning"),
+    )
+    record = wait._new_record("abc123", current, "local", 0, 0)
+    record["grace"].update(recheck_pending=True, confirmed=True)
+    state = {
+        "pending": {"abc123"},
+        "records": {"abc123": record},
+        "observer_timeout_s": observer_timeout_s,
+        "overall_deadline": overall_deadline,
+    }
+
+    outcomes = wait._collect_boundary_outcomes(state, 120)
+
+    assert [item["outcome"] for item in outcomes] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("action_type", "guidance"),
+    [
+        ("invalid", "Repair or drain the malformed pending action"),
+        ("legacy-v1", "Drain the legacy pending action"),
+    ],
+)
+def test_startup_action_blocked_uses_structured_projection_guidance(
+    monkeypatch, capsys, action_type, guidance
+):
+    blocked = snapshot(
+        state="teardown",
+        active=False,
+        status="untrusted status text",
+        pending_action={"phase": "blocked", "action_type": action_type, "status": "Blocked"},
+    )
+
+    rc, _, _ = run_local_wait(monkeypatch, blocked)
+
+    assert rc == 2
+    assert guidance in capsys.readouterr().out
 
 
 def test_json_stuck_record_keeps_diagnostic_on_stderr(monkeypatch, capsys):
@@ -791,6 +1354,8 @@ def test_remote_stuck_json_keeps_guidance_on_stderr_without_capture(monkeypatch,
         "status",
         "failure_kind",
         "active",
+        "archived",
+        "reason",
         "source",
         "observed_age_s",
         "host",
@@ -999,6 +1564,8 @@ def test_observer_failure_reports_latest_valid_snapshot(monkeypatch, capsys, jso
             "status": "Later durable status",
             "failure_kind": None,
             "active": True,
+            "archived": False,
+            "reason": None,
             "source": "fedora.local",
             "observed_age_s": 75.0,
             "host": "fedora.local",
@@ -1325,7 +1892,7 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
     rc, _, _ = run_local_wait(
         monkeypatch,
         initial,
-        [("unreadable", None), ("unreadable", None)],
+        [("unavailable", "server timed out"), ("unavailable", "server timed out")],
         observer_timeout_s=45,
         json_output=True,
     )
@@ -1343,6 +1910,8 @@ def test_jsonl_stdout_contains_only_terminal_records(monkeypatch, capsys):
         "status",
         "failure_kind",
         "active",
+        "archived",
+        "reason",
         "source",
         "observed_age_s",
         "status_display",

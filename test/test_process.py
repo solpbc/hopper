@@ -740,6 +740,8 @@ class TestMillStage:
                     id="test-id",
                     project="my-project",
                     branch="",
+                    state="running",
+                    active=True,
                     run_generation=generation,
                 )
             ]

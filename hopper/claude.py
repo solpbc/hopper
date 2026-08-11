@@ -6,7 +6,7 @@
 import os
 import shlex
 
-from hopper.tmux import new_window, select_window
+from hopper.tmux import WindowSpawnOutcome, new_window, select_window
 
 
 def spawn_claude(
@@ -15,7 +15,7 @@ def spawn_claude(
     foreground: bool = False,
     env: dict[str, str] | None = None,
     spawn_receipt: dict | None = None,
-) -> str | None:
+) -> tuple[WindowSpawnOutcome, str | None]:
     """Spawn Claude via hopper in a new tmux window.
 
     Args:
@@ -24,7 +24,7 @@ def spawn_claude(
         foreground: If True, switch to the new window. Defaults to staying in current window.
 
     Returns:
-        The tmux pane ID on success, None on failure.
+        The authoritative tmux creation result and pane ID when known.
     """
     path = os.environ.get("PATH", "/usr/bin:/bin")
     # Run through /bin/sh so PATH and || work regardless of tmux's default shell

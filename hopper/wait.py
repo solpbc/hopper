@@ -14,10 +14,10 @@ from pathlib import Path
 
 import hopper.client as client
 import hopper.remote as remote
+from hopper.actions import PHASES
 from hopper.lodes import (
     STATUS_ERROR,
     STATUS_SHIPPED,
-    is_terminal_failure_kind,
     lode_status_for_display,
     lode_with_status_annotations,
 )
@@ -31,6 +31,7 @@ WAIT_SUMMARY_UNRESOLVED = "  {lode_id}: not resolved — wait returned first"
 WAIT_SUMMARY_MANY = "hop wait: {resolved} of {requested} lodes resolved — exited {code}"
 WAIT_SUMMARY_INTERRUPT = "hop wait: interrupted — exited 130"
 WAIT_SUMMARY_NO_TARGET = "hop wait: could not resolve target — exited 1"
+WAIT_SUMMARY_STATUS_UNAVAILABLE = "hop wait: status_unavailable — exited 4"
 
 _monotonic = time.monotonic
 
@@ -45,53 +46,70 @@ def validate_snapshot(raw, expected_lid: str) -> dict | None:
         return None
     if not isinstance(raw.get("active"), bool):
         return None
+    if not isinstance(raw.get("archived"), bool):
+        return None
     return dict(raw)
 
 
-def classify(snapshot: dict) -> tuple[str, int] | None:
+def classify(snapshot: dict) -> tuple[str, int, str | None] | None:
     """Apply the shared terminal policy; stuck remains subject to grace."""
+    if snapshot.get("archived") is True:
+        if snapshot["stage"] == "shipped":
+            return "shipped", 0, None
+        return "archived", 1, "archived_before_shipping"
     if snapshot["state"] == "error":
-        return "error", 1
+        return "error", 1, None
     if snapshot["state"] == "gated":
-        return "gated", 2
+        return "gated", 2, None
     if snapshot["state"] == "stuck":
-        return "stuck", 3
+        return "stuck", 3, None
+    if snapshot.get("pending_action") is not None:
+        return None
     if snapshot["state"] == "teardown":
         return None
     if snapshot["stage"] == "shipped":
-        return "shipped", 0
-    # A ready handoff and accepted teardown may both be inactive while durable
-    # work continues. Other inactive states still require recovery.
-    if not snapshot["active"] and snapshot["state"] != "ready":
-        return "inactive", 1
+        return "shipped", 0, None
+    if not snapshot["active"] and snapshot["state"] in {"new", "ready", "reconnecting"}:
+        return None
+    if not snapshot["active"]:
+        return "inactive", 1, None
     return None
 
 
-def read_local_snapshot(
-    socket_path: Path, lid: str, timeout: float = 2.0
-) -> tuple[str, dict | None]:
-    """Read exact active then archived state without conflating absence and failure."""
-    response = client.connect(socket_path, lode_id=lid, timeout=timeout)
-    if response is None or "lode_found" not in response:
-        return "unreadable", None
-    if response.get("lode_found") is True:
-        return "found", response.get("lode")
-    if response.get("lode_found") is not False:
-        return "unreadable", None
+def _snapshot_grace_kind(snapshot: dict) -> str | None:
+    """Return the one semantic grace continuously selected by a snapshot."""
+    if snapshot.get("archived") is True:
+        return None
+    pending_action = snapshot.get("pending_action")
+    if pending_action is not None:
+        if isinstance(pending_action, dict) and pending_action.get("phase") == "spawning":
+            return "action_spawn"
+        return None
+    if snapshot["state"] == "stuck":
+        return "stuck"
+    if snapshot["state"] == "new" and snapshot["active"] is False:
+        return "startup"
+    if snapshot["state"] == "ready" and snapshot["active"] is False:
+        return "handoff"
+    if snapshot["state"] == "reconnecting" and snapshot["active"] is False:
+        return "reconnect"
+    return None
 
-    archived = client.read_archived_lodes(socket_path, timeout=timeout)
-    if archived is None:
-        return "unreadable", None
-    for lode in archived:
-        if isinstance(lode, dict) and lode.get("id") == lid:
-            return "found", lode
-    return "absent", None
+
+def _new_grace(kind: str | None, origin_ts: float) -> dict | None:
+    if kind is None:
+        return None
+    return {
+        "kind": kind,
+        "origin_ts": origin_ts,
+        "recheck_pending": False,
+        "confirmed": False,
+    }
 
 
 def _new_record(lid: str, snapshot: dict, source: str, observed_ts: float, order: int) -> dict:
     """Create one plain supervisor record from an initial valid snapshot."""
     remote_source = source != "local"
-    stuck_since = observed_ts if snapshot["state"] == "stuck" else None
     return {
         "id": lid,
         "order": order,
@@ -103,9 +121,7 @@ def _new_record(lid: str, snapshot: dict, source: str, observed_ts: float, order
         "last_valid_ts": observed_ts,
         "next_reconcile_ts": observed_ts,
         "reconcile_requested": False,
-        "stuck_since": stuck_since,
-        "stuck_recheck_pending": False,
-        "stuck_confirmed": False,
+        "grace": _new_grace(_snapshot_grace_kind(snapshot), observed_ts),
         "consecutive_failures": 0,
         "warned_failure_key": None,
         "not_found_count": 0,
@@ -129,23 +145,25 @@ def _resolve_targets(
         result = resolver(socket_path, raw_id)
         if result.get("outcome") != "found":
             _initial_error(result.get("error", f"Lode '{raw_id}' not found."), json_output)
+            if result.get("outcome") == "unavailable":
+                return 4
             return result.get("exit_code", 1)
         lode = result.get("lode")
 
         lid = lode.get("id") if isinstance(lode, dict) else None
         if not isinstance(lid, str):
             _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return 2
+            return 4
         snapshot = validate_snapshot(lode, lid)
         if snapshot is None:
             _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return 2
+            return 4
         if lid in records:
             continue
         source = result.get("host")
         if not isinstance(source, str):
             _initial_error(f"Lode status unavailable for '{raw_id}'.", json_output)
-            return 2
+            return 4
         observed_ts = _monotonic()
         records[lid] = _new_record(lid, snapshot, source, observed_ts, order)
     return records
@@ -358,16 +376,16 @@ def _apply_observation(record: dict, observation: dict, poll_s: float) -> str | 
         record["consecutive_failures"] = 0
         record["warned_failure_key"] = None
         record["not_found_count"] = 0
-        if snapshot["state"] == "stuck":
-            if record["stuck_since"] is None:
-                record["stuck_since"] = observed_ts
-            deadline = record["stuck_since"] + STUCK_GRACE_MS / 1000.0
-            if record["stuck_recheck_pending"] and observed_ts >= deadline:
-                record["stuck_confirmed"] = True
+        grace_kind = _snapshot_grace_kind(snapshot)
+        grace = record["grace"]
+        if grace_kind is None:
+            record["grace"] = None
+        elif grace is None or grace["kind"] != grace_kind:
+            record["grace"] = _new_grace(grace_kind, observed_ts)
         else:
-            record["stuck_since"] = None
-            record["stuck_recheck_pending"] = False
-            record["stuck_confirmed"] = False
+            deadline = grace["origin_ts"] + STUCK_GRACE_MS / 1000.0
+            if grace["recheck_pending"] and observed_ts >= deadline:
+                grace["confirmed"] = True
         return None
 
     if kind == "absent":
@@ -402,10 +420,11 @@ def _mark_due_reconciliations(state: dict, now: float) -> None:
     """Turn expired grace and periodic deadlines into reconciliation work."""
     for lid in state["pending"]:
         record = state["records"][lid]
-        if record["stuck_since"] is not None and not record["stuck_recheck_pending"]:
-            stuck_deadline = record["stuck_since"] + STUCK_GRACE_MS / 1000.0
-            if now >= stuck_deadline:
-                record["stuck_recheck_pending"] = True
+        grace = record["grace"]
+        if grace is not None and not grace["recheck_pending"]:
+            grace_deadline = grace["origin_ts"] + STUCK_GRACE_MS / 1000.0
+            if now >= grace_deadline:
+                grace["recheck_pending"] = True
                 if not record["remote"]:
                     record["reconcile_requested"] = True
         if record["remote"] and now >= record["next_reconcile_ts"]:
@@ -427,14 +446,29 @@ def _read_due_locals(state: dict, socket_path: Path, now: float) -> None:
 
     for lid in due:
         try:
-            kind, payload = read_local_snapshot(socket_path, lid)
-            detail = "" if kind == "found" else f"local status {kind}"
+            kind, payload = client.read_lode_snapshot(socket_path, lid)
+            if kind == "found":
+                detail = ""
+                failure_key = kind
+            elif kind == "ambiguous":
+                match_ids = payload if isinstance(payload, list) else []
+                matches = ", ".join(match_ids) or "<invalid match list>"
+                detail = f"local status ambiguous: {matches}"
+                failure_key = f"ambiguous:{matches}"
+                payload = None
+            elif kind == "unavailable":
+                detail = f"local status unavailable: {payload}"
+                failure_key = f"unavailable:{payload}"
+                payload = None
+            else:
+                detail = f"local status {kind}"
+                failure_key = kind
             observation = {
                 "id": lid,
                 "kind": kind,
                 "payload": payload,
                 "detail": detail,
-                "failure_key": kind,
+                "failure_key": failure_key,
                 "observed_ts": _monotonic(),
             }
         except Exception as error:
@@ -460,8 +494,9 @@ def _next_deadline(state: dict) -> float:
         deadlines.append(record["next_reconcile_ts"])
         if state["observer_timeout_s"] > 0:
             deadlines.append(record["last_valid_ts"] + state["observer_timeout_s"])
-        if record["stuck_since"] is not None and not record["stuck_recheck_pending"]:
-            deadlines.append(record["stuck_since"] + STUCK_GRACE_MS / 1000.0)
+        grace = record["grace"]
+        if grace is not None and not grace["recheck_pending"]:
+            deadlines.append(grace["origin_ts"] + STUCK_GRACE_MS / 1000.0)
     return min(deadlines)
 
 
@@ -472,28 +507,74 @@ def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
         record = state["records"][lid]
         terminal = classify(record["latest_snapshot"])
         if terminal and terminal[0] != "stuck":
-            outcome, code = terminal
+            outcome, code, reason = terminal
+        elif _action_is_blocked(record["latest_snapshot"]):
+            outcome, code, reason = "action_blocked", 2, "durable_action_blocked"
         elif record["not_found_count"] >= 2:
             outcome, code = "not_found", 1
-        elif record["stuck_confirmed"]:
-            outcome, code = "stuck", 3
-        elif state["observer_timeout_s"] > 0 and now >= (
-            record["last_valid_ts"] + state["observer_timeout_s"]
+            reason = None
+        elif (
+            record["grace"] is not None
+            and record["grace"]["kind"] == "stuck"
+            and record["grace"]["confirmed"]
         ):
-            outcome, code = "observer_unavailable", 4
-        elif state["overall_deadline"] is not None and now >= state["overall_deadline"]:
-            outcome, code = "timeout", 4
+            outcome, code = "stuck", 3
+            reason = None
         else:
-            continue
-        outcomes.append({"record": record, "outcome": outcome, "code": code})
+            timed = []
+            if state["observer_timeout_s"] > 0:
+                timed.append(
+                    (
+                        record["last_valid_ts"] + state["observer_timeout_s"],
+                        0,
+                        "observer_unavailable",
+                        4,
+                        None,
+                    )
+                )
+            if state["overall_deadline"] is not None:
+                timed.append((state["overall_deadline"], 1, "timeout", 4, None))
+            grace = record["grace"]
+            if grace is not None and grace["confirmed"]:
+                grace_outcomes = {
+                    "startup": ("startup_stalled", 1, "startup_registration_stalled"),
+                    "handoff": ("handoff_stalled", 1, "ready_handoff_stalled"),
+                    "action_spawn": ("action_stalled", 2, "successor_adoption_stalled"),
+                    "reconnect": ("reconnect_stalled", 1, "runner_reregistration_stalled"),
+                }
+                grace_outcome = grace_outcomes.get(grace["kind"])
+                if grace_outcome is not None:
+                    timed.append(
+                        (
+                            grace["origin_ts"] + STUCK_GRACE_MS / 1000.0,
+                            2,
+                            *grace_outcome,
+                        )
+                    )
+            due = [candidate for candidate in timed if now >= candidate[0]]
+            if not due:
+                continue
+            _deadline, _rank, outcome, code, reason = min(due)
+        outcomes.append({"record": record, "outcome": outcome, "code": code, "reason": reason})
     return outcomes
+
+
+def _action_is_blocked(snapshot: dict) -> bool:
+    """Return whether a structured pending-action projection requires attention."""
+    pending_action = snapshot.get("pending_action")
+    if not isinstance(pending_action, dict):
+        return False
+    phase = pending_action.get("phase")
+    if isinstance(phase, str) and phase in PHASES and phase.endswith("_blocked"):
+        return True
+    return phase == "blocked" and pending_action.get("action_type") in {"invalid", "legacy-v1"}
 
 
 def _observed_age(record: dict, now: float) -> float:
     return round(max(0.0, now - record["latest_snapshot_ts"]), 3)
 
 
-def _json_event(record: dict, outcome: str, now: float) -> dict:
+def _json_event(record: dict, outcome: str, now: float, reason: str | None = None) -> dict:
     """Build one additive, compatibility-preserving JSONL terminal record."""
     snapshot = record["latest_snapshot"]
     annotated = lode_with_status_annotations({**snapshot, "host": record["host"]})
@@ -505,6 +586,8 @@ def _json_event(record: dict, outcome: str, now: float) -> dict:
         "status": snapshot["status"],
         "failure_kind": snapshot.get("failure_kind"),
         "active": snapshot["active"],
+        "archived": snapshot["archived"],
+        "reason": reason,
         "source": record["source"],
         "observed_age_s": _observed_age(record, now),
         "status_display": annotated["status_display"],
@@ -551,12 +634,18 @@ def _snapshot_summary(record: dict, now: float) -> str:
     )
 
 
-def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> None:
+def _emit_outcome(
+    record: dict,
+    outcome: str,
+    json_output: bool,
+    now: float,
+    reason: str | None = None,
+) -> None:
     """Emit one non-timeout terminal outcome from the latest valid snapshot."""
     snapshot = record["latest_snapshot"]
     lid = record["id"]
     if json_output:
-        print(json.dumps(_json_event(record, outcome, now)))
+        print(json.dumps(_json_event(record, outcome, now, reason)))
         if outcome == "stuck":
             print(_stuck_diagnostic(record, now), file=sys.stderr)
         return
@@ -564,20 +653,76 @@ def _emit_outcome(record: dict, outcome: str, json_output: bool, now: float) -> 
         title = snapshot.get("title", "")
         suffix = f" ({title})" if title else ""
         print(f"{STATUS_SHIPPED} {lid} shipped{suffix}")
+    elif outcome == "archived":
+        status = f": {snapshot['status']}" if snapshot["status"] else ""
+        print(f"{STATUS_ERROR} {lid} archived before shipping{status}")
+        print(f"  {_snapshot_summary(record, now)}")
+        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
+        print(f"Inspect with: {hop} lode status {lid}")
+        print(f"Recover with: {hop} lode unarchive {lid}")
+    elif outcome in {"startup_stalled", "handoff_stalled", "reconnect_stalled"}:
+        label = {
+            "startup_stalled": "startup registration stalled",
+            "handoff_stalled": "ready handoff stalled",
+            "reconnect_stalled": "runner reregistration stalled",
+        }[outcome]
+        print(f"{STATUS_ERROR} {lid} {label}: {snapshot['status']}")
+        print(f"  {_snapshot_summary(record, now)}")
+        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
+        print(f"Inspect with: {hop} lode status {lid}")
+        if snapshot.get("tmux_pane"):
+            print(f"Inspect pane with: {hop} lode peek {lid}")
+        print("Do not start another runner until pane absence is proved.")
+    elif outcome in {"action_blocked", "action_stalled"}:
+        pending_action = snapshot.get("pending_action")
+        action_status = (
+            pending_action.get("status")
+            if isinstance(pending_action, dict) and isinstance(pending_action.get("status"), str)
+            else snapshot["status"]
+        )
+        label = "action blocked" if outcome == "action_blocked" else "successor adoption stalled"
+        print(f"{STATUS_ERROR} {lid} {label}: {action_status}")
+        print(f"  {_snapshot_summary(record, now)}")
+        recovery = pending_action.get("recovery") if isinstance(pending_action, dict) else None
+        command = recovery.get("command") if isinstance(recovery, dict) else None
+        if isinstance(command, str) and command:
+            print(f"Recover with: {command}")
+        elif isinstance(pending_action, dict) and pending_action.get("action_type") == "invalid":
+            print("Repair or drain the malformed pending action before upgrading this host.")
+        elif isinstance(pending_action, dict) and pending_action.get("action_type") == "legacy-v1":
+            print("Drain the legacy pending action before upgrading this host.")
+        else:
+            hop = f"hop -H {record['host']}" if record["remote"] else "hop"
+            print(f"Inspect with: {hop} lode status {lid}")
+            if snapshot.get("tmux_pane"):
+                print(f"Inspect pane with: {hop} lode peek {lid}")
+            print("Do not start another runner while the durable action remains pending.")
     elif outcome == "error":
         print(f"{STATUS_ERROR} {lid} error: {snapshot['status']}")
         print(f"  {_snapshot_summary(record, now)}")
-        if not is_terminal_failure_kind(snapshot.get("failure_kind")):
-            print(f"Lode {lid} entered error state. Restart with: hop lode restart {lid}")
+        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
+        print(f"Inspect with: {hop} lode status {lid}")
     elif outcome == "gated":
         display_status = lode_status_for_display({**snapshot, "host": record["host"]})
         display_snapshot = {**snapshot, "status": display_status}
         display_record = {**record, "latest_snapshot": display_snapshot}
-        print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
+        spawn_disposition = snapshot.get("spawn_disposition")
+        if spawn_disposition in {"already_live", "unknown"}:
+            print(f"Lode {lid} is gated pending runner inspection.")
+        else:
+            print(f"Lode {lid} is gated. Review with: hop gate show {lid}")
         print(f"  {_snapshot_summary(display_record, now)}")
+        if spawn_disposition in {"already_live", "unknown"}:
+            hop = f"hop -H {record['host']}" if record["remote"] else "hop"
+            print(f"Inspect with: {hop} lode status {lid}")
+            if snapshot.get("tmux_pane"):
+                print(f"Inspect pane with: {hop} lode peek {lid}")
+            print("Do not start another runner until pane absence is proved.")
     elif outcome == "inactive":
         print(f"Lode '{lid}' is not active ({_snapshot_summary(record, now)})")
-        print(f"Recover with: hop lode resume {lid} or hop lode restart {lid}")
+        hop = f"hop -H {record['host']}" if record["remote"] else "hop"
+        print(f"Inspect with: {hop} lode status {lid}")
+        print("Do not start another runner until pane absence is proved.")
     elif outcome == "stuck":
         print(_stuck_diagnostic(record, now))
     elif outcome == "not_found":
@@ -605,7 +750,13 @@ def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | Non
         if outcome == "timeout" and not state["json_output"]:
             pass
         else:
-            _emit_outcome(record, outcome, state["json_output"], now)
+            _emit_outcome(
+                record,
+                outcome,
+                state["json_output"],
+                now,
+                item.get("reason"),
+            )
         with state["condition"]:
             state["pending"].discard(record["id"])
         state["resolved"].append(item)
@@ -675,7 +826,8 @@ def wait_for_lodes(
         poll_s = max(MIN_POLL_S, float(poll_s or 30))
         records = _resolve_targets(socket_path, lode_ids, json_output, resolver)
         if not isinstance(records, dict):
-            print(WAIT_SUMMARY_NO_TARGET, file=sys.stderr)
+            summary = WAIT_SUMMARY_STATUS_UNAVAILABLE if records == 4 else WAIT_SUMMARY_NO_TARGET
+            print(summary, file=sys.stderr)
             return records if isinstance(records, int) else 1
         _publish_resident_routes(records)
 

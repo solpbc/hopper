@@ -309,6 +309,24 @@ def test_lode_to_row_disconnected():
     assert row.status == STATUS_DISCONNECTED
 
 
+def test_lode_to_row_reconnecting_is_pending_with_durable_status():
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "state": "reconnecting",
+        "status": "Runner pane %8 survived server replacement; waiting for registration",
+        "last_progress_summary": "stale work",
+        "active": False,
+        "created_at": 1000,
+        "updated_at": 1000,
+    }
+
+    row = lode_to_row(lode)
+
+    assert row.status == STATUS_NEW
+    assert row.status_text == lode["status"]
+
+
 @pytest.mark.parametrize("active", [True, False])
 def test_lode_to_row_teardown_keeps_status_and_icon(active):
     lode = {
@@ -1135,6 +1153,15 @@ def test_ready_lode_does_not_trigger_jam():
     app._lodes = [{"active": False, "stage": "refine", "state": "ready"}]
     app._update_window_title()
     assert app._window_title == "hopper"
+
+
+def test_reconnecting_lode_is_hopping_not_jammed():
+    app = HopperApp()
+    app._lodes = [{"active": False, "stage": "refine", "state": "reconnecting"}]
+
+    app._update_window_title()
+
+    assert app._window_title == "hopping"
 
 
 @pytest.mark.parametrize("active", [True, False])
@@ -2888,6 +2915,29 @@ async def test_enter_on_non_ready_refine_spawns_directly(monkeypatch, temp_confi
         assert server.events == [
             {"type": "lode_spawn", "lode_id": session["id"], "foreground": False}
         ]
+
+
+@pytest.mark.asyncio
+async def test_enter_on_reconnecting_reports_pending_without_spawning(monkeypatch):
+    session = {
+        "id": "aaaa1111",
+        "stage": "refine",
+        "state": "reconnecting",
+        "active": False,
+        "created_at": 1000,
+    }
+    monkeypatch.setattr("hopper.tui.find_project", lambda name: None)
+    server = MockServer([session])
+    app = HopperApp(server=server)
+
+    async with app.run_test() as pilot:
+        with patch.object(app, "notify") as notify:
+            await pilot.press("enter")
+
+    notify.assert_called_once_with(
+        "Runner registration is pending; inspect with: hop lode status aaaa1111."
+    )
+    assert server.events == []
 
 
 # Tests for LegendScreen

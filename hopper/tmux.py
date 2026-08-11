@@ -24,6 +24,14 @@ class Liveness(Enum):
     UNKNOWN = "unknown"
 
 
+class WindowSpawnOutcome(Enum):
+    """Authoritative result of asking tmux to create one window."""
+
+    SPAWNED = "spawned"
+    PROVEN_NO_PANE = "proven_no_pane"
+    UNKNOWN = "unknown"
+
+
 class PanePhase(Enum):
     """Claude pane activity phase inferred from its tmux title."""
 
@@ -255,8 +263,8 @@ def new_window(
     env: dict[str, str] | None = None,
     background: bool = False,
     spawn_receipt: dict | None = None,
-) -> str | None:
-    """Create a new tmux window and return its pane ID.
+) -> tuple[WindowSpawnOutcome, str | None]:
+    """Create a tmux window without conflating refusal with lost identity.
 
     Args:
         command: The command to run in the new window.
@@ -266,7 +274,7 @@ def new_window(
         spawn_receipt: Durable completion action facts to publish before command start.
 
     Returns:
-        The tmux pane ID (e.g., "%1") on success, None on failure.
+        A tri-state creation result and the exact pane ID when known.
     """
     if spawn_receipt is not None:
         fields = (
@@ -300,41 +308,61 @@ def new_window(
     cmd.append(command)
 
     channel_locked = False
+    outcome = (WindowSpawnOutcome.UNKNOWN, None)
     try:
+        can_launch = True
         if spawn_receipt is not None:
             acquired = subprocess.run(
                 ["tmux", "wait-for", "-L", wait_channel], capture_output=True, text=True
             )
             if acquired.returncode != 0:
                 logger.error(f"tmux spawn receipt lock failed: {acquired.stderr.strip()}")
-                return None
-            channel_locked = True
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"tmux new-window failed: {result.stderr.strip()}")
-            return None
-        pane_id = result.stdout.strip()
-        if spawn_receipt is not None:
-            waited = subprocess.run(
-                ["tmux", "wait-for", "-L", wait_channel], capture_output=True, text=True
-            )
-            if waited.returncode != 0:
-                logger.error(f"tmux spawn receipt wait failed: {waited.stderr.strip()}")
-                return None
-        return pane_id
+                can_launch = False
+            else:
+                channel_locked = True
+        if can_launch:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"tmux new-window failed: {result.stderr.strip()}")
+                outcome = (WindowSpawnOutcome.PROVEN_NO_PANE, None)
+            else:
+                pane_id = result.stdout.strip()
+                if re.fullmatch(r"%[0-9]+", pane_id) is None:
+                    logger.error("tmux new-window returned an invalid pane ID: %r", pane_id)
+                elif spawn_receipt is None:
+                    outcome = (WindowSpawnOutcome.SPAWNED, pane_id)
+                else:
+                    waited = subprocess.run(
+                        ["tmux", "wait-for", "-L", wait_channel],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if waited.returncode != 0:
+                        logger.error(f"tmux spawn receipt wait failed: {waited.stderr.strip()}")
+                    else:
+                        outcome = (WindowSpawnOutcome.SPAWNED, pane_id)
     except FileNotFoundError:
         logger.error("tmux command not found")
-        return None
+        if spawn_receipt is None:
+            outcome = (WindowSpawnOutcome.PROVEN_NO_PANE, None)
+    except OSError as error:
+        logger.error("tmux window creation is unverified: %s", error)
     finally:
         if channel_locked:
             try:
-                subprocess.run(
+                released = subprocess.run(
                     ["tmux", "wait-for", "-U", wait_channel],
                     capture_output=True,
                     text=True,
                 )
-            except FileNotFoundError:
-                pass
+                if released.returncode != 0 and outcome[0] is WindowSpawnOutcome.SPAWNED:
+                    logger.error("tmux spawn receipt unlock failed: %s", released.stderr.strip())
+                    outcome = (WindowSpawnOutcome.UNKNOWN, None)
+            except OSError as error:
+                if outcome[0] is WindowSpawnOutcome.SPAWNED:
+                    logger.error("tmux spawn receipt unlock failed: %s", error)
+                    outcome = (WindowSpawnOutcome.UNKNOWN, None)
+    return outcome
 
 
 def bootstrap_spawn_receipt(

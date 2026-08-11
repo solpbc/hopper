@@ -126,7 +126,7 @@ def lode_to_row(lode: dict) -> Row:
         lode.get("active")
         and progress_text
         and not refusal_status
-        and lode.get("state") != "teardown"
+        and lode.get("state") not in {"reconnecting", "teardown"}
     ):
         status_text = progress_text
 
@@ -1499,14 +1499,15 @@ class HopperApp(App):
             or (
                 not lode.get("active", False)
                 and lode.get("stage", "mill") != "shipped"
-                and lode.get("state", "new") not in ("new", "ready", "gated", "teardown")
+                and lode.get("state", "new")
+                not in ("new", "ready", "reconnecting", "gated", "teardown")
             )
             for lode in self._lodes
         )
         if needs_attention:
             target = "hopJAM"
         elif any(
-            lode.get("state") == "teardown"
+            lode.get("state") in {"reconnecting", "teardown"}
             or (lode.get("active", False) and lode.get("stage", "mill") != "shipped")
             for lode in self._lodes
         ):
@@ -2032,6 +2033,12 @@ class HopperApp(App):
         lode = self._get_lode(key)
         if not lode:
             self.notify(f"Lode {key} not found", severity="error")
+            return
+
+        if lode.get("state") == "reconnecting":
+            self.notify(
+                f"Runner registration is pending; inspect with: hop lode status {lode['id']}."
+            )
             return
 
         lode_project = lode.get("project", "")

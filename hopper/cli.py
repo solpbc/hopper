@@ -1938,6 +1938,13 @@ def format_lode_detail(lode: dict) -> str:
     lines.append(f"  project:  {lode.get('project', '')}")
     lines.append(f"  stage:    {lode.get('stage', '')}")
     lines.append(f"  state:    {lode.get('state', '')}")
+    if lode.get("state") == "reconnecting":
+        prior_state = lode.get("reconnect_prior_state")
+        prior_status = lode.get("reconnect_prior_status")
+        if isinstance(prior_state, str):
+            lines.append(f"  reconnect prior state:  {prior_state}")
+        if isinstance(prior_status, str):
+            lines.append(f"  reconnect prior status: {prior_status}")
 
     status_text = lode_status_for_display(lode)
     if status_text:

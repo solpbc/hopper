@@ -21,6 +21,7 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
+import hopper.client as hopper_client
 import hopper.server as hopper_server
 from hopper import actions, git
 from hopper.backlog import BacklogItem
@@ -41,14 +42,13 @@ from hopper.lodes import (
 from hopper.projects import Project, touch_project
 from hopper.server import (
     LISTEN_BACKLOG,
-    PROGRESS_REJECT_STATES,
     Server,
     ServerLockHeld,
     SpawnOutcome,
     get_git_hash,
     start_server_with_tui,
 )
-from hopper.tmux import Liveness
+from hopper.tmux import Liveness, WindowSpawnOutcome
 from hopper.wait import classify
 
 
@@ -141,6 +141,18 @@ def _mock_client(server: Server) -> MagicMock:
 
 
 TEST_RUN_GENERATION = "a" * 32
+
+
+def test_reconnecting_is_server_only_and_rejects_progress():
+    assert "reconnecting" not in hopper_server.SUPPORTED_LODE_STATES
+    assert "reconnecting" in hopper_server.PROGRESS_REJECT_STATES
+    assert hopper_server.HELD_RUNNER_MUTATION_TYPES == (
+        hopper_client.RUNNER_MUTATION_TYPES - {"lode_register", "lode_supervisor_register"}
+    )
+
+
+def _spawned(pane_id: str) -> tuple[WindowSpawnOutcome, str]:
+    return WindowSpawnOutcome.SPAWNED, pane_id
 
 
 def _completion_process(pid: int, ppid: int, pgid: int) -> dict:
@@ -521,6 +533,29 @@ def _action_step_result(record: dict, *, phase: str, result: dict) -> dict:
         "attempt_id": record["markers"][marker_name]["attempt_id"],
         "result": result,
     }
+
+
+def _spawning_completion_record() -> dict:
+    record = _pending_completion_record()
+    _complete_marker(record, "containment")
+    record["containment"].update(
+        state="proven",
+        result="linux-degraded-bounded-empty",
+        proof_label="bounded empty containment",
+    )
+    _complete_marker(record, "lode_mutation")
+    record["spawn"] = {
+        "target_lode_id": record["lode_id"],
+        "target_generation": "e" * 32,
+        "receipt_relative_path": f"spawn-{record['action_id']}.json",
+        "pane_id": None,
+        "supervisor_adopted": False,
+        "worker_adopted": False,
+    }
+    actions.transition_marker(record, "spawn", "intent")
+    record["phase"] = "spawning"
+    actions.write_pending_action(record)
+    return record
 
 
 class _InjectedActionCrash(BaseException):
@@ -1344,7 +1379,7 @@ def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(
 ):
     lode_id = "abcd2345"
     server = Server(socket_path)
-    lode = make_lode(id=lode_id, active=False, run_generation=generation)
+    lode = make_lode(id=lode_id, state="running", active=False, run_generation=generation)
     server.lodes = [lode]
     conn = _mock_client(server)
 
@@ -1379,7 +1414,7 @@ def test_async_manual_action_response_keeps_exchange_id_over_real_socket(
     server, socket_path, make_lode
 ):
     """The client must accept a terminal response emitted by a later server event."""
-    lode = make_lode(id="abcd2345", active=False, run_generation=None)
+    lode = make_lode(id="abcd2345", state="running", active=False, run_generation=None)
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
 
@@ -2410,7 +2445,7 @@ def test_pending_action_fences_spawn_after_generation_moves(socket_path, make_lo
     with patch("hopper.server.spawn_claude") as spawn:
         outcome, pane_id = server._gated_spawn(lode, "/repo")
 
-    assert outcome is SpawnOutcome.FAILED
+    assert outcome is SpawnOutcome.UNKNOWN
     assert pane_id is None
     assert lode == before
     spawn.assert_not_called()
@@ -3020,6 +3055,210 @@ def test_completion_spawn_refuses_retained_pane_from_another_generation(socket_p
     assert actions.load_pending_action(record["lode_id"])["recovery"]["kind"] == "spawn"
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "absent_target",
+        "generation_conflict",
+        "pane_conflict",
+        "invalid_receipt",
+        "mismatched_receipt",
+    ],
+)
+def test_action_spawn_preparation_failures_stay_structured_and_action_owned(
+    socket_path, make_lode, failure
+):
+    record = _pending_completion_record()
+    _complete_marker(record, "containment")
+    _complete_marker(record, "lode_mutation")
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="refine",
+        state="teardown",
+        active=False,
+        project="proj",
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    if failure != "absent_target":
+        server.lodes = [lode]
+    if failure == "generation_conflict":
+        lode["run_generation"] = "f" * 32
+    elif failure == "pane_conflict":
+        lode["tmux_pane"] = "%99"
+
+    def load_receipt(*args):
+        if failure == "invalid_receipt":
+            raise ValueError("invalid receipt")
+        if failure == "mismatched_receipt":
+            return {
+                "target_lode_id": "bcde2345",
+                "target_generation": "d" * 32,
+                "pane_id": "%9",
+            }
+        return None
+
+    with (
+        patch("hopper.server.actions.load_spawn_receipt", side_effect=load_receipt),
+        patch.object(server, "_schedule_action_step") as schedule,
+    ):
+        assert server._prepare_action_spawn(record) is False
+
+    schedule.assert_not_called()
+    blocked = actions.load_pending_action(record["lode_id"])
+    assert blocked["phase"] == "cleanup_blocked"
+    assert blocked["recovery"]["kind"] == "spawn"
+    assert blocked["recovery"]["command"] == f"hop lode restart {record['lode_id']}"
+    if server.lodes:
+        assert lode["state"] == "teardown"
+        assert lode["pending_action"]["phase"] == "cleanup_blocked"
+        assert lode["state"] not in {"error", "gated"}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "absent_target",
+        "missing_project",
+        "invalid_receipt",
+        "mismatched_receipt",
+        "receipt_pane_not_live",
+        "inventory_unavailable",
+        "tag_without_receipt",
+        "spawn_proven_absent",
+        "spawn_unknown",
+        "bootstrap_receipt_missing",
+    ],
+)
+def test_action_successor_failures_block_only_the_durable_action(socket_path, make_lode, failure):
+    record = _spawning_completion_record()
+    target = make_lode(
+        id=record["lode_id"],
+        project="proj",
+        stage="refine",
+        state="teardown",
+        active=False,
+        run_generation=record["spawn"]["target_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    if failure != "absent_target":
+        server.lodes = [target]
+
+    valid_receipt = {
+        "action_id": record["action_id"],
+        "source_lode_id": record["lode_id"],
+        "target_lode_id": target["id"],
+        "target_generation": record["spawn"]["target_generation"],
+        "pane_id": "%9",
+    }
+    receipt_reads = 0
+
+    def load_receipt(*args):
+        nonlocal receipt_reads
+        receipt_reads += 1
+        if failure == "invalid_receipt":
+            raise ValueError("invalid receipt")
+        if failure == "mismatched_receipt":
+            return {**valid_receipt, "action_id": "b" * 32}
+        if failure == "receipt_pane_not_live":
+            return valid_receipt
+        if failure == "bootstrap_receipt_missing":
+            return None
+        return None
+
+    with (
+        patch(
+            "hopper.server.find_project",
+            return_value=(
+                None if failure == "missing_project" else Project(path="/repo", name="proj")
+            ),
+        ),
+        patch("hopper.server.actions.load_spawn_receipt", side_effect=load_receipt),
+        patch(
+            "hopper.server.completion_action_panes",
+            return_value=(
+                None
+                if failure == "inventory_unavailable"
+                else ["%8"]
+                if failure == "tag_without_receipt"
+                else []
+            ),
+        ),
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+        patch(
+            "hopper.server.spawn_claude",
+            return_value=(
+                (WindowSpawnOutcome.PROVEN_NO_PANE, None)
+                if failure == "spawn_proven_absent"
+                else (WindowSpawnOutcome.UNKNOWN, None)
+                if failure == "spawn_unknown"
+                else (WindowSpawnOutcome.SPAWNED, "%9")
+            ),
+        ),
+    ):
+        context = server._action_step_context(record, "spawn")
+        result = server._spawn_action_successor(record, context)
+
+    assert result["ok"] is False
+    if failure == "bootstrap_receipt_missing":
+        assert receipt_reads == 2
+    server._handle_action_step_result(_action_step_result(record, phase="spawning", result=result))
+
+    blocked = actions.load_pending_action(record["lode_id"])
+    assert blocked["phase"] == "cleanup_blocked"
+    assert blocked["recovery"]["kind"] == "spawn"
+    if server.lodes:
+        assert target["state"] == "teardown"
+        assert target["pending_action"]["phase"] == "cleanup_blocked"
+        assert target["state"] not in {"error", "gated"}
+
+
+@pytest.mark.parametrize("adoption_path", ["reconcile", "registration"])
+def test_incomplete_action_spawn_adoption_remains_bounded_spawning(
+    socket_path, make_lode, adoption_path
+):
+    record = _spawning_completion_record()
+    record["spawn"]["pane_id"] = "%9"
+    actions.write_pending_action(record)
+    lode = make_lode(
+        id=record["lode_id"],
+        state="teardown",
+        active=False,
+        run_generation=record["spawn"]["target_generation"],
+        tmux_pane="%9",
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    if adoption_path == "reconcile":
+        with (
+            patch(
+                "hopper.server.actions.load_spawn_receipt",
+                return_value={
+                    "target_lode_id": lode["id"],
+                    "target_generation": record["spawn"]["target_generation"],
+                    "pane_id": "%9",
+                },
+            ),
+            patch("hopper.server.actions.load_run_ownership", side_effect=[{}, None]),
+        ):
+            server._reconcile_spawn_adoption(record)
+    else:
+        server._record_action_spawn_adoption(
+            record["lode_id"], record["spawn"]["target_generation"], "supervisor"
+        )
+
+    pending = actions.load_pending_action(record["lode_id"])
+    assert pending["phase"] == "spawning"
+    assert pending["markers"]["spawn"]["state"] == "intent"
+    assert not (pending["spawn"]["supervisor_adopted"] and pending["spawn"]["worker_adopted"])
+    assert lode["state"] == "teardown"
+    assert lode["pending_action"]["phase"] == "spawning"
+
+
 def test_completion_spawn_adopts_only_the_fsynced_receipt_pane(socket_path, make_lode):
     record = _pending_completion_record()
     _complete_marker(record, "containment")
@@ -3314,14 +3553,23 @@ def test_server_lode_snapshot_found_absent_and_ambiguous(socket_path, make_lode)
     ):
         server._handle_mutation({"type": "lode_snapshot", "prefix": "active-o"}, conn)
         found = send_response.call_args.args[1]
-        assert found == {"type": "lode_snapshot", "result": "found", "lode": other_active}
+        assert found == {
+            "type": "lode_snapshot",
+            "result": "found",
+            "lode": {**other_active, "archived": False},
+        }
         assert found["lode"] is not other_active
         found["lode"]["status"] = "changed"
         assert other_active["status"] == ""
+        assert "archived" not in other_active
 
         send_response.reset_mock()
         server._handle_mutation({"type": "lode_snapshot", "prefix": "archived-o"}, conn)
-        assert send_response.call_args.args[1]["lode"]["id"] == "archived-only"
+        archived_response = send_response.call_args.args[1]["lode"]
+        assert archived_response["id"] == "archived-only"
+        assert archived_response["archived"] is True
+        assert "archived_at" not in other_archived
+        assert "archived" not in other_archived
 
         send_response.reset_mock()
         server._handle_mutation({"type": "lode_snapshot", "prefix": "missing"}, conn)
@@ -3339,6 +3587,42 @@ def test_server_lode_snapshot_found_absent_and_ambiguous(socket_path, make_lode)
     save_active.assert_not_called()
     assert server.lodes == [active, other_active]
     assert server.archived_lodes == [archived, other_archived]
+
+
+@pytest.mark.parametrize("archived_first", [False, True], ids=["active-first", "archived-first"])
+def test_lode_snapshot_twin_collapse_prefers_archived_in_both_orders(make_lode, archived_first):
+    active = make_lode(id="same-id", status="active twin")
+    archived = make_lode(id="same-id", status="archived twin")
+    matches = (
+        [(archived, True), (active, False)]
+        if archived_first
+        else [
+            (active, False),
+            (archived, True),
+        ]
+    )
+
+    assert hopper_server._collapse_lode_snapshot_matches(matches) == [(archived, True)]
+
+
+def test_server_lode_snapshot_returns_archived_twin_identity(socket_path, make_lode):
+    active = make_lode(id="same-id", status="active twin", active=True)
+    archived = make_lode(id="same-id", status="archived twin", active=True)
+    server = Server(socket_path)
+    server.lodes = [active]
+    server.archived_lodes = [archived]
+    conn = _mock_client(server)
+
+    server._handle_mutation({"type": "lode_snapshot", "prefix": "same"}, conn)
+
+    response = _decode_mock_response(conn)
+    assert response["result"] == "found"
+    assert response["lode"]["id"] == "same-id"
+    assert response["lode"]["status"] == "archived twin"
+    assert response["lode"]["active"] is True
+    assert response["lode"]["archived"] is True
+    assert "archived" not in active
+    assert "archived" not in archived
 
 
 @pytest.mark.parametrize("prefix", [None, 1, [], {}], ids=["missing", "integer", "list", "dict"])
@@ -3369,6 +3653,7 @@ def test_server_lode_snapshot_empty_prefix_is_valid(socket_path, make_lode):
     assert response["type"] == "lode_snapshot"
     assert response["result"] == "found"
     assert response["lode"]["id"] == "only-lode"
+    assert response["lode"]["archived"] is False
 
 
 def test_read_only_handlers_echo_thread_local_exchange_ids(socket_path):
@@ -3466,6 +3751,7 @@ def test_lode_snapshot_handles_twelve_simultaneous_clients(socket_path, server, 
     for target, result in zip(targets, results):
         assert result[0] == "found"
         assert result[1]["id"] == target
+        assert result[1]["archived"] is target.startswith("archived-")
 
 
 def test_server_uses_configured_listen_backlog(socket_path, monkeypatch):
@@ -3533,18 +3819,50 @@ def test_parallel_lode_snapshots_do_not_write_state(socket_path, server, temp_co
             assert result[1] == expected_payload
     assert active_path.read_bytes() == active_before
     assert archived_path.read_bytes() == archived_before
+    for path in (active_path, archived_path):
+        assert all("archived" not in json.loads(line) for line in path.read_text().splitlines())
     broadcast.assert_not_called()
+
+
+def test_large_archive_snapshot_is_one_bounded_request(socket_path, server, make_lode, monkeypatch):
+    target = make_lode(id="target-archive", stage="shipped", status="legacy archived")
+    server.archived_lodes = [
+        *(make_lode(id=f"archive-{index:04d}") for index in range(5_000)),
+        target,
+    ]
+    read_archived = MagicMock(side_effect=AssertionError("bounded snapshot must not read archive"))
+    list_archived = MagicMock(side_effect=AssertionError("bounded snapshot must not list archive"))
+    monkeypatch.setattr(hopper_client, "read_archived_lodes", read_archived)
+    monkeypatch.setattr(hopper_client, "list_archived_lodes", list_archived)
+
+    with patch.object(
+        hopper_client,
+        "_exchange_message",
+        wraps=hopper_client._exchange_message,
+    ) as exchange:
+        result = read_lode_snapshot(socket_path, "target", timeout=5)
+
+    assert result == ("found", {**target, "archived": True})
+    exchange.assert_called_once_with(
+        socket_path,
+        {"type": "lode_snapshot", "prefix": "target", "exchange_id": ANY},
+        timeout=5,
+        wait_for_response=True,
+    )
+    read_archived.assert_not_called()
+    list_archived.assert_not_called()
 
 
 def test_lode_snapshot_serializes_with_archive_transition(
     socket_path, server, make_lode, monkeypatch
 ):
-    lode = make_lode(id="abcd2345", active=False)
+    lode = make_lode(id="abcd2345", state="running", active=False)
     server.lodes = [lode]
     save_lodes(server.lodes)
     before = read_lode_snapshot(socket_path, "abcd")
     assert before[0] == "found"
     assert before[1]["id"] == "abcd2345"
+    assert before[1]["archived"] is False
 
     real_archive_lode = hopper_server.archive_lode_for_action
     mid_transition = threading.Event()
@@ -3600,6 +3918,7 @@ def test_lode_snapshot_serializes_with_archive_transition(
     assert not snapshot_thread.is_alive()
     assert result[0][0] == "found"
     assert result[0][1]["id"] == "abcd2345"
+    assert result[0][1]["archived"] is True
     assert server.lodes == []
     assert [archived["id"] for archived in server.archived_lodes] == ["abcd2345"]
 
@@ -4147,12 +4466,14 @@ thread.join(timeout=2)
                 process.communicate()
 
 
-def test_startup_reconciliation_alive_preserves_identity_and_clears_refusal(socket_path, make_lode):
+def test_startup_reconciliation_alive_enters_reconnect_grace(socket_path, make_lode):
     lode = make_lode(
         id="alive-id",
+        state="running",
         active=True,
         tmux_pane="%1",
         pid=1234,
+        run_generation=TEST_RUN_GENERATION,
         status="spawn refused: tmux unreachable — verify tmux is running, then retry",
     )
     server = Server(socket_path)
@@ -4164,20 +4485,25 @@ def test_startup_reconciliation_alive_preserves_identity_and_clears_refusal(sock
     ):
         server._reconcile_startup_lodes()
 
-    assert lode["active"] is True
+    assert lode["state"] == "reconnecting"
+    assert lode["active"] is False
     assert lode["tmux_pane"] == "%1"
     assert lode["pid"] == 1234
-    assert lode["status"] == ""
-    assert lode["updated_at"] == 1000
+    assert lode["reconnect_prior_state"] == "running"
+    assert lode["reconnect_prior_status"].startswith("spawn refused:")
+    assert lode["status"] == "Runner pane %1 survived server replacement; waiting for registration"
+    assert lode["updated_at"] > 1000
     mock_save.assert_called_once_with(server.lodes)
 
 
 def test_startup_reconciliation_gone_clears_identity_and_refusal(socket_path, make_lode):
     lode = make_lode(
         id="gone-id",
+        state="running",
         active=True,
         tmux_pane="%2",
         pid=2345,
+        run_generation=TEST_RUN_GENERATION,
         status="spawn refused: tmux unreachable — verify tmux is running, then retry",
     )
     server = Server(socket_path)
@@ -4190,42 +4516,38 @@ def test_startup_reconciliation_gone_clears_identity_and_refusal(socket_path, ma
         server._reconcile_startup_lodes()
 
     assert lode["active"] is False
+    assert lode["state"] == "error"
     assert lode["tmux_pane"] is None
     assert lode["pid"] is None
-    assert lode["status"] == ""
-    assert lode["updated_at"] == 1000
+    assert "Recorded runner pane %2 is gone" in lode["status"]
+    assert lode["updated_at"] > 1000
     mock_save.assert_called_once_with(server.lodes)
 
 
-def test_startup_reconciliation_unknown_preserves_identity_and_warns(
-    socket_path, make_lode, caplog
-):
+def test_startup_reconciliation_unknown_gates_without_restart(socket_path, make_lode):
     lode = make_lode(
         id="unknown-id",
         state="running",
         active=True,
         tmux_pane="%3",
         pid=3456,
+        run_generation=TEST_RUN_GENERATION,
     )
     server = Server(socket_path)
     server.lodes = [lode]
-    caplog.set_level(logging.WARNING)
-
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN),
         patch("hopper.server.save_lodes") as mock_save,
     ):
         server._reconcile_startup_lodes()
 
-    assert lode["state"] == "running"
-    assert lode["active"] is True
+    assert lode["state"] == "gated"
+    assert lode["active"] is False
     assert lode["tmux_pane"] == "%3"
     assert lode["pid"] == 3456
-    assert lode["status"] == (
-        "spawn refused: tmux unreachable — verify tmux is running, then retry"
-    )
-    assert lode["updated_at"] == 1000
-    assert "unknown-id" in caplog.text
+    assert "Do not restart" in lode["status"]
+    assert lode["spawn_disposition"] == "unknown"
+    assert lode["updated_at"] > 1000
     mock_save.assert_called_once_with(server.lodes)
 
 
@@ -4250,8 +4572,9 @@ def test_startup_reconciliation_without_pane_clears_unsupported_identity(socket_
     assert lode["active"] is False
     assert lode["tmux_pane"] is None
     assert lode["pid"] is None
-    assert lode["status"] == ""
-    assert lode["updated_at"] == 1000
+    assert lode["state"] == "gated"
+    assert "Do not restart" in lode["status"]
+    assert lode["updated_at"] > 1000
     mock_save.assert_called_once_with(server.lodes)
 
 
@@ -4276,13 +4599,86 @@ def test_startup_reconciliation_mixed_lodes_saves_once(socket_path, make_lode):
     mock_save.assert_called_once_with(server.lodes)
 
 
+@pytest.mark.parametrize("state", ["new", "ready"])
+def test_startup_reconciliation_alive_preserves_bounded_grace(socket_path, make_lode, state):
+    lode = make_lode(
+        id=f"{state}-id",
+        state=state,
+        status="Waiting for registration",
+        active=True,
+        tmux_pane="%8",
+        pid=8080,
+        run_generation=TEST_RUN_GENERATION,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE):
+        server._reconcile_startup_lodes()
+
+    assert (lode["state"], lode["active"], lode["status"]) == (
+        state,
+        False,
+        "Waiting for registration",
+    )
+
+
+def test_startup_reconciliation_intentionally_unspawned_new_retains_grace(socket_path, make_lode):
+    lode = make_lode(id="new-id", state="new", active=True)
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with patch("hopper.server.pane_liveness") as liveness:
+        server._reconcile_startup_lodes()
+
+    liveness.assert_not_called()
+    assert (lode["state"], lode["active"]) == ("new", False)
+
+
+@pytest.mark.parametrize(
+    ("state", "stage", "pending_action"),
+    [
+        ("error", "mill", None),
+        ("gated", "mill", None),
+        ("stuck", "mill", None),
+        ("running", "shipped", None),
+        ("teardown", "mill", {"phase": "spawning"}),
+    ],
+)
+def test_startup_reconciliation_preserves_stronger_authority_inactive(
+    socket_path, make_lode, state, stage, pending_action
+):
+    lode = make_lode(
+        id="strong-id",
+        state=state,
+        stage=stage,
+        status="Durable authority",
+        active=True,
+        tmux_pane="%9",
+        run_generation=TEST_RUN_GENERATION,
+        pending_action=pending_action,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with patch("hopper.server.pane_liveness") as liveness:
+        server._reconcile_startup_lodes()
+
+    liveness.assert_not_called()
+    assert (lode["state"], lode["active"], lode["status"]) == (
+        state,
+        False,
+        "Durable authority",
+    )
+
+
 def test_gated_spawn_without_recorded_pane_spawns(socket_path, make_lode):
     server = Server(socket_path)
     lode = make_lode(id="fresh-id", active=False, tmux_pane=None, pid=None)
     server.lodes = [lode]
 
     with (
-        patch("hopper.server.spawn_claude", return_value="%10") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%10")) as mock_spawn,
         patch.object(server, "broadcast") as mock_broadcast,
     ):
         outcome, pane = server._gated_spawn(lode, "/repo", foreground=False)
@@ -4324,13 +4720,16 @@ def test_gated_spawn_alive_refuses_even_when_active_is_false(socket_path, make_l
     assert pane is None
     mock_spawn.assert_not_called()
     assert lode["stage"] == "ship"
-    assert lode["state"] == "running"
+    assert lode["state"] == "gated"
     assert lode["active"] is False
     assert lode["tmux_pane"] == "%11"
     assert lode["pid"] == 1111
-    assert lode["updated_at"] == 1000
-    assert lode["status"] == ("spawn refused: runner already live in pane %11 — attach instead")
-    assert lode["state"] not in PROGRESS_REJECT_STATES
+    assert lode["updated_at"] > 1000
+    assert lode["status"] == (
+        "Runner pane %11 is already live; attach with: hop lode peek incident-id. "
+        "No new pane was started."
+    )
+    assert lode["spawn_disposition"] == "already_live"
     assert "attach instead of spawning" in caplog.text
 
 
@@ -4341,7 +4740,7 @@ def test_gated_spawn_gone_clears_stale_identity_then_spawns(socket_path, make_lo
 
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
-        patch("hopper.server.spawn_claude", return_value="%13") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%13")) as mock_spawn,
     ):
         outcome, pane = server._gated_spawn(lode, "/repo")
 
@@ -4371,17 +4770,19 @@ def test_gated_spawn_unknown_preserves_identity_and_refuses(socket_path, make_lo
     ):
         outcome, pane = server._gated_spawn(lode, "/repo")
 
-    assert outcome is SpawnOutcome.REFUSED_UNKNOWN
+    assert outcome is SpawnOutcome.UNKNOWN
     assert pane is None
     mock_spawn.assert_not_called()
-    assert lode["state"] == "running"
-    assert lode["active"] is True
+    assert lode["state"] == "gated"
+    assert lode["active"] is False
     assert lode["tmux_pane"] == "%14"
     assert lode["pid"] == 1414
-    assert lode["updated_at"] == 1000
-    assert lode["status"] == (
-        "spawn refused: tmux unreachable — verify tmux is running, then retry"
-    )
+    assert lode["updated_at"] > 1000
+    assert "pane may be live" in lode["status"]
+    assert "retry" not in lode["status"].lower()
+    assert "restart" not in lode["status"].lower()
+    assert "Do not launch another runner" in lode["status"]
+    assert lode["spawn_disposition"] == "unknown"
     assert "unknown-id" in caplog.text
 
 
@@ -4418,45 +4819,183 @@ def test_legacy_reset_wire_refuses_without_mutation(socket_path, make_lode, forc
     assert response["reason"] == "protocol_upgrade_required"
 
 
-def test_gated_spawn_failure_sets_visible_status(socket_path, make_lode, caplog):
+def test_gated_spawn_missing_project_sets_visible_status(socket_path, make_lode):
     lode = make_lode(id="failed-id")
     server = Server(socket_path)
     server.lodes = [lode]
-    caplog.set_level(logging.ERROR)
-
-    with patch("hopper.server.spawn_claude", return_value=None):
+    with patch("hopper.server.spawn_claude") as spawn:
         outcome, pane = server._gated_spawn(lode, None)
 
-    assert outcome is SpawnOutcome.FAILED
+    assert outcome is SpawnOutcome.PROJECT_MISSING
     assert pane is None
-    assert lode["status"] == (
-        "spawn failed: tmux could not create a runner pane — verify tmux is running, then retry"
-    )
-    assert "failed-id" in caplog.text
+    assert lode["state"] == "error"
+    assert lode["active"] is False
+    assert lode["spawn_disposition"] == "project_missing"
+    assert "restore its registration/path" in lode["status"]
+    assert "hop lode restart failed-id" in lode["status"]
+    spawn.assert_not_called()
 
 
-def test_gated_spawn_oserror_is_failed_and_restores_updates(socket_path, make_lode, caplog):
+def test_gated_spawn_unknown_preserves_updates_and_forbids_restart(socket_path, make_lode):
     lode = make_lode(id="permission-id", stage="ship", state="ready", status="Ready")
     server = Server(socket_path)
     server.lodes = [lode]
-    caplog.set_level(logging.ERROR)
-
-    with patch("hopper.server.spawn_claude", side_effect=PermissionError("tmux denied")):
+    with patch(
+        "hopper.server.spawn_claude",
+        return_value=(WindowSpawnOutcome.UNKNOWN, None),
+    ):
         outcome, pane = server._gated_spawn(
             lode,
             "/repo",
-            spawn_updates={"stage": "refine", "state": "running", "status": "Resuming"},
+            pending_state="ready",
+            spawn_updates={"stage": "refine"},
         )
 
-    assert outcome is SpawnOutcome.FAILED
+    assert outcome is SpawnOutcome.UNKNOWN
     assert pane is None
-    assert lode["stage"] == "ship"
-    assert lode["state"] == "ready"
+    assert lode["stage"] == "refine"
+    assert lode["state"] == "gated"
     assert lode["active"] is False
     assert lode["tmux_pane"] is None
     assert lode["pid"] is None
-    assert lode["status"].startswith("spawn failed: ")
-    assert "tmux denied" in caplog.text
+    assert lode["spawn_disposition"] == "unknown"
+    assert "retry" not in lode["status"].lower()
+    assert "restart" not in lode["status"].lower()
+    assert "Do not launch another runner" in lode["status"]
+
+
+@pytest.mark.parametrize(
+    (
+        "window_outcome",
+        "project_path",
+        "pending_state",
+        "recorded_pane",
+        "expected_outcome",
+        "expected_state",
+        "expected_disposition",
+        "status_fragment",
+    ),
+    [
+        (
+            WindowSpawnOutcome.SPAWNED,
+            "/repo",
+            "new",
+            None,
+            SpawnOutcome.SPAWNED,
+            "new",
+            "spawned",
+            "waiting for startup registration",
+        ),
+        (
+            WindowSpawnOutcome.SPAWNED,
+            "/repo",
+            "ready",
+            None,
+            SpawnOutcome.SPAWNED,
+            "ready",
+            "spawned",
+            "waiting for handoff registration",
+        ),
+        (
+            WindowSpawnOutcome.PROVEN_NO_PANE,
+            "/repo",
+            "new",
+            None,
+            SpawnOutcome.PROVEN_NO_PANE,
+            "error",
+            "proven_no_pane",
+            "repair or start tmux, then run: hop lode restart mapping-id",
+        ),
+        (
+            WindowSpawnOutcome.UNKNOWN,
+            "/repo",
+            "new",
+            None,
+            SpawnOutcome.UNKNOWN,
+            "gated",
+            "unknown",
+            "pane may be live",
+        ),
+        (
+            None,
+            None,
+            "new",
+            None,
+            SpawnOutcome.PROJECT_MISSING,
+            "error",
+            "project_missing",
+            "restore its registration/path, then run: hop lode restart mapping-id",
+        ),
+        (
+            None,
+            "/repo",
+            "ready",
+            "%70",
+            SpawnOutcome.ALREADY_LIVE,
+            "gated",
+            "already_live",
+            "attach with: hop lode peek mapping-id",
+        ),
+    ],
+    ids=[
+        "spawned-startup",
+        "spawned-handoff",
+        "proven-no-pane",
+        "unknown",
+        "project-missing",
+        "already-live",
+    ],
+)
+def test_gated_spawn_persists_truthful_disposition_table(
+    socket_path,
+    make_lode,
+    window_outcome,
+    project_path,
+    pending_state,
+    recorded_pane,
+    expected_outcome,
+    expected_state,
+    expected_disposition,
+    status_fragment,
+):
+    lode = make_lode(
+        id="mapping-id",
+        project="proj",
+        state="new" if pending_state == "new" else "paused",
+        tmux_pane=recorded_pane,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    spawn_result = (
+        (window_outcome, "%71" if window_outcome is WindowSpawnOutcome.SPAWNED else None)
+        if window_outcome is not None
+        else None
+    )
+
+    with (
+        patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
+        patch("hopper.server.spawn_claude", return_value=spawn_result) as spawn,
+    ):
+        outcome, pane_id = server._gated_spawn(
+            lode,
+            project_path,
+            pending_state=pending_state,
+        )
+
+    assert outcome is expected_outcome
+    assert pane_id == ("%71" if expected_outcome is SpawnOutcome.SPAWNED else None)
+    assert (lode["state"], lode["active"], lode["spawn_disposition"]) == (
+        expected_state,
+        False,
+        expected_disposition,
+    )
+    assert status_fragment in lode["status"]
+    if expected_outcome is SpawnOutcome.UNKNOWN:
+        assert "retry" not in lode["status"].lower()
+        assert "restart" not in lode["status"].lower()
+        assert "Do not launch another runner" in lode["status"]
+    if expected_outcome in {SpawnOutcome.PROJECT_MISSING, SpawnOutcome.ALREADY_LIVE}:
+        spawn.assert_not_called()
 
 
 def test_two_queued_spawn_requests_create_one_runner(socket_path, make_lode):
@@ -4465,9 +5004,12 @@ def test_two_queued_spawn_requests_create_one_runner(socket_path, make_lode):
     server.lodes = [lode]
 
     with (
-        patch("hopper.server.find_project", return_value=None),
+        patch(
+            "hopper.server.find_project",
+            return_value=Project(path="/repo", name="proj"),
+        ),
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
-        patch("hopper.server.spawn_claude", return_value="%20") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%20")) as mock_spawn,
     ):
         event_thread = threading.Thread(target=server._event_loop, daemon=True)
         event_thread.start()
@@ -4475,12 +5017,12 @@ def test_two_queued_spawn_requests_create_one_runner(socket_path, make_lode):
         server.enqueue({"type": "lode_spawn", "lode_id": "queued-id"})
 
         deadline = time.monotonic() + 2
-        while not lode["status"].startswith("spawn refused: ") and time.monotonic() < deadline:
+        while lode["spawn_disposition"] != "already_live" and time.monotonic() < deadline:
             time.sleep(0.01)
         server.stop_event.set()
         event_thread.join(timeout=1)
 
-    mock_spawn.assert_called_once_with("queued-id", None, foreground=False, env=ANY)
+    mock_spawn.assert_called_once_with("queued-id", "/repo", foreground=False, env=ANY)
     assert lode["tmux_pane"] == "%20"
 
 
@@ -4501,7 +5043,12 @@ def test_lode_spawn_action_passes_foreground_to_gate(socket_path, make_lode):
             None,
         )
 
-    mock_gate.assert_called_once_with(lode, "/repo", foreground=True)
+    mock_gate.assert_called_once_with(
+        lode,
+        "/repo",
+        pending_state="new",
+        foreground=True,
+    )
 
 
 def test_unarchive_and_spawn_is_one_server_action(socket_path, make_lode):
@@ -4530,7 +5077,12 @@ def test_unarchive_and_spawn_is_one_server_action(socket_path, make_lode):
     assert server.archived_lodes == []
     assert server.lodes == [lode]
     assert "archived_at" not in lode
-    mock_gate.assert_called_once_with(lode, "/repo", foreground=False)
+    mock_gate.assert_called_once_with(
+        lode,
+        "/repo",
+        pending_state="new",
+        foreground=False,
+    )
 
 
 def test_unarchive_spawn_fence_precedes_archive_list_mutation(socket_path, make_lode):
@@ -4571,9 +5123,9 @@ def test_resume_refine_applies_updates_before_allowed_spawn(socket_path, make_lo
 
     def assert_updated_before_spawn(*args, **kwargs):
         assert lode["stage"] == "refine"
-        assert lode["state"] == "running"
-        assert lode["status"] == "Resuming refine"
-        return "%21"
+        assert lode["state"] == "ready"
+        assert lode["active"] is False
+        return _spawned("%21")
 
     with (
         patch(
@@ -4585,14 +5137,14 @@ def test_resume_refine_applies_updates_before_allowed_spawn(socket_path, make_lo
         server._handle_mutation({"type": "lode_resume_refine", "lode_id": "refine-id"}, None)
 
     assert lode["stage"] == "refine"
-    assert lode["state"] == "running"
+    assert lode["state"] == "ready"
+    assert lode["active"] is False
+    assert "waiting for handoff registration" in lode["status"]
     assert lode["tmux_pane"] == "%21"
     assert "refine" not in lode["runs"]
 
 
-def test_resume_refine_failed_spawn_restores_workflow_and_clears_gone_identity(
-    socket_path, make_lode
-):
+def test_resume_refine_proven_failure_keeps_refine_and_clears_gone_identity(socket_path, make_lode):
     lode = make_lode(
         id="refine-id",
         stage="ship",
@@ -4600,7 +5152,7 @@ def test_resume_refine_failed_spawn_restores_workflow_and_clears_gone_identity(
         status="Ready to refine",
         project="proj",
         active=True,
-        tmux_pane="%gone",
+        tmux_pane="%22",
         pid=2222,
     )
     server = Server(socket_path)
@@ -4612,24 +5164,29 @@ def test_resume_refine_failed_spawn_restores_workflow_and_clears_gone_identity(
             return_value=Project(path="/repo", name="proj"),
         ),
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
-        patch("hopper.server.spawn_claude", return_value=None),
+        patch(
+            "hopper.server.spawn_claude",
+            return_value=(WindowSpawnOutcome.PROVEN_NO_PANE, None),
+        ),
         patch("hopper.server.save_lodes") as mock_save,
         patch.object(server, "broadcast") as mock_broadcast,
     ):
         server._handle_mutation({"type": "lode_resume_refine", "lode_id": "refine-id"}, None)
 
-    assert lode["stage"] == "ship"
-    assert lode["state"] == "ready"
+    assert lode["stage"] == "refine"
+    assert lode["state"] == "error"
     assert lode["active"] is False
     assert lode["tmux_pane"] is None
     assert lode["pid"] is None
-    assert lode["status"].startswith("spawn failed: ")
+    assert "repair or start tmux" in lode["status"]
+    assert "hop lode restart refine-id" in lode["status"]
+    assert lode["spawn_disposition"] == "proven_no_pane"
     assert mock_save.call_count == 2
     mock_save.assert_called_with(server.lodes)
     mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
 
-def test_resume_refine_refusal_leaves_stage_and_state_unchanged(socket_path, make_lode):
+def test_resume_refine_live_pane_gates_without_changing_stage(socket_path, make_lode):
     lode = make_lode(
         id="refine-id",
         stage="ship",
@@ -4650,8 +5207,9 @@ def test_resume_refine_refusal_leaves_stage_and_state_unchanged(socket_path, mak
 
     mock_spawn.assert_not_called()
     assert lode["stage"] == "ship"
-    assert lode["state"] == "ready"
+    assert lode["state"] == "gated"
     assert lode["tmux_pane"] == "%22"
+    assert lode["spawn_disposition"] == "already_live"
 
 
 def test_resume_uses_gate_without_signaling_recorded_pid(socket_path, make_lode):
@@ -4661,7 +5219,7 @@ def test_resume_uses_gate_without_signaling_recorded_pid(socket_path, make_lode)
         state="paused",
         project="proj",
         active=False,
-        tmux_pane="%dead",
+        tmux_pane="%25",
         pid=4242,
     )
     server = Server(socket_path)
@@ -4673,7 +5231,7 @@ def test_resume_uses_gate_without_signaling_recorded_pid(socket_path, make_lode)
             return_value=Project(path="/repo", name="proj"),
         ),
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
-        patch("hopper.server.spawn_claude", return_value="%26"),
+        patch("hopper.server.spawn_claude", return_value=_spawned("%26")),
         patch("hopper.server.os.kill") as mock_kill,
     ):
         server._handle_mutation(
@@ -4682,7 +5240,8 @@ def test_resume_uses_gate_without_signaling_recorded_pid(socket_path, make_lode)
         )
 
     mock_kill.assert_not_called()
-    assert lode["state"] == "running"
+    assert lode["state"] == "ready"
+    assert lode["active"] is False
     assert lode["tmux_pane"] == "%26"
     assert lode["pid"] is None
 
@@ -4702,7 +5261,7 @@ def test_fresh_backlog_promotion_spawns_through_gate(socket_path):
             "hopper.server.find_project",
             return_value=Project(path="/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", return_value="%23") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%23")) as mock_spawn,
     ):
         lode = server._promote_backlog_item(item)
 
@@ -4718,7 +5277,7 @@ def test_fresh_lode_create_spawns_through_gate(socket_path):
             "hopper.server.find_project",
             return_value=Project(path="/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", return_value="%24") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%24")) as mock_spawn,
     ):
         server._handle_mutation(
             {"type": "lode_create", "project": "proj", "scope": "work", "spawn": True},
@@ -4731,14 +5290,19 @@ def test_fresh_lode_create_spawns_through_gate(socket_path):
 
 
 @pytest.mark.parametrize(
-    "status",
+    ("status", "spawn_disposition"),
     [
-        "spawn refused: tmux unreachable — verify tmux is running, then retry",
-        "spawn failed: tmux could not create a runner pane — verify tmux is running, then retry",
+        ("Runner pane creation is unverified", "unknown"),
+        ("tmux did not create a runner pane", "proven_no_pane"),
     ],
 )
-def test_runner_registration_clears_spawn_status(socket_path, make_lode, status):
-    lode = make_lode(id="register-id", status=status, run_generation=TEST_RUN_GENERATION)
+def test_runner_registration_clears_spawn_status(socket_path, make_lode, status, spawn_disposition):
+    lode = make_lode(
+        id="register-id",
+        status=status,
+        spawn_disposition=spawn_disposition,
+        run_generation=TEST_RUN_GENERATION,
+    )
     server = Server(socket_path)
     server.lodes = [lode]
 
@@ -4751,10 +5315,199 @@ def test_runner_registration_clears_spawn_status(socket_path, make_lode, status)
         proof_mode="other-bounded-no-birth",
     )
 
-    assert lode["status"] == ""
+    assert lode["state"] == "running"
     assert lode["active"] is True
+    assert lode["status"] == "Starting mill"
+    assert lode["spawn_disposition"] is None
     assert lode["tmux_pane"] == "%25"
     assert lode["pid"] == 2525
+
+
+@pytest.mark.parametrize("state", ["new", "ready", "reconnecting"])
+def test_registration_atomically_leaves_only_eligible_graces(socket_path, make_lode, state):
+    generation = "9" * 32
+    lode = make_lode(
+        id="register-id",
+        state=state,
+        status="Waiting for registration",
+        active=False,
+        run_generation=generation,
+        spawn_disposition="spawned",
+        reconnect_prior_state="running",
+        reconnect_prior_status="Connected",
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    persisted = []
+    broadcasts = []
+
+    def observe_save(lodes):
+        persisted.append(
+            (
+                lodes[0]["state"],
+                lodes[0]["active"],
+                lodes[0]["status"],
+                lodes[0]["spawn_disposition"],
+            )
+        )
+
+    with (
+        patch("hopper.server.save_lodes", side_effect=observe_save),
+        patch.object(server, "broadcast", side_effect=lambda message: broadcasts.append(message)),
+    ):
+        assert server._register_lode_client(
+            "register-id",
+            MagicMock(),
+            tmux_pane="%72",
+            pid=7272,
+            run_generation=generation,
+            proof_mode="other-bounded-no-birth",
+        )
+
+    assert persisted == [("running", True, "Starting mill", None)]
+    assert broadcasts[0]["lode"]["state"] == "running"
+    assert broadcasts[0]["lode"]["active"] is True
+    assert not any(saved[:2] == ("new", True) for saved in persisted)
+    assert "reconnect_prior_state" not in lode
+    assert "reconnect_prior_status" not in lode
+
+
+@pytest.mark.parametrize("state", ["new", "ready", "reconnecting"])
+@pytest.mark.parametrize(
+    "msg_type",
+    sorted(hopper_client.RUNNER_MUTATION_TYPES - {"lode_register", "lode_supervisor_register"}),
+)
+def test_lifecycle_grace_denies_every_nonregistration_runner_mutation_without_changes(
+    socket_path, make_lode, state, msg_type
+):
+    generation = "7" * 32
+    lode = make_lode(
+        id="grace777",
+        state=state,
+        status="Waiting for registration",
+        active=False,
+        run_generation=generation,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    before = copy.deepcopy(lode)
+    message = {
+        "type": msg_type,
+        "lode_id": lode["id"],
+        "run_generation": generation,
+        "ack_requested": True,
+    }
+    if msg_type == "lode_action":
+        message.update(
+            expected_generation=generation,
+            action_id="7" * 32,
+            action_type="completion",
+            target_disposition="advance_refine",
+            force_consent=False,
+            stage="mill",
+        )
+    elif msg_type == "lode_set_state":
+        message.update(state="running", status="Connected")
+
+    with (
+        patch("hopper.server.save_lodes") as save,
+        patch.object(server, "broadcast") as broadcast,
+    ):
+        server._handle_mutation(message, conn)
+
+    response = _decode_mock_response(conn)
+    if msg_type == "lode_action":
+        assert response["outcome"] == "refused"
+    else:
+        assert response["accepted"] is False
+    assert response["reason"] == "lifecycle_grace_pending"
+    assert lode == before
+    save.assert_not_called()
+    broadcast.assert_not_called()
+    assert server.action_acceptances == {}
+
+
+def test_supervisor_registration_is_exempt_but_preserves_reconnect_grace(socket_path, make_lode):
+    generation = TEST_RUN_GENERATION
+    lode = make_lode(
+        id="supervisor-id",
+        state="reconnecting",
+        status="Waiting for registration",
+        active=False,
+        run_generation=generation,
+        reconnect_prior_state="running",
+        reconnect_prior_status="Connected",
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    before = copy.deepcopy(lode)
+    record = _strict_completion_run_ownership(lode["id"], generation)
+
+    with (
+        patch("hopper.server.actions.write_run_ownership"),
+        patch.object(server, "_record_action_spawn_adoption") as adoption,
+    ):
+        server._handle_registration_capture_result(
+            {
+                "key": f"supervisor:{lode['id']}:{generation}",
+                "kind": "supervisor",
+                "lode_id": lode["id"],
+                "run_generation": generation,
+                "request": {},
+                "result": {"ok": True, "record": record},
+            },
+            conn,
+        )
+
+    assert lode == before
+    adoption.assert_called_once_with(lode["id"], generation, "supervisor")
+    response = _decode_mock_response(conn)
+    assert response["type"] == "lode_supervisor_registered"
+    assert response["accepted"] is True
+
+
+@pytest.mark.parametrize(
+    ("state", "pending_action"),
+    [
+        ("gated", None),
+        ("stuck", None),
+        ("teardown", {"phase": "spawning"}),
+    ],
+)
+def test_registration_preserves_stronger_state_authority(
+    socket_path, make_lode, state, pending_action
+):
+    generation = "8" * 32
+    lode = make_lode(
+        id="register-id",
+        state=state,
+        status="Durable authority",
+        active=False,
+        pending_action=pending_action,
+        run_generation=generation,
+        spawn_disposition="unknown",
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    with patch("hopper.server.save_lodes"):
+        assert server._register_lode_client(
+            "register-id",
+            MagicMock(),
+            tmux_pane="%73",
+            pid=7373,
+            run_generation=generation,
+            proof_mode="other-bounded-no-birth",
+        )
+
+    assert (lode["state"], lode["status"], lode["active"]) == (
+        state,
+        "Durable authority",
+        True,
+    )
+    assert lode["spawn_disposition"] is None
 
 
 @pytest.mark.parametrize("proof_mode", [None, "unknown"])
@@ -4829,8 +5582,8 @@ def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
             thread.join(timeout=2)
 
 
-def test_startup_archives_shipped_lode_when_tmux_is_unknown(
-    socket_path, temp_config, make_lode, caplog
+def test_startup_archives_shipped_lode_without_reconnect_conversion(
+    socket_path, temp_config, make_lode
 ):
     """UNKNOWN runner evidence does not block lock-held shipped auto-archive."""
     shipped_lode = make_lode(
@@ -4842,8 +5595,6 @@ def test_startup_archives_shipped_lode_when_tmux_is_unknown(
     )
     save_lodes([shipped_lode])
     server = Server(socket_path)
-    caplog.set_level(logging.WARNING)
-
     with patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN):
         thread = threading.Thread(target=server.start, daemon=True)
         thread.start()
@@ -4851,8 +5602,8 @@ def test_startup_archives_shipped_lode_when_tmux_is_unknown(
             assert server.ready.wait(5), "Server did not start"
             assert server.lodes == []
             assert server.archived_lodes[0]["id"] == "unknown-shipped"
-            assert server.archived_lodes[0]["status"].startswith("spawn refused: ")
-            assert "unknown-shipped" in caplog.text
+            assert server.archived_lodes[0]["state"] != "reconnecting"
+            assert server.archived_lodes[0]["active"] is False
         finally:
             server.stop()
             thread.join(timeout=2)
@@ -5333,7 +6084,7 @@ def test_server_handles_connect_with_missing_lode_id(socket_path, server):
 
 def test_server_handles_lode_set_state(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_state message."""
-    lode = make_lode(id="test-id")
+    lode = make_lode(id="test-id", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
 
@@ -5454,7 +6205,7 @@ def test_server_accepts_progress_for_live_states(socket_path, make_lode, state):
     mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
 
-@pytest.mark.parametrize("state", ["new", "gated", "ready", "error"])
+@pytest.mark.parametrize("state", ["gated", "error"])
 def test_server_rejects_progress_for_terminal_or_inactive_states(
     socket_path, make_lode, state, caplog
 ):
@@ -5489,7 +6240,7 @@ def test_server_rejects_progress_for_terminal_or_inactive_states(
 
 def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_title message."""
-    lode = make_lode(id="test-id")
+    lode = make_lode(id="test-id", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
 
@@ -5524,7 +6275,7 @@ def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lo
 
 def test_server_handles_lode_set_branch(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_branch message."""
-    lode = make_lode(id="test-id")
+    lode = make_lode(id="test-id", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
 
@@ -5706,30 +6457,36 @@ def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config
             "hopper.server.find_project",
             return_value=Project(path="/fake/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", return_value="%2") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%2")) as mock_spawn,
         patch.object(srv, "broadcast"),
     ):
         srv._handle_mutation({"type": "lode_resume", "lode_id": "test-id"}, conn)
 
     mock_spawn.assert_called_once_with("test-id", "/fake/repo", foreground=False, env=ANY)
-    assert srv.lodes[0]["state"] == "running"
-    assert srv.lodes[0]["status"] == "Resuming refine"
+    assert srv.lodes[0]["state"] == "ready"
+    assert srv.lodes[0]["active"] is False
+    assert "waiting for handoff registration" in srv.lodes[0]["status"]
     response = _decode_mock_response(conn)
     assert response["type"] == "lode_resumed"
     assert response["tmux_pane"] == "%2"
 
 
 @pytest.mark.parametrize(
-    ("outcome", "guidance"),
+    ("outcome", "status", "guidance"),
     [
-        (SpawnOutcome.ALREADY_LIVE, "attach instead of spawning"),
-        (SpawnOutcome.REFUSED_UNKNOWN, "verify tmux is running, then retry"),
-        (SpawnOutcome.FAILED, "verify tmux is running, then retry"),
+        (SpawnOutcome.ALREADY_LIVE, "attach to pane %1", "attach to pane %1"),
+        (SpawnOutcome.UNKNOWN, "inspect tmux; do not restart", "do not restart"),
+        (SpawnOutcome.PROVEN_NO_PANE, "repair tmux, then restart", "then restart"),
+        (SpawnOutcome.PROJECT_MISSING, "restore the project, then restart", "then restart"),
     ],
 )
-def test_server_resume_failure_response_is_prescriptive(socket_path, make_lode, outcome, guidance):
+def test_server_resume_failure_response_is_prescriptive(
+    socket_path, make_lode, outcome, status, guidance
+):
     server = Server(socket_path)
-    server.lodes = [make_lode(id="test-id", stage="refine", state="paused", project="proj")]
+    server.lodes = [
+        make_lode(id="test-id", stage="refine", state="paused", project="proj", status=status)
+    ]
     conn = _mock_client(server)
 
     with (
@@ -5781,7 +6538,7 @@ def test_server_handles_backlog_set_queued(socket_path, server):
 
 def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, make_lode):
     """A raw shipped-stage mutation cannot publish a completion backlog action."""
-    lode = make_lode(id="lode1234", project="myproj", stage="ship")
+    lode = make_lode(id="lode1234", project="myproj", stage="ship", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
     server.backlog = [
@@ -5794,7 +6551,7 @@ def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, ma
         )
     ]
 
-    with patch("hopper.server.spawn_claude", return_value="%30") as mock_spawn:
+    with patch("hopper.server.spawn_claude", return_value=_spawned("%30")) as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -5913,7 +6670,7 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
     socket_path, server, temp_config, make_lode
 ):
     """Raw stage mutation leaves every queued item for the durable action."""
-    lode = make_lode(id="lode1234", project="myproj", stage="ship")
+    lode = make_lode(id="lode1234", project="myproj", stage="ship", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
     older = BacklogItem(
@@ -5932,7 +6689,7 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
     )
     server.backlog = [newer, older]
 
-    with patch("hopper.server.spawn_claude", return_value="%31") as mock_spawn:
+    with patch("hopper.server.spawn_claude", return_value=_spawned("%31")) as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -5956,7 +6713,7 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
 
 def test_auto_promote_chains_multiple_queued_items(socket_path, server, temp_config, make_lode):
     """Raw shipped-stage mutation cannot start a queued-item chain."""
-    lode = make_lode(id="lode1234", project="myproj", stage="ship")
+    lode = make_lode(id="lode1234", project="myproj", stage="ship", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
     item_a = BacklogItem(
@@ -5982,7 +6739,7 @@ def test_auto_promote_chains_multiple_queued_items(socket_path, server, temp_con
     )
     server.backlog = [item_c, item_b, item_a]  # intentionally out of order
 
-    with patch("hopper.server.spawn_claude", return_value="%32") as mock_spawn:
+    with patch("hopper.server.spawn_claude", return_value=_spawned("%32")) as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -6220,7 +6977,7 @@ def test_auto_spawn_on_disconnect(
 
     with (
         patch("hopper.server.find_project") as mock_find,
-        patch("hopper.server.spawn_claude", return_value="%33") as mock_spawn,
+        patch("hopper.server.spawn_claude", return_value=_spawned("%33")) as mock_spawn,
     ):
         mock_find.return_value = MagicMock(path="/some/path")
 
@@ -6244,7 +7001,7 @@ def test_auto_spawn_on_disconnect(
 
         mock_spawn.assert_not_called()
         assert server.lodes[0]["stage"] == "ship"
-        assert server.lodes[0]["state"] == "ready"
+        assert server.lodes[0]["state"] == "running"
 
 
 def test_auto_archive_shipped_on_disconnect(
@@ -7704,7 +8461,7 @@ class TestActivityLog:
 
     def test_lode_mutation_logged(self, isolate_config, server, socket_path, make_lode):
         """Lode state change produces a log line with lode ID and new state."""
-        server.lodes = [make_lode(id="test-log")]
+        server.lodes = [make_lode(id="test-log", state="running", active=True)]
         save_lodes(server.lodes)
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -7838,7 +8595,7 @@ class TestOomLifecycle:
                 "HOPPER_RUN_GENERATION": generation,
                 "HOPPER_OOM_SCOPE": expected_unit,
             }
-            return "%1"
+            return _spawned("%1")
 
         with (
             patch("hopper.server.uuid.uuid4", return_value=MagicMock(hex=generation)),
@@ -7941,7 +8698,7 @@ class TestOomLifecycle:
     def test_acknowledged_completed_state_is_refused_without_mutation(self, socket_path, make_lode):
         generation = "2" * 32
         srv = Server(socket_path)
-        lode = make_lode(id="test-id", run_generation=generation)
+        lode = make_lode(id="test-id", state="running", active=True, run_generation=generation)
         srv.lodes = [lode]
         conn = _mock_client(srv)
         before = copy.deepcopy(lode)
@@ -8005,6 +8762,8 @@ class TestOomLifecycle:
         srv = Server(socket_path)
         lode = make_lode(
             id="test-id",
+            state="running",
+            active=True,
             run_generation=generation,
             last_progress_at=12_000,
         )
@@ -8032,7 +8791,7 @@ class TestOomLifecycle:
         srv.lodes = [lode]
 
         with patch("hopper.server.spawn_claude") as spawn:
-            assert srv._gated_spawn(lode, "/repo") == (SpawnOutcome.FAILED, None)
+            assert srv._gated_spawn(lode, "/repo") == (SpawnOutcome.UNKNOWN, None)
         spawn.assert_not_called()
         assert (lode["state"], lode["status"], lode["failure_kind"]) == (
             "error",
@@ -8041,13 +8800,12 @@ class TestOomLifecycle:
         )
 
         with (
-            patch("hopper.server.spawn_claude", return_value="%2"),
+            patch("hopper.server.spawn_claude", return_value=_spawned("%2")),
             patch.object(srv, "broadcast"),
         ):
             outcome, _ = srv._gated_spawn(
                 lode,
                 "/repo",
-                spawn_updates={"state": "running", "status": "Resuming refine"},
                 allow_terminal_recovery=True,
             )
 
@@ -8091,7 +8849,7 @@ class TestOomLifecycle:
                 return_value=Project(path="/repo", name="proj"),
             ),
             patch("hopper.server.oom.is_linux", return_value=True),
-            patch("hopper.server.spawn_claude", return_value="%4"),
+            patch("hopper.server.spawn_claude", return_value=_spawned("%4")),
             patch("hopper.server.save_lodes"),
             patch.object(srv, "broadcast") as broadcast,
         ):
@@ -8509,7 +9267,7 @@ class TestOomLifecycle:
                 return_value=Project(path="/repo", name="proj"),
             ),
             patch("hopper.server.oom.is_linux", return_value=False),
-            patch("hopper.server.spawn_claude", return_value="%2") as spawn,
+            patch("hopper.server.spawn_claude", return_value=_spawned("%2")) as spawn,
             patch("hopper.server.save_lodes"),
             patch.object(srv, "broadcast"),
         ):
@@ -8700,13 +9458,13 @@ class TestOomLifecycle:
         ):
             srv._consume_failed_oom_units()
             srv._reconcile_startup_lodes()
-            assert srv._gated_spawn(lode, "/repo") == (SpawnOutcome.FAILED, None)
+            assert srv._gated_spawn(lode, "/repo") == (SpawnOutcome.UNKNOWN, None)
 
         pane_liveness.assert_not_called()
         spawn.assert_not_called()
         release.assert_not_called()
         assert lode["oom_scope"] == "hopper-test.scope"
-        assert lode["active"] is True
+        assert lode["active"] is False
         for pending in srv.pending_disconnects.values():
             pending["deadline"] = 0
         srv._drain_due_disconnects()
@@ -8739,7 +9497,7 @@ class TestOomLifecycle:
         pane_liveness.assert_not_called()
         assert lode["failure_kind"] == "runner_exit_unverified"
         assert lode["failure_kind"] != "oom"
-        assert classify(lode) == ("error", 1)
+        assert classify(lode) == ("error", 1, None)
 
     def test_startup_terminal_lode_skips_unavailable_hold_but_allows_oom_upgrade(
         self, socket_path, make_lode
