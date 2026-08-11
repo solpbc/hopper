@@ -688,15 +688,6 @@ def _runner_process_exited(pid: int) -> bool:
     return False
 
 
-def _set_spawn_refusal(lode: dict, message: str) -> bool:
-    """Set a visible spawn refusal without changing workflow or runner state."""
-    status = format_refusal_status("spawn", message)
-    if lode.get("status") == status:
-        return False
-    lode["status"] = status
-    return True
-
-
 def _clear_spawn_refusal(lode: dict, *, clear_status: bool = True) -> bool:
     """Clear a refusal or failure after live runner evidence supersedes it."""
     changed = lode.get("spawn_disposition") is not None
@@ -4685,11 +4676,7 @@ class Server:
         lode = self._find_lode(lode_id)
         if not lode or run_generation != lode.get("run_generation"):
             return False
-        registration_grace = (
-            lode.get("active") is False
-            and lode.get("pending_action") is None
-            and lode.get("state") in {"new", "ready", "reconnecting"}
-        )
+        registration_grace = _lifecycle_grace_pending(lode)
         terminal_recovery = is_terminal_failure_kind(lode.get("failure_kind"))
         if terminal_recovery and (not tmux_pane or tmux_pane != lode.get("tmux_pane")):
             return False
