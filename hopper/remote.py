@@ -88,6 +88,13 @@ def run_remote(
         kwargs["input"] = stdin_bytes
     elif stdin_text is not None:
         kwargs["input"] = stdin_text
+    else:
+        # Without an explicit stdin payload, ssh otherwise inherits this
+        # process's real stdin and forwards it to the remote command. A pooled
+        # create probes every candidate host before the one authoritative
+        # create call reads the scope, and concurrent probes racing to drain
+        # the same inherited pipe is what silently emptied it.
+        kwargs["stdin"] = subprocess.DEVNULL
     result = subprocess.run(command, **kwargs)
     if stdin_bytes is None:
         return result

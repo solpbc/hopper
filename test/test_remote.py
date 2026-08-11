@@ -6,6 +6,7 @@
 import fcntl
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -77,7 +78,14 @@ def test_run_remote_builds_ssh_command_and_passes_stdin(monkeypatch):
     assert kwargs["timeout"] == 12
 
 
-def test_run_remote_inherits_stdin_when_none(monkeypatch):
+def test_run_remote_devnulls_stdin_when_none(monkeypatch):
+    """A probe-only call must never inherit this process's real stdin.
+
+    Pooled create probes every pool member concurrently before the one
+    authoritative create call reads the scope from stdin; if a probe
+    inherited the real stdin fd, it could drain the scope before the create
+    call ever sees it.
+    """
     calls = []
 
     def fake_run(command, **kwargs):
@@ -89,6 +97,7 @@ def test_run_remote_inherits_stdin_when_none(monkeypatch):
     run_remote("suze.local", ["ping"])
 
     assert "input" not in calls[0]
+    assert calls[0]["stdin"] is subprocess.DEVNULL
 
 
 @pytest.mark.parametrize(
@@ -562,6 +571,101 @@ def test_select_candidate_uses_minimum_load_and_injected_tie_break():
 
     assert [probe.host for probe in choices] == ["first.example", "second.example"]
     assert selected.host == "second.example"
+
+
+def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
+    temp_config, monkeypatch, capsys
+):
+    """A pooled create across a multi-member pool must not drop the scope.
+
+    Regression: probing every pool candidate (project list + lode list, one
+    ssh call each) ran through run_remote with no stdin payload, and prior
+    to the fix that meant subprocess.run inherited this process's real
+    stdin for those calls. Concurrent probes across a multi-member pool
+    could drain the local scope before the one authoritative create call
+    ever read it. This exercises the real
+    probe_candidates -> run_remote path end to end (only subprocess.run is
+    mocked) with a two-host pool, which a test that stubs out pool selection
+    entirely cannot see.
+    """
+    from io import StringIO
+
+    scope_text = "this is a stdin scope that is long enough to pass the minimum length check"
+    config_path = temp_config / "config.json"
+    config_path.write_bytes(b'{"remote.journal": ["fedora.local", "suze.local"]}\n')
+    monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal"])
+    monkeypatch.setattr(sys, "stdin", StringIO(scope_text))
+
+    calls = []
+    calls_lock = threading.Lock()
+
+    def hop_args_of(command):
+        remote_command = command[7]
+        marker = 'hop"'
+        tail = remote_command[remote_command.index(marker) + len(marker) :].strip()
+        return shlex.split(tail) if tail else []
+
+    def fake_run(command, **kwargs):
+        with calls_lock:
+            calls.append((command, kwargs))
+        host = command[6]
+        hop_args = hop_args_of(command)
+        if hop_args[:2] == ["project", "list"]:
+            payload = {
+                "projects": [
+                    {
+                        "name": "journal",
+                        "path": "/srv/journal",
+                        "disabled": False,
+                        "disabled_reason": "",
+                    }
+                ]
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+        if hop_args[:2] == ["lode", "list"]:
+            active_row = {
+                "id": "aaaaaaaa",
+                "project": "journal",
+                "stage": "mill",
+                "state": "running",
+                "status": "running",
+                "active": True,
+            }
+            lodes = [active_row] if host == "fedora.local" else []
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps({"lodes": lodes}), stderr=""
+            )
+        if hop_args[:2] == ["implement", "journal"]:
+            created = {"id": "abcdefgh", "project": "journal", "host": "local"}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(created), stderr="")
+        raise AssertionError(f"unexpected remote hop invocation: {hop_args}")
+
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("hopper.remote.remember_lode") as remember,
+    ):
+        assert main() == 0
+
+    # fedora.local carries one active lode (load 1), suze.local carries none
+    # (load 0), so the least-loaded, uniquely-eligible host is suze.local.
+    create_calls = [
+        (command, kwargs)
+        for command, kwargs in calls
+        if hop_args_of(command)[:2] == ["implement", "journal"]
+    ]
+    assert len(create_calls) == 1
+    probe_only_calls = [(c, k) for c, k in calls if (c, k) not in create_calls]
+    assert probe_only_calls, "expected at least one probe call across the two-host pool"
+    for _command, kwargs in probe_only_calls:
+        assert "input" not in kwargs
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+
+    create_command, create_kwargs = create_calls[0]
+    assert create_command[6] == "suze.local"
+    assert create_kwargs["input"] == scope_text
+
+    remember.assert_called_once_with("abcdefgh", "suze.local", "journal")
+    assert capsys.readouterr().out == "Created lode abcdefgh (journal) on suze.local\n"
 
 
 def test_discover_lodes_preserves_rows_and_every_unavailable_reason():
