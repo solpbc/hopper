@@ -193,6 +193,18 @@ hop lode restart <lode-id>
 hop lode restart <lode-id> --force   # also restarts active lodes with a dead pane
 ```
 
+Archive an already-inactive lode whose recorded run ownership is unavailable:
+
+```bash
+hop lode archive <lode-id>
+```
+
+Status recommends `archive` only when the lode is inactive, its pane and process
+handles are empty, and its generation ownership cannot be loaded. The server then
+archives the stale row while retaining the worktree and branch. Submit the scope as
+a new lode if it still needs to run. Restart remains the recovery when ownership is
+available.
+
 Kill a lode (the pane and process go; the worktree and branch are retained):
 
 ```bash

@@ -564,7 +564,7 @@ def _bind_explicit_manual_action(
     command_args: list[str],
 ) -> tuple[list[str] | None, int | None]:
     """Mint a lifecycle action identity before an explicit routed mutation."""
-    verbs = {"pause", "restart", "kill"}
+    verbs = {"archive", "pause", "restart", "kill"}
     if command == "lode" and len(command_args) >= 2 and command_args[0] in verbs:
         verb = command_args[0]
         candidate_indexes = range(1, len(command_args))
@@ -1840,8 +1840,35 @@ def _format_lode_error(lode: dict) -> str:
         lines.append(f"  status: {status}")
     if not lode.get("recovery") and not is_terminal_failure_kind(lode.get("failure_kind")):
         lines.append("")
-        lines.append(f"to retry: hop lode restart {lode_id}")
+        if _lode_needs_archive_recovery(lode):
+            lines.append(f"to recover: hop lode archive {lode_id}")
+            lines.append("  worktree and branch are retained")
+        else:
+            lines.append(f"to retry: hop lode restart {lode_id}")
     return "\n".join(lines)
+
+
+def _lode_needs_archive_recovery(lode: dict) -> bool:
+    """Return whether an inert generation lacks the proof required to restart."""
+    lode_id = lode.get("id")
+    generation = lode.get("run_generation")
+    if (
+        not isinstance(lode_id, str)
+        or not is_canonical_lode_id(lode_id)
+        or not isinstance(generation, str)
+        or re.fullmatch(r"[0-9a-f]{32}", generation) is None
+        or lode.get("active")
+        or any(lode.get(field) is not None for field in ("tmux_pane", "pid", "oom_scope"))
+    ):
+        return False
+
+    from hopper import actions
+
+    try:
+        ownership = actions.load_run_ownership(lode_id, generation, require_worker=True)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True
+    return ownership is None
 
 
 def _load_lode_recovery(lode_id: str) -> dict | None:
@@ -2741,6 +2768,7 @@ def _manual_action_identity(parsed, lode: dict, verb: str) -> dict | None:
 
     action_type = verb
     target = {
+        "archive": "archived",
         "pause": "paused",
         "restart": "replacement_spawned",
         "kill": "killed_archived",
@@ -2840,6 +2868,13 @@ def cmd_lode(args: list[str]) -> int:
         help="Consent to discarding an active or already-started stage",
     )
     _add_action_identity_args(restart_p)
+    archive_p = subs.add_parser(
+        "archive",
+        help="Archive an already-inactive lode and retain its worktree",
+        exit_on_error=False,
+    )
+    archive_p.add_argument("lode_id", help="Inactive lode ID to archive")
+    _add_action_identity_args(archive_p)
     repair_p = subs.add_parser(
         "repair-output",
         help="Restore missing bytes for an accepted completion",
@@ -2928,7 +2963,7 @@ def cmd_lode(args: list[str]) -> int:
         return 0
 
     subcommand = parsed.subcommand or "list"
-    if subcommand in {"pause", "restart", "kill"}:
+    if subcommand in {"archive", "pause", "restart", "kill"}:
         supplied_id = getattr(parsed, "action_id", None)
         supplied_generation = getattr(parsed, "expected_generation", None)
         if (supplied_id is None) != (supplied_generation is None):
@@ -3592,6 +3627,57 @@ def cmd_lode(args: list[str]) -> int:
         )
         return _render_manual_action_disposition(
             "kill",
+            lode_id,
+            identity,
+            response,
+        )
+
+    if subcommand == "archive":
+        if (rc := require_not_inside_lode()) is not None:
+            return rc
+        resolved = _resolve_lode(socket_path, parsed.lode_id)
+        if resolved["outcome"] != "found":
+            print(resolved["error"])
+            return resolved["exit_code"]
+        lode_id = resolved["canonical_id"]
+        lode = resolved["lode"]
+        stage = lode.get("stage", "")
+        if stage not in ("mill", "refine", "ship"):
+            print(f"Cannot archive: lode {lode_id} stage is {stage}.")
+            print(f"Check its current state with: hop lode status {lode_id}")
+            return 1
+        if lode.get("active") or any(
+            lode.get(field) is not None for field in ("tmux_pane", "pid", "oom_scope")
+        ):
+            print(f"Cannot archive: lode {lode_id} is not already inactive and empty.")
+            print(f"Use: hop lode kill {lode_id}")
+            return 1
+        identity = _manual_action_identity(parsed, lode, "archive")
+        if identity is None:
+            return 1
+        if resolved["host"] != "local":
+            return _run_remote_cli(
+                resolved["host"],
+                [
+                    "lode",
+                    "archive",
+                    lode_id,
+                    "--action-id",
+                    identity["action_id"],
+                    "--expected-generation",
+                    identity["expected_generation"] or "none",
+                ],
+                reason=f"lode {lode_id}",
+            )
+        response = client.archive_lode(
+            socket_path,
+            lode_id,
+            action_id=identity["action_id"],
+            expected_generation=identity["expected_generation"],
+            stage=stage,
+        )
+        return _render_manual_action_disposition(
+            "archive",
             lode_id,
             identity,
             response,

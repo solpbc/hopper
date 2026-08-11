@@ -655,6 +655,29 @@ def kill_lode(
     )
 
 
+def archive_lode(
+    socket_path: Path,
+    lode_id: str,
+    *,
+    action_id: str,
+    expected_generation: str | None,
+    stage: str,
+    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+) -> dict | None:
+    """Archive an already-inactive lode while retaining its worktree and branch."""
+    return submit_lode_action(
+        socket_path,
+        action_id=action_id,
+        lode_id=lode_id,
+        expected_generation=expected_generation,
+        action_type="archive",
+        target_disposition="archived",
+        force_consent=False,
+        stage=stage,
+        timeout=timeout,
+    )
+
+
 def pause_lode(
     socket_path: Path,
     lode_id: str,

@@ -1497,7 +1497,7 @@ def recovery_command(record: dict, kind: str) -> str:
     if record["action_type"] == "completion":
         return f"hop lode restart {record['lode_id']}"
     if record["action_type"] == "archive":
-        return "press Delete again in the TUI"
+        return f"hop lode archive {record['lode_id']}"
     suffix = " --force" if record["force_consent"] else ""
     return f"hop lode {record['action_type']} {record['lode_id']}{suffix}"
 
@@ -1545,7 +1545,7 @@ def action_retry_command(
     if not lode_id:
         return "hop lode list"
     if action_type == "archive":
-        return "press Delete again in the TUI"
+        return f"hop lode archive {lode_id}"
     if action_type == "completion":
         return "hop processed"
     if action_type in {"pause", "restart", "kill"}:

@@ -626,7 +626,7 @@ def test_completion_status_projects_generic_block():
     )
 
 
-def test_blocked_archive_recovery_names_the_tui_action_and_complete_projection():
+def test_blocked_archive_recovery_names_the_cli_action_and_complete_projection():
     pending = actions.new_pending_action(
         lode_id="abcd2345",
         stage="mill",
@@ -646,7 +646,7 @@ def test_blocked_archive_recovery_names_the_tui_action_and_complete_projection()
 
     projection = actions.pending_action_projection(pending)
 
-    assert projection["recovery"]["command"] == "press Delete again in the TUI"
+    assert projection["recovery"]["command"] == f"hop lode archive {pending['lode_id']}"
     assert projection["containment"]["state"] == "proven"
     assert projection["preserved"] == {
         "worktree": True,
@@ -654,7 +654,7 @@ def test_blocked_archive_recovery_names_the_tui_action_and_complete_projection()
         "stage_session": True,
     }
     assert "Inspect with" not in projection["status"]
-    assert "Retry: press Delete again in the TUI" in projection["status"]
+    assert f"Retry: hop lode archive {pending['lode_id']}" in projection["status"]
 
 
 def test_validate_pending_completion_does_not_mutate_input():

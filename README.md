@@ -68,7 +68,9 @@ answer`, and `hop lode path` for pane inspection, prompt recovery, and locating
 the exact worktree. `hop lode pause ID` closes the owned pane, proves containment
 is empty, and retains the active lode, worktree, branch, and stage session;
 `hop lode resume ID` continues it. Watch, pause, and resume route to the lode's
-resident host. `hop lode kill` proves containment and durability before
+resident host. `hop lode archive ID` removes an already-inactive stale row when
+Hopper cannot prove its recorded run ownership, while retaining its worktree and
+branch. `hop lode kill` proves containment and durability before
 archiving the lode while retaining its worktree and branch for recovery.
 
 Use `hop remote` plus the global `-H/--host` flag for remote hopper hosts.

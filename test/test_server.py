@@ -1338,16 +1338,19 @@ def test_restart_force_consent_is_enforced_at_raw_server_boundary(socket_path, m
     assert actions.load_pending_action(lode_id) is None
 
 
-def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(socket_path, make_lode):
+@pytest.mark.parametrize("generation", [None, "b" * 32])
+def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(
+    socket_path, make_lode, generation
+):
     lode_id = "abcd2345"
     server = Server(socket_path)
-    lode = make_lode(id=lode_id, active=False, run_generation=None)
+    lode = make_lode(id=lode_id, active=False, run_generation=generation)
     server.lodes = [lode]
     conn = _mock_client(server)
 
     with patch("hopper.server.git.unpushed_commits") as durability:
-        server._handle_mutation(_manual_action_message("archive", generation=None), conn)
-        _apply_prepared_action(server, lode_id, None)
+        server._handle_mutation(_manual_action_message("archive", generation=generation), conn)
+        _apply_prepared_action(server, lode_id, generation)
 
     durability.assert_not_called()
     assert server.lodes == []
@@ -1363,7 +1366,7 @@ def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(socke
 
     retry = _mock_client(server)
     archived_before = copy.deepcopy(archived)
-    server._handle_mutation(_manual_action_message("archive", generation=None), retry)
+    server._handle_mutation(_manual_action_message("archive", generation=generation), retry)
     retry_response = _decode_mock_response(retry)
     assert retry_response["outcome"] == "idempotent"
     assert retry_response["reason"] == "already_completed"
@@ -1722,11 +1725,7 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     archive.assert_not_called()
     blocked_response = _decode_mock_response(blocked_conn)
     assert blocked_response["outcome"] == "blocked"
-    expected_command = (
-        "press Delete again in the TUI"
-        if action_type == "archive"
-        else f"hop lode {action_type} {lode['id']}"
-    )
+    expected_command = f"hop lode {action_type} {lode['id']}"
     if force and action_type != "archive":
         expected_command += " --force"
     assert blocked_response["recovery_command"] == expected_command

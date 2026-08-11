@@ -19,6 +19,7 @@ from hopper.client import (
     HopperConnection,
     InvalidServerResponse,
     _exchange_message,
+    archive_lode,
     complete_lode,
     connect,
     get_gate,
@@ -862,6 +863,7 @@ def test_repair_lode_output_sends_raw_action_identity_and_bytes(socket_path):
 @pytest.mark.parametrize(
     ("operation", "action_type", "target", "force"),
     [
+        (archive_lode, "archive", "archived", False),
         (pause_lode, "pause", "paused", False),
         (restart_lode, "restart", "replacement_spawned", True),
         (kill_lode, "kill", "killed_archived", True),

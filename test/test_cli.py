@@ -1698,6 +1698,31 @@ def test_lode_restart_active(capsys):
     assert "--force" in out
 
 
+def test_lode_restart_repeated_refusal_never_reports_success(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "run_generation": "b" * 32,
+    }
+    refusal = {
+        "type": "lode_action_ack",
+        "outcome": "refused",
+        "reason": "ownership_unavailable",
+        "status": "Restart refused (ownership_unavailable)",
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.restart_lode", return_value=refusal) as restart,
+    ):
+        assert cmd_lode(["restart", "abcd2345"]) == 1
+        assert cmd_lode(["restart", "abcd2345"]) == 1
+
+    assert restart.call_count == 2
+    assert capsys.readouterr().out.count("Restart refused") == 2
+
+
 def test_lode_restart_unknown_ack_gives_status_next_step(capsys):
     lode = {
         "id": "test1234",
@@ -2005,6 +2030,64 @@ def test_lode_kill_happy(capsys):
     out = capsys.readouterr().out
     assert "Killed lode test1234" in out
     assert "worktree and branch retained" in out
+
+
+def test_lode_archive_inactive_generation_retains_worktree(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "tmux_pane": None,
+        "pid": None,
+        "oom_scope": None,
+        "run_generation": "b" * 32,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.archive_lode",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "completed",
+                "disposition": "archived",
+                "status": "Archived lode abcd2345; worktree and branch retained",
+            },
+        ) as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 0
+
+    archive.assert_called_once_with(
+        config.server_socket_path(),
+        "abcd2345",
+        action_id=archive.call_args.kwargs["action_id"],
+        expected_generation="b" * 32,
+        stage="mill",
+    )
+    assert "worktree and branch retained" in capsys.readouterr().out
+
+
+def test_lode_archive_refuses_nonempty_runner_without_server_mutation(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "tmux_pane": "%7",
+        "pid": None,
+        "oom_scope": None,
+        "run_generation": "b" * 32,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.archive_lode") as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 1
+
+    archive.assert_not_called()
+    output = capsys.readouterr().out
+    assert "not already inactive and empty" in output
+    assert "hop lode kill abcd2345" in output
 
 
 def test_lode_kill_reports_delivery_failure(capsys):
@@ -5927,6 +6010,49 @@ def test_terminal_failure_json_is_unchanged(capsys, make_lode):
     assert payload["status"] == status
 
 
+@pytest.mark.parametrize("ownership", [None, ValueError("malformed ownership")])
+def test_error_status_recommends_archive_when_inert_generation_has_no_ownership(
+    ownership,
+):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "status": "Exited with code 143",
+        "active": False,
+        "tmux_pane": None,
+        "pid": None,
+        "oom_scope": None,
+        "run_generation": "b" * 32,
+    }
+    effect = {"return_value": ownership} if ownership is None else {"side_effect": ownership}
+    with patch("hopper.actions.load_run_ownership", **effect):
+        output = hopper_cli._format_lode_error(lode)
+
+    assert "to recover: hop lode archive abcd2345" in output
+    assert "worktree and branch are retained" in output
+    assert "hop lode restart" not in output
+
+
+def test_error_status_keeps_restart_when_generation_ownership_is_available():
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "status": "Exited with code 143",
+        "active": False,
+        "tmux_pane": None,
+        "pid": None,
+        "oom_scope": None,
+        "run_generation": "b" * 32,
+    }
+    with patch("hopper.actions.load_run_ownership", return_value={"worker": {}}):
+        output = hopper_cli._format_lode_error(lode)
+
+    assert "to retry: hop lode restart abcd2345" in output
+    assert "hop lode archive" not in output
+
+
 def test_format_lode_detail_corrects_parked_gone_status(make_lode):
     reason = "no pane output"
     branch = "hopper-test-id"
@@ -7555,6 +7681,7 @@ def test_explicit_host_bypasses_unavailable_resident_cache(monkeypatch):
 @pytest.mark.parametrize(
     ("argv", "forwarded_prefix", "verb"),
     [
+        (["lode", "archive", "abc"], ["lode", "archive"], "archive"),
         (["lode", "pause", "abc"], ["lode", "pause"], "pause"),
         (["lode", "restart", "abc"], ["lode", "restart"], "restart"),
         (["lode", "kill", "abc"], ["lode", "kill"], "kill"),
@@ -7810,7 +7937,7 @@ def test_lode_pause_resume_routes_canonical_full_id(verb):
         assert remote_args == ["lode", "resume", "abc12345"]
 
 
-@pytest.mark.parametrize("verb", ["pause", "restart", "kill"])
+@pytest.mark.parametrize("verb", ["archive", "pause", "restart", "kill"])
 def test_manual_action_hidden_identity_is_all_or_none_before_resolution(verb, capsys):
     with patch("hopper.cli._resolve_lode") as resolve:
         assert cmd_lode([verb, "abc12345", "--action-id", "a" * 32]) == 1
@@ -7819,7 +7946,7 @@ def test_manual_action_hidden_identity_is_all_or_none_before_resolution(verb, ca
     assert "must be provided together" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("verb", ["pause", "restart", "kill"])
+@pytest.mark.parametrize("verb", ["archive", "pause", "restart", "kill"])
 def test_routed_manual_action_without_identity_refuses_before_resolution(verb, monkeypatch, capsys):
     monkeypatch.setenv("HOP_NO_ROUTE", "1")
     with patch("hopper.cli._resolve_lode") as resolve:
@@ -7857,7 +7984,7 @@ def test_manual_action_retry_reuses_full_forced_binding():
 
 @pytest.mark.parametrize(
     ("verb", "extra"),
-    [("pause", []), ("restart", ["--force"]), ("kill", ["--force"])],
+    [("archive", []), ("pause", []), ("restart", ["--force"]), ("kill", ["--force"])],
 )
 def test_remote_manual_action_forwards_existing_identity_without_regeneration(verb, extra):
     lode = {
@@ -7903,6 +8030,7 @@ def test_remote_manual_action_forwards_existing_identity_without_regeneration(ve
 @pytest.mark.parametrize(
     ("verb", "client_name", "disposition"),
     [
+        ("archive", "archive_lode", "archived"),
         ("pause", "pause_lode", "paused"),
         ("restart", "restart_lode", "replacement_spawned"),
         ("kill", "kill_lode", "killed_archived"),
@@ -7950,7 +8078,7 @@ def test_remote_parser_preserves_forwarded_generation_over_fresh_snapshot(
 
 
 def test_manual_action_help_hides_protocol_identity_options(capsys):
-    for verb in ("pause", "restart", "kill"):
+    for verb in ("archive", "pause", "restart", "kill"):
         assert cmd_lode([verb, "--help"]) == 0
         output = capsys.readouterr().out
         assert "--action-id" not in output
