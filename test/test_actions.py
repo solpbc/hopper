@@ -109,6 +109,13 @@ def _stage() -> tuple[dict, dict]:
     return output, _record(output)
 
 
+def _blocked_facts_text() -> str:
+    return (
+        f"Action {'1' * 32} owns generation {'2' * 32} for advance refine; "
+        "containment: not_started. Preserved: worktree, branch, stage session"
+    )
+
+
 def _run_ownership() -> dict:
     pending = _record(
         {
@@ -539,7 +546,8 @@ def test_completion_status_projects_exact_output_recovery():
     assert actions.action_status(pending) == (
         "Teardown blocked: accepted mill output is unavailable "
         f"(sha256 {output['digest_hex']}, 15 bytes). Repair with: "
-        f"hop lode repair-output abcd2345 - --token {'A' * 43}"
+        f"hop lode repair-output abcd2345 - --token {'A' * 43}. "
+        f"{_blocked_facts_text()}"
     )
 
 
@@ -554,7 +562,7 @@ def test_completion_status_projects_retryable_publication_failure():
 
     assert actions.action_status(pending) == (
         "Teardown blocked: canonical directory is temporarily read-only. "
-        "Retry with: hop lode restart abcd2345"
+        f"Retry with: hop lode restart abcd2345. {_blocked_facts_text()}"
     )
     assert actions.pending_output_recovery(pending) is None
 
@@ -613,8 +621,40 @@ def test_completion_status_projects_generic_block():
         "command": "hop lode restart abcd2345",
     }
     assert actions.action_status(pending) == (
-        "Teardown blocked: cgroup identity changed. Retry with: hop lode restart abcd2345"
+        "Teardown blocked: cgroup identity changed. Retry with: hop lode restart abcd2345. "
+        f"{_blocked_facts_text()}"
     )
+
+
+def test_blocked_archive_recovery_names_the_tui_action_and_complete_projection():
+    pending = actions.new_pending_action(
+        lode_id="abcd2345",
+        stage="mill",
+        expected_generation=None,
+        action_type="archive",
+        target_disposition="archived",
+        force_consent=False,
+        action_id="7" * 32,
+        already_empty=True,
+    )
+    pending["phase"] = "durability_blocked"
+    pending["recovery"] = {
+        "kind": "durability",
+        "message": "worktree durability could not be proven",
+        "command": actions.recovery_command(pending, "durability"),
+    }
+
+    projection = actions.pending_action_projection(pending)
+
+    assert projection["recovery"]["command"] == "press Delete again in the TUI"
+    assert projection["containment"]["state"] == "proven"
+    assert projection["preserved"] == {
+        "worktree": True,
+        "branch": True,
+        "stage_session": True,
+    }
+    assert "Inspect with" not in projection["status"]
+    assert "Retry: press Delete again in the TUI" in projection["status"]
 
 
 def test_validate_pending_completion_does_not_mutate_input():

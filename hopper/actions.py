@@ -120,7 +120,7 @@ def run_ownership_path(lode_id: str, run_generation: str) -> Path:
 def spawn_receipt_path(lode_id: str, action_id: str) -> Path:
     """Return the action-scoped pane bootstrap receipt path."""
     if _HEX32.fullmatch(action_id) is None:
-        raise ValueError("completion action ID must be 32 lowercase hexadecimal characters")
+        raise ValueError("action ID must be 32 lowercase hexadecimal characters")
     return lode_dir(lode_id) / f"spawn-{action_id}.json"
 
 
@@ -1206,12 +1206,23 @@ def append_action_result(lode: dict, result: dict) -> None:
 def pending_action_projection(record: dict) -> dict:
     """Return the public, capability-free projection of a pending action."""
     validate_pending_action(record)
+    containment = record["containment"]
     return {
         "action_id": record["action_id"],
         "action_type": record["action_type"],
         "expected_generation": record["expected_generation"],
         "target_disposition": record["target_disposition"],
+        "force_consent": record["force_consent"],
+        "stage": record["stage"],
         "phase": record["phase"],
+        "containment": {
+            "state": containment["state"],
+            "result": containment["result"],
+            "proof_label": containment["proof_label"],
+            "last_error": containment["last_error"],
+        },
+        "preserved": _preserved_artifacts(record["action_type"], record=record),
+        "recovery": dict(record["recovery"]),
         "status": action_status(record),
     }
 
@@ -1485,8 +1496,196 @@ def recovery_command(record: dict, kind: str) -> str:
         )
     if record["action_type"] == "completion":
         return f"hop lode restart {record['lode_id']}"
+    if record["action_type"] == "archive":
+        return "press Delete again in the TUI"
     suffix = " --force" if record["force_consent"] else ""
     return f"hop lode {record['action_type']} {record['lode_id']}{suffix}"
+
+
+def _preserved_artifacts(action_type: str, *, record: dict | None = None) -> dict:
+    """Describe user-owned artifacts retained while an action is blocked."""
+    if action_type == "completion" and record is not None and record["stage"] == "ship":
+        quarantine = record["ship"]["quarantine"]
+        return {
+            "worktree": quarantine["removal_outcome"] != "removed",
+            "branch": quarantine["branch_outcome"] != "deleted",
+            "stage_session": False,
+        }
+    return {
+        "worktree": True,
+        "branch": True,
+        "stage_session": action_type != "restart",
+    }
+
+
+def _preserved_text(preserved: dict) -> str:
+    names = [name.replace("_", " ") for name, kept in preserved.items() if kept]
+    return ", ".join(names) if names else "none"
+
+
+def _blocked_facts(record: dict) -> str:
+    containment = record["containment"]
+    truth = containment["proof_label"] or containment["result"] or containment["state"]
+    preserved = _preserved_text(_preserved_artifacts(record["action_type"], record=record))
+    return (
+        f"Action {record['action_id']} owns generation "
+        f"{record['expected_generation'] or 'none'} for "
+        f"{record['target_disposition'].replace('_', ' ')}; containment: {truth}. "
+        f"Preserved: {preserved}"
+    )
+
+
+def action_retry_command(
+    action_type: str | None,
+    lode_id: str | None,
+    *,
+    force_consent: bool = False,
+) -> str:
+    """Return the authoritative safe retry instruction for an action request."""
+    if not lode_id:
+        return "hop lode list"
+    if action_type == "archive":
+        return "press Delete again in the TUI"
+    if action_type == "completion":
+        return "hop processed"
+    if action_type in {"pause", "restart", "kill"}:
+        suffix = " --force" if force_consent else ""
+        return f"hop lode {action_type} {lode_id}{suffix}"
+    return f"hop lode status {lode_id}"
+
+
+def action_ack_projection(
+    *,
+    outcome: str,
+    reason: str,
+    action_id: str | None = None,
+    lode_id: str | None = None,
+    expected_generation: str | None = None,
+    action_type: str | None = None,
+    target_disposition: str | None = None,
+    force_consent: bool = False,
+    disposition: str | None = None,
+    detail: str | None = None,
+    record: dict | None = None,
+    receipt: dict | None = None,
+    owner: dict | None = None,
+) -> dict:
+    """Build the single wire/status projection for an action response."""
+    if record is not None:
+        validate_pending_action(record)
+        action_id = record["action_id"]
+        lode_id = record["lode_id"]
+        expected_generation = record["expected_generation"]
+        action_type = record["action_type"]
+        target_disposition = record["target_disposition"]
+        force_consent = record["force_consent"]
+    if receipt is not None:
+        _validate_action_result(receipt)
+        action_id = receipt["action_id"]
+        lode_id = receipt["lode_id"]
+        expected_generation = receipt["expected_generation"]
+        action_type = receipt["action_type"]
+        target_disposition = receipt["target_disposition"]
+        force_consent = receipt["force_consent"]
+        disposition = receipt["terminal_disposition"]
+
+    response = {
+        "accepted": outcome != "refused",
+        "outcome": outcome,
+        "reason": reason,
+    }
+    bound_fields = {
+        "action_id": action_id,
+        "lode_id": lode_id,
+        "expected_generation": expected_generation,
+        "action_type": action_type,
+        "target_disposition": target_disposition,
+        "force_consent": force_consent,
+    }
+    response.update({key: value for key, value in bound_fields.items() if value is not None})
+    if action_id is not None or lode_id is not None:
+        response["expected_generation"] = expected_generation
+    if disposition is not None:
+        response["disposition"] = disposition
+
+    if record is not None:
+        projection = pending_action_projection(record)
+        for key in ("phase", "containment", "preserved", "recovery"):
+            response[key] = projection[key]
+    elif receipt is not None:
+        response["containment"] = {
+            "state": "proven",
+            "result": receipt["containment_proof"],
+            "proof_label": receipt["containment_proof"],
+            "last_error": None,
+        }
+        response["preserved"] = {
+            "worktree": receipt["retained"]["worktree"],
+            "branch": receipt["retained"]["branch"],
+            "stage_session": receipt["retained"]["session"],
+        }
+
+    retry_force = force_consent or reason in {
+        "registered_runner_requires_force",
+        "started_stage_requires_force",
+    }
+    retry = action_retry_command(action_type, lode_id, force_consent=retry_force)
+    inspect = f"hop lode status {lode_id}" if lode_id else "hop lode list"
+    if outcome == "refused":
+        owner_text = (
+            f"Action {owner['action_id']} ({owner['action_type']}) owns generation "
+            f"{owner['expected_generation'] or 'none'}."
+            if isinstance(owner, dict)
+            else (
+                f"Action {action_id or 'unbound'} did not acquire generation "
+                f"{expected_generation or 'none'}."
+            )
+        )
+        preserved = (
+            dict(owner["preserved"])
+            if isinstance(owner, dict) and isinstance(owner.get("preserved"), dict)
+            else _preserved_artifacts(action_type or "")
+        )
+        explanation = detail or (
+            "This request uses a retired mixed-version control message; upgrade the "
+            "calling hop CLI before retrying"
+            if reason == "protocol_upgrade_required"
+            else reason.replace("_", " ")
+        )
+        response["preserved"] = preserved
+        response["recovery"] = {
+            "kind": reason,
+            "message": explanation,
+            "command": retry,
+        }
+        response["detail"] = explanation
+        response["recovery_command"] = retry
+        response["status"] = (
+            f"{(action_type or 'Action').capitalize()} refused ({reason}): {explanation}. "
+            f"{owner_text} Preserved: {_preserved_text(preserved)}. "
+            f"Inspect with: {inspect}. Retry with: {retry}"
+        )
+    elif outcome == "blocked" and record is not None:
+        response["detail"] = record["recovery"]["message"]
+        response["recovery_command"] = record["recovery"]["command"]
+        response["status"] = action_status(record)
+    elif outcome in {"completed", "idempotent"} and disposition is not None:
+        preserved = response.get("preserved", _preserved_artifacts(action_type or ""))
+        response["status"] = (
+            f"{(action_type or 'Action').capitalize()} completed: "
+            f"{disposition.replace('_', ' ')}. Preserved: {_preserved_text(preserved)}."
+        )
+    elif outcome == "accepted" and action_type == "completion":
+        stage = record["stage"] if record is not None else "stage"
+        response["status"] = (
+            f"Accepted {stage} output for durable teardown (action {action_id or 'unknown'}). "
+            "The server will close and prove containment independently."
+        )
+    elif record is not None:
+        response["status"] = action_status(record)
+    else:
+        response["status"] = f"{(action_type or 'Action').capitalize()} {outcome}."
+    return response
 
 
 def action_status(record: dict) -> str:
@@ -1499,7 +1698,16 @@ def action_status(record: dict) -> str:
         if phase.endswith("_blocked"):
             detail = recovery["message"] or f"{record['action_type']} action is blocked"
             command = recovery["command"] or f"hop lode status {record['lode_id']}"
-            return f"{label} blocked: {detail}. Inspect with: {command}"
+            containment = record["containment"]
+            truth = containment["proof_label"] or containment["result"] or containment["state"]
+            preserved = _preserved_text(_preserved_artifacts(record["action_type"], record=record))
+            retry_label = "Retry" if record["action_type"] == "archive" else "Retry with"
+            return (
+                f"{label} blocked: {detail}. Action {record['action_id']} owns generation "
+                f"{record['expected_generation'] or 'none'} for "
+                f"{record['target_disposition'].replace('_', ' ')}; containment: {truth}. "
+                f"Preserved: {preserved}. {retry_label}: {command}"
+            )
         if phase == "complete":
             return f"{label}: {record['target_disposition'].replace('_', ' ')}"
         return f"{label}: teardown in progress"
@@ -1507,19 +1715,25 @@ def action_status(record: dict) -> str:
         detail = recovery["message"] or "completion output publication failed"
         command = recovery["command"]
         if recovery["kind"] == "publication":
-            return f"Teardown blocked: {detail}. Retry with: {command}"
+            return f"Teardown blocked: {detail}. Retry with: {command}. {_blocked_facts(record)}"
         output = record["output"]
         return (
             f"Teardown blocked: accepted {stage} output is unavailable "
             f"(sha256 {output['digest_hex']}, {output['byte_length']} bytes). Repair with: "
-            f"{command}"
+            f"{command}. {_blocked_facts(record)}"
         )
     if phase in {"containment_blocked", "ship_blocked", "cleanup_blocked"}:
         detail = recovery["message"] or "unknown teardown failure"
         ship = record.get("ship")
         if phase == "cleanup_blocked" and ship is not None and ship["archive_published"]:
-            return f"Shipped; cleanup retained: {detail}. Retry with: {recovery['command']}"
-        return f"Teardown blocked: {detail}. Retry with: {recovery['command']}"
+            return (
+                f"Shipped; cleanup retained: {detail}. Retry with: {recovery['command']}. "
+                f"{_blocked_facts(record)}"
+            )
+        return (
+            f"Teardown blocked: {detail}. Retry with: {recovery['command']}. "
+            f"{_blocked_facts(record)}"
+        )
     if phase in {"accepted", "publishing_output"}:
         return f"Teardown: publishing accepted {stage} output"
     if phase == "capturing_ownership":

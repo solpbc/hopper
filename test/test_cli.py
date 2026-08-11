@@ -1510,6 +1510,7 @@ def test_lode_restart_happy(capsys):
                     "type": "lode_action_ack",
                     "outcome": "completed",
                     "disposition": "replacement_spawned",
+                    "status": "Restarted mill for test1234 with a replacement runner",
                 },
             ) as mock_restart:
                 assert cmd_lode(["restart", "test1234"]) == 0
@@ -1533,6 +1534,7 @@ def test_lode_restart_pending_completion_uses_retry_not_stage_reset(capsys):
             "expected_generation": generation,
             "action_type": "completion",
             "target_disposition": "advance_refine",
+            "force_consent": False,
         },
     }
     with (
@@ -1543,6 +1545,7 @@ def test_lode_restart_pending_completion_uses_retry_not_stage_reset(capsys):
                 "type": "lode_action_ack",
                 "outcome": "completed",
                 "disposition": "advance_refine",
+                "status": "Completed durable teardown for abcd2345 (advance refine)",
             },
         ) as retry,
         patch("hopper.client.restart_lode") as restart,
@@ -1558,6 +1561,7 @@ def test_lode_restart_pending_completion_uses_retry_not_stage_reset(capsys):
         target_disposition="advance_refine",
         force_consent=False,
         stage="mill",
+        wait_for_disposition=True,
     )
     restart.assert_not_called()
     assert "Completed durable teardown" in capsys.readouterr().out
@@ -1681,6 +1685,10 @@ def test_lode_restart_active(capsys):
                 "reason": "registered_runner_requires_force",
                 "detail": "Cannot restart: lode test1234 has a registered runner.",
                 "recovery_command": "hop lode restart test1234 --force",
+                "status": (
+                    "Restart refused: lode test1234 has a registered runner. "
+                    "Retry with: hop lode restart test1234 --force"
+                ),
             },
         ),
     ):
@@ -1746,6 +1754,7 @@ def test_lode_restart_refusal_names_operator_next_steps(reason, capsys):
                 "outcome": "refused",
                 "reason": reason,
                 "recovery_command": "hop lode status test1234",
+                "status": f"Restart refused ({reason}). Inspect with: hop lode status test1234",
             },
         ),
     ):
@@ -1793,6 +1802,10 @@ def test_lode_restart_renders_server_started_stage_refusal(capsys):
                 "reason": "started_stage_requires_force",
                 "detail": "Lode test1234 has been started (claude[mill].started=True).",
                 "recovery_command": "hop lode restart test1234 --force",
+                "status": (
+                    "Restart refused (started_stage_requires_force). "
+                    "Retry with: hop lode restart test1234 --force"
+                ),
             },
         ) as mock_restart,
     ):
@@ -1821,6 +1834,7 @@ def test_lode_restart_force_proceeds_when_started(capsys):
                     "type": "lode_action_ack",
                     "outcome": "completed",
                     "disposition": "replacement_spawned",
+                    "status": "Restarted mill for test1234 with a replacement runner",
                 },
             ) as mock_restart:
                 result = cmd_lode(["restart", "test1234", "--force"])
@@ -1846,6 +1860,7 @@ def test_lode_restart_error_proceeds_when_started_without_force(capsys):
                     "type": "lode_action_ack",
                     "outcome": "completed",
                     "disposition": "replacement_spawned",
+                    "status": "Restarted mill for test1234 with a replacement runner",
                 },
             ) as mock_restart:
                 result = cmd_lode(["restart", "test1234"])
@@ -1980,6 +1995,7 @@ def test_lode_kill_happy(capsys):
                     "type": "lode_action_ack",
                     "outcome": "completed",
                     "disposition": "killed_archived",
+                    "status": "Killed lode test1234; worktree and branch retained for recovery",
                 },
             ) as mock_kill:
                 rc = cmd_lode(["kill", "test1234"])
@@ -2010,6 +2026,7 @@ def test_lode_pause_waits_for_terminal_disposition(capsys):
         "type": "lode_action_ack",
         "outcome": "completed",
         "disposition": "paused",
+        "status": "Paused lode test1234; worktree and stage session retained",
     }
     with (
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
@@ -2070,6 +2087,7 @@ def test_lode_kill_archived(capsys):
                     "outcome": "refused",
                     "reason": "lode_archived",
                     "recovery_command": "hop lode status test1234",
+                    "status": "Kill refused (lode_archived). Inspect: hop lode status test1234",
                 },
             ):
                 rc = cmd_lode(["kill", "test1234"])
@@ -4039,7 +4057,12 @@ def test_processed_submits_exact_bytes_without_writing_canonical(temp_config, ca
         ),
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": True, "reason": "accepted", "action_id": "b" * 32},
+            return_value={
+                "accepted": True,
+                "reason": "accepted",
+                "action_id": "b" * 32,
+                "status": "Accepted mill output for durable teardown",
+            },
         ) as complete,
         patch("sys.stdin", stdin),
     ):
@@ -4078,7 +4101,14 @@ def test_processed_server_refusal_leaves_existing_canonical_unchanged(temp_confi
         ),
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": False, "reason": "ownership_unavailable"},
+            return_value={
+                "accepted": False,
+                "reason": "ownership_unavailable",
+                "status": (
+                    "Completion refused: launch ownership unavailable. "
+                    "Retry with: hop lode restart test-session --force"
+                ),
+            },
         ),
         patch("sys.stdin", stdin),
     ):
@@ -4117,7 +4147,12 @@ def test_processed_preparation_refusal_names_phase_and_remedy(
         patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": False, "reason": reason, "detail": detail},
+            return_value={
+                "accepted": False,
+                "reason": reason,
+                "detail": detail,
+                "status": f"{guidance}: {detail}; retry `hop processed`",
+            },
         ),
         patch("sys.stdin", stdin),
     ):
@@ -4151,7 +4186,14 @@ def test_processed_pidfd_capability_refusal_is_prescriptive(temp_config, capsys)
         ),
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": False, "reason": "pidfd_unavailable"},
+            return_value={
+                "accepted": False,
+                "reason": "pidfd_unavailable",
+                "status": (
+                    "pidfd_open and pidfd_send_signal require libc support; "
+                    "repair the host, then retry `hop processed`"
+                ),
+            },
         ),
         patch("sys.stdin", stdin),
     ):
@@ -4240,6 +4282,7 @@ def test_processed_saves_file(temp_config, capsys):
                             "accepted": True,
                             "reason": "accepted",
                             "action_id": "b" * 32,
+                            "status": "Accepted mill output for durable teardown",
                         },
                     ) as complete:
                         with patch("sys.stdin", _processed_stdin(output_text)):
@@ -4284,6 +4327,7 @@ def test_processed_refine_stage(temp_config, capsys):
                             "accepted": True,
                             "reason": "accepted",
                             "action_id": "b" * 32,
+                            "status": "Accepted refine output for durable teardown",
                         },
                     ) as complete:
                         with patch("sys.stdin", _processed_stdin(output_text)):
@@ -4311,7 +4355,12 @@ def test_processed_non_ship_stage_never_runs_landing_proof(temp_config, stage):
         ),
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": True, "reason": "accepted", "action_id": "b" * 32},
+            return_value={
+                "accepted": True,
+                "reason": "accepted",
+                "action_id": "b" * 32,
+                "status": f"Accepted {stage} output for durable teardown",
+            },
         ) as complete,
         patch("hopper.git.ship_landing_verdict") as landing_proof,
         patch("sys.stdin", _processed_stdin("stage output\n")),
@@ -4326,8 +4375,18 @@ def test_processed_non_ship_stage_never_runs_landing_proof(temp_config, stage):
 @pytest.mark.parametrize(
     "server_ack",
     [
-        {"accepted": True, "reason": "accepted", "action_id": "b" * 32},
-        {"accepted": True, "reason": "already_accepted", "action_id": "b" * 32},
+        {
+            "accepted": True,
+            "reason": "accepted",
+            "action_id": "b" * 32,
+            "status": "Accepted ship output for durable teardown",
+        },
+        {
+            "accepted": True,
+            "reason": "already_accepted",
+            "action_id": "b" * 32,
+            "status": "Accepted ship output for durable teardown",
+        },
     ],
 )
 def test_processed_ship_accepts_proven_landing_without_extra_claims(
@@ -4382,7 +4441,11 @@ def test_processed_ship_refusal_writes_nothing_and_sends_no_mutation(temp_config
         patch("hopper.git.ship_landing_verdict") as landing_proof,
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": False, "reason": "ship_provenance_unavailable"},
+            return_value={
+                "accepted": False,
+                "reason": "ship_provenance_unavailable",
+                "status": ("Completion refused: could not capture the ship repository identity"),
+            },
         ) as complete,
         patch("sys.stdin", _processed_stdin("ship output\n")),
     ):
@@ -4449,7 +4512,7 @@ def test_processed_each_explicit_refusal_is_distinct_and_nonzero(
         patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
         patch(
             "hopper.client.complete_lode",
-            return_value={"accepted": False, "reason": reason},
+            return_value={"accepted": False, "reason": reason, "status": message},
         ),
         patch("sys.stdin", _processed_stdin(output)),
     ):
@@ -5230,6 +5293,7 @@ def test_restart_delegates_to_lode_restart(capsys):
                         "type": "lode_action_ack",
                         "outcome": "completed",
                         "disposition": "replacement_spawned",
+                        "status": "Restarted mill for abc123 with a replacement runner",
                     },
                 ):
                     assert cmd_restart(["abc123"]) == 0
@@ -5798,6 +5862,41 @@ def test_format_lode_line_shows_spawn_refusal():
     }
 
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)
+
+
+def test_format_lode_detail_expands_pending_action_recovery(make_lode):
+    lode = make_lode(
+        id="test-id",
+        pending_action={
+            "action_id": "a" * 32,
+            "action_type": "restart",
+            "expected_generation": "b" * 32,
+            "target_disposition": "replacement_spawned",
+            "phase": "containment_blocked",
+            "containment": {
+                "state": "blocked",
+                "result": None,
+                "proof_label": None,
+                "last_error": "inspection failed",
+            },
+            "preserved": {"worktree": True, "branch": True, "stage_session": False},
+            "recovery": {
+                "kind": "containment",
+                "message": "inspection failed",
+                "command": "hop lode restart test-id --force",
+            },
+            "status": "Restart blocked",
+        },
+    )
+
+    detail = format_lode_detail(lode)
+
+    assert f"action:      {'a' * 32}" in detail
+    assert f"generation:  {'b' * 32}" in detail
+    assert "disposition: replacement_spawned" in detail
+    assert "containment: blocked" in detail
+    assert "preserved:   worktree, branch" in detail
+    assert "recovery:    hop lode restart test-id --force" in detail
 
 
 @pytest.mark.parametrize("failure_kind", ["oom", "runner_exit_unverified"])
@@ -7121,6 +7220,7 @@ def test_lode_restart_force_requests_server_side_termination(capsys):
                     "type": "lode_action_ack",
                     "outcome": "completed",
                     "disposition": "replacement_spawned",
+                    "status": "Restart completed: replacement spawned",
                 },
             ) as mock_restart:
                 assert cmd_lode(["restart", "abc123", "--force"]) == 0
@@ -7617,6 +7717,32 @@ def test_routed_manual_action_without_identity_refuses_before_resolution(verb, m
     assert "upgrade the calling hop CLI" in capsys.readouterr().out
 
 
+def test_manual_action_retry_reuses_full_forced_binding():
+    pending = {
+        "action_id": "a" * 32,
+        "action_type": "restart",
+        "expected_generation": "b" * 32,
+        "target_disposition": "replacement_spawned",
+        "force_consent": True,
+    }
+    parsed = MagicMock(action_id=None, expected_generation=None, force=False)
+
+    identity = hopper_cli._manual_action_identity(
+        parsed,
+        {
+            "id": "abc12345",
+            "run_generation": "c" * 32,
+            "pending_action": pending,
+            "action_results": [],
+        },
+        "restart",
+    )
+
+    assert identity == pending
+    retry = hopper_cli._manual_action_retry_command("restart", "abc12345", identity)
+    assert "--force" in shlex.split(retry)
+
+
 @pytest.mark.parametrize(
     ("verb", "extra"),
     [("pause", []), ("restart", ["--force"]), ("kill", ["--force"])],
@@ -7689,6 +7815,7 @@ def test_remote_parser_preserves_forwarded_generation_over_fresh_snapshot(
                 "type": "lode_action_ack",
                 "outcome": "completed",
                 "disposition": disposition,
+                "status": f"{verb.capitalize()} completed: {disposition}",
             },
         ) as operation,
     ):
@@ -8890,6 +9017,7 @@ def _kill(lode_id, extra=None):
                 "type": "lode_action_ack",
                 "outcome": "completed",
                 "disposition": "killed_archived",
+                "status": "Killed lode test1234; worktree and branch retained for recovery",
             },
         ) as mock_kill,
     ):

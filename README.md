@@ -47,7 +47,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | Command | Description |
 |---------|-------------|
 | `hop status` | Show or update lode status |
-| `hop processed` | Durably submit stage output and wait for its disposition |
+| `hop processed` | Durably submit stage output; return after acceptance |
 | `hop gate` | Pause lode at a review gate |
 | `hop code` | Run a stage prompt via Codex |
 

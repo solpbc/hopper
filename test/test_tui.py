@@ -2197,6 +2197,23 @@ def test_action_delete_archives_lode():
     assert server.events[0]["force_consent"] is False
 
 
+def test_action_delete_ignores_selection_that_disappeared():
+    """A poll-cycle selection race must not dereference a missing lode."""
+    from hopper.tui import LodeTable
+
+    server = MockServer([])
+    app = HopperApp(server=server)
+
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
+        patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
+        patch.object(app, "_get_lode", return_value=None),
+    ):
+        app.action_delete()
+
+    assert server.events == []
+
+
 def test_action_reload_enqueues_identity_bound_restart():
     """Reload uses the same durable action path as the CLI restart verb."""
     from hopper.tui import LodeTable
@@ -2228,6 +2245,44 @@ def test_action_reload_enqueues_identity_bound_restart():
     assert event["action_type"] == "restart"
     assert event["target_disposition"] == "replacement_spawned"
     assert event["force_consent"] is False
+
+
+def test_action_reload_reuses_forced_restart_binding():
+    """Reload retries the recorded consent instead of constructing a new identity."""
+    from hopper.tui import LodeTable
+
+    pending = {
+        "action_id": "a" * 32,
+        "action_type": "restart",
+        "expected_generation": "b" * 32,
+        "target_disposition": "replacement_spawned",
+        "force_consent": True,
+        "stage": "refine",
+    }
+    sessions = [
+        {
+            "id": "aaaa1111",
+            "stage": "refine",
+            "state": "teardown",
+            "active": False,
+            "created_at": 1000,
+            "run_generation": "c" * 32,
+            "pending_action": pending,
+        }
+    ]
+    server = MockServer(sessions)
+    app = HopperApp(server=server)
+
+    with (
+        patch.object(HopperApp, "focused", new_callable=PropertyMock, return_value=LodeTable()),
+        patch.object(app, "_get_selected_lode_id", return_value="aaaa1111"),
+    ):
+        app.action_reload()
+
+    event = server.events[0]
+    assert event["action_id"] == pending["action_id"]
+    assert event["expected_generation"] == pending["expected_generation"]
+    assert event["force_consent"] is True
 
 
 def test_action_delete_shows_modal_for_unmerged_changes():

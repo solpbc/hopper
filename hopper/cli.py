@@ -1223,7 +1223,7 @@ def cmd_screenshot(args: list[str]) -> int:
     return 0
 
 
-@command("processed", "Durably submit stage output and wait for its disposition", group="lode")
+@command("processed", "Durably submit stage output for server-owned teardown", group="lode")
 def cmd_processed(args: list[str]) -> int:
     """Read stage output from stdin and submit the durable completion action."""
     from hopper.client import complete_lode, get_lode
@@ -1293,83 +1293,19 @@ def cmd_processed(args: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    if acknowledgement["accepted"] is False:
-        reason = acknowledgement.get("reason")
-        detail = acknowledgement.get("detail")
-        detail_suffix = f" Server detail: {detail}." if isinstance(detail, str) and detail else ""
-        refusal_messages = {
-            "lode_not_found": f"Lode {lode_id} not found or archived.",
-            "missing_expected_generation": (
-                "Completion was refused because this command has no runner generation. "
-                "Run it inside the current lode runner, then retry."
-            ),
-            "stale_expected_generation": (
-                "Completion was refused because this runner generation is stale. "
-                f"Check `hop lode status {lode_id}` and use the current runner."
-            ),
-            "terminal_failure": (
-                "Completion was refused because this lode has a terminal failure. "
-                f"Check `hop lode status {lode_id}` before recovering it."
-            ),
-            "inactive_runner": (
-                "Completion was refused because this runner is not registered as active. "
-                f"Check `hop lode status {lode_id}` and retry from its current runner."
-            ),
-            "stage_mismatch": (
-                "Completion was refused because the submitted stage is stale. "
-                f"Check `hop lode status {lode_id}` and retry from its current runner."
-            ),
-            "completion_pending": (
-                "Completion was already accepted for this lode. "
-                f"Check `hop lode status {lode_id}` for teardown progress."
-            ),
-            "ownership_unavailable": (
-                "Completion was refused because Hopper could not verify this runner's "
-                "launch ownership. Inspect the current state with `hop lode status "
-                f"{lode_id}`, then replace this runner with `hop lode restart {lode_id} "
-                "--force` and retry `hop processed`." + detail_suffix
-            ),
-            "pidfd_unavailable": (
-                "Completion was refused because strict Linux teardown requires "
-                "pidfd_open and pidfd_send_signal, but neither the Python stdlib nor "
-                "libc provides the complete interface. Install a libc or Python build "
-                "with both calls, restart Hopper, then retry `hop processed`."
-            ),
-            "invalid_output": (
-                "Completion was refused because the submitted bytes failed validation. "
-                "Retry `hop processed` with the intended nonempty output."
-            ),
-            "ship_provenance_unavailable": (
-                "Completion was refused because Hopper could not capture the ship "
-                f"repository identity. Inspect its worktree with `hop lode path {lode_id}`, "
-                "repair the Git worktree registration if needed with `git worktree repair`, "
-                "then retry `hop processed`." + detail_suffix
-            ),
-            "output_staging_unavailable": (
-                "Completion was refused because Hopper could not durably stage the submitted "
-                "bytes. Free space or fix permissions in the Hopper data directory, then retry "
-                "`hop processed`." + detail_suffix
-            ),
-            "completion_persistence_unavailable": (
-                "Completion was refused because Hopper could not durably record ownership of "
-                "the staged bytes and next action. Free space or fix permissions in the Hopper "
-                "data directory, then retry `hop processed`." + detail_suffix
-            ),
-        }
+    status = acknowledgement.get("status")
+    if not isinstance(status, str) or not status:
         print(
-            refusal_messages.get(
-                reason,
-                "Completion was refused by the server. "
-                f"Check `hop lode status {lode_id}` for its current state.",
-            ),
+            "error: completion disposition is UNKNOWN because the server response "
+            f"omitted status. Check with `hop lode status {lode_id}`.",
             file=sys.stderr,
         )
         return 1
+    if acknowledgement["accepted"] is False:
+        print(status, file=sys.stderr)
+        return 1
 
-    print(
-        f"Accepted {stage} output for durable teardown "
-        f"(action {acknowledgement.get('action_id', 'unknown')})."
-    )
+    print(status)
     return 0
 
 
@@ -1925,6 +1861,33 @@ def format_lode_detail(lode: dict) -> str:
             ]
         )
 
+    pending_action = lode.get("pending_action")
+    if isinstance(pending_action, dict):
+        containment = pending_action.get("containment", {})
+        preserved = pending_action.get("preserved", {})
+        recovery = pending_action.get("recovery", {})
+        preserved_names = [name.replace("_", " ") for name, kept in preserved.items() if kept]
+        recovery_command = recovery.get("command") or f"hop lode status {lode.get('id', '')}"
+        containment_truth = (
+            containment.get("proof_label")
+            or containment.get("result")
+            or containment.get("state", "unknown")
+        )
+        lines.extend(
+            [
+                "",
+                "  pending action:",
+                f"    action:      {pending_action.get('action_id', '')}",
+                f"    type:        {pending_action.get('action_type', '')}",
+                f"    generation:  {pending_action.get('expected_generation') or 'none'}",
+                f"    disposition: {pending_action.get('target_disposition', '')}",
+                f"    phase:       {pending_action.get('phase', '')}",
+                f"    containment: {containment_truth}",
+                f"    preserved:   {', '.join(preserved_names) or 'none'}",
+                f"    recovery:    {recovery_command}",
+            ]
+        )
+
     created_age = format_age(lode.get("created_at", 0))
     updated_at = lode.get("updated_at", 0) or lode.get("created_at", 0)
     updated_age = format_age(updated_at)
@@ -1987,7 +1950,7 @@ def _show_lode_status(socket_path: Path, lode_ref: str, *, json_output: bool) ->
             pending_output = actions.pending_output_recovery(pending) if pending else None
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logger.warning(
-                "Failed to read pending completion for %s: %s",
+                "Failed to read pending action for %s: %s",
                 result["canonical_id"],
                 error,
             )
@@ -2689,18 +2652,13 @@ def _manual_action_identity(parsed, lode: dict, verb: str) -> dict | None:
         "kill": "killed_archived",
     }[verb]
     force_consent = bool(getattr(parsed, "force", False))
-    if (
-        verb == "restart"
-        and isinstance(matching, dict)
-        and matching.get("action_type") == "completion"
+    if isinstance(matching, dict) and (
+        matching.get("action_type") == verb
+        or (verb == "restart" and matching.get("action_type") == "completion")
     ):
-        action_type = "completion"
-        target = matching.get("target_disposition") or {
-            "mill": "advance_refine",
-            "refine": "advance_ship",
-            "ship": "shipped_archived",
-        }.get(lode.get("stage"))
-        force_consent = False
+        action_type = matching["action_type"]
+        target = matching["target_disposition"]
+        force_consent = matching["force_consent"]
     return {
         "action_id": action_id,
         "expected_generation": generation,
@@ -2710,10 +2668,10 @@ def _manual_action_identity(parsed, lode: dict, verb: str) -> dict | None:
     }
 
 
-def _manual_action_retry_command(verb: str, lode_id: str, identity: dict, *, force: bool) -> str:
+def _manual_action_retry_command(verb: str, lode_id: str, identity: dict) -> str:
     generation = identity["expected_generation"] or "none"
     parts = ["hop", "lode", verb, lode_id]
-    if force:
+    if identity["force_consent"]:
         parts.append("--force")
     parts.extend(
         [
@@ -2729,47 +2687,27 @@ def _manual_action_retry_command(verb: str, lode_id: str, identity: dict, *, for
 def _render_manual_action_disposition(
     verb: str,
     lode_id: str,
-    stage: str,
     identity: dict,
     response: dict | None,
-    *,
-    force: bool,
 ) -> int:
     """Render only terminal success; every unknown or blocked result is nonzero."""
-    retry = _manual_action_retry_command(verb, lode_id, identity, force=force)
+    retry = _manual_action_retry_command(verb, lode_id, identity)
     generation = identity["expected_generation"] or "none"
     terminal = bool(
         response
         and response.get("outcome") in {"completed", "idempotent"}
         and isinstance(response.get("disposition"), str)
     )
-    if terminal:
-        if identity["action_type"] == "completion":
-            print(
-                f"Completed durable teardown for {lode_id} "
-                f"({response['disposition'].replace('_', ' ')})"
-            )
-        elif verb == "pause":
-            print(f"Paused lode {lode_id}; worktree and stage session retained")
-        elif verb == "restart":
-            print(f"Restarted {stage} for {lode_id} with a replacement runner")
-        else:
-            print(f"Killed lode {lode_id}; worktree and branch retained for recovery")
+    if terminal and isinstance(response.get("status"), str):
+        print(response["status"])
         return 0
 
-    if response and response.get("outcome") in {"blocked", "refused"}:
-        outcome = response["outcome"]
-        reason = response.get("reason", outcome)
-        detail = response.get("detail")
-        print(f"{verb.capitalize()} {outcome} ({reason}).")
-        if detail:
-            print(f"Server detail: {detail}")
-        recovery = response.get("recovery_command")
-        if recovery:
-            print(f"Recover with: {recovery}")
-        else:
-            print(f"Inspect with: hop lode status {lode_id}")
-            print(f"Retry the same action with: {retry}")
+    if (
+        response
+        and response.get("outcome") in {"blocked", "refused"}
+        and isinstance(response.get("status"), str)
+    ):
+        print(response["status"])
         return 1
 
     print(f"{verb.capitalize()} disposition is UNKNOWN; no success was reported.")
@@ -3144,10 +3082,8 @@ def cmd_lode(args: list[str]) -> int:
         return _render_manual_action_disposition(
             "pause",
             lode_id,
-            lode.get("stage", ""),
             identity,
             response,
-            force=False,
         )
 
     if subcommand == "resume":
@@ -3370,7 +3306,7 @@ def cmd_lode(args: list[str]) -> int:
             return 1
         if resolved["host"] != "local":
             remote_args = ["lode", "restart", lode_id]
-            if parsed.force:
+            if identity["force_consent"]:
                 remote_args.append("--force")
             remote_args.extend(
                 [
@@ -3397,6 +3333,7 @@ def cmd_lode(args: list[str]) -> int:
                 target_disposition=identity["target_disposition"],
                 force_consent=False,
                 stage=stage,
+                wait_for_disposition=True,
             )
         else:
             acknowledgement = client.restart_lode(
@@ -3405,15 +3342,13 @@ def cmd_lode(args: list[str]) -> int:
                 stage,
                 action_id=identity["action_id"],
                 expected_generation=identity["expected_generation"],
-                force=parsed.force,
+                force=identity["force_consent"],
             )
         return _render_manual_action_disposition(
             "restart",
             lode_id,
-            stage,
             identity,
             acknowledgement,
-            force=parsed.force,
         )
 
     if subcommand == "watch":
@@ -3538,7 +3473,7 @@ def cmd_lode(args: list[str]) -> int:
             return 1
         if resolved["host"] != "local":
             remote_args = ["lode", "kill", lode_id]
-            if parsed.force:
+            if identity["force_consent"]:
                 remote_args.append("--force")
             remote_args.extend(
                 [
@@ -3559,15 +3494,13 @@ def cmd_lode(args: list[str]) -> int:
             action_id=identity["action_id"],
             expected_generation=identity["expected_generation"],
             stage=stage,
-            force=parsed.force,
+            force=identity["force_consent"],
         )
         return _render_manual_action_disposition(
             "kill",
             lode_id,
-            stage,
             identity,
             response,
-            force=parsed.force,
         )
 
     if subcommand in ("peek", "nudge", "answer"):
@@ -3797,7 +3730,7 @@ def cmd_kill(args: list[str]) -> int:
             "-f",
             "--force",
             action="store_true",
-            help="Kill even when commits exist only in this lode's worktree",
+            help="Override only unknown or unpushed commit durability refusal",
         )
         try:
             parse_args(p, args)

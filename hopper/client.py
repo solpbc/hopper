@@ -579,22 +579,26 @@ def submit_lode_action(
     force_consent: bool,
     stage: str,
     payload: dict | None = None,
+    wait_for_disposition: bool = False,
     timeout: float = MUTATION_ACK_TIMEOUT_SEC,
 ) -> dict | None:
     """Submit one identity-bound lode action and await its final server response."""
+    request = {
+        "type": "lode_action",
+        "action_id": action_id,
+        "lode_id": lode_id,
+        "expected_generation": expected_generation,
+        "action_type": action_type,
+        "target_disposition": target_disposition,
+        "force_consent": force_consent,
+        "stage": stage,
+        **(payload or {}),
+    }
+    if wait_for_disposition:
+        request["wait_for_disposition"] = True
     response = send_message(
         socket_path,
-        {
-            "type": "lode_action",
-            "action_id": action_id,
-            "lode_id": lode_id,
-            "expected_generation": expected_generation,
-            "action_type": action_type,
-            "target_disposition": target_disposition,
-            "force_consent": force_consent,
-            "stage": stage,
-            **(payload or {}),
-        },
+        request,
         timeout=timeout,
         wait_for_response=True,
     )

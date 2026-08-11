@@ -168,8 +168,11 @@ message discriminator; `prepared` contains only server-produced output,
 ownership, ship, and durability facts. The return object always has `outcome`
 (`accepted`, `idempotent`, or `refused`), `reason`, and `action_id`; it has
 `record` for accepted/in-progress actions, `disposition` for a completed retry,
-and `detail` plus `recovery_command` for refusals or blocked actions. Callers do
-not mutate a lode based on an exception or a partial result.
+and factual `detail` for a refusal. `actions.action_ack_projection` is the one
+place that adds status text, preservation/containment fields, and recovery
+instructions to the wire acknowledgement; CLI and TUI render that projection
+without reconstructing it. Callers do not mutate a lode based on an exception
+or a partial result.
 
 The opener performs these steps in this exact order:
 
@@ -478,7 +481,16 @@ On unknown disposition, return nonzero and print the action ID, expected
 generation, `hop lode status <id>`, and the exact same-verb retry. The normal
 retry command reuses `pending_action`; hidden flags also make the identity
 explicit for transport/debug recovery. Success prose is printed only for a
-terminal disposition, never mere acceptance.
+terminal disposition, never mere acceptance. `hop processed` is the deliberate
+exception: it returns after durable acceptance because the accepted action
+closes the calling pane. The server then drives containment and terminal
+publication independently; waiting in the calling process would deadlock
+teardown. Manual verbs run outside the pane and continue to wait for a terminal
+or blocked disposition. When `hop lode restart` recovers a pending completion,
+it sets the non-binding `wait_for_disposition` response-policy field; the server
+retains that request's correlated waiter while retrying the already-bound
+completion action. `hop processed` leaves the field false and returns at durable
+acceptance.
 
 Remote forwarding appends both hidden arguments before calling
 `_run_remote_cli`. The remote parser must preserve provided values even if its
@@ -495,7 +507,9 @@ remote exit/output (`hopper/cli.py:517-547`).
   malformed slot remains visibly fail-closed and has no product migration verb.
 - Changed wire messages: the five old mutation types above become
   `lode_action`; manual responses become `lode_action_ack`; completion output
-  repair keeps its message but renames generic identity field
+  recovery from an outside manual restart adds the non-binding
+  `wait_for_disposition: true` response policy; completion output repair keeps
+  its message but renames generic identity field
   `run_generation` to `expected_generation`; successor registration/receipt and
   ordinary runner messages retain their generation fields.
 - The new server keeps refusal-only branches for old action message types. They

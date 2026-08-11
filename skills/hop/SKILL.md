@@ -115,7 +115,7 @@ its full output.
 `hop lode status` prints a `stage:` line and a `state:` line. `stage` walks `mill → refine → ship → shipped`; `state` is the within-stage condition (`new`, `running`, `stuck`, `teardown`, `error`, `gated`).
 
 1. **`state: teardown` is not terminal.** Hopper has accepted an action and is durably closing and proving runner containment before the terminal disposition. For the final workflow stage, key status loops on `stage: shipped`, never on a teardown status line.
-2. **Debounce `stuck`: one poll is not a wedge.** A single `state: stuck` reading is usually the model thinking mid-stage, not a hang; `hop wait` waits ~2 min before treating stuck as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Require it to persist (~4 consecutive polls) before diagnosing the pane (see § Stuck lodes).
+2. **Debounce `stuck`: one reading is not terminal.** `hop wait` allows a 120-second grace before treating `stuck` as terminal, including when the first snapshot is already stuck, then confirms it with another authoritative read. Wait through the full grace before diagnosing the pane (see § Stuck lodes).
 3. **Use the complete exit-code table above; do not reconstruct it from this
    example.** In particular, `hop wait` timeout is exit `4`, not gate; gate is
    exit `2`.
@@ -308,18 +308,18 @@ EOF
 hop code <stage>                      # run prompts/<stage>.md via Codex
 ```
 
-`hop processed` submits exact bytes to the server and waits for a terminal or
-blocked disposition. Acceptance durably stages those bytes before teardown
-begins; the CLI does not write the canonical output file. The server closes the
-owned pane and proves the recorded runner containment is empty before advancing.
+`hop processed` submits exact bytes and returns after the server durably accepts
+the action. Acceptance stages those bytes before teardown begins; the CLI does
+not write the canonical output file. The server then closes the owned pane and
+proves the recorded runner containment is empty independently before advancing.
 In ship, the server later re-proves landing against the canonical session
 worktree: it must be clean, and one stable HEAD must be contained in freshly
 fetched upstream `main`, falling back to upstream `master` only when `main` is
 absent. Without `origin`, that same stable, clean HEAD must be contained in local
 `main`, or local `master` only when `main` is absent. Hopper verifies only: it
-never merges, rebases, commits, or pushes. If submission is blocked or refused,
-follow the printed recovery command and retry the same action only after the
-stated condition is satisfied.
+never merges, rebases, commits, or pushes. If submission is refused, follow the
+printed recovery. If its disposition is unknown, inspect `hop lode status`
+before taking another action; do not submit the output again blindly.
 
 ## Responding to a gate
 

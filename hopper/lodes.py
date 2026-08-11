@@ -49,6 +49,16 @@ from hopper.tmux import Liveness, pane_liveness
 ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
 REFUSAL_STATUS_PREFIXES = ("spawn refused: ", "spawn failed: ", "action refused: ")
+_REFUSAL_STATUS_INDEX = {"spawn": 0, "spawn_failed": 1, "action": 2}
+
+
+def format_refusal_status(kind: str, message: str) -> str:
+    """Format a refusal using the single prefix vocabulary rendered by the TUI."""
+    try:
+        prefix = REFUSAL_STATUS_PREFIXES[_REFUSAL_STATUS_INDEX[kind]]
+    except KeyError as error:
+        raise ValueError(f"unknown refusal status kind: {kind}") from error
+    return f"{prefix}{message}"
 
 
 def is_canonical_lode_id(value: object) -> bool:
@@ -539,6 +549,20 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
             save_lodes(lodes)
             return lode
     return None
+
+
+def stop_lode_runtime(lode: dict, *, stopped_at: int | None = None) -> bool:
+    """Close the current stage's open runtime interval exactly once."""
+    stage = lode.get("stage")
+    if stage not in ("mill", "refine", "ship"):
+        return False
+    stage_run = lode.setdefault("runs", {}).get(stage)
+    if not isinstance(stage_run, dict) or "started_at" not in stage_run:
+        return False
+    if "stopped_at" in stage_run:
+        return False
+    stage_run["stopped_at"] = stopped_at if stopped_at is not None else current_time_ms()
+    return True
 
 
 def update_lode_status(lodes: list[dict], lode_id: str, status: str) -> dict | None:

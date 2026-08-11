@@ -2074,6 +2074,8 @@ class HopperApp(App):
             if not lode_id:
                 return
             lode = self._get_lode(lode_id)
+            if lode is None:
+                return
             branch = lode.get("branch", "") if lode else ""
             branch = branch or f"hopper-{lode_id}"
             # Check for worktree with unmerged changes
@@ -2168,8 +2170,8 @@ class HopperApp(App):
                 ),
                 "action_type": bound_type,
                 "target_disposition": target,
-                "force_consent": False,
-                "stage": lode.get("stage"),
+                "force_consent": pending.get("force_consent", False) if reuse else False,
+                "stage": pending.get("stage", lode.get("stage")) if reuse else lode.get("stage"),
             }
         )
 

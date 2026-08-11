@@ -159,6 +159,32 @@ def test_parse_linux_process_stat_uses_field_22_and_survives_parentheses():
     )
 
 
+def test_parse_linux_process_stat_accepts_observed_kernel_thread_pgid_zero():
+    assert teardown.parse_linux_process_stat(
+        _linux_stat(pid=2, ppid=0, pgid=0, command="kthreadd"), "boot-one"
+    ) == _linux_process(2, 0, 0, 12345)
+
+
+def test_linux_process_table_accepts_kernel_thread_pgid_zero(tmp_path):
+    (tmp_path / "2").mkdir()
+    (tmp_path / "2" / "stat").write_text(_linux_stat(pid=2, ppid=0, pgid=0, command="kthreadd"))
+    (tmp_path / "101").mkdir()
+    (tmp_path / "101" / "stat").write_text(
+        _linux_stat(pid=101, ppid=1, pgid=101, command="hop process")
+    )
+
+    observed = teardown.read_process_table(platform="linux", proc_root=tmp_path, boot_id="boot-one")
+
+    assert observed == {
+        "state": "complete",
+        "identities": [
+            _linux_process(2, 0, 0, 12345),
+            _linux_process(101, 1, 101, 12345),
+        ],
+        "error": None,
+    }
+
+
 @pytest.mark.parametrize("text", ["", "100 (x) S 1", "bad (x) " + " ".join(["0"] * 20)])
 def test_parse_linux_process_stat_rejects_ambiguous_rows(text):
     with pytest.raises(ValueError):

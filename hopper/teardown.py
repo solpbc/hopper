@@ -123,7 +123,10 @@ def parse_linux_process_stat(text: str, boot_id: str) -> dict:
         starttime = int(fields[19])
     except ValueError as error:
         raise ValueError("malformed /proc stat identity") from error
-    if pid < 1 or ppid < 0 or pgid < 1 or starttime < 0 or not boot_id:
+    # Linux exposes kernel threads with a zero process-group ID in /proc.  They
+    # are valid observed table rows even though Hopper-owned launch identities
+    # must still report a positive process group at their validation boundary.
+    if pid < 1 or ppid < 0 or pgid < 0 or starttime < 0 or not boot_id:
         raise ValueError("invalid /proc stat identity")
     return {
         "pid": pid,

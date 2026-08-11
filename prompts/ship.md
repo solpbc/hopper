@@ -187,7 +187,7 @@ DONE
 
 ⛔ **`hop processed` is the LAST thing you do. Stop immediately after it returns.**
 Do not run another command, add a closing summary, re-read a file, or "just check"
-one more thing. The command durably submits your output; Hopper then closes the
-owned pane, proves the recorded runner containment is empty, and archives the
-shipped lode. If it reports an unknown disposition, inspect
-`hop lode status $HOPPER_LID` before retrying the exact same action.
+one more thing. The command returns after Hopper durably accepts your output or
+refuses it. After acceptance, Hopper closes this pane, waits for its processes to
+end, and archives the shipped lode. If the disposition is unknown, inspect
+`hop lode status $HOPPER_LID` and follow its recovery; do not submit again blindly.
