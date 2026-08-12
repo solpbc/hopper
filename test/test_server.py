@@ -7374,6 +7374,14 @@ _IDLE_QUESTION_THIRD_CAPTURE = (
     "  4. Type something.\n"
     "↑/↓ to navigate · Enter to select · Esc to cancel\n"
 )
+# Constructed from the existing selector fixture with the same legacy tuple shape but new content.
+_FOLLOW_ON_QUESTION_CAPTURE = (
+    "Which release should ship?\n"
+    "❯ 1. Ship the patch release\n"
+    "  2. Ship the minor release\n"
+    "  3. Type something.\n"
+    "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+)
 _EDITED_FREE_TEXT_QUESTION_CAPTURE = (
     "  1. Widen scope to include it\n"
     "  2. Leave it; relax AC1\n"
@@ -7383,6 +7391,16 @@ _EDITED_FREE_TEXT_QUESTION_CAPTURE = (
     "  5. Chat about this\n"
     "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
 )
+# Constructed from the verified staged-composer shape. No agent was killed during prep; the
+# surviving Claude frame and shell prompt written beneath it are inferred from the specified
+# killed-agent pane behavior.
+_DEAD_AGENT_STAGED_CAPTURE = (
+    "Claude's last rendered response\n─────\n❯ Please revise\n─────\nextro@host:~/project$ \n"
+)
+# Constructed from the verified composer shape with its closing U+2500 rule removed.
+_TORN_COMPOSER_CAPTURE = "─────\n❯ \n"
+# Constructed from the shell prompt portion of the inferred killed-agent shape above.
+_SHELL_PROMPT_CAPTURE = "extro@host:~/project$ \n"
 
 
 def _handle_delivery_with_tmux(
@@ -7410,6 +7428,22 @@ def _handle_delivery_with_tmux(
     ):
         srv._handle_mutation(message, conn)
     return mock_capture, mock_title, mock_paste, mock_send, mock_sleep
+
+
+def _observe_acceptance_with_tmux(captures, titles, evidence):
+    """Run acceptance polling with only its existing tmux boundaries patched."""
+    with (
+        patch("hopper.server.capture_pane", side_effect=captures) as mock_capture,
+        patch("hopper.server.pane_title", side_effect=titles) as mock_title,
+        patch("hopper.server.time.sleep") as mock_sleep,
+    ):
+        result = hopper_server._observe_pane_acceptance(
+            "%1",
+            _IDLE_STAGED_CAPTURE,
+            "✳ Ready",
+            evidence,
+        )
+    return result, mock_capture, mock_title, mock_sleep
 
 
 def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
@@ -7691,6 +7725,24 @@ def test_gate_feedback_busy_for_entire_idle_wait_never_touches_pane(socket_path,
     assert "reason=idle_timeout outcome=busy" in caplog.text
 
 
+def test_gate_feedback_circle_processing_title_reports_busy(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, mock_title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[_PROCESSING_CAPTURE] * 13,
+        titles=["◐ Working"] * 12,
+    )
+
+    assert mock_title.call_count == 12
+    mock_paste.assert_not_called()
+    mock_send.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "busy"
+
+
 def test_gate_feedback_identical_old_processing_title_is_frozen_after_idle_wait(
     socket_path, make_lode
 ):
@@ -7726,6 +7778,35 @@ def test_gate_feedback_identical_old_processing_title_is_frozen_after_idle_wait(
     response = _decode_mock_response(conn)
     assert response["outcome"] == "pane_frozen"
     assert f"at least {hopper_server.FROZEN_PANE_THRESHOLD_MS // 60_000} min" in response["error"]
+
+
+def test_gate_feedback_circle_processing_title_past_threshold_is_frozen(socket_path, make_lode):
+    observed_at = 1_000
+    srv = Server(socket_path)
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            state="gated",
+            tmux_pane="%1",
+            pane_title_observation={"title": "◐ Working", "observed_at": observed_at},
+        )
+    ]
+    conn = _mock_client(srv)
+
+    with patch(
+        "hopper.server.current_time_ms",
+        return_value=observed_at + hopper_server.FROZEN_PANE_THRESHOLD_MS,
+    ):
+        _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
+            srv,
+            conn,
+            captures=[_PROCESSING_CAPTURE] * 13,
+            titles=["◐ Working"] * 12,
+        )
+
+    mock_paste.assert_not_called()
+    mock_send.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "pane_frozen"
 
 
 def test_gate_feedback_old_idle_title_still_delivers(socket_path, make_lode):
@@ -7890,6 +7971,216 @@ def test_gate_feedback_placeholder_is_staged_not_accepted(socket_path, make_lode
     assert srv.lodes[0]["state"] == "running"
 
 
+def test_pane_delivery_accepts_answer_when_prior_selector_disappears_without_working_title():
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[
+                _IDLE_QUESTION_CAPTURE,
+                _IDLE_QUESTION_CAPTURE,
+                _IDLE_QUESTION_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+            ],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready"] * 3),
+        patch("hopper.server.send_keys", return_value=True) as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "1", paste=False)
+
+    assert result["reason"] == "selector_changed"
+    mock_send.assert_called_once_with("%1", "Enter")
+
+
+def test_pane_delivery_accepts_paste_when_settled_input_clears_without_working_title():
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_STAGED_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+            ],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready"] * 4),
+        patch("hopper.server.paste_buffer", return_value=True),
+        patch("hopper.server.send_keys", return_value=True) as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "Please revise", paste=True)
+
+    assert result["reason"] == "composer_cleared"
+    mock_send.assert_called_once_with("%1", "Enter")
+
+
+def test_pane_delivery_accepts_answer_followed_by_different_same_shape_selector():
+    assert hopper_server.pane_answer_choices(
+        _IDLE_QUESTION_CAPTURE
+    ) == hopper_server.pane_answer_choices(_FOLLOW_ON_QUESTION_CAPTURE)
+    assert hopper_server.pane_answer_identity(
+        _IDLE_QUESTION_CAPTURE
+    ) != hopper_server.pane_answer_identity(_FOLLOW_ON_QUESTION_CAPTURE)
+
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[
+                _IDLE_QUESTION_CAPTURE,
+                _IDLE_QUESTION_CAPTURE,
+                _IDLE_QUESTION_CAPTURE,
+                _FOLLOW_ON_QUESTION_CAPTURE,
+                _FOLLOW_ON_QUESTION_CAPTURE,
+            ],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready"] * 3),
+        patch("hopper.server.send_keys", return_value=True),
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "1", paste=False)
+
+    assert result["reason"] == "selector_changed"
+
+
+def test_pane_delivery_accepts_circle_processing_title_fast_path():
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_EMPTY_CAPTURE,
+                _IDLE_STAGED_CAPTURE,
+                _PROCESSING_CAPTURE,
+            ],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready", "✳ Ready", "◐ Working"]),
+        patch("hopper.server.paste_buffer", return_value=True),
+        patch("hopper.server.send_keys", return_value=True),
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "Please revise", paste=True)
+
+    assert result["reason"] == "enter_accepted"
+
+
+def test_pane_delivery_auto_submits_with_circle_processing_title():
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[_IDLE_EMPTY_CAPTURE, _IDLE_EMPTY_CAPTURE, _PROCESSING_CAPTURE],
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready", "◑ Working"]),
+        patch("hopper.server.paste_buffer", return_value=True),
+        patch("hopper.server.send_keys") as mock_send,
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "Please revise", paste=True)
+
+    assert result["reason"] == "auto_submitted"
+    mock_send.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        pytest.param("", id="successful-empty-capture"),
+        pytest.param("   \n\t\n", id="whitespace-only"),
+        pytest.param(_SHELL_PROMPT_CAPTURE, id="shell-prompt"),
+    ],
+)
+def test_pane_acceptance_unreadable_capture_times_out(capture):
+    # Empty and whitespace shapes exercise successful captures; the shell shape is defined above.
+    result, mock_capture, mock_title, _sleep = _observe_acceptance_with_tmux(
+        [capture] * 12,
+        ["✳ Ready"] * 12,
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+    assert mock_capture.call_count == 12
+    assert mock_title.call_count == 12
+
+
+def test_pane_acceptance_none_capture_reports_lost_pane():
+    # None is the capture_pane failure sentinel, distinct from a successful empty capture.
+    result, mock_capture, mock_title, _sleep = _observe_acceptance_with_tmux(
+        [None],
+        [],
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "pane_lost_after_submit"
+    assert mock_capture.call_count == 1
+    mock_title.assert_not_called()
+
+
+def test_pane_acceptance_torn_composer_times_out():
+    result, _capture, _title, _sleep = _observe_acceptance_with_tmux(
+        [_TORN_COMPOSER_CAPTURE] * 12,
+        ["✳ Ready"] * 12,
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+
+
+def test_pane_acceptance_dead_agent_frame_times_out():
+    assert hopper_server.pane_surface_readable(_DEAD_AGENT_STAGED_CAPTURE) is True
+    assert hopper_server.read_pane_input(_DEAD_AGENT_STAGED_CAPTURE) == "Please revise"
+
+    result, _capture, _title, _sleep = _observe_acceptance_with_tmux(
+        [_DEAD_AGENT_STAGED_CAPTURE] * 12,
+        ["✳ Ready"] * 12,
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+
+
+def test_pane_acceptance_requires_two_consecutive_consumed_polls():
+    result, _capture, _title, _sleep = _observe_acceptance_with_tmux(
+        [_IDLE_EMPTY_CAPTURE, _IDLE_STAGED_CAPTURE] * 6,
+        ["✳ Ready"] * 12,
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+
+
+def test_pane_acceptance_first_consumed_sighting_on_last_poll_times_out():
+    result, _capture, _title, _sleep = _observe_acceptance_with_tmux(
+        [_IDLE_STAGED_CAPTURE] * 11 + [_IDLE_EMPTY_CAPTURE],
+        ["✳ Ready"] * 12,
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+
+
+def test_pane_acceptance_unchanged_composer_times_out():
+    result, _capture, _title, _sleep = _observe_acceptance_with_tmux(
+        [_IDLE_STAGED_CAPTURE] * 12,
+        ["✳ Ready"] * 12,
+        ("composer", "Please revise"),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+
+
+def test_pane_acceptance_unchanged_selector_times_out():
+    selector_identity = hopper_server.pane_answer_identity(_IDLE_QUESTION_CAPTURE)
+    assert selector_identity is not None
+    result, _capture, _title, _sleep = _observe_acceptance_with_tmux(
+        [_IDLE_QUESTION_CAPTURE] * 12,
+        ["✳ Ready"] * 12,
+        ("selector", selector_identity),
+    )
+
+    assert result["reason"] == "acceptance_timeout"
+
+
 def test_gate_feedback_empty_settle_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
@@ -7996,7 +8287,9 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
     assert set(hopper_server._PANE_INPUT_MESSAGES) == shared | choice_only
     assert hopper_server._ACCEPTED_DELIVERY_REASONS == {
         "auto_submitted",
+        "composer_cleared",
         "enter_accepted",
+        "selector_changed",
     }
     assert hopper_server._PRE_PASTE_REASONS == {
         "pane_unavailable",
@@ -8301,7 +8594,9 @@ def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_
     ("reason", "outcome", "level"),
     [
         ("auto_submitted", "accepted", logging.INFO),
+        ("composer_cleared", "accepted", logging.INFO),
         ("enter_accepted", "accepted", logging.INFO),
+        ("selector_changed", "accepted", logging.INFO),
         ("pane_unavailable", "pane_unavailable", logging.WARNING),
         ("idle_timeout", "busy", logging.WARNING),
         ("pane_state_unknown", "pane_state_unknown", logging.WARNING),
@@ -8375,10 +8670,16 @@ def test_render_observed_title_distinguishes_none_and_preserves_verbatim():
     )
 
 
-def test_send_pane_input_round_trips_over_real_server_socket(server, socket_path, make_lode):
+@pytest.mark.parametrize(
+    "reason",
+    ["auto_submitted", "composer_cleared", "enter_accepted", "selector_changed"],
+)
+def test_send_pane_input_round_trips_over_real_server_socket(
+    server, socket_path, make_lode, reason
+):
     server.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     attempt_result = {
-        "reason": "auto_submitted",
+        "reason": reason,
         "capture": _PROCESSING_CAPTURE,
         "title": "⠂ Working",
     }
@@ -8397,6 +8698,27 @@ def test_send_pane_input_round_trips_over_real_server_socket(server, socket_path
         "lode_id": "test-id",
         "tmux_pane": "%1",
     }
+
+
+@pytest.mark.parametrize("reason", ["composer_cleared", "selector_changed"])
+def test_gate_feedback_handler_accepts_consumed_input_reasons(socket_path, make_lode, reason):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+    attempt_result = {
+        "reason": reason,
+        "capture": _IDLE_EMPTY_CAPTURE,
+        "title": "✳ Ready",
+    }
+
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Please revise"},
+            conn,
+        )
+
+    assert srv.lodes[0]["state"] == "running"
+    assert _decode_mock_response(conn)["type"] == "feedback_sent"
 
 
 def test_feedback_epoch_rejects_stale_resume(socket_path, make_lode, caplog):

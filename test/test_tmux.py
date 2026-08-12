@@ -26,9 +26,11 @@ from hopper.tmux import (
     kill_pane,
     new_window,
     pane_answer_choices,
+    pane_answer_identity,
     pane_identity,
     pane_liveness,
     pane_needs_answer,
+    pane_surface_readable,
     pane_title,
     paste_buffer,
     read_pane_input,
@@ -335,11 +337,16 @@ class TestPaneTitle:
     ("title", "expected"),
     [
         ("✳ Ready", PanePhase.IDLE),
+        ("◐ Thinking", PanePhase.PROCESSING),
+        ("◑ Thinking", PanePhase.PROCESSING),
+        ("◒ Thinking", PanePhase.PROCESSING),
+        ("◓ Thinking", PanePhase.PROCESSING),
         ("⠀ Thinking", PanePhase.PROCESSING),
         ("⠐ Thinking", PanePhase.PROCESSING),
         ("⣿ Thinking", PanePhase.PROCESSING),
         (None, PanePhase.UNKNOWN),
         ("", PanePhase.UNKNOWN),
+        ("Fix auth bug", PanePhase.UNKNOWN),
         ("extro", PanePhase.UNKNOWN),
         ("★ Other", PanePhase.UNKNOWN),
     ],
@@ -693,6 +700,70 @@ def test_pane_needs_answer_detects_a_plain_selector():
     )
     assert pane_needs_answer(plain) is True
     assert pane_answer_choices(plain) == (1, (1, 2, 3), frozenset({3}))
+
+
+def test_pane_answer_identity_distinguishes_same_shape_questions():
+    # Constructed from the existing plain-selector fixture with different question and label text.
+    deploy = (
+        "Deploy where?\n"
+        "❯ 1. Production\n"
+        "  2. Staging\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+    delete = (
+        "Delete the database?\n"
+        "❯ 1. Delete permanently\n"
+        "  2. Cancel\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+
+    assert pane_answer_choices(deploy) == pane_answer_choices(delete)
+    assert pane_answer_identity(deploy) == (
+        "Deploy where?",
+        ((1, "Production"), (2, "Staging")),
+    )
+    assert pane_answer_identity(deploy) != pane_answer_identity(delete)
+
+
+def test_pane_answer_identity_is_total_for_a_selector_without_a_question():
+    # Constructed from the existing edited-free-text fixture by omitting all preceding prose.
+    selector = "❯ 1. Keep current behavior\n  2. Change it\nEnter to select · Esc to cancel\n"
+
+    assert pane_answer_identity(selector) == (
+        "",
+        ((1, "Keep current behavior"), (2, "Change it")),
+    )
+
+
+def test_pane_answer_identity_normalizes_wrapped_rendered_text():
+    # Constructed from the existing plain-selector fixture with terminal-wrapped question and label.
+    selector = (
+        "Which environment should receive\n"
+        "  this deployment?\n"
+        "❯ 1. The production\n"
+        "     environment\n"
+        "  2. Staging\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+
+    assert pane_answer_identity(selector) == (
+        "Which environment should receive this deployment?",
+        ((1, "The production environment"), (2, "Staging")),
+    )
+
+
+def test_pane_surface_readable_accepts_empty_composer_and_selector():
+    # Composer shape comes from PROCESSING_EMPTY_INPUT_CAPTURE; selector shape is the plain fixture.
+    selector = (
+        "Which cutover should I take?\n"
+        "❯ 1. Delete the Python wire now\n"
+        "  2. Keep both behind a flag\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+
+    assert read_pane_input(PROCESSING_EMPTY_INPUT_CAPTURE) == ""
+    assert pane_surface_readable(PROCESSING_EMPTY_INPUT_CAPTURE) is True
+    assert pane_surface_readable(selector) is True
 
 
 def test_pane_answer_choices_recognizes_edited_free_text_row_before_rule():

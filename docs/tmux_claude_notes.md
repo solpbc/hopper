@@ -15,9 +15,10 @@ tmux display-message -t :$WINDOW -p '#{pane_title}'
 | Prefix | Meaning | Example |
 |--------|---------|---------|
 | `✳` (U+2733 sparkle) | Idle/waiting for input | `✳ Claude Code` |
+| `◐`–`◓` (U+25D0–U+25D3 circles) | Active/processing | `◐ Fixing auth bug` |
 | `⠐`/`⠂` (braille dots) | Active/processing | `⠐ Fixing auth bug` |
 
-The braille characters animate as a spinner while Claude is working.
+The circle and braille characters animate as spinners while Claude is working.
 
 ### Title Text Content
 

@@ -156,7 +156,7 @@ def classify_pane_phase(title: str | None) -> PanePhase:
     marker = title[0]
     if marker == "\u2733":
         return PanePhase.IDLE
-    if "\u2800" <= marker <= "\u28ff":
+    if "\u25d0" <= marker <= "\u25d3" or "\u2800" <= marker <= "\u28ff":
         return PanePhase.PROCESSING
     return PanePhase.UNKNOWN
 
@@ -192,8 +192,10 @@ _QUESTION_CHROME_RE = re.compile(
 )
 
 
-def pane_answer_choices(snapshot: str) -> tuple[int, tuple[int, ...], frozenset[int]] | None:
-    """Return the selected row, visible choices, and free-text rows for a selector."""
+def _parse_pane_answer(
+    snapshot: str,
+) -> tuple[list[str], list[tuple[int, int, str, bool]], int, int] | None:
+    """Parse the current contiguous rows from a numbered selector."""
     if not snapshot:
         return None
     text = _ANSI_ESCAPE_RE.sub("", snapshot)
@@ -224,7 +226,16 @@ def pane_answer_choices(snapshot: str) -> tuple[int, tuple[int, ...], frozenset[
     while last + 1 < len(rows) and rows[last + 1][1] == rows[last][1] + 1:
         last += 1
     rows = rows[first : last + 1]
-    selected = rows[selected_position - first][1]
+    return lines, rows, selected_position - first, chrome_line
+
+
+def pane_answer_choices(snapshot: str) -> tuple[int, tuple[int, ...], frozenset[int]] | None:
+    """Return the selected row, visible choices, and free-text rows for a selector."""
+    parsed = _parse_pane_answer(snapshot)
+    if parsed is None:
+        return None
+    lines, rows, selected_position, _chrome_line = parsed
+    selected = rows[selected_position][1]
     choices = tuple(number for _index, number, _label, _cursor in rows)
 
     free_text: set[int] = set()
@@ -237,6 +248,50 @@ def pane_answer_choices(snapshot: str) -> tuple[int, tuple[int, ...], frozenset[
             free_text.add(number)
 
     return selected, choices, frozenset(free_text)
+
+
+def _normalize_pane_text(parts: list[str]) -> str:
+    """Collapse rendered whitespace in selector identity text."""
+    return " ".join(" ".join(parts).split())
+
+
+def pane_answer_identity(snapshot: str) -> tuple[str, tuple[tuple[int, str], ...]] | None:
+    """Return stable rendered content identifying a numbered selector."""
+    parsed = _parse_pane_answer(snapshot)
+    if parsed is None:
+        return None
+    lines, rows, _selected_position, chrome_line = parsed
+
+    question_parts: list[str] = []
+    for line in reversed(lines[: rows[0][0]]):
+        stripped = line.strip()
+        if (
+            not stripped
+            or set(stripped) == {"\u2500"}
+            or _QUESTION_OPTION_RE.match(line) is not None
+        ):
+            break
+        question_parts.append(stripped)
+    question = _normalize_pane_text(list(reversed(question_parts)))
+
+    options: list[tuple[int, str]] = []
+    for position, (index, number, label, _cursor) in enumerate(rows):
+        next_index = rows[position + 1][0] if position + 1 < len(rows) else chrome_line
+        label_parts = [label]
+        for line in lines[index + 1 : next_index]:
+            stripped = line.strip()
+            if not stripped or set(stripped) == {"\u2500"}:
+                break
+            label_parts.append(stripped)
+        options.append((number, _normalize_pane_text(label_parts)))
+    return question, tuple(options)
+
+
+def pane_surface_readable(snapshot: str) -> bool:
+    """Return whether a non-empty capture contains a readable Claude input surface."""
+    return bool(snapshot.strip()) and (
+        read_pane_input(snapshot) is not None or pane_answer_choices(snapshot) is not None
+    )
 
 
 def pane_needs_answer(snapshot: str) -> bool:

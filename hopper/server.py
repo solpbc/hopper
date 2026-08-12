@@ -85,9 +85,11 @@ from hopper.tmux import (
     classify_pane_phase,
     completion_action_panes,
     pane_answer_choices,
+    pane_answer_identity,
     pane_identity,
     pane_liveness,
     pane_needs_answer,
+    pane_surface_readable,
     pane_title,
     paste_buffer,
     read_pane_input,
@@ -394,7 +396,9 @@ def _capture_worker_registration(source: dict, message: dict) -> dict:
     return {"record": record, "pidfd": pidfd}
 
 
-_ACCEPTED_DELIVERY_REASONS = frozenset({"auto_submitted", "enter_accepted"})
+_ACCEPTED_DELIVERY_REASONS = frozenset(
+    {"auto_submitted", "composer_cleared", "enter_accepted", "selector_changed"}
+)
 _DELIVERY_FAILURE_OUTCOMES = {
     "pane_unavailable": "pane_unavailable",
     "idle_timeout": "busy",
@@ -771,8 +775,11 @@ def _observe_pane_acceptance(
     pane_id: str,
     latest_capture: str,
     observed_title: str | None,
+    acceptance_evidence: tuple[str, object],
 ) -> dict:
     """Verify that one submitted input started a new processing turn."""
+    evidence_kind, pre_enter_evidence = acceptance_evidence
+    evidence_observed = False
     for _ in range(_FEEDBACK_ACCEPTANCE_POLL_COUNT):
         time.sleep(_FEEDBACK_POLL_INTERVAL)
         capture = capture_pane(pane_id, plain=True)
@@ -790,6 +797,31 @@ def _observe_pane_acceptance(
                 "capture": latest_capture,
                 "title": observed_title,
             }
+        if evidence_kind == "selector":
+            selector_identity = pane_answer_identity(latest_capture)
+            consumed = (
+                bool(latest_capture.strip())
+                and pane_surface_readable(latest_capture)
+                and (
+                    (selector_identity is not None and selector_identity != pre_enter_evidence)
+                    or (selector_identity is None and read_pane_input(latest_capture) is not None)
+                )
+            )
+            accepted_reason = "selector_changed"
+        else:
+            consumed = (
+                bool(latest_capture.strip())
+                and pane_surface_readable(latest_capture)
+                and read_pane_input(latest_capture) != pre_enter_evidence
+            )
+            accepted_reason = "composer_cleared"
+        if consumed and evidence_observed:
+            return {
+                "reason": accepted_reason,
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        evidence_observed = consumed
     return {
         "reason": "acceptance_timeout",
         "capture": latest_capture,
@@ -917,6 +949,8 @@ def _attempt_pane_delivery(
                 "capture": latest_capture,
                 "title": observed_title,
             }
+        selector_identity = pane_answer_identity(latest_capture)
+        assert selector_identity is not None
         if not send_keys(pane_id, "Enter"):
             return {
                 "reason": "choice_submit_failed",
@@ -927,6 +961,7 @@ def _attempt_pane_delivery(
             pane_id,
             latest_capture,
             observed_title,
+            ("selector", selector_identity),
         )
 
     delivered = paste_buffer(pane_id, text) if paste else send_keys(pane_id, text)
@@ -947,6 +982,7 @@ def _attempt_pane_delivery(
         )
         return {"reason": reason, "capture": latest_capture, "title": observed_title}
 
+    staged_input = None
     for _ in range(_FEEDBACK_SETTLE_POLL_COUNT):
         time.sleep(_FEEDBACK_POLL_INTERVAL)
         capture = capture_pane(pane_id, plain=True)
@@ -965,7 +1001,9 @@ def _attempt_pane_delivery(
                 "capture": latest_capture,
                 "title": observed_title,
             }
-        if phase is PanePhase.IDLE and read_pane_input(latest_capture):
+        post_delivery_input = read_pane_input(latest_capture)
+        if phase is PanePhase.IDLE and post_delivery_input:
+            staged_input = post_delivery_input
             break
     else:
         return {
@@ -981,10 +1019,12 @@ def _attempt_pane_delivery(
             "title": observed_title,
         }
 
+    assert staged_input is not None
     return _observe_pane_acceptance(
         pane_id,
         latest_capture,
         observed_title,
+        ("composer", staged_input),
     )
 
 
