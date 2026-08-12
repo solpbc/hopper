@@ -485,8 +485,8 @@ _GATE_FEEDBACK_MESSAGES = {
         "it once instead of pasting it again."
     ),
     "acceptance_timeout": (
-        "Hopper pressed Enter in pane {pane}, but did not observe the required "
-        f"idle-to-processing transition within {_FEEDBACK_ACCEPTANCE_WAIT_SECONDS:.1f}s. "
+        "Hopper pressed Enter in pane {pane}, but acceptance could not be verified within "
+        f"{_FEEDBACK_ACCEPTANCE_WAIT_SECONDS:.1f}s. "
         "The delivery outcome is unknown. Inspect with `hop lode peek {lode_id}` before "
         "deciding whether to retry; do not paste the feedback again unless the pane proves "
         "it was not accepted or staged."
@@ -585,8 +585,8 @@ _PANE_INPUT_MESSAGES = {
         "`hop lode peek {lode_id}`, then submit it once instead of sending it again."
     ),
     "acceptance_timeout": (
-        "Hopper pressed Enter in pane {pane}, but did not observe the required "
-        f"idle-to-processing transition within {_FEEDBACK_ACCEPTANCE_WAIT_SECONDS:.1f}s. "
+        "Hopper pressed Enter in pane {pane}, but acceptance could not be verified within "
+        f"{_FEEDBACK_ACCEPTANCE_WAIT_SECONDS:.1f}s. "
         "Inspect with `hop lode peek {lode_id}` before retrying; do not send it again unless "
         "the pane shows it was not accepted or staged."
     ),

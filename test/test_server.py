@@ -7382,6 +7382,19 @@ _FOLLOW_ON_QUESTION_CAPTURE = (
     "  3. Type something.\n"
     "↑/↓ to navigate · Enter to select · Esc to cancel\n"
 )
+# Paired fixtures constructed from the existing selector fixture with a changing
+# unnumbered ancillary control.
+_QUESTION_ANCILLARY_FIRST_CAPTURE = (
+    "Which cutover should I take?\n"
+    "❯ 1. Delete the Python wire now\n"
+    "  2. Keep both behind a flag\n"
+    "  3. Type something.\n"
+    "  n to add notes\n"
+    "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+)
+_QUESTION_ANCILLARY_SECOND_CAPTURE = _QUESTION_ANCILLARY_FIRST_CAPTURE.replace(
+    "n to add notes", "n notes unavailable"
+)
 _EDITED_FREE_TEXT_QUESTION_CAPTURE = (
     "  1. Widen scope to include it\n"
     "  2. Leave it; relax AC1\n"
@@ -8044,6 +8057,34 @@ def test_pane_delivery_accepts_answer_followed_by_different_same_shape_selector(
     assert result["reason"] == "selector_changed"
 
 
+def test_pane_delivery_ancillary_selector_change_does_not_establish_acceptance():
+    expected_identity = hopper_server.pane_answer_identity(_IDLE_QUESTION_CAPTURE)
+    assert (
+        hopper_server.pane_answer_identity(_QUESTION_ANCILLARY_FIRST_CAPTURE) == expected_identity
+    )
+    assert (
+        hopper_server.pane_answer_identity(_QUESTION_ANCILLARY_SECOND_CAPTURE) == expected_identity
+    )
+
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=[_IDLE_QUESTION_CAPTURE] * 3
+            + [
+                _QUESTION_ANCILLARY_FIRST_CAPTURE,
+                _QUESTION_ANCILLARY_SECOND_CAPTURE,
+            ]
+            * 6,
+        ),
+        patch("hopper.server.pane_title", side_effect=["✳ Ready"] * 13),
+        patch("hopper.server.send_keys", return_value=True),
+        patch("hopper.server.time.sleep"),
+    ):
+        result = hopper_server._attempt_pane_delivery("%1", "1", paste=False)
+
+    assert result["reason"] == "acceptance_timeout"
+
+
 def test_pane_delivery_accepts_circle_processing_title_fast_path():
     with (
         patch(
@@ -8219,7 +8260,7 @@ def test_gate_feedback_enter_failure_keeps_staged_text(socket_path, make_lode):
     assert "submit it once instead of pasting it again" in response["error"]
 
 
-def test_gate_feedback_acceptance_requires_processing_title(socket_path, make_lode):
+def test_gate_feedback_capture_change_with_same_staged_input_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
     conn = _mock_client(srv)
@@ -8354,8 +8395,8 @@ def test_preexisting_gate_feedback_failure_contracts_stay_unchanged():
             "it once instead of pasting it again."
         ),
         "acceptance_timeout": (
-            "Hopper pressed Enter in pane %1, but did not observe the required "
-            "idle-to-processing transition within 3.0s. The delivery outcome is unknown. "
+            "Hopper pressed Enter in pane %1, but acceptance could not be verified within "
+            "3.0s. The delivery outcome is unknown. "
             "Inspect with `hop lode peek test-id` before deciding whether to retry; do not "
             "paste the feedback again unless the pane proves it was not accepted or staged."
         ),
@@ -8555,7 +8596,7 @@ def test_lode_send_pane_input_answer_without_processing_is_unverified(socket_pat
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["outcome"] == "unverified"
-    assert "did not observe the required idle-to-processing transition" in response["error"]
+    assert "acceptance could not be verified" in response["error"]
 
 
 def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_path, make_lode):

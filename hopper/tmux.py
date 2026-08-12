@@ -277,10 +277,14 @@ def pane_answer_identity(snapshot: str) -> tuple[str, tuple[tuple[int, str], ...
     options: list[tuple[int, str]] = []
     for position, (index, number, label, _cursor) in enumerate(rows):
         next_index = rows[position + 1][0] if position + 1 < len(rows) else chrome_line
+        row_indent = len(lines[index]) - len(lines[index].lstrip())
         label_parts = [label]
         for line in lines[index + 1 : next_index]:
             stripped = line.strip()
             if not stripped or set(stripped) == {"\u2500"}:
+                break
+            continuation_indent = len(line) - len(line.lstrip())
+            if continuation_indent <= row_indent:
                 break
             label_parts.append(stripped)
         options.append((number, _normalize_pane_text(label_parts)))

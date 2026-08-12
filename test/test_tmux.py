@@ -752,6 +752,20 @@ def test_pane_answer_identity_normalizes_wrapped_rendered_text():
     )
 
 
+def test_pane_answer_identity_ignores_ancillary_line_after_last_option():
+    # Constructed from the existing plain-selector fixture with an unnumbered ancillary control.
+    first = (
+        "Deploy where?\n"
+        "❯ 1. Production\n"
+        "  2. Staging\n"
+        "  n to add notes\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+    second = first.replace("n to add notes", "n notes unavailable")
+
+    assert pane_answer_identity(first) == pane_answer_identity(second)
+
+
 def test_pane_surface_readable_accepts_empty_composer_and_selector():
     # Composer shape comes from PROCESSING_EMPTY_INPUT_CAPTURE; selector shape is the plain fixture.
     selector = (
