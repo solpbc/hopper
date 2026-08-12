@@ -190,8 +190,9 @@ hop list                  # alias for lode list (same flags)
 
 A single-source `hop lode list -p PROJECT` refuses when that project has a
 configured remote pool because the local server cannot vouch for the complete
-answer. Use `--all-hosts` to query the local server and the project's pool
-hosts. Unknown project names report close registered-name suggestions.
+answer. Use `--all-hosts` to query the local server and all configured pool
+hosts; `-p` filters returned rows, not which hosts are contacted. Unknown
+project names report close registered-name suggestions.
 
 Every successful list reports its searched sources on stderr, including JSON
 and empty results. `--all-hosts` preserves rows from sources that answer. Its JSON

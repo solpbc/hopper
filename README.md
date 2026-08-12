@@ -118,8 +118,9 @@ explicit recovery when the resident route cannot be read or verified.
 
 A single-source `hop lode list -p PROJECT` refuses when the project has a
 configured remote pool because the local server cannot vouch for the complete
-answer. Use `--all-hosts` to query the local server and that project's pool
-hosts; unknown project names report close registered-name suggestions.
+answer. Use `--all-hosts` to query the local server and all configured pool
+hosts; `-p` filters returned rows, not which hosts are contacted. Unknown
+project names report close registered-name suggestions.
 
 `hop lode list --all-hosts` keeps rows from sources that answered and reports
 the local and configured pool sources searched on stderr. Successful local-only
