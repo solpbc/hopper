@@ -9,6 +9,7 @@ Lodes are plain dicts with these fields:
 - created_at: int - milliseconds since epoch
 - project: str - project name (default "")
 - scope: str - user's task scope description (default "")
+- originating_extro_sid: str | None - submitting client's Extro session ID (default None)
 - updated_at: int - milliseconds since epoch (default 0, meaning use created_at)
 - state: str - server-validated lifecycle state (default "new")
 - status: str - human-readable status text (default "")
@@ -408,7 +409,12 @@ def _make_claude_sessions() -> dict:
 
 
 def create_lode(
-    lodes: list[dict], project: str, scope: str = "", *, lode_id: str | None = None
+    lodes: list[dict],
+    project: str,
+    scope: str = "",
+    *,
+    lode_id: str | None = None,
+    originating_extro_sid: str | None = None,
 ) -> dict:
     """Create a new lode, add to list, and create its directory.
 
@@ -439,6 +445,7 @@ def create_lode(
         "created_at": now,
         "project": project,
         "scope": scope,
+        "originating_extro_sid": originating_extro_sid,
         "updated_at": now,
         "state": "new",
         "status": "Ready to start",

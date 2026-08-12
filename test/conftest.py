@@ -19,6 +19,7 @@ def isolate_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "worktree_root", lambda: tmp_path / "worktrees")
     monkeypatch.setattr(config, "hostname", lambda: "test-host")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.delenv("EXTRO_SESSION", raising=False)
     return tmp_path
 
 
@@ -59,6 +60,7 @@ def make_lode():
             "updated_at": 1000,
             "project": "",
             "scope": "",
+            "originating_extro_sid": None,
             "state": "new",
             "status": "",
             "title": "",

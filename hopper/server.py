@@ -5494,6 +5494,7 @@ class Server:
         elif msg_type == "lode_create":
             project = message.get("project", "")
             scope = message.get("scope", "")
+            originating_extro_sid = message.get("originating_extro_sid")
             proj = find_project(project)
             if proj and proj.disabled:
                 logger.warning("Refusing to create lode for disabled project %s", project)
@@ -5503,7 +5504,12 @@ class Server:
                         {"type": "error", "error": disabled_project_message(proj)},
                     )
                 return
-            lode = create_lode(self.lodes, project, scope)
+            lode = create_lode(
+                self.lodes,
+                project,
+                scope,
+                originating_extro_sid=originating_extro_sid,
+            )
             backlog_data = message.get("backlog")
             if backlog_data:
                 lode["backlog"] = backlog_data

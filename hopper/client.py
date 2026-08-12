@@ -577,11 +577,19 @@ def create_lode(
     scope: str,
     spawn: bool = True,
     timeout: float = 5.0,
+    *,
+    originating_extro_sid: str | None = None,
 ) -> dict | None:
     """Create a new lode via the server. Returns the created lode dict or None."""
     response = send_message(
         socket_path,
-        {"type": "lode_create", "project": project, "scope": scope, "spawn": spawn},
+        {
+            "type": "lode_create",
+            "project": project,
+            "scope": scope,
+            "spawn": spawn,
+            "originating_extro_sid": originating_extro_sid,
+        },
         timeout=timeout,
         wait_for_response=True,
     )

@@ -1339,6 +1339,53 @@ def test_lode_create_happy(capsys):
     assert "myproj" in out
 
 
+@pytest.mark.parametrize(
+    ("command", "env_value", "extra_args", "expected"),
+    [
+        ("lode", None, [], None),
+        ("implement", "  extro-implement  ", [], "extro-implement"),
+        ("submit", "", [], None),
+        ("lode", "   ", [], None),
+        ("lode", "receiving-host-value", ["--originating-extro-sid", ""], None),
+    ],
+)
+def test_create_captures_originating_extro_sid(
+    command,
+    env_value,
+    extra_args,
+    expected,
+    monkeypatch,
+):
+    """Create aliases normalize local provenance and honor transported empty values."""
+    from io import StringIO
+
+    if env_value is None:
+        monkeypatch.delenv("EXTRO_SESSION", raising=False)
+    else:
+        monkeypatch.setenv("EXTRO_SESSION", env_value)
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
+    command_args = ["myproj", *extra_args]
+    handler = {
+        "lode": cmd_lode,
+        "implement": cmd_implement,
+        "submit": cmd_submit,
+    }[command]
+    if command == "lode":
+        command_args.insert(0, "create")
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch("hopper.client.create_lode", return_value=created_lode) as mock_create,
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert handler(command_args) == 0
+
+    assert mock_create.call_args.kwargs["originating_extro_sid"] == expected
+
+
 def test_lode_create_dirty_repo_rejected(capsys):
     from io import StringIO
 
@@ -7050,6 +7097,29 @@ def test_lode_status_json_keeps_raw_pane_activity(capsys, make_lode):
     assert set(payload) == set(lode) | {"status_display", "pane_liveness"}
 
 
+def test_legacy_lode_without_originating_extro_sid_renders(capsys, make_lode):
+    lode = make_lode(id="test-id", host="local")
+    lode.pop("originating_extro_sid")
+
+    detail = format_lode_detail(lode)
+
+    assert "test-id" in detail
+    assert "not captured" in detail
+
+    with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
+        assert cmd_lode(["status", "test-id", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["id"] == "test-id"
+    assert "originating_extro_sid" not in payload
+
+
+def test_lode_status_detail_includes_originating_extro_sid(make_lode):
+    detail = format_lode_detail(make_lode(originating_extro_sid="extro-session-1"))
+
+    assert "extro-session-1" in detail
+
+
 def test_format_lode_detail_pane_active(make_lode):
     """Active lode with tmux_pane shows pane line."""
     lode = make_lode(active=True, tmux_pane="%123")
@@ -7352,7 +7422,13 @@ def test_explicit_host_create_bypasses_pool_selection(
     create.assert_called_once()
     assert create.call_args.args[:2] == (
         "explicit.example",
-        ["implement", "journal", "--json"],
+        [
+            "implement",
+            "journal",
+            "--json",
+            "--originating-extro-sid",
+            "",
+        ],
     )
     remember.assert_called_once_with("abcdefgh", "explicit.example", "journal")
     assert capsys.readouterr().out == "Created lode abcdefgh (journal) on explicit.example\n"
@@ -7392,7 +7468,13 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
 
     create.assert_called_once()
     assert create.call_args.args[0] == "ready.example"
-    assert create.call_args.args[1][-1] == "--json"
+    assert create.call_args.args[1] == [
+        "implement",
+        "journal",
+        "--json",
+        "--originating-extro-sid",
+        "",
+    ]
     assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SEC
     remember.assert_called_once_with("abcdefgh", "ready.example", "journal")
     captured = capsys.readouterr()
@@ -7536,6 +7618,13 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
         )
 
     create.assert_called_once()
+    assert create.call_args.args[1] == [
+        "implement",
+        "journal",
+        "--json",
+        "--originating-extro-sid",
+        "",
+    ]
     assert create.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SEC
     remember.assert_not_called()
     captured = capsys.readouterr()
@@ -7548,8 +7637,10 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
 
 def test_authoritative_remote_create_buffers_success_until_route_is_cached(
     emitted_create_json,
+    monkeypatch,
     capsys,
 ):
+    monkeypatch.setenv("EXTRO_SESSION", "extro-session-1")
     result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
     observed = []
 
@@ -7574,6 +7665,13 @@ def test_authoritative_remote_create_buffers_success_until_route_is_cached(
         )
 
     create.assert_called_once()
+    assert create.call_args.args[1] == [
+        "implement",
+        "journal",
+        "--json",
+        "--originating-extro-sid",
+        "extro-session-1",
+    ]
     assert observed == [("abcdefgh", "selected.example", "journal", "")]
     assert capsys.readouterr().out == "Created lode abcdefgh (journal) on selected.example\n"
 
@@ -7628,7 +7726,16 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
             rc = main()
 
     assert rc == 0
-    assert mock_remote.call_args.args[:2] == ("fedora.local", ["implement", "journal", "--json"])
+    assert mock_remote.call_args.args[:2] == (
+        "fedora.local",
+        [
+            "implement",
+            "journal",
+            "--json",
+            "--originating-extro-sid",
+            "",
+        ],
+    )
     assert mock_remote.call_args.kwargs["timeout"] == REMOTE_CREATE_TIMEOUT_SEC
     assert json.loads(capsys.readouterr().out)["host"] == "fedora.local"
 

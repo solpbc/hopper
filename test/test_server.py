@@ -5160,6 +5160,21 @@ def test_lode_snapshot_serializes_with_archive_transition(
     assert [archived["id"] for archived in server.archived_lodes] == ["abcd2345"]
 
 
+def test_lode_create_preserves_originating_extro_sid_over_socket(socket_path, server, temp_config):
+    created = request_lode_creation(
+        socket_path,
+        "project-a",
+        "scope-a",
+        spawn=False,
+        originating_extro_sid="extro-session-1",
+    )
+
+    assert created["originating_extro_sid"] == "extro-session-1"
+    assert server.lodes[0]["originating_extro_sid"] == "extro-session-1"
+    persisted = json.loads((temp_config / "active.jsonl").read_text().strip())
+    assert persisted["originating_extro_sid"] == "extro-session-1"
+
+
 def test_concurrent_lode_create_responses_are_causally_bound(
     socket_path, server, temp_config, monkeypatch
 ):
@@ -5172,13 +5187,24 @@ def test_concurrent_lode_create_responses_are_causally_bound(
     a_broadcast_delivered = threading.Event()
     results = {}
 
-    def controlled_create_lode(lodes, project, scope=""):
+    def controlled_create_lode(
+        lodes,
+        project,
+        scope="",
+        *,
+        originating_extro_sid=None,
+    ):
         if scope == "scope-a":
             a_create_started.set()
             assert release_a.wait(5), "B was not connected and enqueued"
         elif scope == "scope-b":
             assert a_broadcast_delivered.wait(5), "A broadcast was not delivered"
-        return real_create_lode(lodes, project, scope)
+        return real_create_lode(
+            lodes,
+            project,
+            scope,
+            originating_extro_sid=originating_extro_sid,
+        )
 
     def observed_enqueue(message, conn=None):
         real_enqueue_event(message, conn)

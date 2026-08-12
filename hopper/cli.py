@@ -453,6 +453,7 @@ def _run_authoritative_remote_create(
     remote_args = list(hop_args)
     if "--json" not in remote_args:
         remote_args.append("--json")
+    remote_args.extend(["--originating-extro-sid", os.environ.get("EXTRO_SESSION") or ""])
     print(f"→ {host} ({reason})", file=sys.stderr)
     try:
         result = run_remote(
@@ -2037,6 +2038,7 @@ def format_lode_detail(lode: dict) -> str:
     updated_age = format_age(updated_at)
     pane_activity_at = lode.get("last_pane_activity_at")
     activity_text = _age_phrase(pane_activity_at) if pane_activity_at else "unmeasured"
+    lines.append(f"  extro:    {lode.get('originating_extro_sid') or 'not captured'}")
     lines.append(f"  created:  {created_age} ago")
     lines.append(f"  updated:  {updated_age} ago")
     lines.append(f"  activity: {activity_text}")
@@ -3125,6 +3127,7 @@ def _add_create_args(parser):
     parser.add_argument("project", help="Project name")
     parser.add_argument("-f", "--force", action="store_true", help="Override dirty-repo check")
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    parser.add_argument("--originating-extro-sid", default=None, help=argparse.SUPPRESS)
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     prog = parser.prog
     parser.epilog = (
@@ -3807,7 +3810,19 @@ def cmd_lode(args: list[str]) -> int:
         if err:
             return err
         _warn_target_load(socket_path)
-        lode = client.create_lode(socket_path, project_name, scope, spawn=True)
+        raw_originating_extro_sid = (
+            parsed.originating_extro_sid
+            if parsed.originating_extro_sid is not None
+            else os.environ.get("EXTRO_SESSION")
+        )
+        originating_extro_sid = (raw_originating_extro_sid or "").strip() or None
+        lode = client.create_lode(
+            socket_path,
+            project_name,
+            scope,
+            spawn=True,
+            originating_extro_sid=originating_extro_sid,
+        )
         if getattr(parsed, "json_output", False):
             if not lode:
                 print("error: lode was not created", file=sys.stderr)

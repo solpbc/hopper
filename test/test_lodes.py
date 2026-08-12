@@ -196,6 +196,7 @@ def test_create_lode(temp_config):
 
     assert lode["stage"] == "mill"
     assert lode["project"] == "test-project"
+    assert lode["originating_extro_sid"] is None
     assert lode["branch"] == ""
     assert lode["worktree_path"] is None
     assert lode["last_progress_at"] is None
@@ -400,6 +401,44 @@ def test_unarchive_lode(temp_config):
     assert len(loaded_active) == 2
     loaded_archived = load_archived_lodes()
     assert len(loaded_archived) == 0
+
+
+def test_originating_extro_sid_survives_archive_and_unarchive(temp_config, make_lode):
+    active_lodes = [make_lode(id="extro111", originating_extro_sid="extro-session-1")]
+    save_lodes(active_lodes)
+
+    archived = archive_lode(active_lodes, "extro111")
+
+    assert archived["originating_extro_sid"] == "extro-session-1"
+    persisted_archived = load_archived_lodes()
+    assert persisted_archived[0]["originating_extro_sid"] == "extro-session-1"
+
+    restored = unarchive_lode(persisted_archived, active_lodes, "extro111")
+
+    assert restored["originating_extro_sid"] == "extro-session-1"
+    assert load_lodes()[0]["originating_extro_sid"] == "extro-session-1"
+
+
+def test_originating_extro_sid_survives_action_archive(temp_config, make_lode):
+    active_lodes = [
+        make_lode(
+            id="extro222",
+            stage="shipped",
+            originating_extro_sid="extro-session-2",
+        )
+    ]
+    archived_lodes = []
+
+    archived = archive_lode_for_action(
+        active_lodes,
+        archived_lodes,
+        "extro222",
+        "a" * 32,
+    )
+
+    assert archived["originating_extro_sid"] == "extro-session-2"
+    assert archived_lodes[0]["originating_extro_sid"] == "extro-session-2"
+    assert load_archived_lodes()[0]["originating_extro_sid"] == "extro-session-2"
 
 
 def test_unarchive_lode_not_found(temp_config):
