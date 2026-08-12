@@ -2267,6 +2267,88 @@ def test_pane_close_discovery_failure_uses_platform_policy(
     descendant_merge.assert_not_called()
 
 
+@pytest.mark.parametrize("proof_mode", ["linux-degraded", "linux-strict"])
+def test_pane_close_cross_boot_discovery_uses_platform_policy(socket_path, caplog, proof_mode):
+    """A foreign-boot process cannot enter recorded ownership at pane close."""
+    ownership = (
+        _strict_completion_run_ownership()
+        if proof_mode == "linux-strict"
+        else _completion_run_ownership()
+    )
+    record = _blocked_pane_close_record(ownership)
+    recorded_descendants = copy.deepcopy(record["ownership"]["descendants"])
+    recorded_boot_id = ownership["pane"]["root_process"]["birth"]["boot_id"]
+    current_boot_id = "boot-two"
+    assert current_boot_id != recorded_boot_id
+    foreign = _completion_process(150, 999, ownership["process_group"])
+    foreign["birth"]["boot_id"] = current_boot_id
+    assert foreign["pid"] not in {item["pid"] for item in recorded_descendants}
+    assert foreign["pgid"] == ownership["process_group"]
+    table = _root_free_process_table(ownership, [foreign])
+    detail = f"Linux boot identity mismatch: recorded {recorded_boot_id}, current {current_boot_id}"
+    server = Server(socket_path)
+
+    with (
+        patch("hopper.server.teardown.read_boot_id", return_value=current_boot_id),
+        patch("hopper.server.teardown.read_process_table", return_value=table) as table_reader,
+        patch(
+            "hopper.server.teardown.read_process_identity",
+            return_value={"state": "alive", "identity": foreign, "error": None},
+        ) as process_reader,
+        patch(
+            "hopper.server.teardown.close_owned_pane",
+            return_value={"state": "gone", "error": None},
+        ) as close_pane,
+        patch("hopper.server.teardown.read_host_boot_identity", return_value=current_boot_id),
+        patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+        patch(
+            "hopper.server.teardown.reopen_process_pidfd",
+            return_value={"state": "gone", "fd": None, "error": None},
+        ),
+        patch("hopper.server.teardown._opened_cgroup", return_value=(None, "absent")),
+        patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
+        patch(
+            "hopper.server.oom.read_scope_control_group",
+            return_value={"state": "absent", "control_group": None},
+        ),
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+    ):
+        server._retry_action(record["lode_id"], None)
+        closed = _join_action_step(server, record, "closing_pane")
+        server._handle_action_step_result(closed)
+        observed = (
+            _join_action_step(server, record, "observing_containment")
+            if proof_mode == "linux-strict"
+            else None
+        )
+
+    table_reader.assert_not_called()
+    process_reader.assert_not_called()
+    assert "descendants" not in closed["result"]
+    durable = actions.load_pending_action(record["lode_id"])
+    assert durable["ownership"]["descendants"] == recorded_descendants
+    assert foreign not in durable["ownership"]["descendants"]
+    if proof_mode != "linux-strict":
+        assert closed["result"] == {
+            "ok": False,
+            "error": f"owned process enumeration before pane close failed: {detail}",
+        }
+        close_pane.assert_not_called()
+        assert durable["markers"]["ownership_capture"]["state"] == "done"
+        assert durable["markers"]["pane_close"]["state"] == "blocked"
+        assert durable["recovery"]["kind"] == "ownership"
+        return
+
+    assert closed["result"] == {"ok": True, "error": None}
+    close_pane.assert_called_once()
+    assert any(detail in message for message in caplog.messages)
+    assert durable["markers"]["pane_close"]["state"] == "done"
+    assert durable["phase"] == "observing_containment"
+    assert observed["result"]["containment"]["result"] == "linux-strict-empty"
+    with patch.object(server, "_continue_action"):
+        server._handle_action_step_result(observed)
+
+
 @pytest.mark.parametrize("instrument_recovers", [True, False])
 def test_pane_close_ownership_retry_repeats_real_discovery(
     socket_path, make_lode, instrument_recovers

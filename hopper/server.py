@@ -2798,8 +2798,7 @@ class Server:
                 return {
                     "ok": False,
                     "error": (
-                        "owned process enumeration before pane close failed: "
-                        f"{discovered['error']}"
+                        f"owned process enumeration before pane close failed: {discovered['error']}"
                     ),
                 }
             # Deliberate source-spec polarity: strict containment proves the cgroup,

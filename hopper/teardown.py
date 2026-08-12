@@ -709,6 +709,18 @@ def discover_owned_set(
     boot_id = boot_id_reader(proc_root=proc_root) if platform == "linux" else None
     if platform == "linux" and boot_id is None:
         return {"state": "cannot-tell", "descendants": None, "error": "boot ID unavailable"}
+    if platform == "linux":
+        recorded_boot_id = ownership["pane"]["root_process"]["birth"]["boot_id"]
+        # This is a host-level boot consistency check, not the deleted root-liveness gate;
+        # it does not probe whether any recorded root is alive.
+        if boot_id != recorded_boot_id:
+            return {
+                "state": "cannot-tell",
+                "descendants": None,
+                "error": (
+                    f"Linux boot identity mismatch: recorded {recorded_boot_id}, current {boot_id}"
+                ),
+            }
     identity_kwargs = (
         {"platform": platform, "proc_root": proc_root, "boot_id": boot_id}
         if platform == "linux"
