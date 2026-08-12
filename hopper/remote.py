@@ -459,6 +459,14 @@ def _run_candidate_probe(
     return payload, None
 
 
+def _has_typed_fields(value: object, required: dict[str, type]) -> bool:
+    """Return whether a mapping contains every required field with the expected type."""
+    return isinstance(value, dict) and all(
+        field in value and isinstance(value[field], expected_type)
+        for field, expected_type in required.items()
+    )
+
+
 def _validate_project_readiness(
     host: str,
     project: str,
@@ -466,19 +474,19 @@ def _validate_project_readiness(
 ) -> CandidateProbe | None:
     args = ["project", "list", "--json"]
     rows = payload.get("projects")
-    fields = {"name", "path", "disabled", "disabled_reason"}
-    if set(payload) != {"projects"} or not isinstance(rows, list):
+    if not _has_typed_fields(payload, {"projects": list}):
         return _unavailable(host, "project listing violated its JSON contract", args)
 
     matches = []
     for row in rows:
-        if (
-            not isinstance(row, dict)
-            or set(row) != fields
-            or not isinstance(row.get("name"), str)
-            or not isinstance(row.get("path"), str)
-            or not isinstance(row.get("disabled"), bool)
-            or not isinstance(row.get("disabled_reason"), str)
+        if not _has_typed_fields(
+            row,
+            {
+                "name": str,
+                "path": str,
+                "disabled": bool,
+                "disabled_reason": str,
+            },
         ):
             return _unavailable(host, "project listing contained a malformed project", args)
         if row["name"] == project:
@@ -538,9 +546,9 @@ def _validate_lode_inventory(
     *,
     canonical_ids: bool = True,
 ) -> tuple[list[dict] | None, str | None]:
-    """Validate the strict lode-list contract shared by probing and discovery."""
+    """Validate the required lode-list contract shared by probing and discovery."""
     lodes = payload.get("lodes")
-    if set(payload) != {"lodes"} or not isinstance(lodes, list):
+    if not _has_typed_fields(payload, {"lodes": list}):
         return None, "lode inventory violated its JSON contract"
 
     validated = validate_lode_records(lodes, canonical_ids=canonical_ids)

@@ -20,6 +20,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import redirect_stdout
+from difflib import get_close_matches
 from pathlib import Path
 
 import setproctitle
@@ -3451,7 +3452,7 @@ def cmd_lode(args: list[str]) -> int:
         return _run_wait_command(args[1:], command_name="lode wait")
 
     import hopper.client as client
-    from hopper.projects import disabled_project_message, find_project
+    from hopper.projects import disabled_project_message, find_project, load_projects
 
     STAGE_ORDER = {"mill": 0, "refine": 1, "ship": 2, "shipped": 3}
 
@@ -3597,6 +3598,48 @@ def cmd_lode(args: list[str]) -> int:
             return err
         archived = getattr(parsed, "archived", False)
         project_filter = getattr(parsed, "project", None)
+        if project_filter and not all_hosts and not _remote_disabled():
+            from hopper.remote import remote_registry
+
+            pool = remote_registry().get(project_filter)
+            if pool:
+                hosts = ", ".join(pool)
+                recovery = shlex.join(
+                    ["hop", "lode", "list", "--all-hosts", "--project", project_filter]
+                )
+                print(
+                    f"Project '{project_filter}' is registered to remote pool hosts: {hosts}.",
+                    file=sys.stderr,
+                )
+                print(
+                    "This host cannot vouch for that project's lodes from the local server alone.",
+                    file=sys.stderr,
+                )
+                print(
+                    f"Use --all-hosts to return the pool's lodes and any local ones: {recovery}",
+                    file=sys.stderr,
+                )
+                return 2
+
+            registered_names = list(dict.fromkeys(project.name for project in load_projects()))
+            if project_filter not in registered_names:
+                print(f"Project '{project_filter}' not found.", file=sys.stderr)
+                near_matches = get_close_matches(
+                    project_filter,
+                    registered_names,
+                    n=3,
+                    cutoff=0.6,
+                )
+                if near_matches:
+                    print(f"Did you mean: {', '.join(near_matches)}", file=sys.stderr)
+                elif registered_names:
+                    print(
+                        f"Registered projects: {', '.join(registered_names)}",
+                        file=sys.stderr,
+                    )
+                return 1
+
+        searched_sources = ["local"]
 
         def prepare_local_lodes(rows: list[dict]) -> list[dict]:
             rows = list(rows)
@@ -3647,6 +3690,7 @@ def cmd_lode(args: list[str]) -> int:
             if project_filter:
                 remote_args.extend(["--project", project_filter])
             hosts = _remote_hosts()
+            searched_sources.extend(hosts)
 
             def discovery_runner(host, args, *, timeout):
                 if host != "local":
@@ -3700,6 +3744,7 @@ def cmd_lode(args: list[str]) -> int:
                     stamped = dict(remote_lode)
                     stamped["host"] = discovery.host
                     lodes.append(stamped)
+        print(f"Searched lode sources: {', '.join(searched_sources)}", file=sys.stderr)
         if getattr(parsed, "json_output", False):
             lodes = [lode_with_status_annotations(lode) for lode in lodes]
             payload = {"lodes": lodes}

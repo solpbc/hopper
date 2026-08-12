@@ -116,13 +116,21 @@ host. That route survives pool replacement or removal, so status, waiting, pane
 actions, and lifecycle commands continue to reach the same host. Use `-H` for
 explicit recovery when the resident route cannot be read or verified.
 
-`hop lode list --all-hosts` queries local and pooled hosts concurrently. It
-keeps rows from sources that answered. JSON adds `unavailable_hosts`, containing
-`{"host": str, "reason": str}` for each failed source, and the command exits 2
-when results are partial.
+A single-source `hop lode list -p PROJECT` refuses when the project has a
+configured remote pool because the local server cannot vouch for the complete
+answer. Use `--all-hosts` to query the local server and that project's pool
+hosts; unknown project names report close registered-name suggestions.
+
+`hop lode list --all-hosts` keeps rows from sources that answered and reports
+the local and configured pool sources searched on stderr. Successful local-only
+lists report their local source there as well, including JSON and empty results.
+JSON still has the same keys: `lodes`, plus `unavailable_hosts` only for
+`--all-hosts`. Each unavailable row contains `{"host": str, "reason": str}`,
+and partial results exit 2.
 
 `hop project list --json` and its `hop projects` alias emit project records with
-`name`, `path`, `disabled`, and `disabled_reason`.
+`name`, `path`, `disabled`, and `disabled_reason`. Remote readiness requires
+those fields while ignoring additive payload and row keys.
 
 ### Ship completion proof
 

@@ -83,6 +83,7 @@ from hopper.remote import (
     REMOTE_SET_PING_TIMEOUT_SEC,
     CandidateProbe,
     make_child_registry,
+    set_remote,
 )
 from hopper.server import Server
 from hopper.tmux import Liveness
@@ -92,8 +93,9 @@ LONG_SCOPE = "this is a stdin scope that is long enough to pass the minimum char
 
 @pytest.fixture(autouse=True)
 def clear_hopper_lid_env(monkeypatch):
-    """Default tests to not running inside a lode unless explicitly set."""
+    """Default tests to direct local routing unless explicitly overridden."""
     monkeypatch.delenv("HOPPER_LID", raising=False)
+    monkeypatch.delenv("HOP_NO_ROUTE", raising=False)
 
 
 def test_main_is_callable():
@@ -1093,6 +1095,7 @@ def test_lode_list_archived_sorted(capsys):
 
 def test_lode_list_project_filter(capsys):
     """List -p filters active lodes by project."""
+    save_projects([Project(path="/repo/hopper", name="hopper")])
     lodes = [
         {
             "id": "hop00001",
@@ -1123,6 +1126,7 @@ def test_lode_list_project_filter(capsys):
 
 def test_lode_list_project_filter_no_match(capsys):
     """List -p with no matches prints the standard empty message."""
+    save_projects([Project(path="/repo/nonexistent", name="nonexistent")])
     lodes = [
         {
             "id": "oth00001",
@@ -1143,6 +1147,7 @@ def test_lode_list_project_filter_no_match(capsys):
 
 def test_lode_list_archived_project_filter(capsys):
     """List -a -p filters archived lodes by project."""
+    save_projects([Project(path="/repo/hopper", name="hopper")])
     lodes = [
         {
             "id": "hop00001",
@@ -1173,6 +1178,146 @@ def test_lode_list_archived_project_filter(capsys):
     out = capsys.readouterr().out
     assert "hop00001" in out
     assert "oth00001" not in out
+
+
+@pytest.mark.parametrize("disabled", [None, False, True], ids=["absent", "active", "disabled"])
+@pytest.mark.parametrize(
+    "extra_args",
+    [[], ["--json"], ["--archived"], ["--archived", "--json"]],
+    ids=["active-human", "active-json", "archived-human", "archived-json"],
+)
+def test_lode_list_project_pool_refuses_single_source(disabled, extra_args, capsys):
+    if disabled is not None:
+        save_projects([Project(path="/repo/journal", name="journal", disabled=disabled)])
+    hosts = ["one.example", "two.example"]
+    set_remote("journal", hosts)
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes") as active_list,
+        patch("hopper.client.list_archived_lodes") as archived_list,
+        patch("hopper.remote.run_remote") as remote,
+    ):
+        assert cmd_lode(["list", "--project", "journal", *extra_args]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert all(host in captured.err for host in hosts)
+    active_list.assert_not_called()
+    archived_list.assert_not_called()
+    remote.assert_not_called()
+
+
+def test_lode_list_project_gate_runs_after_server_requirement(capsys):
+    with (
+        patch("hopper.cli.require_server", return_value=1),
+        patch("hopper.remote.remote_registry") as registry,
+    ):
+        assert cmd_lode(["list", "--project", "journal"]) == 1
+
+    registry.assert_not_called()
+    assert capsys.readouterr().out == ""
+
+
+def test_lode_list_unknown_project_suggests_registered_near_matches(capsys):
+    save_projects(
+        [
+            Project(path="/repo/journal", name="journal"),
+            Project(path="/repo/journey", name="journey", disabled=True),
+            Project(path="/repo/unrelated", name="unrelated"),
+        ]
+    )
+
+    with patch("hopper.cli.require_server", return_value=None):
+        assert cmd_lode(["list", "--project", "journl"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "journl" in captured.err
+    assert "journal" in captured.err
+    assert "journey" in captured.err
+
+
+@pytest.mark.parametrize("registered_names", [[], ["alpha", "beta"]], ids=["empty", "distant"])
+def test_lode_list_unknown_project_without_near_matches(registered_names, capsys):
+    save_projects([Project(path=f"/repo/{name}", name=name) for name in registered_names])
+
+    with patch("hopper.cli.require_server", return_value=None):
+        assert cmd_lode(["list", "--project", "zzzzzz"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "zzzzzz" in captured.err
+    assert all(name in captured.err for name in registered_names)
+    if not registered_names:
+        assert len(captured.err.splitlines()) == 1
+
+
+def test_lode_list_empty_project_filter_remains_unfiltered(capsys):
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[]),
+    ):
+        assert cmd_lode(["list", "--project", "", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"lodes": []}
+    assert "local" in captured.err
+
+
+def test_lode_list_disabled_project_without_pool_lists_normally(capsys):
+    save_projects([Project(path="/repo/journal", name="journal", disabled=True)])
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[]),
+    ):
+        assert cmd_lode(["list", "--project", "journal", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"lodes": []}
+
+
+def test_lode_list_routed_project_filter_bypasses_local_refusal(
+    monkeypatch,
+    capsys,
+    make_lode,
+):
+    set_remote("journal", ["builder.example"])
+    monkeypatch.setenv("HOP_NO_ROUTE", "1")
+    lode = make_lode(id="abc23456", project="journal")
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=[lode]),
+        patch("hopper.remote.remote_registry") as registry,
+    ):
+        assert cmd_lode(["list", "--project", "journal", "--json"]) == 0
+
+    registry.assert_not_called()
+    captured = capsys.readouterr()
+    assert [row["id"] for row in json.loads(captured.out)["lodes"]] == ["abc23456"]
+    assert "local" in captured.err
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
+@pytest.mark.parametrize("has_lode", [False, True], ids=["empty", "nonempty"])
+def test_lode_list_discloses_local_source_on_stderr(
+    json_output,
+    has_lode,
+    capsys,
+    make_lode,
+):
+    rows = [make_lode(id="abc23456")] if has_lode else []
+    args = ["list", "--json"] if json_output else ["list"]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=rows),
+    ):
+        assert cmd_lode(args) == 0
+
+    captured = capsys.readouterr()
+    assert "local" in captured.err
+    if json_output:
+        assert set(json.loads(captured.out)) == {"lodes"}
 
 
 def test_lode_create_happy(capsys):
@@ -3732,6 +3877,27 @@ def test_invalid_config_fails_unavailable_without_remote_contact(
 
     remote_probe.assert_not_called()
     assert str(path) in capsys.readouterr().err
+
+
+def test_lode_list_project_filter_invalid_pool_config_fails_through_main(
+    temp_config,
+    monkeypatch,
+    capsys,
+):
+    path = temp_config / "config.json"
+    path.write_bytes(b'{"remote.journal": []}\n')
+    monkeypatch.setattr(sys, "argv", ["hop", "lode", "list", "--project", "journal"])
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes") as local_list,
+    ):
+        assert main() == 2
+
+    local_list.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(path) in captured.err
 
 
 def test_wrong_shaped_projects_stop_pooled_routing_without_contact(
@@ -6433,6 +6599,46 @@ def test_lode_list_all_hosts_probes_stamped_local_parked_lode(capsys, make_lode)
     mock_liveness.assert_called_once_with("%43")
 
 
+def test_lode_list_all_hosts_project_filter_keeps_local_and_remote_legs(capsys, make_lode):
+    local_match = make_lode(id="abc23456", project="journal")
+    local_other = make_lode(id="def23456", project="other")
+    remote_match = make_lode(id="ghi23456", project="journal")
+
+    def run_remote(host, args, *, timeout):
+        assert host == "builder.example"
+        assert args == ["lode", "list", "--json", "--project", "journal"]
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"lodes": [remote_match]}),
+            stderr="remote-leg-disclosure",
+        )
+
+    with (
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.read_lodes", return_value=[local_match, local_other]),
+        patch(
+            "hopper.remote.remote_registry",
+            return_value={"journal": ["builder.example"]},
+        ),
+        patch("hopper.remote.run_remote", side_effect=run_remote),
+    ):
+        assert cmd_lode(["list", "--all-hosts", "--project", "journal", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert set(payload) == {"lodes", "unavailable_hosts"}
+    assert [(row["id"], row["host"]) for row in payload["lodes"]] == [
+        ("abc23456", "local"),
+        ("ghi23456", "builder.example"),
+    ]
+    assert payload["unavailable_hosts"] == []
+    assert "local" in captured.err
+    assert "builder.example" in captured.err
+    assert "remote-leg-disclosure" not in captured.err
+
+
 def test_lode_list_all_hosts_json_overwrites_remote_annotations_without_probe(capsys, make_lode):
     stored = format_park_status("quiet", "abc23456")
     remote_lode = make_lode(
@@ -6496,10 +6702,15 @@ def test_lode_list_all_hosts_uses_unique_union_of_pool_members(capsys):
         "shared.example",
         "two.example",
     ]
-    assert json.loads(capsys.readouterr().out) == {
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
         "lodes": [],
         "unavailable_hosts": [],
     }
+    assert all(
+        source in captured.err
+        for source in ("local", "one.example", "shared.example", "two.example")
+    )
 
 
 def test_lode_list_all_hosts_marks_local_read_failure_unavailable(capsys):
@@ -8742,6 +8953,7 @@ def test_routed_watch_forwards_stdout_before_remote_exit(monkeypatch, capsys):
 
     assert result == [7]
     assert "PYTHONUNBUFFERED=1" in calls[0][0][7]
+    assert "HOP_NO_ROUTE=1" in calls[0][0][7]
     assert "stderr" not in calls[0][1]
     assert capsys.readouterr().out == "✓ abc123 shipped  Done\n"
 

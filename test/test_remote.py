@@ -586,12 +586,77 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
     ]
 
 
+def test_probe_candidate_accepts_project_contract_superset(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+):
+    project_payload = json.loads(emitted_project_json)
+    project_payload["schema_version"] = 2
+    for row in project_payload["projects"]:
+        row["last_used_at"] = 123
+
+    def runner(_host, args, *, timeout):
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
+        stdout = (
+            json.dumps(project_payload) if args[0] == "project" else emitted_lode_inventory_json
+        )
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate("ready.example", "journal", runner, monotonic=lambda: 0.0)
+
+    assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
+
+
+def test_probe_and_discovery_accept_lode_inventory_superset(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+):
+    inventory = json.loads(emitted_lode_inventory_json)
+    inventory["schema_version"] = 2
+    inventory["lodes"][0]["future_annotation"] = "preserved"
+    inventory_json = json.dumps(inventory)
+
+    def probe_runner(_host, args, *, timeout):
+        assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
+        stdout = emitted_project_json if args[0] == "project" else inventory_json
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate("ready.example", "journal", probe_runner, monotonic=lambda: 0.0)
+    discoveries = discover_lodes(
+        ["ready.example"],
+        ["lode", "list", "--json"],
+        lambda _host, _args, *, timeout: subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=inventory_json,
+            stderr="successful-leg-disclosure",
+        ),
+    )
+
+    assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
+    assert discoveries[0].reason is None
+    assert discoveries[0].lodes[0]["future_annotation"] == "preserved"
+
+
 @pytest.mark.parametrize(
     ("project_payload", "reason"),
     [
         ({}, "JSON contract"),
         ({"projects": "not-a-list"}, "JSON contract"),
         ({"projects": [{"name": "journal"}]}, "malformed project"),
+        (
+            {
+                "projects": [
+                    {
+                        "name": "journal",
+                        "path": "/srv/journal",
+                        "disabled": "no",
+                        "disabled_reason": "",
+                    }
+                ]
+            },
+            "malformed project",
+        ),
         (
             {
                 "projects": [

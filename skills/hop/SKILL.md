@@ -188,10 +188,17 @@ hop lode list --all-hosts # aggregate local and all pool hosts
 hop list                  # alias for lode list (same flags)
 ```
 
-`--all-hosts` preserves rows from sources that answer. Its JSON object includes
-`unavailable_hosts`, an array of `{"host": str, "reason": str}` rows. Partial
-discovery exits 2; complete discovery exits 0. Do not discard proven rows just
-because another source failed.
+A single-source `hop lode list -p PROJECT` refuses when that project has a
+configured remote pool because the local server cannot vouch for the complete
+answer. Use `--all-hosts` to query the local server and the project's pool
+hosts. Unknown project names report close registered-name suggestions.
+
+Every successful list reports its searched sources on stderr, including JSON
+and empty results. `--all-hosts` preserves rows from sources that answer. Its JSON
+object includes `unavailable_hosts`, an array of `{"host": str, "reason": str}`
+rows. Partial discovery exits 2; complete discovery exits 0. The JSON payload is
+unchanged; source disclosure is never added to stdout. Do not discard proven rows
+just because another source failed.
 
 Show detailed status for a lode:
 
@@ -281,8 +288,8 @@ hop project rename NAME NEW_NAME      # rename a project
 
 Project-list JSON is
 `{"projects": [{"name": str, "path": str, "disabled": bool,
-"disabled_reason": str}]}`. Pooled readiness consumes this exact remote
-contract.
+"disabled_reason": str}]}`. Pooled readiness requires these fields and ignores
+additive keys in the remote payload and project rows.
 
 ## Configuration
 
