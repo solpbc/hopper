@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -877,6 +878,56 @@ def test_capture_worker_registration_accepts_strict_linux_oom_modes(armed_mode):
         platform="linux",
     )
     prove.assert_called_once_with(ownership["worker"], ownership["cgroup"]["relative_path"])
+
+
+def test_capture_worker_registration_opens_generic_pidfd_when_available():
+    source, ownership, message = _strict_registration_facts()
+    message["armed_mode"] = "supported"
+    captured = {"state": "captured", "ownership": ownership, "error": None}
+    membership = {
+        "state": "proven",
+        "control_group": ownership["cgroup"]["relative_path"],
+        "error": None,
+    }
+    read_fd, write_fd = os.pipe()
+    pidfd_interface = {
+        "source": "test",
+        "open": MagicMock(return_value=read_fd),
+        "send_signal": MagicMock(),
+    }
+
+    try:
+        with (
+            patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+            patch("hopper.server.teardown.capture_ownership", return_value=captured),
+            patch(
+                "hopper.server.teardown.capture_worker_cgroup_membership",
+                return_value=membership,
+            ),
+            patch(
+                "hopper.server.teardown.resolve_pidfd_interface",
+                return_value=pidfd_interface,
+            ),
+            patch(
+                "hopper.teardown.read_boot_id",
+                return_value=ownership["supervisor"]["birth"]["boot_id"],
+            ),
+            patch(
+                "hopper.teardown.read_linux_process_identity",
+                return_value={
+                    "state": "alive",
+                    "identity": ownership["supervisor"],
+                    "error": None,
+                },
+            ),
+        ):
+            result = hopper_server._capture_worker_registration(source, message)
+
+        assert result["pidfd"] == read_fd
+        pidfd_interface["open"].assert_called_once_with(ownership["supervisor"]["pid"], 0)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 @pytest.mark.parametrize(
@@ -1770,7 +1821,7 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
         last_error=(
             "strict Linux containment is ambiguous"
             if failure_point == "inspection"
-            else "exact cgroup kill failed"
+            else "strict Linux force verification budget expired"
         ),
     )
     phase = "observing_containment" if failure_point == "inspection" else "force_killing"
@@ -2849,6 +2900,94 @@ def test_action_step_result_discards_stale_attempt(socket_path, make_lode):
     assert actions.load_pending_action(record["lode_id"]) == record
 
 
+def test_containment_step_exception_closes_handles_opened_before_failure(socket_path):
+    record = _pending_manual_containment_record("pause", failure_point="inspection")
+    server = Server(socket_path)
+    read_fd, write_fd = os.pipe()
+
+    try:
+        with (
+            patch(
+                "hopper.server.teardown.read_host_boot_identity",
+                return_value=record["boot_id"],
+            ),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch(
+                "hopper.server.teardown.reopen_process_pidfd",
+                side_effect=[
+                    {"state": "alive", "fd": read_fd, "error": None},
+                    RuntimeError("pane pidfd acquisition failed"),
+                ],
+            ),
+            pytest.raises(RuntimeError, match="pane pidfd acquisition failed"),
+        ):
+            server._observe_action_containment(record, retained_pidfd=None)
+
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("event_type", ["_action_step_result", "_registration_capture_result"])
+@pytest.mark.parametrize("drop_reason", ["queue-full", "server-stopped"])
+def test_dropped_worker_result_closes_owned_descriptor(socket_path, event_type, drop_reason):
+    server = Server(socket_path)
+    server.event_queue = queue.Queue(maxsize=1)
+    if drop_reason == "queue-full":
+        server.event_queue.put_nowait(({"type": "occupied"}, None))
+    else:
+        server.stop_event.set()
+    read_fd, write_fd = os.pipe()
+    result = {"ok": True, "pidfd": read_fd}
+    if event_type == "_action_step_result":
+        result["pidfd_owned"] = True
+
+    try:
+        server._enqueue_event({"type": event_type, "result": result})
+
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        os.close(write_fd)
+
+
+def test_stop_waits_for_descriptor_borrowers_before_closing_retained_handles(socket_path):
+    server = Server(socket_path)
+    read_fd, write_fd = os.pipe()
+    key = ("abcd2345", TEST_RUN_GENERATION)
+    server.supervisor_pidfds[key] = read_fd
+    entered = threading.Event()
+    release = threading.Event()
+
+    def borrow_descriptor():
+        entered.set()
+        assert release.wait(2)
+        os.fstat(read_fd)
+
+    worker = threading.Thread(target=borrow_descriptor)
+    server.action_threads[("a" * 32, "force_killing")] = worker
+    worker.start()
+    assert entered.wait(2)
+    stopper = threading.Thread(target=server.stop)
+    stopper.start()
+    assert server.stop_event.wait(2)
+
+    try:
+        assert stopper.is_alive()
+        os.fstat(read_fd)
+        release.set()
+        stopper.join(timeout=2)
+        assert not stopper.is_alive()
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        release.set()
+        worker.join(timeout=2)
+        stopper.join(timeout=2)
+        os.close(write_fd)
+
+
 @pytest.mark.parametrize(
     ("remove_staged", "expected_kind"),
     [(False, "publication"), (True, "output")],
@@ -3604,25 +3743,47 @@ def test_degraded_identity_survives_block_step_and_server_restart(socket_path):
     ]
 
 
-def test_degraded_descendant_merge_releases_pid_reuse_without_adopting_replacement():
+def test_degraded_descendant_merge_releases_pid_reuse_across_observation_cycles(socket_path):
     record = _pending_completion_record()
-    old_identity = copy.deepcopy(record["ownership"]["worker"])
-    old_identity.update(pid=909, ppid=old_identity["pid"], pgid=909)
-    old_identity["birth"]["value"] = "old-birth"
+    old_identity = record["ownership"]["descendants"][0]
     replacement = copy.deepcopy(old_identity)
     replacement["birth"]["value"] = "replacement-birth"
-    record["ownership"]["descendants"] = [old_identity]
+    table = {
+        "state": "complete",
+        "resolution": "complete",
+        "identities": [
+            record["ownership"]["pane"]["root_process"],
+            record["ownership"]["supervisor"],
+            replacement,
+        ],
+        "error": None,
+    }
+    clock = {"now": 1_000_000_000}
+    record["containment"] = teardown.start_containment(record, now_ns=lambda: clock["now"])
+    reads = []
 
-    merged = Server._merge_observed_descendants(
-        record["ownership"],
-        {
-            "state": "populated",
-            "resolution": "complete",
-            "identities": [replacement],
-        },
-    )
+    def poll(_seconds):
+        clock["now"] = record["containment"]["deadline_monotonic_ns"]
 
-    assert merged == []
+    server = Server(socket_path)
+    with (
+        patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+        patch(
+            "hopper.server.teardown.read_process_table",
+            side_effect=lambda **_kwargs: reads.append("table") or table,
+        ),
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+    ):
+        result = server._observe_action_containment(
+            record,
+            retained_pidfd=None,
+            now_ns=lambda: clock["now"],
+            poll=poll,
+        )
+
+    assert reads == ["table", "table"]
+    assert result["descendants"] == []
+    assert replacement not in result["descendants"]
 
 
 def test_post_containment_advance_reuses_one_generation_across_reconcile(socket_path, make_lode):

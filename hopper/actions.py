@@ -24,6 +24,9 @@ SPAWN_RECEIPT_SCHEMA_VERSION = 1
 ACTION_RESULT_LIMIT = 8
 DIGEST_ALGORITHM = "sha256"
 POLL_INTERVAL_MS = 50
+SCOPE_RELEASE_RESIDUAL_SEPARATOR = "; "
+SCOPE_RELEASE_RESIDUAL_PREFIX = "scope "
+SCOPE_RELEASE_RESIDUAL_SUFFIX = " not released"
 
 STAGES = {"mill", "refine", "ship"}
 ACTION_TYPES = {"completion", "pause", "restart", "kill", "archive"}
@@ -440,7 +443,7 @@ def _validate_containment(value: dict) -> None:
     _integer(value["started_monotonic_ns"], "containment.started_monotonic_ns", nullable=True)
     _integer(value["deadline_monotonic_ns"], "containment.deadline_monotonic_ns", nullable=True)
     if value["poll_interval_ms"] != POLL_INTERVAL_MS:
-        raise ValueError("containment.poll_interval_ms must be 50")
+        raise ValueError(f"containment.poll_interval_ms must be {POLL_INTERVAL_MS}")
     _string(
         value["last_cgroup_observation"],
         "containment.last_cgroup_observation",
@@ -1255,22 +1258,25 @@ def missing_containment_proof(record: dict) -> str | None:
 
 def append_scope_release_residual(proof_label: str, unit_name: str) -> str:
     """Append the standardized non-gating scope-release residual once."""
-    residual = f"scope {unit_name} not released"
-    if proof_label == residual or proof_label.endswith(f"; {residual}"):
+    residual = f"{SCOPE_RELEASE_RESIDUAL_PREFIX}{unit_name}{SCOPE_RELEASE_RESIDUAL_SUFFIX}"
+    if proof_label == residual or proof_label.endswith(
+        f"{SCOPE_RELEASE_RESIDUAL_SEPARATOR}{residual}"
+    ):
         return proof_label
-    return f"{proof_label}; {residual}"
+    return f"{proof_label}{SCOPE_RELEASE_RESIDUAL_SEPARATOR}{residual}"
 
 
 def scope_release_residual(record: dict) -> str | None:
     """Extract the standardized scope-release residual from a proof label."""
     proof_label = record["containment"]["proof_label"]
+    marker = f"{SCOPE_RELEASE_RESIDUAL_SEPARATOR}{SCOPE_RELEASE_RESIDUAL_PREFIX}"
     if (
         not proof_label
-        or "; scope " not in proof_label
-        or not proof_label.endswith(" not released")
+        or marker not in proof_label
+        or not proof_label.endswith(SCOPE_RELEASE_RESIDUAL_SUFFIX)
     ):
         return None
-    return f"scope {proof_label.rsplit('; scope ', 1)[1]}"
+    return f"{SCOPE_RELEASE_RESIDUAL_PREFIX}{proof_label.rsplit(marker, 1)[1]}"
 
 
 def _with_scope_release_residual(status: str, record: dict) -> str:

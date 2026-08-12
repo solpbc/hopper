@@ -4,6 +4,7 @@
 """Acceptance tests for captured pending-action containment records."""
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -128,7 +129,8 @@ def test_captured_restart_remains_blocked_at_ownership_capture(tmp_path):
     original_containment = record["containment"].copy()
     signals = []
 
-    server = Server(tmp_path / "server.sock")
+    with patch("hopper.server.get_git_hash", return_value="test-hash"):
+        server = Server(tmp_path / "server.sock")
     with (
         patch("hopper.teardown.kill_cgroup", side_effect=lambda *_args: signals.append("cgroup")),
         patch(
@@ -144,6 +146,113 @@ def test_captured_restart_remains_blocked_at_ownership_capture(tmp_path):
     assert reloaded["markers"]["ownership_capture"]["state"] == "blocked"
     assert reloaded["containment"] == original_containment
     assert signals == []
+
+
+def test_captured_strict_record_drives_through_server_force_and_proof_gates(tmp_path):
+    loaded, fixture_bytes = _load_captured_record(tmp_path, "wedged-populated-scope-5tuofgwh.json")
+    fixture_identity = (
+        loaded["lode_id"],
+        loaded["action_id"],
+        loaded["expected_generation"],
+    )
+    supervisor_fd, supervisor_write = os.pipe()
+    pane_fd, pane_write = os.pipe()
+    cgroup_fd, cgroup_write = os.pipe()
+    cgroup_observations = iter(["populated", "populated", "empty"])
+    signals = []
+    durable_intents = []
+
+    def kill_cgroup(_cgroup, **_kwargs):
+        durable = actions.load_pending_action(loaded["lode_id"])
+        durable_intents.append(
+            (
+                durable["markers"]["scope_kill"]["state"],
+                durable["markers"]["supervisor_kill"]["state"],
+            )
+        )
+        signals.append("cgroup")
+        return {"state": "signalled", "error": None}
+
+    with patch("hopper.server.get_git_hash", return_value="test-hash"):
+        server = Server(tmp_path / "server.sock")
+    try:
+        with (
+            patch(
+                "hopper.server.teardown.read_host_boot_identity",
+                return_value=loaded["boot_id"],
+            ),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch(
+                "hopper.server.teardown.reopen_process_pidfd",
+                side_effect=[
+                    {"state": "alive", "fd": supervisor_fd, "error": None},
+                    {"state": "alive", "fd": pane_fd, "error": None},
+                ],
+            ),
+            patch(
+                "hopper.server.teardown._opened_cgroup",
+                return_value=(cgroup_fd, None),
+            ),
+            patch(
+                "hopper.server.teardown.observe_retained_cgroup",
+                side_effect=lambda *_args, **_kwargs: next(cgroup_observations),
+            ),
+            patch("hopper.server.teardown.observe_pidfd", return_value="gone"),
+            patch("hopper.server.teardown.kill_cgroup", side_effect=kill_cgroup),
+            patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
+            patch(
+                "hopper.server.oom.read_scope_control_group",
+                return_value={"state": "absent", "control_group": None},
+            ),
+        ):
+            server._retry_action(loaded["lode_id"], None)
+            armed = actions.load_pending_action(loaded["lode_id"])
+            assert armed["phase"] == "force_killing"
+            assert armed["markers"]["containment"]["state"] == "intent"
+            assert armed["markers"]["scope_kill"]["state"] == "intent"
+            assert armed["markers"]["supervisor_kill"]["state"] == "intent"
+
+            thread = server.action_threads[(loaded["action_id"], "force_killing")]
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            internal, _conn = server.event_queue.get(timeout=2)
+            result = internal["result"]
+            assert result["pidfd"] == supervisor_fd
+            assert result["pane_root_pidfd"] == pane_fd
+            assert result["cgroup_fd"] == cgroup_fd
+
+            with patch.object(server, "_continue_completion_action") as continuation:
+                server._handle_action_step_result(internal)
+
+        terminal = actions.load_pending_action(loaded["lode_id"])
+        assert terminal["phase"] == "publishing_terminal"
+        assert terminal["containment"]["state"] == "proven"
+        assert terminal["containment"]["result"] == "linux-strict-killed-empty"
+        assert terminal["markers"]["containment"]["state"] == "done"
+        assert durable_intents == [("intent", "intent")]
+        assert signals == ["cgroup"]
+        continuation.assert_called_once()
+        continued = continuation.call_args.args[0]
+        assert actions.containment_is_proven(continued)
+        assert (
+            continued["lode_id"],
+            continued["action_id"],
+            continued["expected_generation"],
+        ) == fixture_identity
+        assert json.loads(fixture_bytes)["action_id"] == terminal["action_id"]
+    finally:
+        for fd in (
+            supervisor_fd,
+            pane_fd,
+            cgroup_fd,
+            supervisor_write,
+            pane_write,
+            cgroup_write,
+        ):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def test_captured_records_keep_the_exact_schema_boundary(tmp_path):

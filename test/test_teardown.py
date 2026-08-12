@@ -777,94 +777,6 @@ def test_capture_ownership_blocks_before_close_on_supervisor_pgid_mismatch(monke
     }
 
 
-@pytest.mark.parametrize(
-    ("events", "expected"),
-    [
-        ("populated 0\nfrozen 0\n", "empty"),
-        ("populated 1\nfrozen 0\n", "populated"),
-        ("frozen 0\n", "cannot-tell"),
-        ("populated 0\npopulated 1\n", "cannot-tell"),
-        ("populated 2\n", "cannot-tell"),
-    ],
-)
-def test_observe_cgroup_uses_recursive_populated_fact(tmp_path, monkeypatch, events, expected):
-    cgroup = tmp_path / "scope"
-    cgroup.mkdir()
-    identity = {"st_dev": cgroup.stat().st_dev, "st_ino": cgroup.stat().st_ino}
-    record = {
-        "relative_path": "/user.slice/test.scope",
-        "absolute_path": str(cgroup),
-        "identity": identity,
-        "boot_id": "boot-one",
-    }
-    monkeypatch.setattr(
-        oom, "_read_text", lambda path: events if path.name == "cgroup.events" else ""
-    )
-
-    assert (
-        teardown.observe_cgroup(
-            record,
-            {"state": "present", "control_group": "/user.slice/test.scope"},
-            boot_id="boot-one",
-        )
-        == expected
-    )
-
-
-def test_cgroup_absence_requires_explicit_unit_absence(tmp_path):
-    record = {
-        "relative_path": "/user.slice/gone.scope",
-        "absolute_path": str(tmp_path / "gone.scope"),
-        "identity": {"st_dev": 1, "st_ino": 2},
-        "boot_id": "old-boot",
-    }
-    assert teardown.observe_cgroup(record, {"state": "absent"}) == "empty"
-    assert teardown.observe_cgroup(record, {"state": "present"}) == "cannot-tell"
-    assert teardown.observe_cgroup(record, {"state": "cannot-tell"}) == "cannot-tell"
-
-
-def test_cgroup_identity_mismatch_is_unknown(tmp_path):
-    cgroup = tmp_path / "scope"
-    cgroup.mkdir()
-    record = {
-        "relative_path": "/user.slice/test.scope",
-        "absolute_path": str(cgroup),
-        "identity": {"st_dev": cgroup.stat().st_dev, "st_ino": cgroup.stat().st_ino + 1},
-        "boot_id": "boot-one",
-    }
-    assert (
-        teardown.observe_cgroup(
-            record,
-            {"state": "present", "control_group": "/user.slice/test.scope"},
-            boot_id="boot-one",
-        )
-        == "cannot-tell"
-    )
-
-
-def test_cgroup_unit_path_change_is_unknown_before_read(tmp_path, monkeypatch):
-    cgroup = tmp_path / "scope"
-    cgroup.mkdir()
-    record = {
-        "relative_path": "/user.slice/original.scope",
-        "absolute_path": str(cgroup),
-        "identity": {"st_dev": cgroup.stat().st_dev, "st_ino": cgroup.stat().st_ino},
-        "boot_id": "boot-one",
-    }
-    read = MagicMock(side_effect=AssertionError("mismatched unit must block before cgroup read"))
-    monkeypatch.setattr(oom, "_read_text", read)
-
-    assert (
-        teardown.observe_cgroup(
-            record,
-            {"state": "present", "control_group": "/user.slice/reused.scope"},
-            boot_id="boot-one",
-        )
-        == "cannot-tell"
-    )
-    read.assert_not_called()
-
-
 def test_kill_cgroup_reports_structured_outcomes(tmp_path, monkeypatch):
     cgroup = tmp_path / "scope"
     cgroup.mkdir()
@@ -887,6 +799,22 @@ def test_kill_cgroup_reports_structured_outcomes(tmp_path, monkeypatch):
 
     record["absolute_path"] = str(tmp_path / "gone")
     assert teardown.kill_cgroup(record, boot_id="boot-one") == _force("already-gone")
+
+
+def test_kill_cgroup_classifies_a_completed_write_as_signalled(tmp_path, monkeypatch):
+    cgroup = tmp_path / "scope"
+    cgroup.mkdir()
+    record = {
+        "absolute_path": str(cgroup),
+        "identity": {"st_dev": cgroup.stat().st_dev, "st_ino": cgroup.stat().st_ino},
+        "boot_id": "boot-one",
+    }
+    writes = []
+    monkeypatch.setattr(oom, "_write_text", lambda path, value: writes.append((path.name, value)))
+    monkeypatch.setattr(teardown, "_cgroup_identity_matches", lambda *_args: False)
+
+    assert teardown.kill_cgroup(record, boot_id="boot-one") == _force("signalled")
+    assert writes == [("cgroup.kill", "1")]
 
 
 @pytest.mark.parametrize("error_number", [errno.ENOENT, errno.ENODEV])
@@ -1093,41 +1021,6 @@ def test_close_owned_pane_mismatch_never_kills():
     )
     assert result["state"] == "cannot-tell"
     assert calls == []
-
-
-@pytest.mark.parametrize(
-    ("pane_closed", "process_state", "current", "expected"),
-    [
-        (True, "gone", None, "gone"),
-        (True, "alive", _linux_process(100), "alive"),
-        (True, "alive", _linux_process(100, start=2), "gone"),
-        (False, "gone", None, "cannot-tell"),
-        (True, "cannot-tell", None, "cannot-tell"),
-    ],
-)
-def test_pane_root_absence_uses_durable_close_and_recorded_birth(
-    pane_closed, process_state, current, expected
-):
-    ownership = {
-        "platform": "linux",
-        "pane": {
-            "pane_id": "%1",
-            "window_id": "@1",
-            "root_process": _linux_process(100),
-        },
-    }
-    assert (
-        teardown.observe_pane_root_absence(
-            ownership,
-            pane_closed=pane_closed,
-            process_reader=lambda _pid, **_kwargs: {
-                "state": process_state,
-                "identity": current,
-                "error": None,
-            },
-        )
-        == expected
-    )
 
 
 def test_bounded_observation_retains_reparented_process_and_adds_child():

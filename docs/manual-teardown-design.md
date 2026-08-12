@@ -25,8 +25,8 @@ Use **action** for the durable transaction and reserve **completion** for the
   `completion_acceptances` to `action_acceptances`, and all generic scheduling,
   persistence, result, retry, continuation, projection, and startup-reconcile
   methods from `completion` to `action`. These are the primitives currently
-  concentrated at `hopper/server.py:930-1051`, `:1502-1533`, `:1918-2206`, and
-  `:2521-2817`.
+  concentrated at `hopper/server.py:1369-1420`, `:1732-2600`, `:3230-3480`, and
+  `:4111-4488`.
 - Keep completion-specific names for completion-only behavior:
   `stage_output`, `publish_output`, `repair_staged_output`,
   `pending_output_recovery`, ship landing/quarantine helpers, `hop processed`,
@@ -412,7 +412,7 @@ Refusal precedence is strict:
 
 Clear spawn refusal/failure only when pane liveness or a successful admitted
 spawn supersedes it, preserving the current intent of `_clear_spawn_refusal`
-(`hopper/server.py:631-637`, `:2884-2915`, `:3021-3025`). Clear a manual refusal
+(`hopper/server.py:745-753`, `:4784-4800`, `:5184-5205`). Clear a manual refusal
 only when the same or a later valid action is durably accepted and its teardown
 projection replaces the status, or when an explicit successful operator action
 publishes a newer terminal status. Startup liveness and progress summaries do

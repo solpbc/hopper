@@ -385,7 +385,7 @@ def _capture_worker_registration(source: dict, message: dict) -> dict:
     if proof_mode == "linux-strict":
         pidfd_interface = teardown.resolve_pidfd_interface()
         if pidfd_interface is not None:
-            reopened = teardown.reopen_supervisor_pidfd(
+            reopened = teardown.reopen_process_pidfd(
                 record["supervisor"], pidfd_interface=pidfd_interface
             )
             if reopened["state"] != "alive":
@@ -621,6 +621,15 @@ class SpawnOutcome(Enum):
     PROJECT_MISSING = "project_missing"
     PROVEN_NO_PANE = "proven_no_pane"
     UNKNOWN = "unknown"
+
+
+def _containment_phase_for_cursor(cursor: str) -> str | None:
+    """Map one durable containment cursor to its worker phase."""
+    if cursor in {"not_started", "pane_close_pending", "grace"}:
+        return "observing_containment"
+    if cursor in {"kill_pending", "verify_after_kill"}:
+        return "force_killing"
+    return None
 
 
 def _process_group_has_live_members(process_group: int) -> bool | None:
@@ -1232,6 +1241,22 @@ class Server:
                 os.close(fd)
             except OSError:
                 pass
+
+    @classmethod
+    def _close_dropped_event_handles(cls, message: dict) -> None:
+        """Release worker-owned descriptors when an internal result cannot be consumed."""
+        result = message.get("result")
+        if not isinstance(result, dict):
+            return
+        if message.get("type") == "_action_step_result":
+            cls._close_action_result_handles(result)
+        elif message.get("type") == "_registration_capture_result":
+            fd = result.get("pidfd")
+            if isinstance(fd, int):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _adopt_action_result_handles(self, record: dict, result: dict) -> None:
         """Install newly opened descriptors, closing superseded handles once."""
@@ -2846,8 +2871,14 @@ class Server:
         }
 
     @staticmethod
-    def _merge_observed_descendants(ownership: dict, observed: dict) -> list[dict]:
+    def _merge_observed_descendants(
+        ownership: dict,
+        observed: dict,
+        *,
+        excluded_pids: set[int] | None = None,
+    ) -> list[dict]:
         """Persist only identity-resolved, schema-valid discovered descendants."""
+        excluded_pids = set() if excluded_pids is None else excluded_pids
         roots = {
             (identity["pid"], json.dumps(identity["birth"], sort_keys=True))
             for identity in (
@@ -2866,6 +2897,7 @@ class Server:
             for identity in observed["identities"]
             if identity["pgid"] > 0
             and identity["pid"] not in root_pids
+            and identity["pid"] not in excluded_pids
             and (
                 identity["pid"] not in recorded_birth_by_pid
                 or recorded_birth_by_pid[identity["pid"]]
@@ -2922,11 +2954,32 @@ class Server:
         poll: Callable[[float], None] = time.sleep,
     ) -> dict:
         """Build identity-bound observers and run the bounded state machine."""
+        result_handles = {}
+        try:
+            return self._observe_action_containment_impl(
+                record,
+                retained_pidfd,
+                result_handles=result_handles,
+                now_ns=now_ns,
+                poll=poll,
+            )
+        except Exception:
+            self._close_action_result_handles(result_handles)
+            raise
+
+    def _observe_action_containment_impl(
+        self,
+        record: dict,
+        retained_pidfd: int | None,
+        *,
+        result_handles: dict,
+        now_ns: Callable[[], int],
+        poll: Callable[[float], None],
+    ) -> dict:
         ownership = record["ownership"]
         mode = ownership["proof_mode"]
         key = self._containment_handle_key(record)
         host_boot_identity = teardown.read_host_boot_identity(platform=ownership["platform"])
-        result_handles = {}
         systemctl = None
         if mode == "linux-strict":
             containment = record["containment"]
@@ -3052,6 +3105,7 @@ class Server:
                 ),
             }
         else:
+            replaced_descendant_pids = set()
 
             def observe_bounded() -> dict:
                 owned = [
@@ -3065,7 +3119,12 @@ class Server:
                     platform=ownership["platform"],
                     process_table=teardown.read_process_table(platform=ownership["platform"]),
                 )
-                ownership["descendants"] = self._merge_observed_descendants(ownership, observed)
+                replaced_descendant_pids.update(observed.get("replaced_pids", ()))
+                ownership["descendants"] = self._merge_observed_descendants(
+                    ownership,
+                    observed,
+                    excluded_pids=replaced_descendant_pids,
+                )
                 return observed
 
             def observe_pane() -> str:
@@ -4120,14 +4179,7 @@ class Server:
                     now_ns=time.monotonic_ns,
                 )
             cursor = record["containment"]["state"]
-            phase_by_cursor = {
-                "not_started": "observing_containment",
-                "pane_close_pending": "observing_containment",
-                "grace": "observing_containment",
-                "kill_pending": "force_killing",
-                "verify_after_kill": "force_killing",
-            }
-            phase = phase_by_cursor.get(cursor)
+            phase = _containment_phase_for_cursor(cursor)
             containment_marker = record["markers"]["containment"]
             if phase is None or containment_marker["state"] == "done":
                 self._block_action(
@@ -4413,11 +4465,16 @@ class Server:
         elif record["markers"]["pane_close"]["state"] != "done":
             selected = ("pane_close", "closing_pane")
         elif record["markers"]["containment"]["state"] != "done":
-            phase = (
-                "force_killing"
-                if record["containment"]["state"] in {"kill_pending", "verify_after_kill"}
-                else "observing_containment"
-            )
+            cursor = record["containment"]["state"]
+            phase = _containment_phase_for_cursor(cursor)
+            if phase is None:
+                self._block_action(
+                    record,
+                    "containment",
+                    "containment",
+                    f"action resume refused: containment cursor {cursor} cannot be observed",
+                )
+                return
             selected = ("containment", phase)
         else:
             if record["markers"]["pending_clear"]["state"] == "done":
@@ -6042,9 +6099,13 @@ class Server:
 
     def _enqueue_event(self, message: dict, conn: socket.socket | None = None) -> None:
         """Enqueue a mutation event for the event loop thread."""
+        if self.stop_event.is_set():
+            self._close_dropped_event_handles(message)
+            return
         try:
             self.event_queue.put_nowait((message, conn))
         except queue.Full:
+            self._close_dropped_event_handles(message)
             logger.warning(f"Event queue full, dropping: {message.get('type')}")
 
     def enqueue(self, message: dict) -> None:
@@ -6138,9 +6199,25 @@ class Server:
 
         # Wait for threads
         if self.event_thread and self.event_thread.is_alive():
-            self.event_thread.join(timeout=1.0)
+            self.event_thread.join()
         if self.writer_thread and self.writer_thread.is_alive():
-            self.writer_thread.join(timeout=1.0)
+            self.writer_thread.join()
+
+        current_thread = threading.current_thread()
+        workers = {
+            *self.action_threads.values(),
+            *self.registration_threads.values(),
+        }
+        for thread in workers:
+            if thread is not current_thread and thread.is_alive():
+                thread.join()
+
+        while True:
+            try:
+                message, _conn = self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._close_dropped_event_handles(message)
 
         descriptors = set()
         for handles in (

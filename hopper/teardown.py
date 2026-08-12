@@ -15,10 +15,9 @@ import time
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from hopper import oom, tmux
+from hopper import actions, oom, tmux
 
 CONTAINMENT_TIMEOUT_SEC = 30.0
-CONTAINMENT_POLL_SEC = 0.05
 PROCESS_QUERY_TIMEOUT_SEC = 1.0
 
 _PS_ROW = re.compile(
@@ -715,29 +714,6 @@ def observe_retained_cgroup(
     return _parse_cgroup_events(text)
 
 
-def observe_cgroup(cgroup: dict, unit_observation: dict, *, boot_id: str | None = None) -> str:
-    """Observe recursive cgroup population with authoritative absence handling."""
-    unit_state = unit_observation.get("state")
-    if unit_state not in {"present", "absent"}:
-        return "cannot-tell"
-    if unit_state == "present" and unit_observation.get("control_group") != cgroup.get(
-        "relative_path"
-    ):
-        return "cannot-tell"
-    fd, error = _opened_cgroup(cgroup)
-    if fd is None:
-        if error == "absent" and unit_state == "absent":
-            return "empty"
-        return "cannot-tell"
-    try:
-        current_boot = boot_id or read_boot_id()
-        if current_boot is None:
-            return "cannot-tell"
-        return observe_retained_cgroup(fd, cgroup, boot_id=current_boot)
-    finally:
-        os.close(fd)
-
-
 def _force_result(state: str, error: str | None = None) -> dict:
     return {"state": state, "error": error}
 
@@ -755,8 +731,6 @@ def kill_cgroup(cgroup: dict, *, boot_id: str | None = None) -> dict:
             return _force_result("unaddressable", "cgroup boot identity mismatch")
         try:
             oom._write_text(Path(f"/proc/self/fd/{fd}") / "cgroup.kill", "1")
-            if not _cgroup_identity_matches(fd, cgroup):
-                return _force_result("unaddressable", "cgroup identity changed during kill")
         except OSError as error:
             if error.errno in {errno.ENOENT, errno.ENODEV}:
                 try:
@@ -909,26 +883,6 @@ def close_owned_pane(
     return {"state": "gone", "error": None}
 
 
-def observe_pane_root_absence(
-    ownership: dict,
-    *,
-    pane_closed: bool,
-    process_reader: Callable[..., dict] | None = None,
-) -> str:
-    """Combine durable pane closure with the recorded root's birth identity."""
-    if not pane_closed:
-        return "cannot-tell"
-    process_reader = read_process_identity if process_reader is None else process_reader
-    recorded = ownership["pane"]
-    observed = process_reader(recorded["root_process"]["pid"], platform=ownership["platform"])
-    if observed["state"] == "cannot-tell":
-        return "cannot-tell"
-    root_alive = observed["state"] == "alive" and same_birth(
-        recorded["root_process"], observed["identity"]
-    )
-    return "alive" if root_alive else "gone"
-
-
 def observe_bounded_processes(
     owned: list[dict],
     *,
@@ -949,10 +903,12 @@ def observe_bounded_processes(
             "error": "owned process birth identity is unavailable",
             "resolution": resolution,
             "platform": platform_name(platform),
+            "replaced_pids": [],
         }
 
     current = {identity["pid"]: identity for identity in process_table["identities"]}
     retained_by_pid = {}
+    replaced_pids = set()
     present_pids = set()
     unresolved_pids = set()
     for identity in owned:
@@ -962,6 +918,7 @@ def observe_bounded_processes(
             present_pids.add(identity["pid"])
             continue
         if candidate is not None:
+            replaced_pids.add(identity["pid"])
             continue
         if resolution == "complete":
             continue
@@ -974,6 +931,8 @@ def observe_bounded_processes(
             if same_birth(identity, observed["identity"]):
                 retained_by_pid[identity["pid"]] = observed["identity"]
                 present_pids.add(identity["pid"])
+            else:
+                replaced_pids.add(identity["pid"])
             continue
         if observed["state"] == "gone" and platform_name(platform) == "linux":
             continue
@@ -984,7 +943,7 @@ def observe_bounded_processes(
     while changed:
         changed = False
         for identity in process_table["identities"]:
-            if identity["pid"] in retained_by_pid:
+            if identity["pid"] in retained_by_pid or identity["pid"] in replaced_pids:
                 continue
             if identity["ppid"] in present_pids:
                 retained_by_pid[identity["pid"]] = identity
@@ -1007,6 +966,7 @@ def observe_bounded_processes(
         "error": process_table.get("error") if state == "cannot-tell" else None,
         "resolution": resolution,
         "platform": platform_name(platform),
+        "replaced_pids": sorted(replaced_pids),
     }
 
 
@@ -1017,7 +977,7 @@ def arm_phase(containment: dict, state: str, *, now_ns: Callable[[], int]) -> di
     armed["state"] = state
     armed["started_monotonic_ns"] = started
     armed["deadline_monotonic_ns"] = started + int(CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
-    armed["poll_interval_ms"] = int(CONTAINMENT_POLL_SEC * 1000)
+    armed["poll_interval_ms"] = actions.POLL_INTERVAL_MS
     armed["result"] = None
     armed["proof_label"] = None
     armed["last_error"] = None
@@ -1029,7 +989,7 @@ def continue_phase(containment: dict) -> dict:
     continued = dict(containment)
     if continued["started_monotonic_ns"] is None or continued["deadline_monotonic_ns"] is None:
         raise ValueError(f"containment phase {continued['state']} has no armed budget")
-    continued["poll_interval_ms"] = int(CONTAINMENT_POLL_SEC * 1000)
+    continued["poll_interval_ms"] = actions.POLL_INTERVAL_MS
     return continued
 
 
@@ -1120,7 +1080,7 @@ def _scalar_observations(handles: dict, names: tuple[str, ...]) -> tuple[dict, l
 
 def _poll(now_ns: Callable[[], int], poll: Callable[[float], None], deadline: int) -> None:
     remaining = max(0.0, (deadline - now_ns()) / 1_000_000_000)
-    poll(min(CONTAINMENT_POLL_SEC, remaining))
+    poll(min(actions.POLL_INTERVAL_MS / 1000, remaining))
 
 
 def _observe_strict(
