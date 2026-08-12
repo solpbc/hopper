@@ -9,11 +9,11 @@ VPE (`req_d72rqbpw`) destroys them — `hop lode restart` clears the pending act
 
 ## What these are actually for
 
-⚠ **The value is the schema boundary, not discrimination between wedge classes.** **No test in the
-hopper repo loads a captured production record** — every record in the suite originates from
-`new_pending_action` inside the same test. So nothing in CI would catch a change that bricks
-records already on disk, which is precisely the blocker an adversarial review caught in a draft
-fix: removing two keys and changing one pinned value would have made every live record unloadable.
+⚠ **The value is the schema boundary, not discrimination between wedge classes.**
+`test/test_containment_records.py` copies these production bytes into the pending-action path,
+loads them through `actions.load_pending_action`, and drives their recorded containment states.
+That boundary catches changes that would brick records already on disk, including the draft fix
+that removed two keys and changed one pinned value.
 
 ✅ All five validate under `actions.validate_pending_action` unmodified at hopper `5d8049f`, and
 both mutation controls genuinely refuse — `poll_interval_ms=250` → *"containment.poll_interval_ms

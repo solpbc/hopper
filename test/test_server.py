@@ -23,7 +23,7 @@ import pytest
 
 import hopper.client as hopper_client
 import hopper.server as hopper_server
-from hopper import actions, config, git
+from hopper import actions, config, git, teardown
 from hopper.backlog import BacklogItem
 from hopper.client import (
     HopperConnection,
@@ -366,6 +366,54 @@ def _complete_marker(record: dict, marker_name: str) -> None:
     )
 
 
+def _earn_degraded_containment_proof(record: dict) -> dict:
+    """Run the real pure machine to earn a non-shortcut empty proof."""
+    record["containment"].update(
+        state="not_started",
+        started_monotonic_ns=None,
+        deadline_monotonic_ns=None,
+        result=None,
+        proof_label=None,
+        last_error=None,
+    )
+    record["ownership"]["proof_mode"] = "linux-degraded"
+    record["ownership"]["platform"] = "linux"
+    record["ownership"]["unit"] = None
+    record["ownership"]["cgroup"] = None
+    proof = teardown.observe_containment(
+        record,
+        {
+            "observe_bounded": lambda: {
+                "state": "empty",
+                "count": 0,
+                "identities": [],
+                "resolution": "complete",
+            },
+            "observe_pane": lambda: "gone",
+        },
+        host_boot_identity=record["boot_id"],
+        now_ns=lambda: 1_000_000_000,
+        poll=lambda _seconds: None,
+    )
+    assert proof["result"] == "linux-degraded-bounded-empty"
+    record["containment"] = proof
+    return proof
+
+
+def _set_marker_state(record: dict, marker_name: str, state: str) -> None:
+    if state == "not_started":
+        return
+    actions.transition_marker(record, marker_name, "intent")
+    if state in {"blocked", "done"}:
+        actions.transition_marker(
+            record,
+            marker_name,
+            state,
+            attempt_id=record["markers"][marker_name]["attempt_id"],
+            detail="test state",
+        )
+
+
 def _manual_action_message(
     action_type: str,
     *,
@@ -632,11 +680,16 @@ def _install_synchronous_action_workers(
             result = {"ok": True, "error": None}
         elif phase == "observing_containment":
             counters["grace"] += 1
+            assert record["containment"]["state"] in {
+                "not_started",
+                "pane_close_pending",
+                "grace",
+            }
             containment = copy.deepcopy(record["containment"])
             containment.update(
                 state="kill_pending",
-                started_monotonic_ns=1_000,
-                deadline_monotonic_ns=2_000,
+                started_monotonic_ns=31_000_000_000,
+                deadline_monotonic_ns=61_000_000_000,
                 last_cgroup_observation="populated",
                 last_supervisor_observation="alive",
                 last_owned_process_count=None,
@@ -647,6 +700,10 @@ def _install_synchronous_action_workers(
             result = {"ok": True, "containment": containment, "error": None}
         elif phase == "force_killing":
             counters["kill"] += 1
+            assert record["containment"]["state"] in {
+                "kill_pending",
+                "verify_after_kill",
+            }
             containment = copy.deepcopy(record["containment"])
             containment.update(
                 state="proven",
@@ -1704,7 +1761,7 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     server.action_waiters[record["action_id"]] = [(blocked_conn, None)]
     containment = copy.deepcopy(record["containment"])
     containment.update(
-        state="blocked",
+        state="grace" if failure_point == "inspection" else "kill_pending",
         last_cgroup_observation=("cannot-tell" if failure_point == "inspection" else "populated"),
         last_supervisor_observation=("cannot-tell" if failure_point == "inspection" else "alive"),
         last_owned_process_count=None,
@@ -1737,7 +1794,8 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     blocked = actions.load_pending_action(lode["id"])
     assert blocked is not None
     assert blocked["phase"] == "containment_blocked"
-    assert blocked["containment"]["state"] == "blocked"
+    expected_cursor = "grace" if failure_point == "inspection" else "kill_pending"
+    assert blocked["containment"]["state"] == expected_cursor
     assert blocked["containment"]["proof_label"] is None
     assert blocked["containment"]["result"] is None
     assert blocked["containment"]["last_cgroup_observation"] in {
@@ -1768,7 +1826,7 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     assert blocked_response["action_id"] == blocked["action_id"]
     assert blocked_response["expected_generation"] == blocked["expected_generation"]
     assert blocked_response["disposition"] == blocked["target_disposition"]
-    assert blocked_response["containment"]["state"] == "blocked"
+    assert blocked_response["containment"]["state"] == expected_cursor
     assert blocked_response["preserved"]["worktree"] is True
     assert blocked_response["preserved"]["branch"] is True
     assert expected_command in blocked_response["status"]
@@ -1812,6 +1870,191 @@ def test_forced_restart_cannot_publish_or_spawn_before_empty_proof(socket_path, 
     assert lode == before
     mutate.assert_not_called()
     spawn.assert_not_called()
+
+
+def test_containment_retry_preserves_the_remaining_waiting_budget(socket_path):
+    record = _pending_manual_containment_record("pause", failure_point="inspection")
+    actions.transition_marker(
+        record,
+        "containment",
+        "blocked",
+        attempt_id=record["markers"]["containment"]["attempt_id"],
+        detail="transient ambiguity",
+    )
+    record["phase"] = "containment_blocked"
+    record["containment"]["last_error"] = "transient ambiguity"
+    record["recovery"] = {
+        "kind": "containment",
+        "message": "transient ambiguity",
+        "command": actions.recovery_command(record, "containment"),
+    }
+    actions.write_pending_action(record)
+    budget = (
+        record["containment"]["started_monotonic_ns"],
+        record["containment"]["deadline_monotonic_ns"],
+    )
+    server = Server(socket_path)
+
+    with patch.object(server, "_schedule_action_step") as schedule:
+        server._retry_action(record["lode_id"], None)
+
+    retry = schedule.call_args.args[0]
+    assert schedule.call_args.args[1:] == ("containment", "observing_containment")
+    assert (
+        retry["containment"]["started_monotonic_ns"],
+        retry["containment"]["deadline_monotonic_ns"],
+    ) == budget
+    assert retry["containment"]["last_error"] is None
+
+
+def test_same_boot_resume_schedules_the_recorded_cursor_without_rearming(socket_path):
+    record = _pending_manual_containment_record("pause", failure_point="inspection")
+    actions.write_pending_action(record)
+    budget = copy.deepcopy(record["containment"])
+    server = Server(socket_path)
+
+    with patch.object(server, "_schedule_action_step") as schedule:
+        server._resume_action(record["lode_id"])
+
+    schedule.assert_called_once_with(record, "containment", "observing_containment")
+    assert record["containment"] == budget
+
+
+@pytest.mark.parametrize("marker_name", ["containment", "scope_kill", "supervisor_kill"])
+@pytest.mark.parametrize("marker_state", ["not_started", "intent", "blocked", "done"])
+def test_containment_retry_never_raises_for_any_legal_marker_state(
+    socket_path, marker_name, marker_state
+):
+    record = _pending_manual_containment_record("pause", failure_point="kill")
+    for name in ("containment", "scope_kill", "supervisor_kill"):
+        record["markers"][name] = actions.new_marker()
+        _set_marker_state(record, name, marker_state if name == marker_name else "intent")
+    record["phase"] = "containment_blocked"
+    record["containment"]["last_error"] = "retry requested"
+    record["recovery"] = {
+        "kind": "containment",
+        "message": "retry requested",
+        "command": actions.recovery_command(record, "containment"),
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+
+    with patch.object(server, "_schedule_action_step"):
+        server._retry_action(record["lode_id"], None)
+
+    persisted = actions.load_pending_action(record["lode_id"])
+    if marker_state == "done":
+        assert persisted["phase"] == "containment_blocked"
+
+
+def test_continue_entry_requires_an_earned_containment_proof(socket_path):
+    record = _pending_completion_record()
+    _earn_degraded_containment_proof(record)
+    _complete_marker(record, "containment")
+    server = Server(socket_path)
+
+    with patch.object(server, "_continue_completion_action") as continuation:
+        server._continue_action(record)
+    continuation.assert_called_once_with(record)
+
+    record["containment"]["proof_label"] = None
+    with patch.object(server, "_continue_completion_action") as continuation:
+        server._continue_action(record)
+    continuation.assert_not_called()
+    blocked = actions.load_pending_action(record["lode_id"])
+    assert blocked["phase"] == "containment_blocked"
+    assert "proof label is missing" in blocked["recovery"]["message"]
+
+
+def test_resume_terminal_entry_requires_an_earned_containment_proof(socket_path):
+    record = _pending_completion_record()
+    _earn_degraded_containment_proof(record)
+    for marker_name in ("output_publish", "ownership_capture", "pane_close"):
+        _complete_marker(record, marker_name)
+    _complete_marker(record, "containment")
+    record["phase"] = "publishing_terminal"
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+
+    with patch.object(server, "_continue_action") as continuation:
+        server._resume_action(record["lode_id"])
+    continuation.assert_called_once()
+
+    record["containment"]["result"] = None
+    actions.write_pending_action(record)
+    with patch.object(server, "_continue_action") as continuation:
+        server._resume_action(record["lode_id"])
+    continuation.assert_not_called()
+    blocked = actions.load_pending_action(record["lode_id"])
+    assert blocked["phase"] == "containment_blocked"
+    assert "result is missing" in blocked["recovery"]["message"]
+
+
+def test_cleanup_retry_entry_requires_an_earned_containment_proof(socket_path):
+    record = _pending_completion_record()
+    _earn_degraded_containment_proof(record)
+    _complete_marker(record, "containment")
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "cleanup",
+        "message": "cleanup interrupted",
+        "command": actions.recovery_command(record, "cleanup"),
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+
+    with patch.object(server, "_continue_action") as continuation:
+        server._retry_action(record["lode_id"], None)
+    continuation.assert_called_once()
+
+    record["phase"] = "cleanup_blocked"
+    record["containment"]["state"] = "grace"
+    record["containment"]["result"] = None
+    record["containment"]["proof_label"] = None
+    record["recovery"] = {
+        "kind": "cleanup",
+        "message": "cleanup interrupted",
+        "command": actions.recovery_command(record, "cleanup"),
+    }
+    actions.write_pending_action(record)
+    with patch.object(server, "_continue_action") as continuation:
+        server._retry_action(record["lode_id"], None)
+    continuation.assert_not_called()
+    blocked = actions.load_pending_action(record["lode_id"])
+    assert "cleanup retry refused" in blocked["recovery"]["message"]
+
+
+def test_spawn_entry_requires_an_earned_containment_proof():
+    record = _spawning_completion_record()
+    _earn_degraded_containment_proof(record)
+    context = {"target": {"id": record["spawn"]["target_lode_id"]}}
+
+    with patch(
+        "hopper.server.actions.load_spawn_receipt", side_effect=OSError("receipt unreadable")
+    ):
+        positive = Server._spawn_action_successor(record, context)
+    assert positive["error"] == "spawn receipt is invalid: receipt unreadable"
+
+    record["containment"]["last_error"] = "stale proof"
+    negative = Server._spawn_action_successor(record, context)
+    assert negative["error"].startswith("action successor refused:")
+    assert "last error is stale proof" in negative["error"]
+
+
+def test_done_pending_clear_fence_is_not_proof_gated_on_resume(socket_path):
+    record = _pending_completion_record()
+    for marker_name in ("output_publish", "ownership_capture", "pane_close"):
+        _complete_marker(record, marker_name)
+    _complete_marker(record, "containment")
+    _complete_marker(record, "pending_clear")
+    record["phase"] = "complete"
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+
+    with patch.object(server, "_clear_completed_action") as clear:
+        server._resume_action(record["lode_id"])
+
+    clear.assert_called_once_with(record)
 
 
 def test_restart_recovery_of_failed_completion_keeps_completion_identity(socket_path, make_lode):
@@ -2682,6 +2925,52 @@ def test_force_kill_refuses_without_durable_target_intents(socket_path):
     assert result == {"ok": False, "error": "cgroup kill intent is not durable"}
 
 
+def test_fresh_force_observation_never_signals_a_target_without_durable_intent(
+    socket_path, tmp_path
+):
+    record = _pending_manual_containment_record("pause", failure_point="inspection")
+    record["containment"].update(
+        state="kill_pending",
+        last_cgroup_observation="empty",
+        last_supervisor_observation="gone",
+    )
+    record["phase"] = "force_killing"
+    record["ownership"]["pane"]["root_process"] = copy.deepcopy(record["ownership"]["supervisor"])
+    server = Server(socket_path)
+    key = (record["lode_id"], record["expected_generation"])
+    supervisor_fd, supervisor_write = os.pipe()
+    cgroup = tmp_path / "scope"
+    cgroup.mkdir()
+    cgroup_fd = os.open(cgroup, os.O_RDONLY | os.O_DIRECTORY)
+    server.supervisor_pidfds[key] = supervisor_fd
+    server.cgroup_fds[key] = cgroup_fd
+    clock = {"now": record["containment"]["started_monotonic_ns"]}
+
+    def poll(seconds):
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    try:
+        with (
+            patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch("hopper.server.teardown.observe_retained_cgroup", return_value="populated"),
+            patch("hopper.server.teardown.observe_pidfd", return_value="gone"),
+            patch("hopper.server.teardown.kill_cgroup") as kill_cgroup,
+        ):
+            result = server._observe_action_containment(
+                record,
+                retained_pidfd=supervisor_fd,
+                now_ns=lambda: clock["now"],
+                poll=poll,
+            )
+        kill_cgroup.assert_not_called()
+        assert result["containment"]["state"] == "kill_pending"
+        assert "durable cgroup kill intent is unavailable" in result["error"]
+    finally:
+        server._close_containment_handles(record)
+        os.close(supervisor_write)
+
+
 def test_completion_worker_does_not_block_unrelated_ping(socket_path, make_lode):
     record = _pending_completion_record()
     server = Server(socket_path)
@@ -2932,8 +3221,17 @@ def test_manual_action_exact_teardown_preserves_every_sibling_and_identity_until
     panes = {ownership["pane"]["pane_id"], "%sibling"}
     process_groups = {ownership["process_group"], 900}
     cgroups = {ownership["cgroup"]["relative_path"], "/user.slice/sibling.scope"}
-    pidfds = {17: ownership["supervisor"]["pid"], 18: 777}
-    processes = {os.getpid(), ownership["supervisor"]["pid"], 777}
+    pidfds = {
+        17: ownership["supervisor"]["pid"],
+        18: 777,
+        19: ownership["pane"]["root_process"]["pid"],
+    }
+    processes = {
+        os.getpid(),
+        ownership["supervisor"]["pid"],
+        ownership["pane"]["root_process"]["pid"],
+        777,
+    }
 
     def close_pane(pane_id):
         assert pane_id == ownership["pane"]["pane_id"]
@@ -2957,42 +3255,71 @@ def test_manual_action_exact_teardown_preserves_every_sibling_and_identity_until
     )
     assert close_result == {"state": "gone", "error": None}
 
-    def kill_cgroup(cgroup):
+    def kill_cgroup(cgroup, **_kwargs):
         assert cgroup == ownership["cgroup"]
         cgroups.remove(cgroup["relative_path"])
-        return True
+        return {"state": "signalled", "error": None}
 
-    def kill_supervisor(fd, **_kwargs):
-        assert fd == 17
+    def signal_process(fd, identity, **_kwargs):
+        assert pidfds[fd] == identity["pid"]
         pidfds.pop(fd)
-        processes.remove(ownership["supervisor"]["pid"])
-        return True
+        processes.remove(identity["pid"])
+        return {"state": "signalled", "error": None}
+
+    key = (record["lode_id"], record["expected_generation"])
+    server.supervisor_pidfds[key] = 17
+    server.pane_root_pidfds[key] = 19
+    server.cgroup_fds[key] = 20
+    clock = {"now": 1_000_000_000}
+
+    def poll(seconds):
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    unit_states = iter(
+        [
+            {
+                "state": "present",
+                "control_group": ownership["cgroup"]["relative_path"],
+            },
+            {"state": "absent", "control_group": None},
+        ]
+    )
 
     with (
         patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
         patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
         patch(
             "hopper.server.oom.read_scope_control_group",
-            return_value={
-                "state": "present",
-                "control_group": ownership["cgroup"]["relative_path"],
-            },
+            side_effect=lambda *_args: next(unit_states),
         ),
-        patch("hopper.server.teardown.observe_cgroup", return_value="empty"),
-        patch("hopper.server.teardown.observe_pidfd", return_value="gone"),
-        patch("hopper.server.teardown.observe_pane_root_absence", return_value="gone"),
+        patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+        patch(
+            "hopper.server.teardown.observe_retained_cgroup",
+            side_effect=lambda *_args, **_kwargs: (
+                "populated" if ownership["cgroup"]["relative_path"] in cgroups else "empty"
+            ),
+        ),
+        patch(
+            "hopper.server.teardown.observe_pidfd",
+            side_effect=lambda fd, **_kwargs: "alive" if fd in pidfds else "gone",
+        ),
         patch("hopper.server.teardown.kill_cgroup", side_effect=kill_cgroup),
         patch(
-            "hopper.server.teardown.kill_supervisor_pidfd",
-            side_effect=kill_supervisor,
+            "hopper.server.teardown.signal_process_pidfd",
+            side_effect=signal_process,
         ),
         patch("hopper.server.oom.release_scope", return_value=True) as release_scope,
         patch("hopper.server.os.kill") as numeric_kill,
         patch("hopper.server.os.killpg") as process_group_kill,
     ):
-        result = server._observe_action_containment(record, retained_pidfd=17)
+        result = server._observe_action_containment(
+            record,
+            retained_pidfd=17,
+            now_ns=lambda: clock["now"],
+            poll=poll,
+        )
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert result["containment"]["state"] == "proven"
     assert panes == {"%sibling"}
     assert process_groups == {ownership["process_group"], 900}
@@ -3003,11 +3330,310 @@ def test_manual_action_exact_teardown_preserves_every_sibling_and_identity_until
     release_scope.assert_called_once_with("/bin/systemctl", ownership["unit"]["name"])
     numeric_kill.assert_not_called()
     process_group_kill.assert_not_called()
+    server.supervisor_pidfds.clear()
+    server.pane_root_pidfds.clear()
+    server.cgroup_fds.clear()
+
+
+def test_scope_release_residual_never_blocks_proven_terminal_progress(
+    socket_path, make_lode, tmp_path
+):
+    record = _pending_manual_containment_record("pause", failure_point="kill")
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        state="teardown",
+        active=True,
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server.lodes = [lode]
+    key = (record["lode_id"], record["expected_generation"])
+    supervisor_fd, supervisor_write = os.pipe()
+    pane_fd, pane_write = os.pipe()
+    cgroup = tmp_path / "scope"
+    cgroup.mkdir()
+    cgroup_fd = os.open(cgroup, os.O_RDONLY | os.O_DIRECTORY)
+    server.supervisor_pidfds[key] = supervisor_fd
+    server.pane_root_pidfds[key] = pane_fd
+    server.cgroup_fds[key] = cgroup_fd
+    clock = {"now": 1_000_000_000, "polls": 0}
+
+    def poll(seconds):
+        clock["polls"] += 1
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    try:
+        with (
+            patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch("hopper.server.teardown.observe_retained_cgroup", return_value="empty"),
+            patch("hopper.server.teardown.observe_pidfd", return_value="gone"),
+            patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
+            patch(
+                "hopper.server.oom.read_scope_control_group",
+                return_value={"state": "cannot-tell", "control_group": None},
+            ),
+            patch("hopper.server.oom.release_scope") as release,
+        ):
+            result = server._observe_action_containment(
+                record,
+                retained_pidfd=supervisor_fd,
+                now_ns=lambda: clock["now"],
+                poll=poll,
+            )
+        assert result["ok"] is True
+        assert result["containment"]["state"] == "proven"
+        assert result["containment"]["result"] == "linux-strict-empty"
+        assert result["containment"]["proof_label"].endswith(
+            f"scope {record['ownership']['unit']['name']} not released"
+        )
+        assert clock["polls"] == 600
+        release.assert_not_called()
+
+        with patch.object(server, "_continue_action") as continuation:
+            server._handle_action_step_result(
+                _action_step_result(record, phase="force_killing", result=result)
+            )
+        continuation.assert_called_once()
+        terminal = actions.load_pending_action(record["lode_id"])
+        projection = actions.pending_action_projection(terminal)
+        assert terminal["phase"] == "publishing_terminal"
+        assert record["ownership"]["unit"]["name"] in projection["status"]
+
+        server._continue_action(terminal)
+        assert lode["state"] == "paused"
+        assert actions.load_pending_action(record["lode_id"]) is None
+    finally:
+        for fd in (supervisor_write, pane_write):
+            os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "process_api",
+    ["subprocess.run", "subprocess.Popen", "os.posix_spawn"],
+)
+def test_strict_containment_cycle_creates_no_external_process_and_observes_pane_root(
+    socket_path, tmp_path, process_api
+):
+    record = _pending_manual_containment_record("pause", failure_point="inspection")
+    record["action_type"] = "kill"
+    key = (record["lode_id"], record["expected_generation"])
+    server = Server(socket_path)
+    supervisor_fd, supervisor_write = os.pipe()
+    pane_fd, pane_write = os.pipe()
+    cgroup = tmp_path / process_api.replace(".", "-")
+    cgroup.mkdir()
+    cgroup_fd = os.open(cgroup, os.O_RDONLY | os.O_DIRECTORY)
+    server.supervisor_pidfds[key] = supervisor_fd
+    server.pane_root_pidfds[key] = pane_fd
+    server.cgroup_fds[key] = cgroup_fd
+    pane_observations = []
+    patch_target = f"hopper.server.{process_api}"
+
+    try:
+        with (
+            patch(
+                patch_target, side_effect=AssertionError("external process created")
+            ) as forbidden_process,
+            patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch("hopper.server.teardown.observe_retained_cgroup", return_value="populated"),
+            patch(
+                "hopper.server.teardown.observe_pidfd",
+                side_effect=lambda fd, **_kwargs: pane_observations.append(fd) or "alive",
+            ),
+        ):
+            result = server._observe_action_containment(
+                record,
+                retained_pidfd=supervisor_fd,
+                now_ns=lambda: 1_000_000_000,
+                poll=lambda _seconds: None,
+            )
+        assert result["containment"]["state"] == "kill_pending"
+        assert pane_fd in pane_observations
+        forbidden_process.assert_not_called()
+    finally:
+        server._close_containment_handles(record)
+        os.close(supervisor_write)
+        os.close(pane_write)
+
+
+def test_absent_cgroup_path_uses_one_restart_reconciliation(socket_path):
+    record = _pending_manual_containment_record("pause", failure_point="inspection")
+    server = Server(socket_path)
+    key = (record["lode_id"], record["expected_generation"])
+    supervisor_fd, supervisor_write = os.pipe()
+    pane_fd, pane_write = os.pipe()
+    server.supervisor_pidfds[key] = supervisor_fd
+    server.pane_root_pidfds[key] = pane_fd
+    clock = {"now": 1_000_000_000}
+
+    def poll(seconds):
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    try:
+        with (
+            patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch("hopper.server.teardown._opened_cgroup", return_value=(None, "absent")),
+            patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
+            patch(
+                "hopper.server.oom.read_scope_control_group",
+                return_value={"state": "absent", "control_group": None},
+            ) as reconciliation,
+            patch("hopper.server.teardown.observe_pidfd", return_value="alive"),
+        ):
+            result = server._observe_action_containment(
+                record,
+                retained_pidfd=supervisor_fd,
+                now_ns=lambda: clock["now"],
+                poll=poll,
+            )
+        assert result["containment"]["state"] == "kill_pending"
+        reconciliation.assert_called_once_with(
+            "/bin/systemctl", record["ownership"]["unit"]["name"]
+        )
+    finally:
+        server._close_containment_handles(record)
+        os.close(supervisor_write)
+        os.close(pane_write)
+
+
+@pytest.mark.parametrize("retained_observation", ["empty", "cannot-tell"])
+def test_removed_or_replaced_retained_cgroup_is_never_a_force_target(
+    socket_path, tmp_path, retained_observation
+):
+    record = _pending_manual_containment_record("pause", failure_point="kill")
+    server = Server(socket_path)
+    key = (record["lode_id"], record["expected_generation"])
+    supervisor_fd, supervisor_write = os.pipe()
+    pane_fd, pane_write = os.pipe()
+    cgroup = tmp_path / retained_observation
+    cgroup.mkdir()
+    cgroup_fd = os.open(cgroup, os.O_RDONLY | os.O_DIRECTORY)
+    server.supervisor_pidfds[key] = supervisor_fd
+    server.pane_root_pidfds[key] = pane_fd
+    server.cgroup_fds[key] = cgroup_fd
+    clock = {"now": 1_000_000_000}
+
+    def poll(seconds):
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    try:
+        with (
+            patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+            patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+            patch(
+                "hopper.server.teardown.observe_retained_cgroup",
+                return_value=retained_observation,
+            ),
+            patch("hopper.server.teardown.observe_pidfd", return_value="gone"),
+            patch("hopper.server.teardown.kill_cgroup") as kill_cgroup,
+            patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
+            patch(
+                "hopper.server.oom.read_scope_control_group",
+                return_value={"state": "absent", "control_group": None},
+            ),
+        ):
+            result = server._observe_action_containment(
+                record,
+                retained_pidfd=supervisor_fd,
+                now_ns=lambda: clock["now"],
+                poll=poll,
+            )
+        kill_cgroup.assert_not_called()
+        if retained_observation == "empty":
+            assert result["containment"]["result"] == "linux-strict-empty"
+        else:
+            assert result["containment"]["state"] == "kill_pending"
+            assert result["containment"]["last_error"] is not None
+    finally:
+        server._close_containment_handles(record)
+        os.close(supervisor_write)
+        os.close(pane_write)
+
+
+def test_degraded_identity_survives_block_step_and_server_restart(socket_path):
+    record = _pending_completion_record()
+    for marker_name in ("output_publish", "ownership_capture", "pane_close"):
+        _complete_marker(record, marker_name)
+    actions.transition_marker(record, "containment", "intent")
+    record["phase"] = "observing_containment"
+    record["ownership"].update(captured=True, captured_at_ms=1_001)
+    descendant = copy.deepcopy(record["ownership"]["worker"])
+    descendant.update(pid=909, ppid=record["ownership"]["worker"]["pid"], pgid=909)
+    descendant["birth"]["value"] = "9090"
+    record["ownership"]["descendants"] = [descendant]
+    record["containment"] = teardown.start_containment(record, now_ns=lambda: 1_000_000_000)
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    clock = {"now": 1_000_000_000}
+
+    def poll(seconds):
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    with (
+        patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+        patch(
+            "hopper.server.teardown.read_process_table",
+            return_value={"state": "unknown", "identities": [], "error": "table unreadable"},
+        ),
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+    ):
+        result = server._observe_action_containment(
+            record,
+            retained_pidfd=None,
+            now_ns=lambda: clock["now"],
+            poll=poll,
+        )
+    server._handle_action_step_result(
+        _action_step_result(record, phase="observing_containment", result=result)
+    )
+
+    restarted = Server(socket_path.with_name("restarted.sock"))
+    persisted = actions.load_pending_action(record["lode_id"])
+    assert persisted["ownership"]["descendants"] == [descendant]
+    assert persisted["containment"]["state"] == "grace"
+    assert persisted["containment"]["proof_label"] is None
+    projection = actions.pending_action_projection(persisted)
+    assert "ambiguous" in projection["recovery"]["message"]
+    assert "containment: grace" in projection["status"]
+    assert restarted._load_action_slot(record["lode_id"])["ownership"]["descendants"] == [
+        descendant
+    ]
+
+
+def test_degraded_descendant_merge_releases_pid_reuse_without_adopting_replacement():
+    record = _pending_completion_record()
+    old_identity = copy.deepcopy(record["ownership"]["worker"])
+    old_identity.update(pid=909, ppid=old_identity["pid"], pgid=909)
+    old_identity["birth"]["value"] = "old-birth"
+    replacement = copy.deepcopy(old_identity)
+    replacement["birth"]["value"] = "replacement-birth"
+    record["ownership"]["descendants"] = [old_identity]
+
+    merged = Server._merge_observed_descendants(
+        record["ownership"],
+        {
+            "state": "populated",
+            "resolution": "complete",
+            "identities": [replacement],
+        },
+    )
+
+    assert merged == []
 
 
 def test_post_containment_advance_reuses_one_generation_across_reconcile(socket_path, make_lode):
     record = _pending_completion_record()
     _complete_marker(record, "containment")
+    record["containment"].update(
+        state="proven",
+        result="linux-degraded-bounded-empty",
+        proof_label="bounded Linux containment observed",
+        last_error=None,
+    )
     actions.write_pending_action(record)
     server = Server(socket_path)
     server.lodes = [
@@ -3319,6 +3945,12 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
         "cleanup_authorization",
     ):
         _complete_marker(record, marker_name)
+    record["containment"].update(
+        state="proven",
+        result="linux-degraded-bounded-empty",
+        proof_label="bounded Linux containment observed",
+        last_error=None,
+    )
     record["ship"]["landing"].update(
         cause="ancestry_contained",
         base_ref="origin/main",

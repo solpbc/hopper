@@ -296,7 +296,8 @@ may directly null pane/PID/OOM identity as the old pause and kill paths do at
 | active/parked archive | accepted; capture ownership; close pane; observe containment; force kill if needed; check durability; publish terminal; complete | ownership capture; pane close; containment; optional scope/supervisor kill; durability recheck; archive; pending clear | archive once with `archived` result; worktree and branch retained |
 | inactive, already-empty archive | accepted; publish terminal; complete | ownership/pane/containment markers constructed done with explicit no-owner proof; archive; pending clear | immediate archive after durable acceptance, with no PTY/process side effect |
 
-Kill starts containment in `kill_pending` and may skip the graceful deadline;
+Kill observes every containment surface once, then enters `kill_pending` with a fresh
+verification budget; ordinary teardown enters `kill_pending` after its waiting budget expires.
 `force_consent` does not control that scheduling. Restart `--force` only consents
 to discarding an active/started stage. It does not authorize worktree cleanup,
 bypass ownership capture, shorten empty proof, or admit a spawn before proof.

@@ -1172,6 +1172,9 @@ class Server:
         ] = {}
         self.action_waiters: dict[str, list[tuple[socket.socket, str | None]]] = {}
         self.supervisor_pidfds: dict[tuple[str, str], int] = {}
+        self.cgroup_fds: dict[tuple[str, str], int] = {}
+        self.pane_root_pidfds: dict[tuple[str, str], int] = {}
+        self.absent_cgroups: set[tuple[str, str]] = set()
         self._startup_actions: list[str] = []
         self._log_handler: logging.FileHandler | None = None
         self._lock_file = None
@@ -1188,6 +1191,68 @@ class Server:
         return self._find_lode(lode_id) or next(
             (lode for lode in self.archived_lodes if lode["id"] == lode_id), None
         )
+
+    @staticmethod
+    def _containment_handle_key(record: dict) -> tuple[str, str]:
+        return record["lode_id"], record["expected_generation"]
+
+    def _close_containment_handles(self, record_or_key: dict | tuple[str, str]) -> None:
+        """Close every retained descriptor for one accepted generation."""
+        key = (
+            self._containment_handle_key(record_or_key)
+            if isinstance(record_or_key, dict)
+            else record_or_key
+        )
+        descriptors = set()
+        for handles in (
+            self.supervisor_pidfds,
+            self.cgroup_fds,
+            self.pane_root_pidfds,
+        ):
+            fd = handles.pop(key, None)
+            if fd is not None:
+                descriptors.add(fd)
+        self.absent_cgroups.discard(key)
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _close_action_result_handles(result: dict) -> None:
+        """Close descriptors returned by a worker result that cannot be adopted."""
+        descriptors = {
+            result[name]
+            for name in ("pidfd", "cgroup_fd", "pane_root_pidfd")
+            if result.get(f"{name}_owned") and isinstance(result.get(name), int)
+        }
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _adopt_action_result_handles(self, record: dict, result: dict) -> None:
+        """Install newly opened descriptors, closing superseded handles once."""
+        key = self._containment_handle_key(record)
+        for name, handles in (
+            ("pidfd", self.supervisor_pidfds),
+            ("cgroup_fd", self.cgroup_fds),
+            ("pane_root_pidfd", self.pane_root_pidfds),
+        ):
+            fd = result.get(name)
+            if not isinstance(fd, int):
+                continue
+            prior = handles.get(key)
+            if result.get(f"{name}_owned") and prior is not None and prior != fd:
+                try:
+                    os.close(prior)
+                except OSError:
+                    pass
+            handles[key] = fd
+        if result.get("cgroup_absent"):
+            self.absent_cgroups.add(key)
 
     @staticmethod
     def _action_spawn_target_id(record: dict) -> str | None:
@@ -1438,9 +1503,7 @@ class Server:
         if kind == "worker":
             pidfd = result.get("pidfd")
             if isinstance(pidfd, int):
-                old = self.supervisor_pidfds.pop((lode_id, generation), None)
-                if old is not None:
-                    os.close(old)
+                self._close_containment_handles((lode_id, generation))
                 self.supervisor_pidfds[(lode_id, generation)] = pidfd
             request = message.get("request", {})
             accepted = bool(
@@ -1456,9 +1519,7 @@ class Server:
                 )
             )
             if not accepted:
-                fd = self.supervisor_pidfds.pop((lode_id, generation), None)
-                if fd is not None:
-                    os.close(fd)
+                self._close_containment_handles((lode_id, generation))
                 if conn:
                     self._send_response(
                         conn,
@@ -2628,9 +2689,11 @@ class Server:
     def _spawn_action_successor(record: dict, context: dict) -> dict:
         if context.get("error"):
             return {"ok": False, "error": context["error"]}
+        if not actions.containment_is_proven(record):
+            missing = actions.missing_containment_proof(record) or "proof facts are inconsistent"
+            return {"ok": False, "error": f"action successor refused: {missing}"}
         if (
             record["action_type"] not in {"completion", "restart"}
-            or record["containment"]["state"] != "proven"
             or record["markers"]["containment"]["state"] != "done"
             or record["markers"]["lode_mutation"]["state"] != "done"
             or record["markers"]["spawn"]["state"] != "intent"
@@ -2729,120 +2792,280 @@ class Server:
             "captured": True,
             "captured_at_ms": actions.accepted_at_ms(),
         }
-        pidfd = retained_pidfd
-        pidfd_owned = False
-        if current["proof_mode"] == "linux-strict" and pidfd is None:
+        if current["proof_mode"] != "linux-strict":
+            return {"ok": True, "ownership": final_ownership}
+
+        opened = []
+        try:
             pidfd_interface = teardown.resolve_pidfd_interface()
             if pidfd_interface is None:
                 raise RuntimeError("pidfd_open and pidfd_send_signal are unavailable")
-            reopened = teardown.reopen_supervisor_pidfd(
-                current["supervisor"], pidfd_interface=pidfd_interface
-            )
-            if reopened["state"] != "alive":
-                raise RuntimeError(reopened["error"] or "outside supervisor identity is gone")
-            pidfd = reopened["fd"]
-            pidfd_owned = True
+            pidfd = retained_pidfd
+            pidfd_owned = False
+            if pidfd is None:
+                reopened = teardown.reopen_process_pidfd(
+                    current["supervisor"], pidfd_interface=pidfd_interface
+                )
+                if reopened["state"] != "alive":
+                    raise RuntimeError(reopened["error"] or "outside supervisor identity is gone")
+                pidfd = reopened["fd"]
+                pidfd_owned = True
+                opened.append(pidfd)
+
+            cgroup_fd, cgroup_error = teardown._opened_cgroup(current["cgroup"])
+            if cgroup_fd is None:
+                raise RuntimeError(cgroup_error or "recorded cgroup directory is unavailable")
+            opened.append(cgroup_fd)
+
+            pane_root_pidfd = None
+            pane_root_pidfd_owned = False
+            pane_root = current["pane"]["root_process"]
+            if pane_root["pid"] != current["supervisor"]["pid"]:
+                reopened = teardown.reopen_process_pidfd(pane_root, pidfd_interface=pidfd_interface)
+                if reopened["state"] != "alive":
+                    raise RuntimeError(reopened["error"] or "pane root identity is gone")
+                pane_root_pidfd = reopened["fd"]
+                pane_root_pidfd_owned = True
+                opened.append(pane_root_pidfd)
+        except Exception:
+            for fd in set(opened):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
         return {
             "ok": True,
             "ownership": final_ownership,
             "pidfd": pidfd,
             "pidfd_owned": pidfd_owned,
+            "cgroup_fd": cgroup_fd,
+            "cgroup_fd_owned": True,
+            "pane_root_pidfd": pane_root_pidfd,
+            "pane_root_pidfd_owned": pane_root_pidfd_owned,
         }
 
-    def _observe_action_containment(self, record: dict, retained_pidfd: int | None) -> dict:
+    @staticmethod
+    def _merge_observed_descendants(ownership: dict, observed: dict) -> list[dict]:
+        """Persist only identity-resolved, schema-valid discovered descendants."""
+        roots = {
+            (identity["pid"], json.dumps(identity["birth"], sort_keys=True))
+            for identity in (
+                ownership["pane"]["root_process"],
+                ownership["supervisor"],
+                ownership["worker"],
+            )
+        }
+        root_pids = {pid for pid, _birth in roots}
+        recorded_birth_by_pid = {
+            identity["pid"]: json.dumps(identity["birth"], sort_keys=True)
+            for identity in ownership["descendants"]
+        }
+        observed_identities = {
+            (identity["pid"], json.dumps(identity["birth"], sort_keys=True)): identity
+            for identity in observed["identities"]
+            if identity["pgid"] > 0
+            and identity["pid"] not in root_pids
+            and (
+                identity["pid"] not in recorded_birth_by_pid
+                or recorded_birth_by_pid[identity["pid"]]
+                == json.dumps(identity["birth"], sort_keys=True)
+            )
+        }
+        if observed["resolution"] == "complete":
+            merged = observed_identities
+        else:
+            retained = {
+                (identity["pid"], json.dumps(identity["birth"], sort_keys=True)): identity
+                for identity in ownership["descendants"]
+                if (identity["pid"], json.dumps(identity["birth"], sort_keys=True))
+                in observed_identities
+            }
+            merged = {**retained, **observed_identities}
+        descendants = [identity for key, identity in merged.items() if key not in roots]
+        unique_by_pid = {}
+        for identity in sorted(descendants, key=lambda item: item["pid"]):
+            unique_by_pid.setdefault(identity["pid"], identity)
+        return list(unique_by_pid.values())
+
+    def _release_proven_scope(
+        self,
+        record: dict,
+        systemctl: str | None,
+        *,
+        now_ns: Callable[[], int],
+        poll: Callable[[float], None],
+    ) -> str | None:
+        """Retry scope release within one bounded bookkeeping budget."""
+        unit_name = record["ownership"]["unit"]["name"]
+        if not systemctl:
+            return unit_name
+        deadline = now_ns() + int(oom.SCOPE_RESULT_SETTLE_SEC * 1_000_000_000)
+        while True:
+            observed = oom.read_scope_control_group(systemctl, unit_name)
+            if observed["state"] == "absent":
+                return None
+            if observed["state"] == "present":
+                oom.release_scope(systemctl, unit_name)
+            current = now_ns()
+            if current >= deadline:
+                return unit_name
+            remaining = max(0.0, (deadline - current) / 1_000_000_000)
+            poll(min(oom.SCOPE_RESULT_POLL_SEC, remaining))
+
+    def _observe_action_containment(
+        self,
+        record: dict,
+        retained_pidfd: int | None,
+        *,
+        now_ns: Callable[[], int] = time.monotonic_ns,
+        poll: Callable[[float], None] = time.sleep,
+    ) -> dict:
         """Build identity-bound observers and run the bounded state machine."""
         ownership = record["ownership"]
         mode = ownership["proof_mode"]
-        pidfd_owned = False
+        key = self._containment_handle_key(record)
+        host_boot_identity = teardown.read_host_boot_identity(platform=ownership["platform"])
+        result_handles = {}
+        systemctl = None
         if mode == "linux-strict":
             containment = record["containment"]
+            distinct_pane_root = (
+                ownership["pane"]["root_process"]["pid"] != ownership["supervisor"]["pid"]
+            )
             if containment["state"] == "kill_pending":
                 if (
-                    containment["last_cgroup_observation"] == "populated"
+                    containment["last_cgroup_observation"] != "empty"
                     and record["markers"]["scope_kill"]["state"] != "intent"
                 ):
                     return {"ok": False, "error": "cgroup kill intent is not durable"}
                 if (
-                    containment["last_supervisor_observation"] == "alive"
-                    and record["markers"]["supervisor_kill"]["state"] != "intent"
-                ):
+                    containment["last_supervisor_observation"] != "gone" or distinct_pane_root
+                ) and record["markers"]["supervisor_kill"]["state"] != "intent":
                     return {"ok": False, "error": "supervisor kill intent is not durable"}
+
             pidfd_interface = teardown.resolve_pidfd_interface()
-            if pidfd_interface is None:
-                return {
-                    "ok": False,
-                    "error": "pidfd_open and pidfd_send_signal are unavailable",
-                }
-            if retained_pidfd is None:
-                reopened = teardown.reopen_supervisor_pidfd(
+            supervisor_fd = retained_pidfd or self.supervisor_pidfds.get(key)
+            supervisor_gone = False
+            if supervisor_fd is None and pidfd_interface is not None:
+                reopened = teardown.reopen_process_pidfd(
                     ownership["supervisor"], pidfd_interface=pidfd_interface
                 )
-                if reopened["state"] == "cannot-tell":
-                    return {
-                        "ok": False,
-                        "error": reopened["error"]
-                        or "verified outside-supervisor pidfd is unavailable",
-                    }
-                retained_pidfd = reopened["fd"]
+                supervisor_fd = reopened["fd"]
                 supervisor_gone = reopened["state"] == "gone"
-                pidfd_owned = retained_pidfd is not None
-            else:
-                supervisor_gone = False
-            systemctl = oom.find_systemctl()
-            if not systemctl:
-                return {
-                    "ok": False,
-                    "error": "systemctl is unavailable for containment proof",
-                    "pidfd": retained_pidfd,
-                    "pidfd_owned": pidfd_owned,
-                }
+                if supervisor_fd is not None:
+                    result_handles.update(pidfd=supervisor_fd, pidfd_owned=True)
 
-            def unit_observation() -> dict:
-                return oom.read_scope_control_group(systemctl, ownership["unit"]["name"])
+            pane_root_fd = self.pane_root_pidfds.get(key)
+            pane_root_gone = not distinct_pane_root and supervisor_gone
+            if distinct_pane_root and pane_root_fd is None and pidfd_interface is not None:
+                reopened = teardown.reopen_process_pidfd(
+                    ownership["pane"]["root_process"], pidfd_interface=pidfd_interface
+                )
+                pane_root_fd = reopened["fd"]
+                pane_root_gone = reopened["state"] == "gone"
+                if pane_root_fd is not None:
+                    result_handles.update(
+                        pane_root_pidfd=pane_root_fd,
+                        pane_root_pidfd_owned=True,
+                    )
+
+            cgroup_fd = self.cgroup_fds.get(key)
+            cgroup_absent = key in self.absent_cgroups
+            if cgroup_fd is None and not cgroup_absent:
+                cgroup_fd, cgroup_error = teardown._opened_cgroup(ownership["cgroup"])
+                if cgroup_fd is not None:
+                    result_handles.update(cgroup_fd=cgroup_fd, cgroup_fd_owned=True)
+                elif cgroup_error == "absent":
+                    systemctl = oom.find_systemctl()
+                    if systemctl:
+                        reconciled = oom.read_scope_control_group(
+                            systemctl, ownership["unit"]["name"]
+                        )
+                        cgroup_absent = reconciled["state"] == "absent"
+                        if cgroup_absent:
+                            result_handles["cgroup_absent"] = True
+
+            def observe_cgroup() -> str:
+                if cgroup_absent:
+                    return "empty"
+                if cgroup_fd is None or host_boot_identity is None:
+                    return "cannot-tell"
+                return teardown.observe_retained_cgroup(
+                    cgroup_fd,
+                    ownership["cgroup"],
+                    boot_id=host_boot_identity,
+                )
+
+            def observe_supervisor() -> str:
+                if supervisor_gone:
+                    return "gone"
+                if supervisor_fd is None:
+                    return "cannot-tell"
+                return teardown.observe_pidfd(supervisor_fd, pidfd_interface=pidfd_interface)
+
+            def observe_pane_root() -> str:
+                if not distinct_pane_root:
+                    return observe_supervisor()
+                if pane_root_gone:
+                    return "gone"
+                if pane_root_fd is None:
+                    return "cannot-tell"
+                return teardown.observe_pidfd(pane_root_fd, pidfd_interface=pidfd_interface)
+
+            def kill_cgroup() -> dict:
+                if record["markers"]["scope_kill"]["state"] != "intent":
+                    return {
+                        "state": "unaddressable",
+                        "error": "durable cgroup kill intent is unavailable",
+                    }
+                observed = observe_cgroup()
+                if observed == "empty":
+                    return {"state": "already-gone", "error": None}
+                if observed != "populated":
+                    return {"state": "unaddressable", "error": "cgroup identity is ambiguous"}
+                return teardown.kill_cgroup(ownership["cgroup"], boot_id=host_boot_identity)
+
+            def signal_identity(fd: int | None, identity: dict) -> dict:
+                if record["markers"]["supervisor_kill"]["state"] != "intent":
+                    return {
+                        "state": "unaddressable",
+                        "error": "durable process kill intent is unavailable",
+                    }
+                if fd is None:
+                    return {"state": "unaddressable", "error": "verified pidfd is unavailable"}
+                return teardown.signal_process_pidfd(
+                    fd,
+                    identity,
+                    pidfd_interface=pidfd_interface,
+                )
 
             handles = {
-                "observe_cgroup": lambda: teardown.observe_cgroup(
-                    ownership["cgroup"], unit_observation()
-                ),
-                "observe_supervisor": (
-                    (lambda: "gone")
-                    if supervisor_gone
-                    else lambda: teardown.observe_pidfd(
-                        retained_pidfd, pidfd_interface=pidfd_interface
-                    )
-                ),
-                "observe_pane_root": lambda: teardown.observe_pane_root_absence(ownership),
-                "kill_cgroup": lambda: teardown.kill_cgroup(ownership["cgroup"]),
-                "kill_supervisor": (
-                    (lambda: True)
-                    if supervisor_gone
-                    else lambda: teardown.kill_supervisor_pidfd(
-                        retained_pidfd, pidfd_interface=pidfd_interface
-                    )
+                "observe_cgroup": observe_cgroup,
+                "observe_supervisor": observe_supervisor,
+                "observe_pane_root": observe_pane_root,
+                "kill_cgroup": kill_cgroup,
+                "kill_supervisor": lambda: signal_identity(supervisor_fd, ownership["supervisor"]),
+                "kill_pane_root": lambda: signal_identity(
+                    supervisor_fd if not distinct_pane_root else pane_root_fd,
+                    ownership["pane"]["root_process"],
                 ),
             }
         else:
-            owned_by_pid = {
-                process["pid"]: process
-                for process in [
+
+            def observe_bounded() -> dict:
+                owned = [
                     ownership["pane"]["root_process"],
                     ownership["supervisor"],
                     ownership["worker"],
                     *ownership["descendants"],
                 ]
-            }
-
-            def observe_bounded() -> dict:
                 observed = teardown.observe_bounded_processes(
-                    list(owned_by_pid.values()),
+                    owned,
                     platform=ownership["platform"],
                     process_table=teardown.read_process_table(platform=ownership["platform"]),
                 )
-                if observed["state"] != "cannot-tell":
-                    owned_by_pid.clear()
-                    owned_by_pid.update(
-                        {process["pid"]: process for process in observed["identities"]}
-                    )
+                ownership["descendants"] = self._merge_observed_descendants(ownership, observed)
                 return observed
 
             def observe_pane() -> str:
@@ -2854,22 +3077,37 @@ class Server:
                 return "cannot-tell"
 
             handles = {"observe_bounded": observe_bounded, "observe_pane": observe_pane}
-        containment = teardown.observe_containment(record, handles)
-        release_error = None
+
+        containment = teardown.observe_containment(
+            record,
+            handles,
+            host_boot_identity=host_boot_identity,
+            now_ns=now_ns,
+            poll=poll,
+        )
         if mode == "linux-strict" and containment["state"] == "proven":
-            unit_state = oom.read_scope_control_group(systemctl, ownership["unit"]["name"])
-            if unit_state["state"] == "present" and not oom.release_scope(
-                systemctl, ownership["unit"]["name"]
-            ):
-                release_error = "strict Linux scope evidence could not be released"
-            elif unit_state["state"] == "cannot-tell":
-                release_error = "strict Linux scope release state is ambiguous"
+            systemctl = systemctl or oom.find_systemctl()
+            residual = self._release_proven_scope(
+                record,
+                systemctl,
+                now_ns=now_ns,
+                poll=poll,
+            )
+            if residual is not None:
+                containment["proof_label"] = actions.append_scope_release_residual(
+                    containment["proof_label"], residual
+                )
+                logger.warning(
+                    "Containment proven but scope was not released lode=%s unit=%s",
+                    record["lode_id"],
+                    residual,
+                )
         return {
-            "ok": containment["state"] != "blocked" and release_error is None,
+            "ok": containment.get("last_error") is None,
             "containment": containment,
-            "error": release_error or containment.get("last_error"),
-            "pidfd": retained_pidfd if mode == "linux-strict" else None,
-            "pidfd_owned": pidfd_owned,
+            "error": containment.get("last_error"),
+            "descendants": ownership["descendants"],
+            **result_handles,
         }
 
     def _block_action(
@@ -2879,6 +3117,7 @@ class Server:
         recovery_kind: str,
         error: str | None,
     ) -> None:
+        self._close_containment_handles(record)
         marker = record["markers"][marker_name]
         if marker["state"] == "intent":
             actions.transition_marker(
@@ -2940,8 +3179,7 @@ class Server:
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logger.error("Cannot apply action result lode=%s: %s", lode_id, error)
             result = message.get("result", {})
-            if result.get("pidfd_owned") and isinstance(result.get("pidfd"), int):
-                os.close(result["pidfd"])
+            self._close_action_result_handles(result)
             return
         marker_by_phase = {
             "publishing_output": "output_publish",
@@ -2988,17 +3226,12 @@ class Server:
                 action_id,
                 phase,
             )
-            if result.get("pidfd_owned") and isinstance(result.get("pidfd"), int):
-                os.close(result["pidfd"])
+            self._close_action_result_handles(result)
             return
 
-        pidfd = result.get("pidfd")
-        if isinstance(pidfd, int):
-            key = (record["lode_id"], record["expected_generation"])
-            prior = self.supervisor_pidfds.get(key)
-            if result.get("pidfd_owned") and prior is not None and prior != pidfd:
-                os.close(prior)
-            self.supervisor_pidfds[key] = pidfd
+        self._adopt_action_result_handles(record, result)
+        if "descendants" in result:
+            record["ownership"]["descendants"] = result["descendants"]
 
         if result.get("ok") is not True:
             if "containment" in result:
@@ -3113,10 +3346,32 @@ class Server:
         record["containment"] = containment
         if containment["state"] == "kill_pending":
             attempt = uuid.uuid4().hex
-            if containment["last_cgroup_observation"] == "populated":
-                actions.transition_marker(record, "scope_kill", "intent", attempt_id=attempt)
-            if containment["last_supervisor_observation"] == "alive":
-                actions.transition_marker(record, "supervisor_kill", "intent", attempt_id=attempt)
+            distinct_pane_root = (
+                record["ownership"]["pane"]["root_process"]["pid"]
+                != record["ownership"]["supervisor"]["pid"]
+            )
+            required_kill_markers = []
+            if containment["last_cgroup_observation"] != "empty":
+                required_kill_markers.append("scope_kill")
+            if containment["last_supervisor_observation"] != "gone" or distinct_pane_root:
+                required_kill_markers.append("supervisor_kill")
+            for kill_marker in required_kill_markers:
+                state = record["markers"][kill_marker]["state"]
+                if state in {"not_started", "blocked"}:
+                    actions.transition_marker(
+                        record,
+                        kill_marker,
+                        "intent",
+                        attempt_id=attempt,
+                    )
+                elif state != "intent":
+                    self._block_action(
+                        record,
+                        marker_name,
+                        "containment",
+                        f"{kill_marker} marker is {state}; durable force intent is unavailable",
+                    )
+                    return
             record["phase"] = "force_killing"
             self._persist_action(record, via="action_intent:force_killing")
             self._schedule_action_step(record, "containment", "force_killing")
@@ -3138,19 +3393,32 @@ class Server:
                 )
         record["phase"] = "publishing_terminal"
         self._persist_action(record, via="action_result:containment_proven")
-        fd = self.supervisor_pidfds.pop((record["lode_id"], record["expected_generation"]), None)
-        if fd is not None:
-            os.close(fd)
+        self._close_containment_handles(record)
         self._continue_action(record)
 
     def _continue_action(self, record: dict) -> None:
         """Dispatch the first unfinished post-containment action."""
         if record["markers"]["containment"]["state"] != "done":
             return
+        if not self._require_containment_proof(record, "post-containment continuation"):
+            return
         if record["action_type"] != "completion":
             self._continue_manual_action(record)
             return
         self._continue_completion_action(record)
+
+    def _require_containment_proof(self, record: dict, entry_site: str) -> bool:
+        """Turn an incomplete post-containment entry into a visible safety block."""
+        if actions.containment_is_proven(record):
+            return True
+        missing = actions.missing_containment_proof(record) or "proof facts are inconsistent"
+        self._block_action(
+            record,
+            "containment",
+            "containment",
+            f"{entry_site} refused: {missing}",
+        )
+        return False
 
     def _continue_completion_action(self, record: dict) -> None:
         """Dispatch completion-only terminal, ship, spawn, and cleanup work."""
@@ -3631,6 +3899,7 @@ class Server:
         self._continue_action(record)
 
     def _clear_completed_action(self, record: dict) -> None:
+        self._close_containment_handles(record)
         if record["action_type"] != "completion":
             self._clear_completed_manual_action(record)
             return
@@ -3822,6 +4091,16 @@ class Server:
         }
         selected = mapping.get(recovery_kind)
         if recovery_kind in {"spawn", "cleanup"}:
+            if not self._require_containment_proof(record, f"{recovery_kind} retry"):
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": record["recovery"]["message"],
+                        },
+                    )
+                return
             record["recovery"] = {"kind": None, "message": None, "command": None}
             self._continue_action(record)
             selected = None
@@ -3835,15 +4114,66 @@ class Server:
         if recovery_kind == "ownership" and record["markers"]["pane_close"]["state"] == "blocked":
             marker_name, phase = "pane_close", "closing_pane"
         if recovery_kind == "containment":
-            actions.transition_marker(record, "containment", "intent")
-            retrying_kill = False
-            for kill_marker in ("scope_kill", "supervisor_kill"):
-                if record["markers"][kill_marker]["state"] == "blocked":
+            if record["containment"]["state"] == "blocked":
+                record["containment"] = teardown.normalize_legacy_blocked_containment(
+                    record,
+                    now_ns=time.monotonic_ns,
+                )
+            cursor = record["containment"]["state"]
+            phase_by_cursor = {
+                "not_started": "observing_containment",
+                "pane_close_pending": "observing_containment",
+                "grace": "observing_containment",
+                "kill_pending": "force_killing",
+                "verify_after_kill": "force_killing",
+            }
+            phase = phase_by_cursor.get(cursor)
+            containment_marker = record["markers"]["containment"]
+            if phase is None or containment_marker["state"] == "done":
+                self._block_action(
+                    record,
+                    "containment",
+                    "containment",
+                    f"containment retry refused: cursor {cursor} with marker "
+                    f"{containment_marker['state']}",
+                )
+                if conn:
+                    self._send_response(
+                        conn,
+                        {"type": "error", "error": record["recovery"]["message"]},
+                    )
+                return
+            distinct_pane_root = (
+                record["ownership"]["pane"]["root_process"]["pid"]
+                != record["ownership"]["supervisor"]["pid"]
+            )
+            required_kill_markers = []
+            if cursor == "kill_pending":
+                if record["containment"]["last_cgroup_observation"] != "empty":
+                    required_kill_markers.append("scope_kill")
+                if (
+                    record["containment"]["last_supervisor_observation"] != "gone"
+                    or distinct_pane_root
+                ):
+                    required_kill_markers.append("supervisor_kill")
+            for kill_marker in required_kill_markers:
+                state = record["markers"][kill_marker]["state"]
+                if state in {"not_started", "blocked"}:
                     actions.transition_marker(record, kill_marker, "intent")
-                    retrying_kill = True
-            record["containment"]["state"] = "kill_pending" if retrying_kill else "grace"
+                elif state != "intent":
+                    self._block_action(
+                        record,
+                        "containment",
+                        "containment",
+                        f"containment retry refused: {kill_marker} marker is {state}",
+                    )
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {"type": "error", "error": record["recovery"]["message"]},
+                        )
+                    return
             record["containment"]["last_error"] = None
-            phase = "force_killing" if retrying_kill else "observing_containment"
         self._schedule_action_step(record, marker_name, phase)
         if conn:
             self._send_response(
@@ -4092,6 +4422,8 @@ class Server:
         else:
             if record["markers"]["pending_clear"]["state"] == "done":
                 self._clear_completed_action(record)
+                return
+            if not self._require_containment_proof(record, "action resume"):
                 return
             self._continue_action(record)
             return
@@ -5810,12 +6142,22 @@ class Server:
         if self.writer_thread and self.writer_thread.is_alive():
             self.writer_thread.join(timeout=1.0)
 
-        for fd in set(self.supervisor_pidfds.values()):
+        descriptors = set()
+        for handles in (
+            self.supervisor_pidfds,
+            self.cgroup_fds,
+            self.pane_root_pidfds,
+        ):
+            descriptors.update(handles.values())
+        for fd in descriptors:
             try:
                 os.close(fd)
             except OSError:
                 pass
         self.supervisor_pidfds.clear()
+        self.cgroup_fds.clear()
+        self.pane_root_pidfds.clear()
+        self.absent_cgroups.clear()
 
         self._unlink_owned_socket()
 

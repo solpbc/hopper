@@ -109,10 +109,23 @@ def _stage() -> tuple[dict, dict]:
     return output, _record(output)
 
 
-def _blocked_facts_text() -> str:
+def _pending_without_io() -> dict:
+    return _record(
+        {
+            "blob_id": "4" * 32,
+            "staged_relative_path": f"completion-staging/{'4' * 32}.blob",
+            "staged_identity": {"st_dev": 1, "st_ino": 2},
+            "byte_length": 15,
+            "digest_algorithm": "sha256",
+            "digest_hex": "5" * 64,
+        }
+    )
+
+
+def _blocked_facts_text(*, truth="not_started") -> str:
     return (
         f"Action {'1' * 32} owns generation {'2' * 32} for advance refine; "
-        "containment: not_started. Preserved: worktree, branch, stage session"
+        f"containment: {truth}. Preserved: worktree, branch, stage session"
     )
 
 
@@ -339,6 +352,54 @@ def test_invalid_or_cross_lode_pending_record_fails_closed():
         actions.write_pending_action(pending)
 
     assert actions.load_pending_action("abcd2345") is None
+
+
+def test_containment_schema_keeps_exact_keys_and_pinned_poll_interval():
+    pending = _pending_without_io()
+    assert actions.validate_pending_action(pending) is pending
+
+    extra = copy.deepcopy(pending)
+    extra["containment"]["new_fact"] = None
+    with pytest.raises(ValueError, match="containment has missing keys.*unknown keys"):
+        actions.validate_pending_action(extra)
+
+    missing = copy.deepcopy(pending)
+    del missing["containment"]["started_monotonic_ns"]
+    with pytest.raises(ValueError, match="containment has missing keys"):
+        actions.validate_pending_action(missing)
+
+    wrong_poll = copy.deepcopy(pending)
+    wrong_poll["containment"]["poll_interval_ms"] = 250
+    with pytest.raises(ValueError, match="containment.poll_interval_ms must be 50"):
+        actions.validate_pending_action(wrong_poll)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"state": "grace"}, "state is grace, expected proven"),
+        ({"result": None}, "result is missing"),
+        ({"proof_label": None}, "proof label is missing"),
+        ({"last_error": "observer failed"}, "last error is observer failed"),
+    ],
+)
+def test_containment_proof_predicate_names_each_missing_fact(mutation, expected):
+    pending = _pending_without_io()
+    pending["containment"].update(
+        {
+            "state": "proven",
+            "result": "linux-degraded-bounded-empty",
+            "proof_label": "bounded Linux containment observed",
+            "last_error": None,
+        }
+    )
+    assert actions.containment_is_proven(pending)
+    assert actions.missing_containment_proof(pending) is None
+
+    pending["containment"].update(mutation)
+
+    assert not actions.containment_is_proven(pending)
+    assert expected in actions.missing_containment_proof(pending)
 
 
 def test_pending_record_rejects_inconsistent_boot_identity():
@@ -615,6 +676,8 @@ def test_linux_degraded_completion_status_preserves_birth_identity_proof():
 def test_completion_status_projects_generic_block():
     _output, pending = _stage()
     pending["phase"] = "containment_blocked"
+    pending["containment"]["state"] = "kill_pending"
+    pending["containment"]["last_error"] = "cgroup identity changed"
     pending["recovery"] = {
         "kind": "containment",
         "message": "cgroup identity changed",
@@ -622,8 +685,54 @@ def test_completion_status_projects_generic_block():
     }
     assert actions.action_status(pending) == (
         "Teardown blocked: cgroup identity changed. Retry with: hop lode restart abcd2345. "
-        f"{_blocked_facts_text()}"
+        f"{_blocked_facts_text(truth='kill_pending')}"
     )
+
+
+def test_scope_release_residual_round_trips_and_renders_in_post_proof_status():
+    _output, pending = _stage()
+    pending["containment"].update(
+        {
+            "state": "proven",
+            "result": "linux-degraded-bounded-empty",
+            "proof_label": "bounded Linux containment observed",
+            "last_error": None,
+        }
+    )
+    pending["containment"]["proof_label"] = actions.append_scope_release_residual(
+        pending["containment"]["proof_label"], "hopper-abcd.scope"
+    )
+
+    assert actions.scope_release_residual(pending) == "scope hopper-abcd.scope not released"
+    assert (
+        actions.append_scope_release_residual(
+            pending["containment"]["proof_label"], "hopper-abcd.scope"
+        )
+        == pending["containment"]["proof_label"]
+    )
+
+    pending["phase"] = "publishing_terminal"
+    assert actions.action_status(pending).endswith("; scope hopper-abcd.scope not released")
+
+    pending["phase"] = "complete"
+    pending["stage"] = "ship"
+    assert actions.action_status(pending).endswith("; scope hopper-abcd.scope not released")
+
+    manual = actions.new_pending_action(
+        lode_id="abcd2345",
+        stage="mill",
+        expected_generation=None,
+        action_type="archive",
+        target_disposition="archived",
+        force_consent=False,
+        action_id="7" * 32,
+        already_empty=True,
+    )
+    manual["containment"]["proof_label"] = actions.append_scope_release_residual(
+        manual["containment"]["proof_label"], "hopper-abcd.scope"
+    )
+    manual["phase"] = "publishing_terminal"
+    assert actions.action_status(manual).endswith("; scope hopper-abcd.scope not released")
 
 
 def test_blocked_archive_recovery_names_the_cli_action_and_complete_projection():

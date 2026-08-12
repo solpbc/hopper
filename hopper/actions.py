@@ -1227,6 +1227,57 @@ def pending_action_projection(record: dict) -> dict:
     }
 
 
+def containment_is_proven(record: dict) -> bool:
+    """Return whether all durable containment-proof facts agree."""
+    containment = record["containment"]
+    return (
+        containment["state"] == "proven"
+        and containment["result"] is not None
+        and containment["proof_label"] is not None
+        and containment["last_error"] is None
+    )
+
+
+def missing_containment_proof(record: dict) -> str | None:
+    """Name every fact that prevents a pending action from proving containment."""
+    containment = record["containment"]
+    missing = []
+    if containment["state"] != "proven":
+        missing.append(f"state is {containment['state']}, expected proven")
+    if containment["result"] is None:
+        missing.append("result is missing")
+    if containment["proof_label"] is None:
+        missing.append("proof label is missing")
+    if containment["last_error"] is not None:
+        missing.append(f"last error is {containment['last_error']}")
+    return "; ".join(missing) or None
+
+
+def append_scope_release_residual(proof_label: str, unit_name: str) -> str:
+    """Append the standardized non-gating scope-release residual once."""
+    residual = f"scope {unit_name} not released"
+    if proof_label == residual or proof_label.endswith(f"; {residual}"):
+        return proof_label
+    return f"{proof_label}; {residual}"
+
+
+def scope_release_residual(record: dict) -> str | None:
+    """Extract the standardized scope-release residual from a proof label."""
+    proof_label = record["containment"]["proof_label"]
+    if (
+        not proof_label
+        or "; scope " not in proof_label
+        or not proof_label.endswith(" not released")
+    ):
+        return None
+    return f"scope {proof_label.rsplit('; scope ', 1)[1]}"
+
+
+def _with_scope_release_residual(status: str, record: dict) -> str:
+    residual = scope_release_residual(record)
+    return f"{status}; {residual}" if residual else status
+
+
 def _validate_spawn_receipt(receipt: dict) -> dict:
     keys = {
         "schema_version",
@@ -1709,7 +1760,11 @@ def action_status(record: dict) -> str:
                 f"Preserved: {preserved}. {retry_label}: {command}"
             )
         if phase == "complete":
-            return f"{label}: {record['target_disposition'].replace('_', ' ')}"
+            return _with_scope_release_residual(
+                f"{label}: {record['target_disposition'].replace('_', ' ')}", record
+            )
+        if phase == "publishing_terminal":
+            return _with_scope_release_residual(f"{label}: teardown in progress", record)
         return f"{label}: teardown in progress"
     if phase == "output_blocked":
         detail = recovery["message"] or "completion output publication failed"
@@ -1764,22 +1819,33 @@ def action_status(record: dict) -> str:
         return "Teardown: quarantining shipped worktree"
     if phase == "publishing_terminal":
         if record["ownership"]["proof_mode"] == "linux-degraded":
-            return (
+            status = (
                 "Teardown: bounded Linux containment observed "
                 "(degraded; leak-free cleanup unproven); awaiting next action"
             )
-        target = record["next_action"]["target_stage"]
-        return f"Teardown: advancing to {target}" if target else "Teardown: archiving shipped lode"
+        else:
+            target = record["next_action"]["target_stage"]
+            status = (
+                f"Teardown: advancing to {target}" if target else "Teardown: archiving shipped lode"
+            )
+        return _with_scope_release_residual(status, record)
     if phase == "spawning":
         return f"Teardown: starting {record['next_action']['target_stage']}"
     if phase == "complete" and record["ownership"]["proof_mode"] == "darwin-bounded":
-        return "Shipped (bounded Darwin teardown; leak-free cleanup unproven)"
+        return _with_scope_release_residual(
+            "Shipped (bounded Darwin teardown; leak-free cleanup unproven)", record
+        )
     if phase == "complete" and record["ownership"]["proof_mode"] == "linux-degraded":
-        return "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)"
+        return _with_scope_release_residual(
+            "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)",
+            record,
+        )
     if phase == "complete" and record["ownership"]["proof_mode"] != "linux-strict":
-        return "Shipped (degraded teardown; birth identity and leak-free cleanup unproven)"
+        return _with_scope_release_residual(
+            "Shipped (degraded teardown; birth identity and leak-free cleanup unproven)", record
+        )
     if phase == "complete":
-        return "Shipped"
+        return _with_scope_release_residual("Shipped", record)
     return "Teardown: archiving shipped lode"
 
 

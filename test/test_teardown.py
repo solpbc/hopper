@@ -44,6 +44,8 @@ def _ps_process(pid: int, ppid: int = 1, pgid: int | None = None, start="Mon Aug
 
 def _containment_record(mode: str, *, state="not_started") -> dict:
     return {
+        "action_type": "completion",
+        "boot_id": "boot-one",
         "ownership": {"proof_mode": mode},
         "containment": {
             "state": state,
@@ -58,6 +60,20 @@ def _containment_record(mode: str, *, state="not_started") -> dict:
             "last_error": None,
         },
     }
+
+
+def _observe(record: dict, handles: dict, *, now_ns, poll, host_boot_identity="boot-one"):
+    return teardown.observe_containment(
+        record,
+        handles,
+        host_boot_identity=host_boot_identity,
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+
+def _force(state: str, error: str | None = None) -> dict:
+    return {"state": state, "error": error}
 
 
 def _fake_clock(start=1_000_000_000):
@@ -183,6 +199,83 @@ def test_linux_process_table_accepts_kernel_thread_pgid_zero(tmp_path):
         ],
         "error": None,
     }
+
+
+def test_linux_process_table_zero_rows_is_unknown(tmp_path):
+    assert teardown.read_process_table(
+        platform="linux", proc_root=tmp_path, boot_id="boot-one"
+    ) == {
+        "state": "unknown",
+        "identities": [],
+        "error": "process table returned no rows",
+    }
+
+
+def test_linux_process_table_failed_read_is_unknown(tmp_path):
+    observed = teardown.read_process_table(
+        platform="linux", proc_root=tmp_path / "missing", boot_id="boot-one"
+    )
+
+    assert observed["state"] == "unknown"
+    assert observed["identities"] == []
+    assert observed["error"]
+
+
+def test_linux_process_table_retains_parsed_rows_when_one_row_is_ambiguous(tmp_path):
+    (tmp_path / "10").mkdir()
+    (tmp_path / "10" / "stat").write_text(_linux_stat(pid=10, ppid=1, pgid=10))
+    (tmp_path / "11").mkdir()
+    (tmp_path / "11" / "stat").write_text("malformed")
+
+    observed = teardown.read_process_table(platform="linux", proc_root=tmp_path, boot_id="boot-one")
+
+    assert observed["state"] == "partial"
+    assert observed["identities"] == [_linux_process(10, 1, 10, 12345)]
+    assert observed["error"] == "PID 11: malformed /proc stat row"
+
+
+def test_linux_process_table_with_only_a_rejected_row_is_partial(tmp_path):
+    (tmp_path / "11").mkdir()
+    (tmp_path / "11" / "stat").write_text("malformed")
+
+    observed = teardown.read_process_table(platform="linux", proc_root=tmp_path, boot_id="boot-one")
+
+    assert observed["state"] == "partial"
+    assert observed["identities"] == []
+
+
+@pytest.mark.parametrize(
+    ("stdout", "state", "pids"),
+    [
+        ("", "unknown", []),
+        (
+            "10 1 10 Mon Aug 10 22:29:26 2026\nmalformed\n",
+            "partial",
+            [10],
+        ),
+        ("malformed\n", "partial", []),
+    ],
+)
+def test_ps_process_table_distinguishes_unknown_and_partial(stdout, state, pids):
+    completed = subprocess.CompletedProcess(["ps"], 0, stdout=stdout, stderr="")
+
+    observed = teardown.read_process_table(
+        platform="darwin", run=lambda *_args, **_kwargs: completed
+    )
+
+    assert observed["state"] == state
+    assert [identity["pid"] for identity in observed["identities"]] == pids
+    assert observed["error"] is not None
+
+
+def test_ps_process_table_failed_read_is_unknown():
+    completed = subprocess.CompletedProcess(["ps"], 1, stdout="", stderr="ps failed")
+
+    observed = teardown.read_process_table(
+        platform="darwin", run=lambda *_args, **_kwargs: completed
+    )
+
+    assert observed == {"state": "unknown", "identities": [], "error": "ps failed"}
 
 
 @pytest.mark.parametrize("text", ["", "100 (x) S 1", "bad (x) " + " ".join(["0"] * 20)])
@@ -772,7 +865,7 @@ def test_cgroup_unit_path_change_is_unknown_before_read(tmp_path, monkeypatch):
     read.assert_not_called()
 
 
-def test_kill_cgroup_writes_only_through_verified_directory(tmp_path, monkeypatch):
+def test_kill_cgroup_reports_structured_outcomes(tmp_path, monkeypatch):
     cgroup = tmp_path / "scope"
     cgroup.mkdir()
     record = {
@@ -783,12 +876,39 @@ def test_kill_cgroup_writes_only_through_verified_directory(tmp_path, monkeypatc
     writes = []
     monkeypatch.setattr(oom, "_write_text", lambda path, value: writes.append((path.name, value)))
 
-    assert teardown.kill_cgroup(record, boot_id="boot-one") is True
+    assert teardown.kill_cgroup(record, boot_id="boot-one") == _force("signalled")
     assert writes == [("cgroup.kill", "1")]
 
     record["identity"]["st_ino"] += 1
-    assert teardown.kill_cgroup(record, boot_id="boot-one") is False
+    assert teardown.kill_cgroup(record, boot_id="boot-one") == _force(
+        "unaddressable", "cgroup identity mismatch"
+    )
     assert writes == [("cgroup.kill", "1")]
+
+    record["absolute_path"] = str(tmp_path / "gone")
+    assert teardown.kill_cgroup(record, boot_id="boot-one") == _force("already-gone")
+
+
+@pytest.mark.parametrize("error_number", [errno.ENOENT, errno.ENODEV])
+def test_retained_cgroup_removed_read_with_matching_identity_proves_removal(
+    tmp_path, monkeypatch, error_number
+):
+    cgroup = tmp_path / "scope"
+    cgroup.mkdir()
+    fd = os.open(cgroup, os.O_RDONLY | os.O_DIRECTORY)
+    record = {
+        "identity": {"st_dev": cgroup.stat().st_dev, "st_ino": cgroup.stat().st_ino},
+        "boot_id": "boot-one",
+    }
+
+    def removed(_path):
+        raise OSError(error_number, os.strerror(error_number))
+
+    monkeypatch.setattr(oom, "_read_text", removed)
+    try:
+        assert teardown.observe_retained_cgroup(fd, record, boot_id="boot-one") == "empty"
+    finally:
+        os.close(fd)
 
 
 def test_pidfd_is_opened_before_birth_verification(monkeypatch):
@@ -807,7 +927,7 @@ def test_pidfd_is_opened_before_birth_verification(monkeypatch):
 
     monkeypatch.setattr(oom, "_read_text", fake_read)
     supervisor = _linux_process(100, 1, 100, 9)
-    observed = teardown.reopen_supervisor_pidfd(
+    observed = teardown.reopen_process_pidfd(
         supervisor, pidfd_interface=_pidfd_interface(open_call=fake_open)
     )
     try:
@@ -829,7 +949,7 @@ def test_pidfd_birth_mismatch_is_gone_and_never_a_signal_target(monkeypatch):
             else _linux_stat(pid=100, ppid=1, pgid=100, starttime=10)
         ),
     )
-    observed = teardown.reopen_supervisor_pidfd(
+    observed = teardown.reopen_process_pidfd(
         _linux_process(100, 1, 100, 9),
         pidfd_interface=_pidfd_interface(open_call=lambda _pid, _flags: read_fd),
     )
@@ -880,9 +1000,13 @@ def test_observe_pidfd_invalid_descriptor_is_unknown(monkeypatch):
 
 @pytest.mark.parametrize(
     ("error", "expected"),
-    [(None, True), (ProcessLookupError(), True), (PermissionError(), False)],
+    [
+        (None, _force("signalled")),
+        (ProcessLookupError(), _force("already-gone")),
+        (PermissionError("denied"), _force("unaddressable", "denied")),
+    ],
 )
-def test_kill_supervisor_pidfd_never_uses_a_numeric_pid(monkeypatch, error, expected):
+def test_signal_process_pidfd_never_uses_a_numeric_pid(monkeypatch, error, expected):
     calls = []
 
     def fake_signal(fd, sig, info, flags):
@@ -890,9 +1014,43 @@ def test_kill_supervisor_pidfd_never_uses_a_numeric_pid(monkeypatch, error, expe
         if error is not None:
             raise error
 
+    monkeypatch.setattr(
+        oom,
+        "_read_text",
+        lambda path: (
+            "boot-one\n"
+            if path.name == "boot_id"
+            else _linux_stat(pid=100, ppid=1, pgid=100, starttime=9)
+        ),
+    )
     interface = _pidfd_interface(signal_call=fake_signal)
-    assert teardown.kill_supervisor_pidfd(17, pidfd_interface=interface) is expected
+    assert (
+        teardown.signal_process_pidfd(17, _linux_process(100, 1, 100, 9), pidfd_interface=interface)
+        == expected
+    )
     assert calls == [(17, signal.SIGKILL, None, 0)]
+
+
+def test_pid_reuse_before_signal_leaves_replacement_alive(monkeypatch):
+    signals = []
+    monkeypatch.setattr(
+        oom,
+        "_read_text",
+        lambda path: (
+            "boot-one\n"
+            if path.name == "boot_id"
+            else _linux_stat(pid=100, ppid=1, pgid=100, starttime=10)
+        ),
+    )
+
+    outcome = teardown.signal_process_pidfd(
+        17,
+        _linux_process(100, 1, 100, 9),
+        pidfd_interface=_pidfd_interface(signal_call=lambda *args: signals.append(args)),
+    )
+
+    assert outcome == _force("already-gone")
+    assert signals == []
 
 
 def test_close_owned_pane_checks_every_identity_before_exact_kill():
@@ -938,16 +1096,18 @@ def test_close_owned_pane_mismatch_never_kills():
 
 
 @pytest.mark.parametrize(
-    ("pane_state", "process_state", "current", "expected"),
+    ("pane_closed", "process_state", "current", "expected"),
     [
-        (tmux.Liveness.GONE, "gone", None, "gone"),
-        (tmux.Liveness.GONE, "alive", _linux_process(100), "alive"),
-        (tmux.Liveness.ALIVE, "gone", None, "alive"),
-        (tmux.Liveness.UNKNOWN, "gone", None, "cannot-tell"),
-        (tmux.Liveness.GONE, "cannot-tell", None, "cannot-tell"),
+        (True, "gone", None, "gone"),
+        (True, "alive", _linux_process(100), "alive"),
+        (True, "alive", _linux_process(100, start=2), "gone"),
+        (False, "gone", None, "cannot-tell"),
+        (True, "cannot-tell", None, "cannot-tell"),
     ],
 )
-def test_pane_root_absence_requires_both_proofs(pane_state, process_state, current, expected):
+def test_pane_root_absence_uses_durable_close_and_recorded_birth(
+    pane_closed, process_state, current, expected
+):
     ownership = {
         "platform": "linux",
         "pane": {
@@ -959,7 +1119,7 @@ def test_pane_root_absence_requires_both_proofs(pane_state, process_state, curre
     assert (
         teardown.observe_pane_root_absence(
             ownership,
-            pane_probe=lambda _pane: pane_state,
+            pane_closed=pane_closed,
             process_reader=lambda _pid, **_kwargs: {
                 "state": process_state,
                 "identity": current,
@@ -983,6 +1143,7 @@ def test_bounded_observation_retains_reparented_process_and_adds_child():
     }
     observed = teardown.observe_bounded_processes(owned, platform="darwin", process_table=table)
     assert observed["state"] == "populated"
+    assert observed["resolution"] == "complete"
     assert [item["pid"] for item in observed["identities"]] == [11, 12]
 
 
@@ -997,49 +1158,127 @@ def test_bounded_observation_never_trusts_unavailable_birth():
     assert observed["state"] == "cannot-tell"
 
 
-def test_strict_containment_proves_clean_exit_without_kill():
+def test_partial_linux_table_resolves_every_owned_identity_and_keeps_discovering():
+    owned = [_linux_process(10), _linux_process(11, 10)]
+    table = {
+        "state": "partial",
+        "identities": [_linux_process(10), _linux_process(12, 10)],
+        "error": "PID 11: unreadable",
+    }
+    reads = []
+
+    observed = teardown.observe_bounded_processes(
+        owned,
+        platform="linux",
+        process_table=table,
+        process_reader=lambda pid, **_kwargs: (
+            reads.append(pid) or {"state": "gone", "identity": None, "error": None}
+        ),
+    )
+
+    assert observed["state"] == "populated"
+    assert observed["resolution"] == "partial"
+    assert [identity["pid"] for identity in observed["identities"]] == [10, 12]
+    assert reads == [11]
+
+
+def test_partial_ps_missing_identity_stays_unknown_but_birth_change_releases_it():
+    owned = [_ps_process(10)]
+    table = {"state": "partial", "identities": [], "error": "malformed row"}
+
+    unknown = teardown.observe_bounded_processes(
+        owned,
+        platform="darwin",
+        process_table=table,
+        process_reader=lambda _pid, **_kwargs: {
+            "state": "cannot-tell",
+            "identity": None,
+            "error": "ps exited 1",
+        },
+    )
+    reused = teardown.observe_bounded_processes(
+        owned,
+        platform="darwin",
+        process_table=table,
+        process_reader=lambda _pid, **_kwargs: {
+            "state": "alive",
+            "identity": _ps_process(10, start="Tue Aug 11 22:29:26 2026"),
+            "error": None,
+        },
+    )
+
+    assert unknown["state"] == "cannot-tell"
+    assert unknown["identities"] == owned
+    assert reused["state"] == "empty"
+    assert reused["identities"] == []
+
+
+def test_unknown_table_retains_owned_identity_across_step_boundary():
+    owned = [_ps_process(10)]
+
+    observed = teardown.observe_bounded_processes(
+        owned,
+        platform="darwin",
+        process_table={"state": "unknown", "identities": [], "error": "ps timed out"},
+    )
+
+    assert observed["state"] == "cannot-tell"
+    assert observed["identities"] == owned
+
+
+def test_strict_containment_proves_all_three_surfaces_without_signalling():
     _clock, now_ns, poll = _fake_clock()
-    kills = []
-    result = teardown.observe_containment(
+    signals = []
+
+    result = _observe(
         _containment_record("linux-strict"),
         {
             "observe_cgroup": lambda: "empty",
             "observe_supervisor": lambda: "gone",
             "observe_pane_root": lambda: "gone",
-            "kill_cgroup": lambda: kills.append("cgroup") or True,
-            "kill_supervisor": lambda: kills.append("supervisor") or True,
+            "kill_cgroup": lambda: signals.append("cgroup") or _force("signalled"),
+            "kill_supervisor": lambda: signals.append("supervisor") or _force("signalled"),
+            "kill_pane_root": lambda: signals.append("pane") or _force("signalled"),
         },
         now_ns=now_ns,
         poll=poll,
     )
+
     assert result["state"] == "proven"
     assert result["result"] == "linux-strict-empty"
-    assert kills == []
+    assert signals == []
 
 
-def test_kill_action_requests_identity_bound_kill_without_grace_sleep():
+@pytest.mark.parametrize(
+    ("cgroup", "supervisor", "pane_root"),
+    [
+        ("populated", "gone", "gone"),
+        ("empty", "alive", "gone"),
+        ("empty", "gone", "alive"),
+    ],
+)
+def test_each_strict_surface_must_be_absent_before_proof(cgroup, supervisor, pane_root):
     clock, now_ns, poll = _fake_clock()
     record = _containment_record("linux-strict")
     record["action_type"] = "kill"
 
-    result = teardown.observe_containment(
+    result = _observe(
         record,
         {
-            "observe_cgroup": lambda: "populated",
-            "observe_supervisor": lambda: "alive",
-            "observe_pane_root": lambda: "gone",
+            "observe_cgroup": lambda: cgroup,
+            "observe_supervisor": lambda: supervisor,
+            "observe_pane_root": lambda: pane_root,
         },
         now_ns=now_ns,
         poll=poll,
     )
 
     assert result["state"] == "kill_pending"
-    assert result["last_cgroup_observation"] == "populated"
-    assert result["last_supervisor_observation"] == "alive"
+    assert result["result"] is None
     assert clock["polls"] == []
 
 
-def test_containment_deadline_is_materialized_before_worker_polling():
+def test_containment_waiting_budget_is_materialized_before_worker_polling():
     _clock, now_ns, _poll = _fake_clock(start=5_000_000_000)
     record = _containment_record("linux-strict", state="pane_close_pending")
 
@@ -1051,101 +1290,401 @@ def test_containment_deadline_is_materialized_before_worker_polling():
     assert record["containment"]["deadline_monotonic_ns"] is None
 
 
-def test_strict_containment_returns_kill_intent_then_verifies_without_real_wait():
+def test_kill_action_escalates_despite_ambiguity_and_arms_verification_budget():
     clock, now_ns, poll = _fake_clock()
-    observations = {"cgroup": "populated", "supervisor": "alive"}
     record = _containment_record("linux-strict")
+    record["action_type"] = "kill"
 
-    pending_kill = teardown.observe_containment(
+    result = _observe(
         record,
-        {
-            "observe_cgroup": lambda: observations["cgroup"],
-            "observe_supervisor": lambda: observations["supervisor"],
-            "observe_pane_root": lambda: "gone",
-        },
-        now_ns=now_ns,
-        poll=poll,
-    )
-
-    assert pending_kill["state"] == "kill_pending"
-    assert clock["now"] == 30_950_000_000
-    record["containment"] = pending_kill
-    kills = []
-
-    def kill_cgroup():
-        kills.append("cgroup")
-        observations["cgroup"] = "empty"
-        return True
-
-    def kill_supervisor():
-        kills.append("supervisor")
-        observations["supervisor"] = "gone"
-        return True
-
-    proven = teardown.observe_containment(
-        record,
-        {
-            "observe_cgroup": lambda: observations["cgroup"],
-            "observe_supervisor": lambda: observations["supervisor"],
-            "observe_pane_root": lambda: "gone",
-            "kill_cgroup": kill_cgroup,
-            "kill_supervisor": kill_supervisor,
-        },
-        now_ns=now_ns,
-        poll=poll,
-    )
-    assert proven["state"] == "proven"
-    assert proven["result"] == "linux-strict-killed-empty"
-    assert kills == ["cgroup", "supervisor"]
-
-
-def test_strict_ambiguity_blocks_without_killing():
-    _clock, now_ns, poll = _fake_clock()
-    kills = []
-    result = teardown.observe_containment(
-        _containment_record("linux-strict"),
         {
             "observe_cgroup": lambda: "cannot-tell",
+            "observe_supervisor": lambda: "cannot-tell",
+            "observe_pane_root": lambda: "cannot-tell",
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "kill_pending"
+    assert result["started_monotonic_ns"] == clock["now"]
+    assert result["deadline_monotonic_ns"] - result["started_monotonic_ns"] == int(
+        teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000
+    )
+    assert clock["polls"] == []
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.25, 0.5, 0.75, 0.99])
+def test_verification_budget_is_independent_fraction_with_zero_cost_observations(fraction):
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict")
+    waiting = {
+        "observe_cgroup": lambda: "populated",
+        "observe_supervisor": lambda: "alive",
+        "observe_pane_root": lambda: "gone",
+    }
+
+    pending = _observe(record, waiting, now_ns=now_ns, poll=poll)
+
+    verification_start = pending["started_monotonic_ns"]
+    assert pending["state"] == "kill_pending"
+    assert pending["deadline_monotonic_ns"] == verification_start + 30_000_000_000
+    record["containment"] = pending
+    signals = []
+    prove_at = verification_start + int(fraction * 30_000_000_000)
+
+    def surface(present, absent):
+        return lambda: absent if signals and clock["now"] >= prove_at else present
+
+    proven = _observe(
+        record,
+        {
+            "observe_cgroup": surface("populated", "empty"),
+            "observe_supervisor": surface("alive", "gone"),
+            "observe_pane_root": lambda: "gone",
+            "kill_cgroup": lambda: signals.append("cgroup") or _force("signalled"),
+            "kill_supervisor": lambda: signals.append("supervisor") or _force("signalled"),
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert proven["state"] == "proven"
+    assert proven["result"] == "linux-strict-killed-empty"
+    assert signals == ["cgroup", "supervisor"]
+    assert clock["now"] - verification_start >= int(fraction * 30_000_000_000)
+
+
+def test_force_observes_before_signalling_and_already_gone_is_not_killed():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    events = []
+    cgroup = {"state": "populated"}
+
+    def observe_cgroup():
+        events.append("observe-cgroup")
+        return cgroup["state"]
+
+    def kill_cgroup():
+        events.append("kill-cgroup")
+        cgroup["state"] = "empty"
+        return _force("already-gone")
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": observe_cgroup,
+            "observe_supervisor": lambda: events.append("observe-supervisor") or "gone",
+            "observe_pane_root": lambda: events.append("observe-pane") or "gone",
+            "kill_cgroup": kill_cgroup,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert events[:4] == ["observe-cgroup", "observe-supervisor", "observe-pane", "kill-cgroup"]
+    assert result["state"] == "proven"
+    assert result["result"] == "linux-strict-empty"
+
+
+def test_unaddressable_force_target_does_not_prevent_independent_signals():
+    _clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    alive = {"value": True}
+    calls = []
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": lambda: "empty" if not alive["value"] else "populated",
+            "observe_supervisor": lambda: "gone" if not alive["value"] else "alive",
+            "observe_pane_root": lambda: "gone",
+            "kill_cgroup": lambda: (
+                calls.append("cgroup") or _force("unaddressable", "identity changed")
+            ),
+            "kill_supervisor": lambda: (
+                calls.append("supervisor") or alive.update(value=False) or _force("signalled")
+            ),
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert calls == ["cgroup", "supervisor"]
+    assert result["state"] == "proven"
+    assert result["result"] == "linux-strict-killed-empty"
+
+
+def test_permanent_ambiguity_escalates_then_blocks_at_force_budget_expiry():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict")
+    ambiguous = {
+        "observe_cgroup": lambda: "cannot-tell",
+        "observe_supervisor": lambda: "cannot-tell",
+        "observe_pane_root": lambda: "cannot-tell",
+    }
+
+    pending = _observe(record, ambiguous, now_ns=now_ns, poll=poll)
+    assert pending["state"] == "kill_pending"
+    assert pending["last_error"] is None
+
+    record["containment"] = pending
+    blocked = _observe(record, ambiguous, now_ns=now_ns, poll=poll)
+
+    assert blocked["state"] == "kill_pending"
+    assert "ambiguous" in blocked["last_error"]
+    assert blocked["result"] is None
+
+
+def test_transient_waiting_ambiguity_resolves_without_force():
+    clock, now_ns, poll = _fake_clock()
+    calls = {"count": 0}
+
+    def cgroup():
+        calls["count"] += 1
+        return "cannot-tell" if calls["count"] < 3 else "empty"
+
+    result = _observe(
+        _containment_record("linux-strict"),
+        {
+            "observe_cgroup": cgroup,
+            "observe_supervisor": lambda: "gone",
+            "observe_pane_root": lambda: "gone",
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "proven"
+    assert result["result"] == "linux-strict-empty"
+    assert calls["count"] == 3
+    assert len(clock["polls"]) == 2
+
+
+def test_programming_error_is_named_and_not_retried():
+    _clock, now_ns, poll = _fake_clock()
+    calls = []
+
+    def broken():
+        calls.append("cgroup")
+        raise TypeError("bad observer wiring")
+
+    result = _observe(
+        _containment_record("linux-strict"),
+        {
+            "observe_cgroup": broken,
+            "observe_supervisor": lambda: "gone",
+            "observe_pane_root": lambda: "gone",
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "grace"
+    assert result["last_error"] == ("observer observe_cgroup raised TypeError: bad observer wiring")
+    assert calls == ["cgroup"]
+
+
+def test_force_programming_error_is_distinct_and_other_target_is_addressed():
+    _clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    calls = []
+
+    def broken():
+        calls.append("cgroup")
+        raise RuntimeError("write contract broken")
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": lambda: "populated",
             "observe_supervisor": lambda: "alive",
             "observe_pane_root": lambda: "gone",
-            "kill_cgroup": lambda: kills.append("cgroup") or True,
-            "kill_supervisor": lambda: kills.append("supervisor") or True,
+            "kill_cgroup": broken,
+            "kill_supervisor": lambda: calls.append("supervisor") or _force("signalled"),
         },
         now_ns=now_ns,
         poll=poll,
     )
-    assert result["state"] == "blocked"
-    assert kills == []
+
+    assert calls == ["cgroup", "supervisor"]
+    assert result["state"] == "verify_after_kill"
+    assert result["last_error"] == (
+        "force action kill_cgroup raised RuntimeError: write contract broken"
+    )
 
 
-def test_darwin_bounded_empty_proves_with_degraded_label():
-    _clock, now_ns, poll = _fake_clock()
-    result = teardown.observe_containment(
-        _containment_record("darwin-bounded"),
+def test_boot_mismatch_rearms_without_comparing_stale_monotonic_values():
+    clock, now_ns, poll = _fake_clock(start=7_000_000_000)
+    record = _containment_record("linux-strict", state="grace")
+    record["containment"]["started_monotonic_ns"] = 999_000_000_000
+    record["containment"]["deadline_monotonic_ns"] = 1
+
+    result = _observe(
+        record,
         {
-            "observe_bounded": lambda: {"state": "empty", "count": 0},
-            "observe_pane": lambda: "gone",
+            "observe_cgroup": lambda: "empty",
+            "observe_supervisor": lambda: "gone",
+            "observe_pane_root": lambda: "gone",
+        },
+        host_boot_identity="boot-two",
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "proven"
+    assert result["started_monotonic_ns"] == 7_000_000_000
+    assert result["deadline_monotonic_ns"] == 37_000_000_000
+    assert clock["polls"] == []
+
+
+def test_same_boot_restart_preserves_remaining_waiting_budget():
+    clock, now_ns, poll = _fake_clock(start=20_000_000_000)
+    record = _containment_record("linux-strict", state="grace")
+    record["containment"]["started_monotonic_ns"] = 1_000_000_000
+    record["containment"]["deadline_monotonic_ns"] = 31_000_000_000
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": lambda: "populated",
+            "observe_supervisor": lambda: "gone",
+            "observe_pane_root": lambda: "gone",
         },
         now_ns=now_ns,
         poll=poll,
     )
+
+    assert result["state"] == "kill_pending"
+    assert sum(clock["polls"]) == pytest.approx(11.0)
+    assert result["started_monotonic_ns"] == 31_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("mode", "cursor"),
+    [("linux-strict", "kill_pending"), ("darwin-bounded", "grace")],
+)
+def test_legacy_blocked_state_normalizes_with_fresh_budget(mode, cursor):
+    _clock, now_ns, _poll = _fake_clock(start=9_000_000_000)
+    record = _containment_record(mode, state="blocked")
+    record["containment"]["started_monotonic_ns"] = 1
+    record["containment"]["deadline_monotonic_ns"] = 2
+    record["containment"]["last_error"] = "legacy block"
+
+    normalized = teardown.normalize_legacy_blocked_containment(record, now_ns=now_ns)
+
+    assert normalized["state"] == cursor
+    assert normalized["started_monotonic_ns"] == 9_000_000_000
+    assert normalized["deadline_monotonic_ns"] == 39_000_000_000
+    assert normalized["last_error"] is None
+
+
+def test_darwin_bounded_ambiguity_retries_then_proves():
+    clock, now_ns, poll = _fake_clock()
+    calls = {"count": 0}
+
+    def bounded():
+        calls["count"] += 1
+        if calls["count"] < 3:
+            return {"state": "cannot-tell", "count": None}
+        return {"state": "empty", "count": 0}
+
+    result = _observe(
+        _containment_record("darwin-bounded"),
+        {"observe_bounded": bounded, "observe_pane": lambda: "gone"},
+        now_ns=now_ns,
+        poll=poll,
+    )
+
     assert result["state"] == "proven"
     assert result["result"] == "darwin-bounded-empty"
     assert "unproven" in result["proof_label"]
+    assert len(clock["polls"]) == 2
 
 
-def test_degraded_survivor_blocks_at_deadline_without_signal_or_real_wait():
+def test_degraded_permanent_ambiguity_blocks_with_cursor_and_original_budget():
     clock, now_ns, poll = _fake_clock()
-    result = teardown.observe_containment(
+
+    result = _observe(
         _containment_record("other-bounded-no-birth"),
         {
-            "observe_bounded": lambda: {"state": "populated", "count": 1},
+            "observe_bounded": lambda: {"state": "cannot-tell", "count": None},
             "observe_pane": lambda: "gone",
         },
         now_ns=now_ns,
         poll=poll,
     )
-    assert result["state"] == "blocked"
-    assert result["last_owned_process_count"] == 1
-    assert clock["now"] == 31_000_000_000
-    assert len(clock["polls"]) == 600
+
+    assert result["state"] == "grace"
+    assert result["last_error"] == "bounded containment remained ambiguous until budget expiry"
+    assert result["started_monotonic_ns"] == 1_000_000_000
+    assert result["deadline_monotonic_ns"] == 31_000_000_000
+    assert sum(clock["polls"]) == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize("latency_ms", range(0, 2001, 80))
+def test_charged_observation_and_force_costs_still_receive_a_full_force_budget(latency_ms):
+    clock, now_ns, poll = _fake_clock()
+    charge_ns = latency_ms * 1_000_000
+    record = _containment_record("linux-strict")
+
+    def charged(value):
+        def call():
+            clock["now"] += charge_ns
+            return value
+
+        return call
+
+    pending = _observe(
+        record,
+        {
+            "observe_cgroup": charged("populated"),
+            "observe_supervisor": charged("alive"),
+            "observe_pane_root": charged("alive"),
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert pending["state"] == "kill_pending"
+
+    record["containment"] = pending
+    force_entry = clock["now"]
+    prove_at = force_entry + 15_000_000_000
+    signals = []
+
+    def charged_surface(present, absent):
+        def observe():
+            clock["now"] += charge_ns
+            return absent if signals and clock["now"] >= prove_at else present
+
+        return observe
+
+    def charged_force(name):
+        def force():
+            clock["now"] += charge_ns
+            signals.append(name)
+            return _force("signalled")
+
+        return force
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": charged_surface("populated", "empty"),
+            "observe_supervisor": charged_surface("alive", "gone"),
+            "observe_pane_root": charged_surface("alive", "gone"),
+            "kill_cgroup": charged_force("cgroup"),
+            "kill_supervisor": charged_force("supervisor"),
+            "kill_pane_root": charged_force("pane-root"),
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert signals == ["cgroup", "supervisor", "pane-root"]
+    assert result["state"] == "proven"
+    assert result["result"] == "linux-strict-killed-empty"
+    assert result["deadline_monotonic_ns"] == pending["deadline_monotonic_ns"]

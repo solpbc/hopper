@@ -234,10 +234,11 @@ def read_process_identity(pid: int, *, platform: str | None = None, **kwargs) ->
 
 def _read_linux_process_table(*, proc_root: Path, boot_id: str) -> dict:
     identities = []
+    errors = []
     try:
         entries = list(proc_root.iterdir())
     except OSError as error:
-        return {"state": "cannot-tell", "identities": [], "error": str(error)}
+        return {"state": "unknown", "identities": [], "error": str(error)}
     for entry in entries:
         if not entry.name.isdigit():
             continue
@@ -247,12 +248,19 @@ def _read_linux_process_table(*, proc_root: Path, boot_id: str) -> dict:
         if observed["state"] == "gone":
             continue
         if observed["state"] != "alive":
-            return {"state": "cannot-tell", "identities": [], "error": observed["error"]}
+            errors.append(f"PID {entry.name}: {observed['error'] or 'cannot tell'}")
+            continue
         identities.append(observed["identity"])
+    if not identities:
+        return {
+            "state": "partial" if errors else "unknown",
+            "identities": [],
+            "error": "; ".join(errors) or "process table returned no rows",
+        }
     return {
-        "state": "complete",
+        "state": "partial" if errors else "complete",
         "identities": sorted(identities, key=lambda item: item["pid"]),
-        "error": None,
+        "error": "; ".join(errors) or None,
     }
 
 
@@ -265,28 +273,40 @@ def _read_ps_process_table(*, run: Callable, timeout: float) -> dict:
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        return {"state": "cannot-tell", "identities": [], "error": str(error)}
+        return {"state": "unknown", "identities": [], "error": str(error)}
     if result.returncode != 0:
         return {
-            "state": "cannot-tell",
+            "state": "unknown",
             "identities": [],
             "error": result.stderr.strip() or f"ps exited {result.returncode}",
         }
     identities = []
+    errors = []
     for row in result.stdout.splitlines():
         if not row.strip():
             continue
         try:
             identities.append(parse_ps_process_row(row))
         except ValueError as error:
-            return {"state": "cannot-tell", "identities": [], "error": str(error)}
-    pids = [identity["pid"] for identity in identities]
-    if len(pids) != len(set(pids)):
-        return {"state": "cannot-tell", "identities": [], "error": "duplicate ps PID"}
+            errors.append(str(error))
+    unique = {}
+    for identity in identities:
+        pid = identity["pid"]
+        if pid in unique:
+            errors.append(f"duplicate ps PID {pid}")
+            continue
+        unique[pid] = identity
+    identities = list(unique.values())
+    if not identities:
+        return {
+            "state": "partial" if errors else "unknown",
+            "identities": [],
+            "error": "; ".join(errors) or "ps returned no rows",
+        }
     return {
-        "state": "complete",
+        "state": "partial" if errors else "complete",
         "identities": sorted(identities, key=lambda item: item["pid"]),
-        "error": None,
+        "error": "; ".join(errors) or None,
     }
 
 
@@ -298,11 +318,11 @@ def read_process_table(
     run: Callable | None = None,
     timeout: float = PROCESS_QUERY_TIMEOUT_SEC,
 ) -> dict:
-    """Read one complete process table or return a fail-closed observation."""
+    """Read a complete, partial, or unknown process-table observation."""
     if platform_name(platform) == "linux":
         boot_id = boot_id or read_boot_id(proc_root=proc_root)
         if boot_id is None:
-            return {"state": "cannot-tell", "identities": [], "error": "boot ID unavailable"}
+            return {"state": "unknown", "identities": [], "error": "boot ID unavailable"}
         return _read_linux_process_table(proc_root=proc_root, boot_id=boot_id)
     return _read_ps_process_table(run=subprocess.run if run is None else run, timeout=timeout)
 
@@ -661,6 +681,40 @@ def _parse_cgroup_events(text: str) -> str:
     return "cannot-tell"
 
 
+def _cgroup_identity_matches(fd: int, cgroup: dict) -> bool:
+    stat = os.fstat(fd)
+    expected = cgroup["identity"]
+    return (stat.st_dev, stat.st_ino) == (expected["st_dev"], expected["st_ino"])
+
+
+def observe_retained_cgroup(
+    fd: int,
+    cgroup: dict,
+    *,
+    boot_id: str,
+) -> str:
+    """Read recursive population through an identity-verified retained directory."""
+    if boot_id != cgroup["boot_id"]:
+        return "cannot-tell"
+    try:
+        if not _cgroup_identity_matches(fd, cgroup):
+            return "cannot-tell"
+        path = Path(f"/proc/self/fd/{fd}") / "cgroup.events"
+        try:
+            text = oom._read_text(path)
+        except OSError as error:
+            if error.errno not in {errno.ENOENT, errno.ENODEV} or not _cgroup_identity_matches(
+                fd, cgroup
+            ):
+                return "cannot-tell"
+            return "empty"
+        if not _cgroup_identity_matches(fd, cgroup):
+            return "cannot-tell"
+    except OSError:
+        return "cannot-tell"
+    return _parse_cgroup_events(text)
+
+
 def observe_cgroup(cgroup: dict, unit_observation: dict, *, boot_id: str | None = None) -> str:
     """Observe recursive cgroup population with authoritative absence handling."""
     unit_state = unit_observation.get("state")
@@ -677,44 +731,49 @@ def observe_cgroup(cgroup: dict, unit_observation: dict, *, boot_id: str | None 
         return "cannot-tell"
     try:
         current_boot = boot_id or read_boot_id()
-        if current_boot is None or current_boot != cgroup["boot_id"]:
+        if current_boot is None:
             return "cannot-tell"
-        path = Path(f"/proc/self/fd/{fd}") / "cgroup.events"
-        try:
-            result = _parse_cgroup_events(oom._read_text(path))
-            after = os.fstat(fd)
-        except (OSError, ValueError):
-            return "cannot-tell"
-        expected = cgroup["identity"]
-        if (after.st_dev, after.st_ino) != (expected["st_dev"], expected["st_ino"]):
-            return "cannot-tell"
-        return result
+        return observe_retained_cgroup(fd, cgroup, boot_id=current_boot)
     finally:
         os.close(fd)
 
 
-def kill_cgroup(cgroup: dict, *, boot_id: str | None = None) -> bool:
+def _force_result(state: str, error: str | None = None) -> dict:
+    return {"state": state, "error": error}
+
+
+def kill_cgroup(cgroup: dict, *, boot_id: str | None = None) -> dict:
     """Write cgroup.kill only through a verified exact cgroup directory."""
-    fd, _error = _opened_cgroup(cgroup)
+    fd, open_error = _opened_cgroup(cgroup)
     if fd is None:
-        return False
+        if open_error == "absent":
+            return _force_result("already-gone")
+        return _force_result("unaddressable", open_error)
     try:
         current_boot = boot_id or read_boot_id()
         if current_boot is None or current_boot != cgroup["boot_id"]:
-            return False
+            return _force_result("unaddressable", "cgroup boot identity mismatch")
         try:
             oom._write_text(Path(f"/proc/self/fd/{fd}") / "cgroup.kill", "1")
-            after = os.fstat(fd)
-        except (OSError, ValueError):
-            return False
-        expected = cgroup["identity"]
-        return (after.st_dev, after.st_ino) == (expected["st_dev"], expected["st_ino"])
+            if not _cgroup_identity_matches(fd, cgroup):
+                return _force_result("unaddressable", "cgroup identity changed during kill")
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ENODEV}:
+                try:
+                    if _cgroup_identity_matches(fd, cgroup):
+                        return _force_result("already-gone")
+                except OSError:
+                    pass
+            return _force_result("unaddressable", str(error))
+        except ValueError as error:
+            return _force_result("unaddressable", str(error))
+        return _force_result("signalled")
     finally:
         os.close(fd)
 
 
-def reopen_supervisor_pidfd(
-    supervisor: dict,
+def reopen_process_pidfd(
+    identity: dict,
     *,
     proc_root: Path = Path("/proc"),
     pidfd_interface: dict | None = None,
@@ -728,7 +787,7 @@ def reopen_supervisor_pidfd(
             "error": "pidfd_open and pidfd_send_signal are unavailable",
         }
     try:
-        fd = interface["open"](supervisor["pid"], 0)
+        fd = interface["open"](identity["pid"], 0)
     except (ProcessLookupError, FileNotFoundError):
         return {"state": "gone", "fd": None, "error": None}
     except OSError as error:
@@ -739,11 +798,11 @@ def reopen_supervisor_pidfd(
     if current_boot is None:
         os.close(fd)
         return {"state": "cannot-tell", "fd": None, "error": "Linux boot identity unavailable"}
-    if current_boot != supervisor["birth"]["boot_id"]:
+    if current_boot != identity["birth"]["boot_id"]:
         os.close(fd)
         return {"state": "gone", "fd": None, "error": None}
     observed = read_linux_process_identity(
-        supervisor["pid"],
+        identity["pid"],
         proc_root=proc_root,
         boot_id=current_boot,
     )
@@ -753,7 +812,7 @@ def reopen_supervisor_pidfd(
     if observed["state"] != "alive":
         os.close(fd)
         return {"state": "cannot-tell", "fd": None, "error": observed["error"]}
-    if not same_birth(supervisor, observed["identity"]):
+    if not same_birth(identity, observed["identity"]):
         os.close(fd)
         return {"state": "gone", "fd": None, "error": None}
     return {"state": "alive", "fd": fd, "error": None}
@@ -780,18 +839,38 @@ def observe_pidfd(fd: int, *, pidfd_interface: dict | None = None) -> str:
     return "alive"
 
 
-def kill_supervisor_pidfd(fd: int, *, pidfd_interface: dict | None = None) -> bool:
-    """SIGKILL only the stable process referenced by a verified pidfd."""
+def signal_process_pidfd(
+    fd: int,
+    identity: dict,
+    *,
+    proc_root: Path = Path("/proc"),
+    pidfd_interface: dict | None = None,
+) -> dict:
+    """SIGKILL an identity-verified process descriptor, never a numeric PID."""
     interface = resolve_pidfd_interface() if pidfd_interface is None else pidfd_interface
     if interface is None:
-        return False
+        return _force_result("unaddressable", "pidfd_send_signal is unavailable")
+    current_boot = read_boot_id(proc_root=proc_root)
+    if current_boot is None:
+        return _force_result("unaddressable", "Linux boot identity unavailable")
+    if current_boot != identity["birth"]["boot_id"]:
+        return _force_result("already-gone")
+    observed = read_linux_process_identity(
+        identity["pid"], proc_root=proc_root, boot_id=current_boot
+    )
+    if observed["state"] == "gone":
+        return _force_result("already-gone")
+    if observed["state"] != "alive":
+        return _force_result("unaddressable", observed["error"])
+    if not same_birth(identity, observed["identity"]):
+        return _force_result("already-gone")
     try:
         interface["send_signal"](fd, signal.SIGKILL, None, 0)
     except ProcessLookupError:
-        return True
-    except (AttributeError, OSError):
-        return False
-    return True
+        return _force_result("already-gone")
+    except (AttributeError, OSError) as error:
+        return _force_result("unaddressable", str(error))
+    return _force_result("signalled")
 
 
 def close_owned_pane(
@@ -833,23 +912,21 @@ def close_owned_pane(
 def observe_pane_root_absence(
     ownership: dict,
     *,
-    pane_probe: Callable[[str], tmux.Liveness] | None = None,
+    pane_closed: bool,
     process_reader: Callable[..., dict] | None = None,
 ) -> str:
-    """Require both the exact pane and its recorded root birth to be absent."""
-    pane_probe = tmux.pane_liveness if pane_probe is None else pane_probe
+    """Combine durable pane closure with the recorded root's birth identity."""
+    if not pane_closed:
+        return "cannot-tell"
     process_reader = read_process_identity if process_reader is None else process_reader
     recorded = ownership["pane"]
-    pane_state = pane_probe(recorded["pane_id"])
     observed = process_reader(recorded["root_process"]["pid"], platform=ownership["platform"])
-    if pane_state is tmux.Liveness.UNKNOWN or observed["state"] == "cannot-tell":
+    if observed["state"] == "cannot-tell":
         return "cannot-tell"
     root_alive = observed["state"] == "alive" and same_birth(
         recorded["root_process"], observed["identity"]
     )
-    if pane_state is tmux.Liveness.GONE and not root_alive:
-        return "gone"
-    return "alive"
+    return "alive" if root_alive else "gone"
 
 
 def observe_bounded_processes(
@@ -857,58 +934,116 @@ def observe_bounded_processes(
     *,
     platform: str,
     process_table: dict,
+    process_reader: Callable[..., dict] | None = None,
 ) -> dict:
-    """Observe a bounded identity set and add children of still-owned processes."""
-    if process_table["state"] != "complete":
+    """Resolve owned identities against a complete, partial, or unknown table."""
+    resolution = process_table["state"]
+    if resolution not in {"complete", "partial", "unknown"}:
+        raise ValueError(f"invalid process table resolution: {resolution}")
+    process_reader = read_process_identity if process_reader is None else process_reader
+    if any(identity["birth"]["kind"] == "unavailable" for identity in owned):
         return {
             "state": "cannot-tell",
             "count": None,
             "identities": list(owned),
-            "error": process_table.get("error"),
+            "error": "owned process birth identity is unavailable",
+            "resolution": resolution,
+            "platform": platform_name(platform),
         }
+
     current = {identity["pid"]: identity for identity in process_table["identities"]}
-    retained = []
+    retained_by_pid = {}
+    present_pids = set()
+    unresolved_pids = set()
     for identity in owned:
-        if identity["birth"]["kind"] == "unavailable":
-            return {
-                "state": "cannot-tell",
-                "count": None,
-                "identities": list(owned),
-                "error": "owned process birth identity is unavailable",
-            }
         candidate = current.get(identity["pid"])
         if candidate is not None and same_birth(identity, candidate):
-            retained.append(candidate)
-    retained_by_pid = {identity["pid"]: identity for identity in retained}
+            retained_by_pid[identity["pid"]] = candidate
+            present_pids.add(identity["pid"])
+            continue
+        if candidate is not None:
+            continue
+        if resolution == "complete":
+            continue
+        if resolution == "unknown":
+            retained_by_pid[identity["pid"]] = identity
+            unresolved_pids.add(identity["pid"])
+            continue
+        observed = process_reader(identity["pid"], platform=platform)
+        if observed["state"] == "alive":
+            if same_birth(identity, observed["identity"]):
+                retained_by_pid[identity["pid"]] = observed["identity"]
+                present_pids.add(identity["pid"])
+            continue
+        if observed["state"] == "gone" and platform_name(platform) == "linux":
+            continue
+        retained_by_pid[identity["pid"]] = identity
+        unresolved_pids.add(identity["pid"])
+
     changed = True
     while changed:
         changed = False
         for identity in process_table["identities"]:
-            if identity["pid"] not in retained_by_pid and identity["ppid"] in retained_by_pid:
+            if identity["pid"] in retained_by_pid:
+                continue
+            if identity["ppid"] in present_pids:
                 retained_by_pid[identity["pid"]] = identity
+                present_pids.add(identity["pid"])
                 changed = True
     identities = sorted(retained_by_pid.values(), key=lambda item: item["pid"])
+    if present_pids:
+        state = "populated"
+        count = len(identities)
+    elif unresolved_pids or resolution == "unknown":
+        state = "cannot-tell"
+        count = None
+    else:
+        state = "empty"
+        count = 0
     return {
-        "state": "empty" if not identities else "populated",
-        "count": len(identities),
+        "state": state,
+        "count": count,
         "identities": identities,
-        "error": None,
+        "error": process_table.get("error") if state == "cannot-tell" else None,
+        "resolution": resolution,
         "platform": platform_name(platform),
     }
 
 
-def _containment_copy(record: dict, now_ns: Callable[[], int]) -> dict:
+def arm_phase(containment: dict, state: str, *, now_ns: Callable[[], int]) -> dict:
+    """Arm a fresh budget for exactly one containment phase."""
+    armed = dict(containment)
+    started = now_ns()
+    armed["state"] = state
+    armed["started_monotonic_ns"] = started
+    armed["deadline_monotonic_ns"] = started + int(CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
+    armed["poll_interval_ms"] = int(CONTAINMENT_POLL_SEC * 1000)
+    armed["result"] = None
+    armed["proof_label"] = None
+    armed["last_error"] = None
+    return armed
+
+
+def continue_phase(containment: dict) -> dict:
+    """Continue an already armed phase without extending its budget."""
+    continued = dict(containment)
+    if continued["started_monotonic_ns"] is None or continued["deadline_monotonic_ns"] is None:
+        raise ValueError(f"containment phase {continued['state']} has no armed budget")
+    continued["poll_interval_ms"] = int(CONTAINMENT_POLL_SEC * 1000)
+    return continued
+
+
+def normalize_legacy_blocked_containment(
+    record: dict,
+    *,
+    now_ns: Callable[[], int],
+) -> dict:
+    """Migrate the sole legacy blocked-state encoding to a phase cursor."""
     containment = dict(record["containment"])
-    if containment["started_monotonic_ns"] is None:
-        containment["started_monotonic_ns"] = now_ns()
-    if containment["deadline_monotonic_ns"] is None:
-        containment["deadline_monotonic_ns"] = containment["started_monotonic_ns"] + int(
-            CONTAINMENT_TIMEOUT_SEC * 1_000_000_000
-        )
-    containment["poll_interval_ms"] = int(CONTAINMENT_POLL_SEC * 1000)
-    if containment["state"] in {"not_started", "pane_close_pending"}:
-        containment["state"] = "grace"
-    return containment
+    if containment["state"] != "blocked":
+        return containment
+    state = "kill_pending" if record["ownership"]["proof_mode"] == "linux-strict" else "grace"
+    return arm_phase(containment, state, now_ns=now_ns)
 
 
 def start_containment(
@@ -916,15 +1051,17 @@ def start_containment(
     *,
     now_ns: Callable[[], int] = time.monotonic_ns,
 ) -> dict:
-    """Return the deadline-bearing grace state to persist before polling."""
-    return _containment_copy(record, now_ns)
+    """Return the phase state that must be persisted before polling."""
+    containment = normalize_legacy_blocked_containment(record, now_ns=now_ns)
+    if containment["state"] in {"not_started", "pane_close_pending"}:
+        return arm_phase(containment, "grace", now_ns=now_ns)
+    if containment["state"] == "proven":
+        return containment
+    return continue_phase(containment)
 
 
 def _blocked(containment: dict, error: str) -> dict:
-    containment["state"] = "blocked"
     containment["last_error"] = error
-    containment["result"] = None
-    containment["proof_label"] = None
     return containment
 
 
@@ -936,18 +1073,49 @@ def _proven(containment: dict, result: str, label: str) -> dict:
     return containment
 
 
-def _call_observer(handles: dict, name: str):
+def _call_observer(handles: dict, name: str) -> dict:
     try:
-        return handles[name]()
-    except Exception:
-        return "cannot-tell"
+        return {"kind": "value", "value": handles[name]()}
+    except Exception as error:
+        return {
+            "kind": "programming-error",
+            "error": _programming_error("observer", name, error),
+        }
 
 
-def _call_action(handles: dict, name: str) -> bool:
+def _call_action(handles: dict, name: str) -> dict:
     try:
-        return bool(handles[name]())
-    except Exception:
-        return False
+        outcome = handles[name]()
+        if not isinstance(outcome, dict) or outcome.get("state") not in {
+            "signalled",
+            "already-gone",
+            "unaddressable",
+        }:
+            raise ValueError(f"invalid force outcome: {outcome!r}")
+        return {"kind": "value", "value": outcome}
+    except Exception as error:
+        return {
+            "kind": "programming-error",
+            "error": _programming_error("force action", name, error),
+        }
+
+
+def _programming_error(role: str, name: str, error: Exception) -> str:
+    detail = str(error)
+    suffix = f": {detail}" if detail else ""
+    return f"{role} {name} raised {type(error).__name__}{suffix}"
+
+
+def _scalar_observations(handles: dict, names: tuple[str, ...]) -> tuple[dict, list[str]]:
+    values = {}
+    errors = []
+    for name in names:
+        observed = _call_observer(handles, name)
+        if observed["kind"] == "programming-error":
+            errors.append(observed["error"])
+        else:
+            values[name] = observed["value"]
+    return values, errors
 
 
 def _poll(now_ns: Callable[[], int], poll: Callable[[float], None], deadline: int) -> None:
@@ -964,39 +1132,89 @@ def _observe_strict(
     poll: Callable[[float], None],
 ) -> dict:
     deadline = containment["deadline_monotonic_ns"]
-    kill_at = deadline - int(CONTAINMENT_POLL_SEC * 1_000_000_000)
-    killed = containment["state"] in {"kill_pending", "verify_after_kill"}
-    if containment["state"] == "kill_pending":
-        if containment["last_cgroup_observation"] == "populated" and not _call_action(
-            handles, "kill_cgroup"
-        ):
-            return _blocked(containment, "exact cgroup kill failed")
-        if containment["last_supervisor_observation"] == "alive" and not _call_action(
-            handles, "kill_supervisor"
-        ):
-            return _blocked(containment, "verified supervisor kill failed")
-        containment["state"] = "verify_after_kill"
-
+    force_attempted = containment["state"] == "verify_after_kill"
+    force_errors = []
     while True:
-        cgroup = _call_observer(handles, "observe_cgroup")
-        supervisor = _call_observer(handles, "observe_supervisor")
-        pane_root = _call_observer(handles, "observe_pane_root")
-        containment["last_cgroup_observation"] = cgroup
-        containment["last_supervisor_observation"] = supervisor
-        if "cannot-tell" in {cgroup, supervisor, pane_root}:
-            return _blocked(containment, "strict Linux containment is ambiguous")
+        observations, programming_errors = _scalar_observations(
+            handles,
+            ("observe_cgroup", "observe_supervisor", "observe_pane_root"),
+        )
+        expected = {
+            "observe_cgroup": {"empty", "populated", "cannot-tell"},
+            "observe_supervisor": {"gone", "alive", "cannot-tell"},
+            "observe_pane_root": {"gone", "alive", "cannot-tell"},
+        }
+        for name, value in observations.items():
+            if value not in expected[name]:
+                programming_errors.append(
+                    _programming_error(
+                        "observer", name, ValueError(f"invalid observation: {value!r}")
+                    )
+                )
+        cgroup = observations.get("observe_cgroup")
+        supervisor = observations.get("observe_supervisor")
+        pane_root = observations.get("observe_pane_root")
+        if cgroup in expected["observe_cgroup"]:
+            containment["last_cgroup_observation"] = cgroup
+        if supervisor in expected["observe_supervisor"]:
+            containment["last_supervisor_observation"] = supervisor
         if cgroup == "empty" and supervisor == "gone" and pane_root == "gone":
+            killed = containment["state"] == "verify_after_kill"
             result = "linux-strict-killed-empty" if killed else "linux-strict-empty"
             return _proven(containment, result, "strict Linux containment proven")
-        if record.get("action_type") == "kill" and containment["state"] == "grace":
-            containment["state"] = "kill_pending"
-            return containment
+
         current = now_ns()
+
+        if containment["state"] == "grace":
+            if record["action_type"] == "kill" or current >= deadline:
+                return arm_phase(containment, "kill_pending", now_ns=now_ns)
+            if programming_errors:
+                return _blocked(containment, programming_errors[0])
+            _poll(now_ns, poll, deadline)
+            continue
+
+        if programming_errors:
+            return _blocked(containment, programming_errors[0])
+
+        ambiguous = "cannot-tell" in {cgroup, supervisor, pane_root}
+        if containment["state"] == "kill_pending" and not force_attempted:
+            force_attempted = True
+            signalled = False
+            action_errors = []
+            targets = []
+            if cgroup == "populated":
+                targets.append("kill_cgroup")
+            if supervisor == "alive":
+                targets.append("kill_supervisor")
+            if pane_root == "alive":
+                targets.append("kill_pane_root")
+            for name in targets:
+                action = _call_action(handles, name)
+                if action["kind"] == "programming-error":
+                    action_errors.append(action["error"])
+                    continue
+                outcome = action["value"]
+                if outcome["state"] == "signalled":
+                    signalled = True
+                elif outcome["state"] == "unaddressable":
+                    force_errors.append(f"{name}: {outcome.get('error') or 'unaddressable'}")
+            if signalled:
+                containment["state"] = "verify_after_kill"
+            if action_errors:
+                return _blocked(containment, action_errors[0])
+            continue
+
         if current >= deadline:
-            return _blocked(containment, "strict Linux containment deadline expired")
-        if containment["state"] == "grace" and current >= kill_at:
-            containment["state"] = "kill_pending"
-            return containment
+            if ambiguous:
+                return _blocked(
+                    containment,
+                    "strict Linux force verification remained ambiguous until budget expiry",
+                )
+            detail = f" after {'; '.join(force_errors)}" if force_errors else ""
+            return _blocked(
+                containment,
+                f"strict Linux force verification budget expired{detail}",
+            )
         _poll(now_ns, poll, deadline)
 
 
@@ -1024,17 +1242,48 @@ def _observe_degraded(
         ),
     }[mode]
     while True:
-        bounded = _call_observer(handles, "observe_bounded")
-        pane = _call_observer(handles, "observe_pane")
-        if not isinstance(bounded, dict):
-            return _blocked(containment, "bounded process observation is ambiguous")
-        containment["last_owned_process_count"] = bounded.get("count")
-        if bounded.get("state") == "cannot-tell" or pane == "cannot-tell":
-            return _blocked(containment, "bounded process observation is ambiguous")
-        if bounded.get("state") == "empty" and pane == "gone":
+        observed, programming_errors = _scalar_observations(
+            handles, ("observe_bounded", "observe_pane")
+        )
+        bounded = observed.get("observe_bounded")
+        pane = observed.get("observe_pane")
+        if bounded is not None and (
+            not isinstance(bounded, dict)
+            or bounded.get("state") not in {"empty", "populated", "cannot-tell"}
+        ):
+            programming_errors.append(
+                _programming_error(
+                    "observer",
+                    "observe_bounded",
+                    ValueError(f"invalid observation: {bounded!r}"),
+                )
+            )
+            bounded = None
+        if pane is not None and pane not in {"gone", "alive", "cannot-tell"}:
+            programming_errors.append(
+                _programming_error(
+                    "observer", "observe_pane", ValueError(f"invalid observation: {pane!r}")
+                )
+            )
+            pane = None
+        if isinstance(bounded, dict):
+            containment["last_owned_process_count"] = bounded.get("count")
+        if isinstance(bounded, dict) and bounded.get("state") == "empty" and pane == "gone":
             return _proven(containment, *result_and_label)
+        if programming_errors:
+            return _blocked(containment, programming_errors[0])
+        ambiguous = (
+            not isinstance(bounded, dict)
+            or bounded.get("state") == "cannot-tell"
+            or pane == "cannot-tell"
+        )
         if now_ns() >= deadline:
-            return _blocked(containment, "bounded containment deadline expired")
+            error = (
+                "bounded containment remained ambiguous until budget expiry"
+                if ambiguous
+                else "bounded containment budget expired"
+            )
+            return _blocked(containment, error)
         _poll(now_ns, poll, deadline)
 
 
@@ -1042,12 +1291,26 @@ def observe_containment(
     record: dict,
     handles: dict,
     *,
+    host_boot_identity: str | None,
     now_ns: Callable[[], int] = time.monotonic_ns,
     poll: Callable[[float], None] = time.sleep,
 ) -> dict:
     """Run one persisted containment state to its next durable transition."""
-    containment = start_containment(record, now_ns=now_ns)
-    if containment["state"] in {"proven", "blocked"}:
+    if record["containment"]["state"] == "proven":
+        return dict(record["containment"])
+    original_state = record["containment"]["state"]
+    if original_state == "blocked":
+        containment = normalize_legacy_blocked_containment(record, now_ns=now_ns)
+    elif original_state in {"not_started", "pane_close_pending"}:
+        containment = arm_phase(record["containment"], "grace", now_ns=now_ns)
+    elif host_boot_identity != record["boot_id"]:
+        containment = arm_phase(record["containment"], original_state, now_ns=now_ns)
+    else:
+        try:
+            containment = continue_phase(record["containment"])
+        except ValueError as error:
+            return _blocked(dict(record["containment"]), str(error))
+    if containment["state"] == "proven":
         return containment
     mode = record["ownership"]["proof_mode"]
     if mode == "linux-strict":
