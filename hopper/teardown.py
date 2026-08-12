@@ -574,34 +574,21 @@ def capture_ownership(
             "ownership": None,
             "error": "root identity changed during capture",
         }
-    # The bounded platforms cannot rely on a cgroup after pane closure.  Seed
-    # their retained set with every member of the supervisor's original
-    # process group as well as transitive descendants.  Retention is by birth
-    # identity from this point onward; the numeric PGID is never a kill target.
-    descendants_by_pid = {
-        identity["pid"]: identity
-        for identity in table["identities"]
-        if identity["pgid"] == process_group
-        and identity["pid"] not in {root["pid"] for root in roots}
-    }
-    descendants_by_pid.update(
-        {identity["pid"]: identity for identity in capture_descendants(roots, table["identities"])}
+
+    discovered = _discover_owned_descendants(
+        roots,
+        process_group,
+        table["identities"],
+        process_reader=read_process_identity,
+        identity_kwargs={"platform": platform, **identity_kwargs},
     )
-    descendants = sorted(descendants_by_pid.values(), key=lambda identity: identity["pid"])
-    verified_descendants = []
-    for descendant in descendants:
-        observed = read_process_identity(descendant["pid"], platform=platform, **identity_kwargs)
-        if observed["state"] == "gone":
-            continue
-        if observed["state"] != "alive":
-            return {
-                "state": "cannot-tell",
-                "ownership": None,
-                "error": "descendant identity became ambiguous during capture",
-            }
-        if same_birth(descendant, observed["identity"]):
-            verified_descendants.append(observed["identity"])
-    descendants = verified_descendants
+    if discovered["state"] == "ambiguous":
+        return {
+            "state": "cannot-tell",
+            "ownership": None,
+            "error": "descendant identity became ambiguous during capture",
+        }
+    descendants = discovered["descendants"]
 
     unit = None
     cgroup = None
@@ -641,6 +628,127 @@ def capture_ownership(
             "unit": unit,
             "cgroup": cgroup,
         },
+        "error": None,
+    }
+
+
+def _discover_owned_descendants(
+    roots: list[dict],
+    process_group: int,
+    process_table: list[dict],
+    *,
+    process_reader: Callable[..., dict],
+    identity_kwargs: dict,
+) -> dict:
+    """Discover and birth-verify the owned descendants of recorded roots."""
+    # The bounded platforms cannot rely on a cgroup after pane closure.  Seed
+    # their retained set with every member of the supervisor's original
+    # process group as well as transitive descendants.  Retention is by birth
+    # identity from this point onward; the numeric PGID is never a kill target.
+    descendants_by_pid = {
+        identity["pid"]: identity
+        for identity in process_table
+        if identity["pgid"] == process_group
+        and identity["pid"] not in {root["pid"] for root in roots}
+    }
+    descendants_by_pid.update(
+        {identity["pid"]: identity for identity in capture_descendants(roots, process_table)}
+    )
+    descendants = sorted(descendants_by_pid.values(), key=lambda identity: identity["pid"])
+    verified_descendants = []
+    for descendant in descendants:
+        observed = process_reader(descendant["pid"], **identity_kwargs)
+        if observed["state"] == "gone":
+            continue
+        if observed["state"] != "alive":
+            return {"state": "ambiguous", "descendants": None}
+        if same_birth(descendant, observed["identity"]):
+            verified_descendants.append(observed["identity"])
+    return {"state": "discovered", "descendants": verified_descendants}
+
+
+def _merge_discovered_descendants(ownership: dict, discovered: list[dict]) -> list[dict]:
+    """Union discovery into recorded descendants without accepting PID reuse."""
+    root_pids = {
+        ownership["pane"]["root_process"]["pid"],
+        ownership["supervisor"]["pid"],
+        ownership["worker"]["pid"],
+    }
+    merged = {
+        identity["pid"]: identity
+        for identity in ownership["descendants"]
+        if identity["pid"] not in root_pids
+    }
+    for identity in discovered:
+        pid = identity["pid"]
+        if pid in root_pids:
+            continue
+        recorded = merged.get(pid)
+        if recorded is None or same_birth(recorded, identity):
+            merged[pid] = identity
+    return [merged[pid] for pid in sorted(merged)]
+
+
+def discover_owned_set(
+    ownership: dict,
+    *,
+    boot_id_reader: Callable | None = None,
+    process_table_reader: Callable | None = None,
+    process_reader: Callable | None = None,
+    proc_root: Path = Path("/proc"),
+    run: Callable | None = None,
+) -> dict:
+    """Discover descendants from recorded ownership immediately before pane close."""
+    platform = platform_name(ownership["platform"])
+    boot_id_reader = read_boot_id if boot_id_reader is None else boot_id_reader
+    process_table_reader = (
+        read_process_table if process_table_reader is None else process_table_reader
+    )
+    process_reader = read_process_identity if process_reader is None else process_reader
+    run = subprocess.run if run is None else run
+    boot_id = boot_id_reader(proc_root=proc_root) if platform == "linux" else None
+    if platform == "linux" and boot_id is None:
+        return {"state": "cannot-tell", "descendants": None, "error": "boot ID unavailable"}
+    identity_kwargs = (
+        {"platform": platform, "proc_root": proc_root, "boot_id": boot_id}
+        if platform == "linux"
+        else {"platform": platform, "run": run}
+    )
+    table = process_table_reader(
+        platform=platform,
+        proc_root=proc_root,
+        boot_id=boot_id,
+        run=run,
+    )
+    if table["state"] != "complete":
+        # This lode moves an existing capture-phase wedge to pane close rather than creating one;
+        # cto-70 carries the fix for the underlying persistently rejecting process table.
+        return {
+            "state": "cannot-tell",
+            "descendants": None,
+            "error": table.get("error") or "process table is incomplete",
+        }
+    roots = [
+        ownership["pane"]["root_process"],
+        ownership["supervisor"],
+        ownership["worker"],
+    ]
+    discovered = _discover_owned_descendants(
+        roots,
+        ownership["process_group"],
+        table["identities"],
+        process_reader=process_reader,
+        identity_kwargs=identity_kwargs,
+    )
+    if discovered["state"] == "ambiguous":
+        return {
+            "state": "cannot-tell",
+            "descendants": None,
+            "error": "descendant identity became ambiguous during owned-set discovery",
+        }
+    return {
+        "state": "discovered",
+        "descendants": _merge_discovered_descendants(ownership, discovered["descendants"]),
         "error": None,
     }
 

@@ -2584,10 +2584,14 @@ class Server:
                 else:
                     result = {"ok": True}
             elif phase == "capturing_ownership":
-                result = self._recapture_action_ownership(record, retained_pidfd)
+                ownership = record["ownership"]
+                ownership.update(
+                    captured=True,
+                    captured_at_ms=actions.accepted_at_ms(),
+                )
+                result = {"ok": True, "ownership": ownership, "error": None}
             elif phase == "closing_pane":
-                closed = teardown.close_owned_pane(record["ownership"])
-                result = {"ok": closed["state"] == "gone", "error": closed["error"]}
+                result = self._close_action_pane(record)
             elif phase in {"observing_containment", "force_killing"}:
                 result = self._observe_action_containment(record, retained_pidfd)
             elif phase == "proving_ship_landing":
@@ -2784,91 +2788,34 @@ class Server:
             return {"ok": False, "error": "pane bootstrap did not publish its exact receipt"}
         return {"ok": True, "pane_id": pane_id, "adopted": False}
 
-    def _recapture_action_ownership(self, record: dict, retained_pidfd: int | None) -> dict:
-        """Reverify generation ownership immediately before pane closure."""
+    @staticmethod
+    def _close_action_pane(record: dict) -> dict:
+        """Discover the owned set before closing the recorded pane."""
         ownership = record["ownership"]
-        source_path = actions.lode_dir(record["lode_id"]) / ownership["source_record_relative_path"]
-        if actions.durable_json_sha256(source_path) != ownership["source_record_sha256"]:
-            raise RuntimeError("generation ownership record digest changed")
-        source = actions.load_run_ownership(
-            record["lode_id"], record["expected_generation"], require_worker=True
-        )
-        if source is None:
-            raise RuntimeError("generation ownership record is absent")
-        systemctl = oom.find_systemctl() if source["proof_mode"] == "linux-strict" else None
-        captured = teardown.capture_ownership(
-            pane_id=source["pane"]["pane_id"],
-            supervisor_pid=source["supervisor"]["pid"],
-            worker_pid=source["worker"]["pid"],
-            process_group=source["process_group"],
-            unit_name=source["unit_name"],
-            systemctl=systemctl,
-            platform=source["platform"],
-        )
-        if captured["state"] != "captured":
-            raise RuntimeError(captured["error"] or "generation ownership cannot be recaptured")
-        current = captured["ownership"]
-        for key in ("platform", "proof_mode", "pane", "supervisor", "worker", "process_group"):
-            if current[key] != ownership[key]:
-                raise RuntimeError(f"generation {key} identity changed before pane closure")
-        final_ownership = {
-            **ownership,
-            **current,
-            "captured": True,
-            "captured_at_ms": actions.accepted_at_ms(),
-        }
-        if current["proof_mode"] != "linux-strict":
-            return {"ok": True, "ownership": final_ownership}
-
-        opened = []
-        try:
-            pidfd_interface = teardown.resolve_pidfd_interface()
-            if pidfd_interface is None:
-                raise RuntimeError("pidfd_open and pidfd_send_signal are unavailable")
-            pidfd = retained_pidfd
-            pidfd_owned = False
-            if pidfd is None:
-                reopened = teardown.reopen_process_pidfd(
-                    current["supervisor"], pidfd_interface=pidfd_interface
-                )
-                if reopened["state"] != "alive":
-                    raise RuntimeError(reopened["error"] or "outside supervisor identity is gone")
-                pidfd = reopened["fd"]
-                pidfd_owned = True
-                opened.append(pidfd)
-
-            cgroup_fd, cgroup_error = teardown._opened_cgroup(current["cgroup"])
-            if cgroup_fd is None:
-                raise RuntimeError(cgroup_error or "recorded cgroup directory is unavailable")
-            opened.append(cgroup_fd)
-
-            pane_root_pidfd = None
-            pane_root_pidfd_owned = False
-            pane_root = current["pane"]["root_process"]
-            if pane_root["pid"] != current["supervisor"]["pid"]:
-                reopened = teardown.reopen_process_pidfd(pane_root, pidfd_interface=pidfd_interface)
-                if reopened["state"] != "alive":
-                    raise RuntimeError(reopened["error"] or "pane root identity is gone")
-                pane_root_pidfd = reopened["fd"]
-                pane_root_pidfd_owned = True
-                opened.append(pane_root_pidfd)
-        except Exception:
-            for fd in set(opened):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            raise
-        return {
-            "ok": True,
-            "ownership": final_ownership,
-            "pidfd": pidfd,
-            "pidfd_owned": pidfd_owned,
-            "cgroup_fd": cgroup_fd,
-            "cgroup_fd_owned": True,
-            "pane_root_pidfd": pane_root_pidfd,
-            "pane_root_pidfd_owned": pane_root_pidfd_owned,
-        }
+        discovered = teardown.discover_owned_set(ownership)
+        if discovered["state"] != "discovered":
+            if ownership["proof_mode"] != "linux-strict":
+                return {
+                    "ok": False,
+                    "error": (
+                        "owned process enumeration before pane close failed: "
+                        f"{discovered['error']}"
+                    ),
+                }
+            # Deliberate source-spec polarity: strict containment proves the cgroup,
+            # supervisor, and pane root and never reads descendants, so do not block
+            # teardown on a /proc walk whose result would be discarded.
+            logger.warning(
+                "Owned process enumeration failed before pane close; strict "
+                "containment will continue lode=%s error=%s",
+                record["lode_id"],
+                discovered["error"],
+            )
+        closed = teardown.close_owned_pane(ownership)
+        result = {"ok": closed["state"] == "gone", "error": closed["error"]}
+        if discovered["state"] == "discovered":
+            result["descendants"] = discovered["descendants"]
+        return result
 
     @staticmethod
     def _merge_observed_descendants(

@@ -142,6 +142,7 @@ def _mock_client(server: Server) -> MagicMock:
 
 
 TEST_RUN_GENERATION = "a" * 32
+PENDING_ACTION_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pending-actions"
 
 
 def test_reconnecting_is_server_only_and_rejects_progress():
@@ -582,6 +583,121 @@ def _action_step_result(record: dict, *, phase: str, result: dict) -> dict:
         "attempt_id": record["markers"][marker_name]["attempt_id"],
         "result": result,
     }
+
+
+def _join_action_step(server: Server, record: dict, phase: str) -> dict:
+    """Join a real action worker and return its queued result."""
+    thread = server.action_threads[(record["action_id"], phase)]
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    internal, _conn = server.event_queue.get(timeout=2)
+    assert internal["type"] == "_action_step_result"
+    assert internal["action_id"] == record["action_id"]
+    assert internal["phase"] == phase
+    return internal
+
+
+def _root_free_process_table(
+    ownership: dict,
+    identities: list[dict],
+    *,
+    state: str = "complete",
+    error: str | None = None,
+) -> dict:
+    """Build a fake table that explicitly excludes every recorded root."""
+    root_pids = {
+        ownership["pane"]["root_process"]["pid"],
+        ownership["supervisor"]["pid"],
+        ownership["worker"]["pid"],
+    }
+    assert root_pids.isdisjoint(identity["pid"] for identity in identities)
+    return {"state": state, "identities": identities, "error": error}
+
+
+def _validated_pending_variant(record: dict) -> dict:
+    """Exercise the durable writer and real pending-action validator."""
+    actions.write_pending_action(record)
+    return actions.load_pending_action(record["lode_id"])
+
+
+def _blocked_capture_completion_record() -> dict:
+    record = _pending_completion_record()
+    _complete_marker(record, "output_publish")
+    record["output"].update(published=True, failure=None)
+    actions.transition_marker(record, "ownership_capture", "intent")
+    actions.transition_marker(
+        record,
+        "ownership_capture",
+        "blocked",
+        attempt_id=record["markers"]["ownership_capture"]["attempt_id"],
+        detail="capture interrupted",
+    )
+    record["phase"] = "containment_blocked"
+    record["recovery"] = {
+        "kind": "ownership",
+        "message": "capture interrupted",
+        "command": actions.recovery_command(record, "ownership"),
+    }
+    return _validated_pending_variant(record)
+
+
+def _pending_manual_record_with_ownership(ownership: dict, *, action_id: str = "d" * 32) -> dict:
+    source = actions.write_run_ownership(ownership)
+    record = actions.new_pending_action(
+        lode_id=ownership["lode_id"],
+        stage="mill",
+        expected_generation=ownership["run_generation"],
+        action_type="pause",
+        target_disposition="paused",
+        force_consent=False,
+        ownership_record=ownership,
+        source_record_sha256=actions.durable_json_sha256(source),
+        action_id=action_id,
+    )
+    return _validated_pending_variant(record)
+
+
+def _blocked_pane_close_record(ownership: dict) -> dict:
+    record = _pending_manual_record_with_ownership(ownership)
+    _complete_marker(record, "ownership_capture")
+    record["ownership"].update(captured=True, captured_at_ms=1_001)
+    record["containment"]["state"] = "pane_close_pending"
+    actions.transition_marker(record, "pane_close", "intent")
+    actions.transition_marker(
+        record,
+        "pane_close",
+        "blocked",
+        attempt_id=record["markers"]["pane_close"]["attempt_id"],
+        detail="pane-close discovery interrupted",
+    )
+    record["phase"] = "containment_blocked"
+    record["recovery"] = {
+        "kind": "ownership",
+        "message": "pane-close discovery interrupted",
+        "command": actions.recovery_command(record, "ownership"),
+    }
+    return _validated_pending_variant(record)
+
+
+def _capture_without_live_probes(server: Server, record: dict) -> dict:
+    """Retry capture while making every former live dependency fatal."""
+
+    def rejected_probe(*_args, **_kwargs):
+        raise AssertionError("capture phase consulted a live probe")
+
+    with (
+        patch("hopper.server.teardown.tmux.pane_identity", side_effect=rejected_probe),
+        patch("hopper.server.teardown.read_process_identity", side_effect=rejected_probe),
+        patch("hopper.server.teardown.read_boot_id", side_effect=rejected_probe),
+        patch("hopper.server.teardown.read_host_boot_identity", side_effect=rejected_probe),
+        patch("hopper.server.teardown.read_process_table", side_effect=rejected_probe),
+        patch("hopper.server.teardown.capture_scope_cgroup", side_effect=rejected_probe),
+        patch("hopper.server.teardown._opened_cgroup", side_effect=rejected_probe),
+        patch("hopper.server.teardown.resolve_pidfd_interface", side_effect=rejected_probe),
+        patch("hopper.server.teardown.reopen_process_pidfd", side_effect=rejected_probe),
+    ):
+        server._retry_action(record["lode_id"], None)
+        return _join_action_step(server, record, "capturing_ownership")
 
 
 def _spawning_completion_record() -> dict:
@@ -1956,6 +2072,252 @@ def test_containment_retry_preserves_the_remaining_waiting_budget(socket_path):
         retry["containment"]["deadline_monotonic_ns"],
     ) == budget
     assert retry["containment"]["last_error"] is None
+
+
+@pytest.mark.parametrize("record_kind", ["completion", "restart"])
+def test_real_capture_adopts_recorded_ownership_without_live_probes(
+    tmp_path, socket_path, record_kind
+):
+    """AC1: completion and restart capture adopt without consulting the host."""
+    if record_kind == "completion":
+        record = _blocked_capture_completion_record()
+    else:
+        fixture_bytes = (
+            PENDING_ACTION_FIXTURE_DIR / "wedged-restart-ownership-blghq7to.json"
+        ).read_bytes()
+        lode_id = json.loads(fixture_bytes)["lode_id"]
+        target = tmp_path / "lodes" / lode_id / "pending-completion.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(fixture_bytes)
+        record = actions.load_pending_action(lode_id)
+    server = Server(socket_path)
+
+    captured = _capture_without_live_probes(server, record)
+
+    assert captured["result"]["error"] is None
+    assert captured["result"]["ok"] is True
+    assert captured["result"]["ownership"]["captured"] is True
+    assert isinstance(captured["result"]["ownership"]["captured_at_ms"], int)
+    descriptor_keys = {
+        "pidfd",
+        "pidfd_owned",
+        "cgroup_fd",
+        "cgroup_fd_owned",
+        "pane_root_pidfd",
+        "pane_root_pidfd_owned",
+    }
+    assert descriptor_keys.isdisjoint(captured["result"])
+
+    table = _root_free_process_table(record["ownership"], [])
+    with (
+        patch("hopper.server.teardown.read_boot_id", return_value=record["boot_id"]),
+        patch("hopper.server.teardown.read_process_table", return_value=table),
+        patch(
+            "hopper.server.teardown.close_owned_pane",
+            return_value={"state": "cannot-tell", "error": "test stop"},
+        ),
+    ):
+        server._handle_action_step_result(captured)
+        closed = _join_action_step(server, record, "closing_pane")
+    assert closed["result"]["error"] == "test stop"
+
+
+def test_pane_close_discovery_seeds_from_recorded_process_group(socket_path):
+    """AC2: an escaped same-PGID process enters the owned set at closure."""
+    record = _blocked_pane_close_record(_completion_run_ownership())
+    ownership = record["ownership"]
+    escaped = _completion_process(150, 999, ownership["process_group"])
+    root_pids = {
+        ownership["pane"]["root_process"]["pid"],
+        ownership["supervisor"]["pid"],
+        ownership["worker"]["pid"],
+    }
+    recorded_descendant_pids = {item["pid"] for item in ownership["descendants"]}
+    assert escaped["pgid"] == ownership["process_group"]
+    assert escaped["pid"] not in recorded_descendant_pids
+    assert escaped["ppid"] not in root_pids
+    table = _root_free_process_table(ownership, [escaped])
+    server = Server(socket_path)
+
+    with (
+        patch("hopper.server.teardown.read_boot_id", return_value=record["boot_id"]),
+        patch("hopper.server.teardown.read_process_table", return_value=table),
+        patch(
+            "hopper.server.teardown.read_process_identity",
+            return_value={"state": "alive", "identity": escaped, "error": None},
+        ),
+        patch(
+            "hopper.server.teardown.close_owned_pane",
+            return_value={"state": "cannot-tell", "error": "test stop"},
+        ),
+    ):
+        server._retry_action(record["lode_id"], None)
+        closed = _join_action_step(server, record, "closing_pane")
+
+    assert closed["result"]["ok"] is False
+    assert escaped in closed["result"]["descendants"]
+    server._handle_action_step_result(closed)
+    durable = actions.load_pending_action(record["lode_id"])
+    assert escaped in durable["ownership"]["descendants"]
+
+
+@pytest.mark.parametrize("failure_mode", ["incomplete", "ambiguous"])
+@pytest.mark.parametrize("proof_mode", ["linux-degraded", "linux-strict"])
+def test_pane_close_discovery_failure_uses_platform_policy(
+    socket_path, caplog, failure_mode, proof_mode
+):
+    """AC5: bounded discovery blocks while strict containment warns and proceeds."""
+    ownership = (
+        _strict_completion_run_ownership()
+        if proof_mode == "linux-strict"
+        else _completion_run_ownership()
+    )
+    record = _blocked_pane_close_record(ownership)
+    if failure_mode == "incomplete":
+        table = _root_free_process_table(
+            ownership,
+            [],
+            state="unknown",
+            error="process table unavailable",
+        )
+        process_observation = {"state": "gone", "identity": None, "error": None}
+        detail = "process table unavailable"
+    else:
+        candidate = _completion_process(150, 999, ownership["process_group"])
+        table = _root_free_process_table(ownership, [candidate])
+        process_observation = {
+            "state": "cannot-tell",
+            "identity": None,
+            "error": "birth unavailable",
+        }
+        detail = "descendant identity became ambiguous during owned-set discovery"
+    server = Server(socket_path)
+
+    with (
+        patch("hopper.server.teardown.read_boot_id", return_value=record["boot_id"]),
+        patch("hopper.server.teardown.read_process_table", return_value=table),
+        patch(
+            "hopper.server.teardown.read_process_identity",
+            return_value=process_observation,
+        ),
+        patch(
+            "hopper.server.teardown.close_owned_pane",
+            return_value={"state": "gone", "error": None},
+        ) as close_pane,
+    ):
+        with caplog.at_level(logging.WARNING, logger="hopper.server"):
+            server._retry_action(record["lode_id"], None)
+            closed = _join_action_step(server, record, "closing_pane")
+
+    if proof_mode != "linux-strict":
+        assert closed["result"] == {
+            "ok": False,
+            "error": f"owned process enumeration before pane close failed: {detail}",
+        }
+        close_pane.assert_not_called()
+        server._handle_action_step_result(closed)
+        durable = actions.load_pending_action(record["lode_id"])
+        assert durable["markers"]["ownership_capture"]["state"] == "done"
+        assert durable["markers"]["pane_close"]["state"] == "blocked"
+        assert durable["phase"] == "containment_blocked"
+        assert durable["recovery"]["kind"] == "ownership"
+        return
+
+    assert closed["result"] == {"ok": True, "error": None}
+    assert "descendants" not in closed["result"]
+    close_pane.assert_called_once()
+    assert any(
+        "Owned process enumeration failed before pane close; strict containment will continue"
+        in message
+        and detail in message
+        for message in caplog.messages
+    )
+    with (
+        patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+        patch("hopper.server.teardown.resolve_pidfd_interface", return_value={}),
+        patch(
+            "hopper.server.teardown.reopen_process_pidfd",
+            return_value={"state": "gone", "fd": None, "error": None},
+        ),
+        patch("hopper.server.teardown._opened_cgroup", return_value=(None, "absent")),
+        patch("hopper.server.oom.find_systemctl", return_value="/bin/systemctl"),
+        patch(
+            "hopper.server.oom.read_scope_control_group",
+            return_value={"state": "absent", "control_group": None},
+        ),
+        patch(
+            "hopper.server.teardown.observe_bounded_processes",
+            side_effect=AssertionError("strict containment consulted descendants"),
+        ) as bounded_observer,
+        patch.object(
+            server,
+            "_merge_observed_descendants",
+            side_effect=AssertionError("strict containment merged descendants"),
+        ) as descendant_merge,
+    ):
+        server._handle_action_step_result(closed)
+        observed = _join_action_step(server, record, "observing_containment")
+    assert observed["result"]["containment"]["result"] == "linux-strict-empty"
+    with patch.object(server, "_continue_action"):
+        server._handle_action_step_result(observed)
+    durable = actions.load_pending_action(record["lode_id"])
+    assert durable["phase"] == "publishing_terminal"
+    assert durable["markers"]["pane_close"]["state"] == "done"
+    bounded_observer.assert_not_called()
+    descendant_merge.assert_not_called()
+
+
+@pytest.mark.parametrize("instrument_recovers", [True, False])
+def test_pane_close_ownership_retry_repeats_real_discovery(
+    socket_path, make_lode, instrument_recovers
+):
+    """AC6: pane-close ownership retry either completes or blocks again."""
+    record = _blocked_pane_close_record(_completion_run_ownership())
+    table = _root_free_process_table(record["ownership"], [])
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage=record["stage"],
+        state="teardown",
+        active=True,
+        tmux_pane=record["ownership"]["pane"]["pane_id"],
+        pid=record["ownership"]["supervisor"]["pid"],
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server.lodes = [lode]
+    observed_table = (
+        table if instrument_recovers else {**table, "state": "unknown", "error": "still rejecting"}
+    )
+
+    with (
+        patch("hopper.server.teardown.read_boot_id", return_value=record["boot_id"]),
+        patch("hopper.server.teardown.read_host_boot_identity", return_value=record["boot_id"]),
+        patch("hopper.server.teardown.read_process_table", return_value=observed_table),
+        patch(
+            "hopper.server.teardown.close_owned_pane",
+            return_value={"state": "gone", "error": None},
+        ),
+        patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
+    ):
+        server._retry_action(record["lode_id"], None)
+        closed = _join_action_step(server, record, "closing_pane")
+        server._handle_action_step_result(closed)
+        if instrument_recovers:
+            observed = _join_action_step(server, record, "observing_containment")
+            server._handle_action_step_result(observed)
+
+    if instrument_recovers:
+        assert actions.load_pending_action(record["lode_id"]) is None
+        assert lode["state"] == "paused"
+        assert lode["action_results"][-1]["terminal_disposition"] == "paused"
+    else:
+        # cto-70 carries the fix for persistently rejecting process tables.
+        durable = actions.load_pending_action(record["lode_id"])
+        assert durable["markers"]["ownership_capture"]["state"] == "done"
+        assert durable["markers"]["pane_close"]["state"] == "blocked"
+        assert durable["phase"] == "containment_blocked"
+        assert durable["recovery"]["kind"] == "ownership"
 
 
 def test_same_boot_resume_schedules_the_recorded_cursor_without_rearming(socket_path):

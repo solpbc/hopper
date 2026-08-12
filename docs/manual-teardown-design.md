@@ -281,26 +281,36 @@ not by attempting a new restart identity.
 
 ## 5. Shared teardown and per-verb state machines
 
-All active-generation paths share exact ownership capture, PTY close,
-containment observation, optional scoped/supervisor kill, and empty proof. They
+All active-generation paths adopt the exact ownership facts durably recorded at
+acceptance, discover additional owned descendants immediately before exact PTY
+close, then perform containment observation, optional scoped/supervisor kill,
+and empty proof. They
 reuse the worker/result attempt guard at `hopper/server.py:1962-2057`; no verb
 may directly null pane/PID/OOM identity as the old pause and kill paths do at
 `hopper/server.py:3883-3910` and `:3978-4001`.
 
 | Action | Ordered phases | Ordered markers | Terminal publication |
 |---|---|---|---|
-| completion | accepted; publishing output; capture ownership; close pane; observe containment; force kill if needed; publish terminal; completion-specific ship/quarantine/cleanup; spawn when advancing; complete | output publish; ownership capture; pane close; containment; optional scope/supervisor kill; ship/cleanup markers as applicable; lode mutation; archive/backlog as applicable; spawn as applicable; pending clear | existing stage advance or shipped archive, then optional successor adoption |
-| pause | accepted; capture ownership; close pane; observe containment; force kill if needed; publish terminal; complete | ownership capture; pane close; containment; optional scope/supervisor kill; lode mutation; pending clear | state `paused`, inactive, pane/PID/OOM handle cleared only after proof; stage, worktree, branch, and Claude stage session retained |
-| restart | accepted; capture ownership; close pane; observe containment; force kill if needed; publish terminal; spawn; complete | ownership capture; pane close; containment; optional scope/supervisor kill; lode mutation; spawn; pending clear | after empty, reset only the accepted stage session/progress, then create and adopt exactly one replacement generation |
-| kill | accepted; capture ownership; close pane; force kill/observe containment; check durability; publish terminal; complete | ownership capture; pane close; scope/supervisor kill as observed; containment; durability recheck; archive; pending clear | archive once with killed status and `killed_archived` result; worktree and branch retained |
-| active/parked archive | accepted; capture ownership; close pane; observe containment; force kill if needed; check durability; publish terminal; complete | ownership capture; pane close; containment; optional scope/supervisor kill; durability recheck; archive; pending clear | archive once with `archived` result; worktree and branch retained |
+| completion | accepted; publishing output; adopt recorded ownership (`capturing_ownership`); close pane; observe containment; force kill if needed; publish terminal; completion-specific ship/quarantine/cleanup; spawn when advancing; complete | output publish; ownership capture; pane close; containment; optional scope/supervisor kill; ship/cleanup markers as applicable; lode mutation; archive/backlog as applicable; spawn as applicable; pending clear | existing stage advance or shipped archive, then optional successor adoption |
+| pause | accepted; adopt recorded ownership (`capturing_ownership`); close pane; observe containment; force kill if needed; publish terminal; complete | ownership capture; pane close; containment; optional scope/supervisor kill; lode mutation; pending clear | state `paused`, inactive, pane/PID/OOM handle cleared only after proof; stage, worktree, branch, and Claude stage session retained |
+| restart | accepted; adopt recorded ownership (`capturing_ownership`); close pane; observe containment; force kill if needed; publish terminal; spawn; complete | ownership capture; pane close; containment; optional scope/supervisor kill; lode mutation; spawn; pending clear | after empty, reset only the accepted stage session/progress, then create and adopt exactly one replacement generation |
+| kill | accepted; adopt recorded ownership (`capturing_ownership`); close pane; force kill/observe containment; check durability; publish terminal; complete | ownership capture; pane close; scope/supervisor kill as observed; containment; durability recheck; archive; pending clear | archive once with killed status and `killed_archived` result; worktree and branch retained |
+| active/parked archive | accepted; adopt recorded ownership (`capturing_ownership`); close pane; observe containment; force kill if needed; check durability; publish terminal; complete | ownership capture; pane close; containment; optional scope/supervisor kill; durability recheck; archive; pending clear | archive once with `archived` result; worktree and branch retained |
 | inactive, already-empty archive | accepted; publish terminal; complete | ownership/pane/containment markers constructed done with explicit no-owner proof; archive; pending clear | immediate archive after durable acceptance, with no PTY/process side effect |
+
+The persisted `capturing_ownership` phase and `ownership_capture` marker remain
+fleet vocabulary; the phase now adopts the acceptance record rather than
+re-deriving live ownership. Pane close first expands the recorded descendant
+set; bounded/degraded modes block if enumeration is unavailable, while strict
+Linux logs the residual and proceeds because strict containment does not consume
+descendants.
 
 Kill observes every containment surface once, then enters `kill_pending` with a fresh
 verification budget; ordinary teardown enters `kill_pending` after its waiting budget expires.
 `force_consent` does not control that scheduling. Restart `--force` only consents
 to discarding an active/started stage. It does not authorize worktree cleanup,
-bypass ownership capture, shorten empty proof, or admit a spawn before proof.
+bypass recorded-ownership adoption or pane-close owned-set discovery, shorten
+empty proof, or admit a spawn before proof.
 Kill `--force` only overrides the unpushed/unknown durability refusal; cleanup
 remains out of scope and worktree/branch remain retained.
 
