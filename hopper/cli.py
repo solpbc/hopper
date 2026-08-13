@@ -4291,8 +4291,23 @@ def cmd_lode(args: list[str]) -> int:
         if lode.get("active") or any(
             lode.get(field) is not None for field in ("tmux_pane", "pid", "oom_scope")
         ):
-            print(f"Cannot archive: lode {lode_id} is not already inactive and empty.")
-            print(f"Use: hop lode kill {lode_id}")
+            blockers = []
+            if lode.get("active"):
+                blockers.append(f"active={lode.get('active')!r}")
+            for field in ("tmux_pane", "pid", "oom_scope"):
+                value = lode.get(field)
+                if value is not None:
+                    blockers.append(f"{field}={value!r}")
+            print(f"Cannot archive: lode {lode_id} has recorded blockers: {', '.join(blockers)}.")
+            print(
+                "This check reads the lode's recorded fields; it does not probe the "
+                "live pane or process."
+            )
+            print(
+                f"Recovery: hop lode kill {lode_id} clears the recorded handles only "
+                "while the run ownership record is loadable."
+            )
+            print("Where it is not loadable, kill refuses for the same reason.")
             return 1
         identity = _manual_action_identity(parsed, lode, "archive")
         if identity is None:

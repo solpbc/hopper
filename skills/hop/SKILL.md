@@ -247,6 +247,12 @@ archives the stale row while retaining the worktree and branch. Submit the scope
 a new lode if it still needs to run. Restart remains the recovery when ownership is
 available.
 
+`hop lode archive` refuses unless the lode record's `active` flag is false and its
+recorded `tmux_pane`, `pid`, and `oom_scope` fields are all empty. This checks the
+lode record, not the machine: a recorded handle to a pane that has already been
+killed still blocks archive, because the command reads recorded fields and does
+not probe the pane or process. The refusal names the fields that blocked it.
+
 Kill a lode (the pane and process go; the worktree and branch are retained):
 
 ```bash

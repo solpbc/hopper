@@ -2283,8 +2283,86 @@ def test_lode_archive_refuses_nonempty_runner_without_server_mutation(capsys):
 
     archive.assert_not_called()
     output = capsys.readouterr().out
-    assert "not already inactive and empty" in output
-    assert "hop lode kill abcd2345" in output
+    assert "tmux_pane" in output
+    assert "%7" in output
+    assert "active" not in output
+    assert "pid" not in output
+    assert "oom_scope" not in output
+
+
+def test_lode_archive_refuses_active_only_and_names_no_handle_blockers(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "active": True,
+        "tmux_pane": None,
+        "pid": None,
+        "oom_scope": None,
+        "run_generation": "b" * 32,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.archive_lode") as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 1
+
+    archive.assert_not_called()
+    output = capsys.readouterr().out
+    assert "active" in output
+    assert "tmux_pane" not in output
+    assert "pid" not in output
+    assert "oom_scope" not in output
+
+
+def test_lode_archive_refuses_active_tmux_pane_and_oom_scope_blockers(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "active": True,
+        "tmux_pane": "%7",
+        "pid": None,
+        "oom_scope": "hopper-abcd2345.scope",
+        "run_generation": "b" * 32,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.archive_lode") as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 1
+
+    archive.assert_not_called()
+    output = capsys.readouterr().out
+    assert "active" in output
+    assert "tmux_pane" in output
+    assert "oom_scope" in output
+    assert "pid" not in output
+
+
+def test_lode_archive_refuses_pid_only_and_names_no_other_blockers(capsys):
+    lode = {
+        "id": "abcd2345",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "tmux_pane": None,
+        "pid": 1234,
+        "oom_scope": None,
+        "run_generation": "b" * 32,
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.archive_lode") as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 1
+
+    archive.assert_not_called()
+    output = capsys.readouterr().out
+    assert "pid" in output
+    assert "active" not in output
+    assert "tmux_pane" not in output
+    assert "oom_scope" not in output
 
 
 def test_lode_kill_reports_delivery_failure(capsys):
