@@ -324,7 +324,7 @@ def _create_worktree_locked(
 def _git_probe(
     worktree_path: str, args: list[str], timeout: float | None
 ) -> subprocess.CompletedProcess[str] | None:
-    """Run one bounded git command, returning None if it could not run."""
+    """Run one git command, returning None if it could not run."""
     try:
         return subprocess.run(
             ["git", *args],
