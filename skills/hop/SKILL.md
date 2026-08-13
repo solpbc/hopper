@@ -457,11 +457,9 @@ worktree and the branch, so "killed" is not "cleaned up": push the branch,
 verify the SHA from a **second** clone, kill, run
 `git worktree remove --force`, then confirm with `ls ~/.hopper/worktrees/`.
 
-**Workspace trust is Hopper-managed.** Before opening Claude, Hopper attempts to
-record trust in the Claude profile inherited by that lode. Registered project
-roots are trusted exactly; lode worktrees inherit one trust grant on Hopper's
-own worktree root. Treat a workspace-trust dialog in a Hopper pane as a launch
-problem to inspect. Use
+**Workspace trust is Hopper-managed.** Before opening Claude, Hopper records
+trust for the exact workspace it will open, including each lode worktree. Treat
+a workspace-trust dialog in a Hopper pane as a launch problem to inspect. Use
 `hop lode peek <lode-id>` and report the lode, stage, path, and effective
 `CLAUDE_CONFIG_DIR`; do not reflexively answer it or add a manual trust entry.
 
