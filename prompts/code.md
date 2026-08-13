@@ -17,6 +17,7 @@ These are internalized, not optional:
 - **DRY** — don't duplicate logic. Reuse what exists.
 - **Clean breaks** — when updating, update all callers. Remove dead code. No compatibility shims unless directed.
 - **Consistency** — match existing naming, patterns, and conventions in the codebase.
+- **Scratch on disk** — temp clones, worktrees, build dirs and logs go under `/var/tmp`, never `/tmp`. `/tmp` is a RAM-backed tmpfs under a quota; filling it wedges the host for every other lane.
 - **Verify proportionally** — during implementation, run the narrowest relevant checks requested by the senior or repository, each through `hop check --allow-capture` so a truncated log cannot hide a failure (the flag is required from a tool call, which has no TTY). Do not choose a full repository gate yourself. Prep runs tests only for an explicitly requested baseline or reproduction; design, commit, and audit do not run tests.
 
 ## Output
