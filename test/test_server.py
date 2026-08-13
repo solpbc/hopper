@@ -4595,6 +4595,182 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
     assert schedule.call_count == 2
 
 
+@pytest.mark.parametrize(
+    ("state", "expected_ok"),
+    [
+        ("deleted", True),
+        ("already-absent", True),
+        ("retained", True),
+        ("anomalous", False),
+        ("unknown", False),
+    ],
+)
+def test_ship_branch_cleanup_step_maps_git_outcomes(state, expected_ok):
+    record = _pending_completion_record(stage="ship")
+    record["ship"]["landing"]["base_ref"] = "origin/main"
+    error = "branch retained" if state == "retained" else None
+    fact = {"state": state, "error": error}
+
+    with patch("hopper.server.git.delete_branch_if_unchanged", return_value=fact) as delete:
+        result = Server._run_ship_cleanup_step(record, "branch_delete")
+
+    delete.assert_called_once_with(record["ship"]["provenance"], base_ref="origin/main")
+    assert result == {"ok": expected_ok, "fact": fact, "error": error}
+
+
+@pytest.mark.parametrize(
+    ("git_state", "record_outcome", "expected_detail"),
+    [
+        ("deleted", "deleted", "deleted"),
+        ("already-absent", "already_absent", "already-absent"),
+        ("retained", "retained", "not contained in origin/main"),
+    ],
+)
+def test_ship_branch_cleanup_success_records_total_outcome_map(
+    socket_path, git_state, record_outcome, expected_detail
+):
+    record = _pending_completion_record(stage="ship")
+    actions.transition_marker(record, "branch_delete", "intent")
+    record["phase"] = "quarantining"
+    actions.write_pending_action(record)
+    error = expected_detail if git_state == "retained" else None
+    result = {"ok": True, "fact": {"state": git_state, "error": error}, "error": error}
+    server = Server(socket_path)
+    message = {
+        "type": "_action_step_result",
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_id": record["action_id"],
+        "marker_name": "branch_delete",
+        "phase": "quarantining",
+        "attempt_id": record["markers"]["branch_delete"]["attempt_id"],
+        "result": result,
+    }
+
+    with patch.object(server, "_continue_action") as continuation:
+        server._handle_action_step_result(message)
+
+    persisted = actions.load_pending_action(record["lode_id"])
+    assert persisted["ship"]["quarantine"]["branch_outcome"] == record_outcome
+    assert persisted["ship"]["cleanup_failure"] is None
+    assert persisted["markers"]["branch_delete"]["state"] == "done"
+    assert persisted["markers"]["branch_delete"]["detail"] == expected_detail
+    continuation.assert_called_once()
+
+
+def test_retained_ship_branch_cleanup_completes_and_clears_pending_action(socket_path, make_lode):
+    record = _pending_completion_record(stage="ship")
+    for marker_name in (
+        "containment",
+        "ship_landing",
+        "quarantine_rename",
+        "worktree_repair",
+        "cleanup_authorization",
+        "lode_mutation",
+        "archive",
+        "backlog",
+        "worktree_remove",
+    ):
+        _complete_marker(record, marker_name)
+    record["containment"].update(
+        state="proven",
+        result="linux-degraded-bounded-empty",
+        proof_label="bounded Linux containment observed",
+        last_error=None,
+    )
+    record["ship"]["landing"].update(
+        cause="ancestry_contained",
+        base_ref="origin/main",
+        detail="landed",
+        accepted=True,
+    )
+    record["ship"]["archive_published"] = True
+    record["ship"]["quarantine"]["removal_outcome"] = "removed"
+    actions.transition_marker(record, "branch_delete", "intent")
+    record["phase"] = "quarantining"
+    actions.write_pending_action(record)
+    archived = make_lode(
+        id=record["lode_id"],
+        stage="shipped",
+        state="teardown",
+        run_generation=record["expected_generation"],
+        archive_action_id=record["action_id"],
+    )
+    server = Server(socket_path)
+    server.archived_lodes = [archived]
+    reason = "accepted branch OID containment in origin/main is not proven"
+    completed_facts = {}
+    real_clear = server._clear_completed_action
+
+    def capture_completed_record(completed):
+        completed_facts.update(
+            branch_outcome=completed["ship"]["quarantine"]["branch_outcome"],
+            cleanup_failure=completed["ship"]["cleanup_failure"],
+            marker_detail=completed["markers"]["branch_delete"]["detail"],
+        )
+        real_clear(completed)
+
+    message = {
+        "type": "_action_step_result",
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_id": record["action_id"],
+        "marker_name": "branch_delete",
+        "phase": "quarantining",
+        "attempt_id": record["markers"]["branch_delete"]["attempt_id"],
+        "result": {
+            "ok": True,
+            "fact": {"state": "retained", "error": reason},
+            "error": reason,
+        },
+    }
+
+    with patch.object(server, "_clear_completed_action", side_effect=capture_completed_record):
+        server._handle_action_step_result(message)
+
+    assert actions.load_pending_action(record["lode_id"]) is None
+    assert archived["pending_action"] is None
+    assert archived["state"] == "ready"
+    assert "cleanup blocked" not in archived["status"].lower()
+    assert completed_facts == {
+        "branch_outcome": "retained",
+        "cleanup_failure": None,
+        "marker_detail": reason,
+    }
+
+
+@pytest.mark.parametrize("state", ["anomalous", "unknown"])
+def test_failed_ship_branch_cleanup_remains_blocked(socket_path, state):
+    record = _pending_completion_record(stage="ship")
+    actions.transition_marker(record, "branch_delete", "intent")
+    record["phase"] = "quarantining"
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    reason = f"branch deletion is {state}"
+    message = {
+        "type": "_action_step_result",
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_id": record["action_id"],
+        "marker_name": "branch_delete",
+        "phase": "quarantining",
+        "attempt_id": record["markers"]["branch_delete"]["attempt_id"],
+        "result": {
+            "ok": False,
+            "fact": {"state": state, "error": reason},
+            "error": reason,
+        },
+    }
+
+    server._handle_action_step_result(message)
+
+    persisted = actions.load_pending_action(record["lode_id"])
+    assert persisted["phase"] == "cleanup_blocked"
+    assert persisted["markers"]["branch_delete"]["state"] == "blocked"
+    assert persisted["ship"]["quarantine"]["branch_outcome"] == "retained"
+    assert persisted["ship"]["cleanup_failure"] == reason
+
+
 @pytest.mark.parametrize("disabled", [False, True], ids=["cross-project", "disabled-project"])
 def test_ship_backlog_plan_detaches_items_that_cannot_be_promoted(
     socket_path, make_lode, monkeypatch, disabled

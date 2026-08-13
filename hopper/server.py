@@ -2706,9 +2706,9 @@ class Server:
                 "error": fact["error"],
             }
         if marker_name == "branch_delete":
-            fact = git.delete_branch_if_unchanged(provenance)
+            fact = git.delete_branch_if_unchanged(provenance, base_ref=ship["landing"]["base_ref"])
             return {
-                "ok": fact["state"] in {"deleted", "already-absent"},
+                "ok": fact["state"] in {"deleted", "already-absent", "retained"},
                 "fact": fact,
                 "error": fact["error"],
             }
@@ -3321,21 +3321,26 @@ class Server:
 
         if phase == "quarantining":
             fact = result["fact"]
+            marker_detail = fact.get("state") or "authorized"
             if marker_name == "worktree_repair":
                 record["ship"]["quarantine"]["registration_repaired"] = True
             elif marker_name == "worktree_remove":
                 record["ship"]["quarantine"]["removal_outcome"] = "removed"
             elif marker_name == "branch_delete":
-                record["ship"]["quarantine"]["branch_outcome"] = (
-                    "already_absent" if fact["state"] == "already-absent" else "deleted"
-                )
+                record["ship"]["quarantine"]["branch_outcome"] = {
+                    "deleted": "deleted",
+                    "already-absent": "already_absent",
+                    "retained": "retained",
+                }[fact["state"]]
+                if fact["state"] == "retained":
+                    marker_detail = fact["error"]
             record["ship"]["cleanup_failure"] = None
             actions.transition_marker(
                 record,
                 marker_name,
                 "done",
                 attempt_id=marker["attempt_id"],
-                detail=fact.get("state") or "authorized",
+                detail=marker_detail,
             )
             self._persist_action(record, via=f"completion_result:{marker_name}")
             self._continue_action(record)

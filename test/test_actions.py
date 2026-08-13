@@ -122,6 +122,44 @@ def _pending_without_io() -> dict:
     )
 
 
+def _ship_pending_without_io() -> dict:
+    pending = _pending_without_io()
+    pending["stage"] = "ship"
+    pending["next_action"] = {"kind": "ship_archive", "target_stage": None}
+    pending["ship"] = {
+        "provenance": {
+            name: {"realpath": f"/tmp/{name}", "identity": {"st_dev": 1, "st_ino": index}}
+            for index, name in enumerate(
+                ("project", "git_common_dir", "worktree", "worktree_git_dir"), start=1
+            )
+        }
+        | {
+            "branch_ref": "refs/heads/hopper-abcd2345",
+            "branch_oid": "a" * 40,
+            "head_oid": "a" * 40,
+        },
+        "landing": {"cause": None, "base_ref": None, "detail": None, "accepted": False},
+        "backlog": {
+            "planned": False,
+            "selected_item_id": None,
+            "promoted_lode_id": None,
+            "remaining_item_ids": [],
+            "applied": False,
+        },
+        "archive_published": False,
+        "quarantine": {
+            "original_path": "/tmp/worktree",
+            "quarantine_path": "/tmp/quarantine",
+            "expected_identity": {"st_dev": 1, "st_ino": 4},
+            "registration_repaired": False,
+            "removal_outcome": "pending",
+            "branch_outcome": "pending",
+        },
+        "cleanup_failure": None,
+    }
+    return pending
+
+
 def _blocked_facts_text(*, truth="not_started") -> str:
     return (
         f"Action {'1' * 32} owns generation {'2' * 32} for advance refine; "
@@ -629,40 +667,7 @@ def test_completion_status_projects_retryable_publication_failure():
 
 
 def test_linux_degraded_completion_status_preserves_birth_identity_proof():
-    _output, pending = _stage()
-    pending["stage"] = "ship"
-    pending["next_action"] = {"kind": "ship_archive", "target_stage": None}
-    pending["ship"] = {
-        "provenance": {
-            name: {"realpath": f"/tmp/{name}", "identity": {"st_dev": 1, "st_ino": index}}
-            for index, name in enumerate(
-                ("project", "git_common_dir", "worktree", "worktree_git_dir"), start=1
-            )
-        }
-        | {
-            "branch_ref": "refs/heads/hopper-abcd2345",
-            "branch_oid": "a" * 40,
-            "head_oid": "a" * 40,
-        },
-        "landing": {"cause": None, "base_ref": None, "detail": None, "accepted": False},
-        "backlog": {
-            "planned": False,
-            "selected_item_id": None,
-            "promoted_lode_id": None,
-            "remaining_item_ids": [],
-            "applied": False,
-        },
-        "archive_published": False,
-        "quarantine": {
-            "original_path": "/tmp/worktree",
-            "quarantine_path": "/tmp/quarantine",
-            "expected_identity": {"st_dev": 1, "st_ino": 4},
-            "registration_repaired": False,
-            "removal_outcome": "pending",
-            "branch_outcome": "pending",
-        },
-        "cleanup_failure": None,
-    }
+    pending = _ship_pending_without_io()
     pending["phase"] = "complete"
 
     status = actions.action_status(pending)
@@ -671,6 +676,28 @@ def test_linux_degraded_completion_status_preserves_birth_identity_proof():
         "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)"
     )
     assert "birth identity" not in status
+
+
+def test_completed_ship_status_with_retained_branch_is_terminal_not_blocked():
+    pending = _ship_pending_without_io()
+    pending["phase"] = "complete"
+    pending["ship"]["quarantine"]["branch_outcome"] = "retained"
+    actions.transition_marker(pending, "branch_delete", "intent")
+    actions.transition_marker(
+        pending,
+        "branch_delete",
+        "done",
+        attempt_id=pending["markers"]["branch_delete"]["attempt_id"],
+        detail="accepted branch OID containment in origin/main is not proven",
+    )
+
+    status = actions.action_status(pending)
+
+    assert (
+        status == "Shipped (bounded Linux teardown; systemd proof and leak-free cleanup unproven)"
+    )
+    assert "blocked" not in status.lower()
+    assert "retry" not in status.lower()
 
 
 def test_completion_status_projects_generic_block():

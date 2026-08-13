@@ -324,7 +324,7 @@ def _create_worktree_locked(
 def _git_probe(
     worktree_path: str, args: list[str], timeout: float | None
 ) -> subprocess.CompletedProcess[str] | None:
-    """Run one bounded read-only git probe, returning None if it could not run."""
+    """Run one bounded git command, returning None if it could not run."""
     try:
         return subprocess.run(
             ["git", *args],
@@ -1074,46 +1074,73 @@ def remove_quarantined_worktree(repo_identity: dict, quarantine: dict) -> dict:
     return {"state": "retained", "error": detail}
 
 
-def delete_branch_if_unchanged(provenance: dict) -> dict:
-    """Safely delete the accepted branch only if its exact OID still exists."""
+def delete_branch_if_unchanged(provenance: dict, *, base_ref: str | None) -> dict:
+    """Delete the accepted branch only when its recorded OID is contained in the landing base_ref.
+
+    Only exit 0 from git merge-base --is-ancestor authorizes an expected-OID
+    compare-and-delete. A missing or unresolvable base_ref, a nonzero containment
+    result, or an unavailable probe does not authorize deletion.
+    """
     project = provenance["project"]["realpath"]
     for name in ("project", "git_common_dir"):
         if _path_matches(provenance[name]["realpath"], provenance[name]) is not True:
-            return {"state": "retained", "error": f"{name} identity changed"}
+            return {"state": "anomalous", "error": f"{name} identity changed"}
     try:
         records = worktree_registrations(project)
     except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
         return {"state": "unknown", "error": str(exc)}
     if any(record.get("branch") == provenance["branch_ref"] for record in records):
-        return {"state": "retained", "error": "accepted branch is still checked out"}
-    result = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", provenance["branch_ref"]],
-        cwd=project,
-        capture_output=True,
-        text=True,
+        return {"state": "anomalous", "error": "accepted branch is still checked out"}
+    result = _git_probe(
+        project,
+        ["rev-parse", "--verify", "--quiet", provenance["branch_ref"]],
+        None,
     )
+    if result is None:
+        return {"state": "unknown", "error": "accepted branch ref could not be read"}
     if result.returncode == 1:
         return {"state": "already-absent", "error": None}
     if result.returncode != 0 or result.stdout.strip() != provenance["branch_oid"]:
-        return {"state": "retained", "error": "accepted branch ref is unknown or changed"}
-    branch = provenance["branch_ref"].removeprefix("refs/heads/")
-    deleted = subprocess.run(
-        ["git", "branch", "-d", "--", branch],
-        cwd=project,
-        capture_output=True,
-        text=True,
-    )
-    if deleted.returncode != 0:
+        return {"state": "anomalous", "error": "accepted branch ref is unknown or changed"}
+    if base_ref is None:
         return {
             "state": "retained",
-            "error": deleted.stderr.strip() or "safe branch deletion failed",
+            "error": "branch deletion is not authorized without a landing base ref",
         }
-    verify = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", provenance["branch_ref"]],
-        cwd=project,
-        capture_output=True,
-        text=True,
+    containment = _git_probe(
+        project,
+        ["merge-base", "--is-ancestor", provenance["branch_oid"], base_ref],
+        None,
     )
+    if containment is None:
+        return {"state": "unknown", "error": "accepted branch containment could not be probed"}
+    if containment.returncode != 0:
+        return {
+            "state": "retained",
+            "error": f"accepted branch OID containment in {base_ref} is not proven",
+        }
+    deleted = _git_probe(
+        project,
+        ["update-ref", "-d", provenance["branch_ref"], provenance["branch_oid"]],
+        None,
+    )
+    if deleted is None:
+        return {"state": "unknown", "error": "safe branch deletion could not run"}
+    if deleted.returncode != 0:
+        return {
+            "state": "anomalous",
+            "error": (
+                "accepted branch ref did not match expected OID at deletion time; "
+                "nothing was deleted"
+            ),
+        }
+    verify = _git_probe(
+        project,
+        ["rev-parse", "--verify", "--quiet", provenance["branch_ref"]],
+        None,
+    )
+    if verify is None:
+        return {"state": "unknown", "error": "branch deletion could not be verified"}
     if verify.returncode == 1:
         return {"state": "deleted", "error": None}
     return {"state": "unknown", "error": "branch deletion could not be verified"}

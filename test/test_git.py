@@ -63,6 +63,15 @@ def _run_git(repo_dir, *args):
     )
 
 
+def _probe_git(repo_dir, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _init_git_repo(tmp_path, *, name="repo", branch="main", bare=False):
     if shutil.which("git") is None:
         pytest.skip("git not on PATH")
@@ -1641,7 +1650,290 @@ class TestDurableShipQuarantine:
         assert not any(
             command[:2] == ["git", "worktree"] and "prune" in command for command in commands
         )
-        assert delete_branch_if_unchanged(provenance)["state"] == "deleted"
+        assert delete_branch_if_unchanged(provenance, base_ref="main")["state"] == "deleted"
+
+    def test_branch_delete_uses_landing_base_when_local_default_is_stale(self, stale_clone_factory):
+        registered, local_sha, _upstream_sha = stale_clone_factory("main")
+        branch = "hopper-ac1"
+        _run_git(registered, "fetch", "origin")
+        _run_git(registered, "switch", "-c", branch, local_sha)
+        _run_git(registered, "commit", "--allow-empty", "-m", "feature")
+        _run_git(registered, "merge", "--no-edit", "origin/main")
+        provenance = capture_worktree_provenance(registered, registered)
+        deleted_oid = provenance["branch_oid"]
+        _run_git(registered, "push", "origin", f"{branch}:main")
+        _run_git(registered, "fetch", "origin")
+        assert (
+            _probe_git(registered, "merge-base", "--is-ancestor", deleted_oid, "main").returncode
+            == 1
+        )
+        assert (
+            _probe_git(
+                registered, "merge-base", "--is-ancestor", deleted_oid, "origin/main"
+            ).returncode
+            == 0
+        )
+        _run_git(registered, "switch", "main")
+
+        result = delete_branch_if_unchanged(provenance, base_ref="origin/main")
+
+        assert result == {"state": "deleted", "error": None}
+        assert (
+            _probe_git(registered, "rev-parse", "--verify", provenance["branch_ref"]).returncode
+            != 0
+        )
+        assert (
+            _probe_git(
+                registered, "merge-base", "--is-ancestor", deleted_oid, "origin/main"
+            ).returncode
+            == 0
+        )
+
+    def test_branch_delete_uses_landing_base_when_branch_upstream_is_behind(
+        self, upstream_clone_factory
+    ):
+        _remote, _publisher, registered = upstream_clone_factory("main", name="branch-behind")
+        branch = "hopper-ac3"
+        _run_git(registered, "switch", "-c", branch)
+        _run_git(registered, "commit", "--allow-empty", "-m", "published feature")
+        _run_git(registered, "push", "-u", "origin", branch)
+        _run_git(registered, "commit", "--allow-empty", "-m", "later feature")
+        provenance = capture_worktree_provenance(registered, registered)
+        deleted_oid = provenance["branch_oid"]
+        _run_git(registered, "push", "origin", f"{branch}:main")
+        _run_git(registered, "fetch", "origin")
+        assert (
+            _probe_git(registered, "merge-base", "--is-ancestor", deleted_oid, "main").returncode
+            == 1
+        )
+        assert (
+            _probe_git(
+                registered, "merge-base", "--is-ancestor", deleted_oid, f"origin/{branch}"
+            ).returncode
+            == 1
+        )
+        assert (
+            _probe_git(
+                registered, "merge-base", "--is-ancestor", deleted_oid, "origin/main"
+            ).returncode
+            == 0
+        )
+        _run_git(registered, "switch", "main")
+
+        result = delete_branch_if_unchanged(provenance, base_ref="origin/main")
+
+        assert result == {"state": "deleted", "error": None}
+        assert (
+            _probe_git(registered, "rev-parse", "--verify", provenance["branch_ref"]).returncode
+            != 0
+        )
+        assert (
+            _probe_git(
+                registered, "merge-base", "--is-ancestor", deleted_oid, "origin/main"
+            ).returncode
+            == 0
+        )
+
+    def test_branch_delete_uses_local_landing_base_without_origin(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="local-landing-base")
+        branch = "hopper-local-base"
+        _run_git(project, "switch", "-c", branch)
+        _run_git(project, "commit", "--allow-empty", "-m", "feature")
+        provenance = capture_worktree_provenance(project, project)
+        deleted_oid = provenance["branch_oid"]
+        _run_git(project, "switch", "main")
+        _run_git(project, "merge", "--ff-only", branch)
+
+        result = delete_branch_if_unchanged(provenance, base_ref="main")
+
+        assert result == {"state": "deleted", "error": None}
+        assert (
+            _probe_git(project, "rev-parse", "--verify", provenance["branch_ref"]).returncode != 0
+        )
+        assert (
+            _probe_git(project, "merge-base", "--is-ancestor", deleted_oid, "main").returncode == 0
+        )
+
+    def test_branch_delete_retains_oid_not_contained_in_landing_base(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="not-contained")
+        branch = "hopper-not-contained"
+        _run_git(project, "switch", "-c", branch)
+        _run_git(project, "commit", "--allow-empty", "-m", "feature")
+        provenance = capture_worktree_provenance(project, project)
+        _run_git(project, "switch", "main")
+
+        result = delete_branch_if_unchanged(provenance, base_ref="main")
+
+        assert result["state"] == "retained"
+        assert (
+            _run_git(project, "rev-parse", provenance["branch_ref"]).stdout.strip()
+            == provenance["branch_oid"]
+        )
+
+    @pytest.mark.parametrize("change", ["deleted", "renamed"])
+    def test_branch_delete_retains_when_landing_base_no_longer_resolves(
+        self, upstream_clone_factory, change
+    ):
+        _remote, publisher, registered = upstream_clone_factory(
+            "main", name=f"cleanup-base-{change}"
+        )
+        branch = f"hopper-base-{change}"
+        _run_git(registered, "switch", "-c", branch)
+        _run_git(registered, "commit", "--allow-empty", "-m", "feature")
+        provenance = capture_worktree_provenance(registered, registered)
+        _run_git(registered, "switch", "main")
+        _remove_or_rename_upstream_default(publisher, "main", change)
+        _run_git(registered, "fetch", "--prune", "origin")
+        assert (
+            _probe_git(
+                registered,
+                "merge-base",
+                "--is-ancestor",
+                provenance["branch_oid"],
+                "origin/main",
+            ).returncode
+            == 128
+        )
+
+        result = delete_branch_if_unchanged(provenance, base_ref="origin/main")
+
+        assert result["state"] == "retained"
+        assert (
+            _run_git(registered, "rev-parse", provenance["branch_ref"]).stdout.strip()
+            == provenance["branch_oid"]
+        )
+
+    def test_branch_delete_retains_without_landing_base(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="missing-landing-base")
+        branch = "hopper-no-base"
+        _run_git(project, "switch", "-c", branch)
+        provenance = capture_worktree_provenance(project, project)
+        _run_git(project, "switch", "main")
+
+        result = delete_branch_if_unchanged(provenance, base_ref=None)
+
+        assert result["state"] == "retained"
+        assert (
+            _run_git(project, "rev-parse", provenance["branch_ref"]).stdout.strip()
+            == provenance["branch_oid"]
+        )
+
+    def test_branch_delete_rejects_ref_advanced_to_another_contained_oid(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="advanced-ref")
+        branch = "hopper-advanced"
+        _run_git(project, "switch", "-c", branch)
+        provenance = capture_worktree_provenance(project, project)
+        _run_git(project, "commit", "--allow-empty", "-m", "advanced feature")
+        advanced_oid = _run_git(project, "rev-parse", "HEAD").stdout.strip()
+        _run_git(project, "switch", "main")
+        _run_git(project, "merge", "--ff-only", branch)
+        assert (
+            _probe_git(project, "merge-base", "--is-ancestor", advanced_oid, "main").returncode == 0
+        )
+
+        result = delete_branch_if_unchanged(provenance, base_ref="main")
+
+        assert result["state"] == "anomalous"
+        assert result["error"] == "accepted branch ref is unknown or changed"
+        assert (
+            _run_git(project, "rev-parse", provenance["branch_ref"]).stdout.strip() == advanced_oid
+        )
+
+    def test_branch_delete_compare_and_delete_preserves_concurrently_moved_ref(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="concurrent-ref-move")
+        branch = "hopper-race"
+        _run_git(project, "switch", "-c", branch)
+        _run_git(project, "commit", "--allow-empty", "-m", "feature")
+        provenance = capture_worktree_provenance(project, project)
+        _run_git(project, "switch", "main")
+        _run_git(project, "merge", "--ff-only", branch)
+        _run_git(project, "commit", "--allow-empty", "-m", "new ref target")
+        moved_oid = _run_git(project, "rev-parse", "HEAD").stdout.strip()
+        real_run = subprocess.run
+
+        def move_before_delete(command, **kwargs):
+            if command[1:] == [
+                "update-ref",
+                "-d",
+                provenance["branch_ref"],
+                provenance["branch_oid"],
+            ]:
+                real_run(
+                    ["git", "update-ref", provenance["branch_ref"], moved_oid],
+                    cwd=project,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return real_run(command, **kwargs)
+
+        with patch("hopper.git.subprocess.run", side_effect=move_before_delete):
+            result = delete_branch_if_unchanged(provenance, base_ref="main")
+
+        assert result["state"] == "anomalous"
+        assert result["error"] != "accepted branch ref is unknown or changed"
+        assert _run_git(project, "rev-parse", provenance["branch_ref"]).stdout.strip() == moved_oid
+
+    def test_branch_delete_blocks_branch_registered_in_another_worktree(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="registered-branch")
+        worktree = tmp_path / "registered-worktree"
+        branch = "hopper-registered"
+        _run_git(project, "worktree", "add", "-b", branch, str(worktree), "main")
+        provenance = capture_worktree_provenance(project, worktree)
+
+        result = delete_branch_if_unchanged(provenance, base_ref="main")
+
+        assert result["state"] == "anomalous"
+        assert (
+            _run_git(project, "rev-parse", provenance["branch_ref"]).stdout.strip()
+            == provenance["branch_oid"]
+        )
+
+    @pytest.mark.parametrize(
+        ("failure_point", "ref_exists"),
+        [
+            ("initial_probe", True),
+            ("containment_probe", True),
+            ("compare_and_delete", True),
+            ("post_delete_probe", False),
+        ],
+    )
+    def test_branch_delete_returns_unknown_when_git_cannot_run(
+        self, tmp_path, failure_point, ref_exists
+    ):
+        project = _init_git_repo(tmp_path, name=f"git-unavailable-{failure_point}")
+        branch = "hopper-unavailable"
+        _run_git(project, "switch", "-c", branch)
+        provenance = capture_worktree_provenance(project, project)
+        _run_git(project, "switch", "main")
+        ref_probe_count = 0
+        real_run = subprocess.run
+
+        def fail_selected_command(command, **kwargs):
+            nonlocal ref_probe_count
+            if command[1:] == ["rev-parse", "--verify", "--quiet", provenance["branch_ref"]]:
+                ref_probe_count += 1
+                if failure_point == "initial_probe" and ref_probe_count == 1:
+                    raise OSError("git unavailable")
+                if failure_point == "post_delete_probe" and ref_probe_count == 2:
+                    raise OSError("git unavailable")
+            if failure_point == "containment_probe" and command[1:3] == [
+                "merge-base",
+                "--is-ancestor",
+            ]:
+                raise OSError("git unavailable")
+            if failure_point == "compare_and_delete" and command[1] == "update-ref":
+                raise OSError("git unavailable")
+            return real_run(command, **kwargs)
+
+        with patch("hopper.git.subprocess.run", side_effect=fail_selected_command):
+            result = delete_branch_if_unchanged(provenance, base_ref="main")
+
+        assert result["state"] == "unknown"
+        ref = _probe_git(project, "rev-parse", "--verify", provenance["branch_ref"])
+        assert (ref.returncode == 0) is ref_exists
+        if ref_exists:
+            assert ref.stdout.strip() == provenance["branch_oid"]
 
     def test_fetch_lock_identity_is_shared_by_linked_worktrees(self, tmp_path):
         project = _init_git_repo(tmp_path, name="lock-project")
