@@ -64,20 +64,31 @@ def test_trust_project_preserves_global_and_project_state(tmp_path):
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
 
 
-def test_lode_worktree_trusts_stable_worktree_root(tmp_path):
+def test_lode_worktree_trusts_exact_worktree(tmp_path):
     worktree_root = config.worktree_root()
     worktree = worktree_root / "abcdefgh"
     worktree.mkdir(parents=True)
     env = {"HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": str(tmp_path / "claude")}
+    config_path = claude_config_path(env)
+    config_path.parent.mkdir()
+    config_path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    str(worktree_root): {"hasTrustDialogAccepted": True},
+                }
+            }
+        )
+    )
 
     trust_root = trust_claude_workspace(str(worktree), env)
 
-    saved = json.loads(claude_config_path(env).read_text())
-    assert trust_root == worktree_root
+    saved = json.loads(config_path.read_text())
+    assert trust_root == worktree
     assert saved["projects"] == {
         str(worktree_root): {"hasTrustDialogAccepted": True},
+        str(worktree): {"hasTrustDialogAccepted": True},
     }
-    assert str(worktree) not in saved["projects"]
 
 
 def test_existing_true_trust_does_not_rewrite_config(tmp_path, monkeypatch):

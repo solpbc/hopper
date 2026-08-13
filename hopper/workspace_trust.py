@@ -11,8 +11,6 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
-from hopper import config
-
 LOCK_TIMEOUT_SEC = 5.0
 LOCK_POLL_SEC = 0.05
 
@@ -38,15 +36,14 @@ def trust_claude_workspace(
 ) -> Path | None:
     """Persist trust for a workspace Hopper is about to open with Claude.
 
-    Project roots are trusted exactly. Lode worktrees share the stable Hopper
-    worktree root because Claude inherits trust from parent directories.
+    Trust is keyed to the exact workspace Claude will open. In particular,
+    Hopper worktrees must not rely on a parent-directory trust grant.
     """
     if cwd is None:
         return None
 
     workspace = Path(cwd).expanduser().resolve()
-    worktree_root = config.worktree_root().expanduser().resolve()
-    trust_root = worktree_root if workspace.is_relative_to(worktree_root) else workspace
+    trust_root = workspace
     config_path = claude_config_path(env)
 
     try:
