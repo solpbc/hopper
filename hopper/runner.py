@@ -11,11 +11,18 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from hopper.cleanup import reap_swiftpm_testing_helpers
-from hopper.client import MUTATION_ACK_TIMEOUT_SEC, RUN_GENERATION_ENV, HopperConnection, connect
-from hopper.lodes import current_time_ms, format_duration_ms, format_park_status, get_lode_dir
+from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
+from hopper.lodes import (
+    current_time_ms,
+    format_duration_ms,
+    format_park_status,
+    get_lode_dir,
+    load_lodes,
+)
 from hopper.projects import find_project
 from hopper.tmux import (
     capture_pane,
@@ -38,8 +45,10 @@ PANE_ACTIVITY_EMIT_INTERVAL_MS = 30_000
 DESCENDANT_TERM_GRACE_SEC = 5.0
 DESCENDANT_POLL_INTERVAL_SEC = 0.1
 REGISTRATION_TIMEOUT_SEC = 30.0
-BRANCH_PERSIST_TIMEOUT_SEC = 5.0
-WORKTREE_PUBLICATION_TIMEOUT_SEC = MUTATION_ACK_TIMEOUT_SEC
+BRANCH_PERSIST_TIMEOUT_SEC = 10.0
+WORKTREE_PUBLICATION_TIMEOUT_SEC = 15.0
+DURABLE_CONFIRMATION_TIMEOUT_SEC = 1.0
+DURABLE_CONFIRMATION_POLL_INTERVAL_SEC = 0.05
 PS_SCAN_TIMEOUT_SEC = 5.0
 
 
@@ -201,6 +210,63 @@ def extract_error_message(stderr_bytes: bytes) -> str | None:
     return "\n".join(tail)
 
 
+def _confirm_durable_lode_mutation(
+    lode_id: str,
+    field: str,
+    emitted_value: str,
+    run_generation: str | None,
+    emitted_at_ms: int,
+    *,
+    normalize: Callable[[str], str],
+) -> str | None:
+    """Return the durable value when a timed-out runner mutation is attributable."""
+    if not isinstance(run_generation, str) or not run_generation:
+        return None
+    try:
+        normalized_emitted = normalize(emitted_value)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not isinstance(normalized_emitted, str):
+        return None
+
+    expires_at = time.monotonic() + DURABLE_CONFIRMATION_TIMEOUT_SEC
+    while True:
+        try:
+            lodes = load_lodes()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not isinstance(lodes, list):
+            return None
+
+        matches = [lode for lode in lodes if isinstance(lode, dict) and lode.get("id") == lode_id]
+        if len(matches) > 1:
+            return None
+        if len(matches) == 1:
+            lode = matches[0]
+            durable_value = lode.get(field)
+            updated_at = lode.get("updated_at")
+            # updated_at is lode-scoped, not field-scoped. Freshness only attributes a
+            # matching value when the record also belongs to this runner generation.
+            attributable = (
+                isinstance(durable_value, str)
+                and lode.get("run_generation") == run_generation
+                and type(updated_at) is int
+                and updated_at >= emitted_at_ms
+            )
+            if attributable:
+                try:
+                    normalized_durable = normalize(durable_value)
+                except (OSError, RuntimeError, ValueError):
+                    return None
+                if isinstance(normalized_durable, str) and normalized_durable == normalized_emitted:
+                    return durable_value
+
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(DURABLE_CONFIRMATION_POLL_INTERVAL_SEC, remaining))
+
+
 class BaseRunner:
     """Base class for lode runners.
 
@@ -235,10 +301,11 @@ class BaseRunner:
         self._registration_refusal_reason: str | None = None
         self._expected_lode_branch: str | None = None
         self._branch_persisted = threading.Event()
+        self._confirmed_lode_branch: str | None = None
         self._worktree_publication_condition = threading.Condition()
         self._expected_worktree_path: str | None = None
         self._worktree_publication_ack: dict | None = None
-        self._worktree_path_persisted = False
+        self._confirmed_worktree_path: str | None = None
         self.is_first_run = False
         self.claude_session_id: str = ""
         self.project_name: str = ""
@@ -474,20 +541,59 @@ class BaseRunner:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
 
-    def _persist_lode_branch(self, branch: str) -> bool:
+    def _persist_lode_branch(self, branch: str) -> dict:
         """Persist branch metadata and wait for its post-save broadcast."""
         self._branch_persisted.clear()
+        self._confirmed_lode_branch = None
         self._expected_lode_branch = branch
         try:
             if not self.connection:
-                return False
+                return {
+                    "accepted": False,
+                    "reason": "transport_unavailable",
+                    "branch": branch,
+                }
+            emitted_at_ms = current_time_ms()
             if not self.connection.emit(
                 "lode_set_branch",
                 lode_id=self.lode_id,
                 branch=branch,
             ):
-                return False
-            return self._branch_persisted.wait(BRANCH_PERSIST_TIMEOUT_SEC)
+                return {
+                    "accepted": False,
+                    "reason": "transport_unavailable",
+                    "branch": branch,
+                }
+            if self._branch_persisted.wait(BRANCH_PERSIST_TIMEOUT_SEC):
+                confirmed = self._confirmed_lode_branch
+                if isinstance(confirmed, str):
+                    return {"accepted": True, "reason": "persisted", "branch": confirmed}
+            confirmed = _confirm_durable_lode_mutation(
+                self.lode_id,
+                "branch",
+                branch,
+                self.run_generation,
+                emitted_at_ms,
+                normalize=lambda value: value,
+            )
+            if confirmed is not None:
+                logger.warning(
+                    "Handshake confirmed from durable state after timeout "
+                    "lode=%s handshake=%s value=%r",
+                    self.lode_id,
+                    "lode_set_branch",
+                    confirmed,
+                )
+                return {
+                    "accepted": True,
+                    "reason": "durable_confirmed_after_timeout",
+                    "branch": confirmed,
+                }
+            return {
+                "accepted": False,
+                "reason": "persistence_unconfirmed",
+                "branch": branch,
+            }
         finally:
             self._expected_lode_branch = None
 
@@ -497,11 +603,16 @@ class BaseRunner:
         with self._worktree_publication_condition:
             self._expected_worktree_path = worktree_path
             self._worktree_publication_ack = None
-            self._worktree_path_persisted = False
+            self._confirmed_worktree_path = None
         try:
             if not self.connection:
-                return {"accepted": False, "reason": "transport_unavailable"}
+                return {
+                    "accepted": False,
+                    "reason": "transport_unavailable",
+                    "worktree_path": worktree_path,
+                }
             try:
+                emitted_at_ms = current_time_ms()
                 emitted = self.connection.emit(
                     "lode_set_worktree_path",
                     lode_id=self.lode_id,
@@ -511,9 +622,17 @@ class BaseRunner:
                 )
             except (OSError, RuntimeError):
                 logger.exception("worktree publication transport failed lode=%s", self.lode_id)
-                return {"accepted": False, "reason": "transport_loss"}
+                return {
+                    "accepted": False,
+                    "reason": "transport_loss",
+                    "worktree_path": worktree_path,
+                }
             if not emitted:
-                return {"accepted": False, "reason": "transport_unavailable"}
+                return {
+                    "accepted": False,
+                    "reason": "transport_unavailable",
+                    "worktree_path": worktree_path,
+                }
 
             with self._worktree_publication_condition:
                 while True:
@@ -522,9 +641,17 @@ class BaseRunner:
                         reason = ack.get("reason")
                         if not isinstance(reason, str) or not reason:
                             reason = "server_refused"
-                        return {"accepted": False, "reason": reason}
-                    if ack is not None and self._worktree_path_persisted:
-                        return {"accepted": True, "reason": "persisted"}
+                        return {
+                            "accepted": False,
+                            "reason": reason,
+                            "worktree_path": worktree_path,
+                        }
+                    if ack is not None and self._confirmed_worktree_path is not None:
+                        return {
+                            "accepted": True,
+                            "reason": "persisted",
+                            "worktree_path": self._confirmed_worktree_path,
+                        }
                     remaining = expires_at - time.monotonic()
                     if remaining <= 0:
                         reason = (
@@ -532,8 +659,35 @@ class BaseRunner:
                             if ack is not None and ack.get("accepted") is True
                             else "mutation_ack_timeout"
                         )
-                        return {"accepted": False, "reason": reason}
+                        break
                     self._worktree_publication_condition.wait(remaining)
+
+            confirmed = _confirm_durable_lode_mutation(
+                self.lode_id,
+                "worktree_path",
+                worktree_path,
+                self.run_generation,
+                emitted_at_ms,
+                normalize=lambda value: str(Path(value).resolve(strict=True)),
+            )
+            if confirmed is not None:
+                logger.warning(
+                    "Handshake confirmed from durable state after timeout "
+                    "lode=%s handshake=%s value=%r",
+                    self.lode_id,
+                    "lode_set_worktree_path",
+                    confirmed,
+                )
+                return {
+                    "accepted": True,
+                    "reason": "durable_confirmed_after_timeout",
+                    "worktree_path": confirmed,
+                }
+            return {
+                "accepted": False,
+                "reason": reason,
+                "worktree_path": worktree_path,
+            }
         finally:
             with self._worktree_publication_condition:
                 self._expected_worktree_path = None
@@ -602,7 +756,7 @@ class BaseRunner:
                 self._expected_worktree_path is not None
                 and lode.get("worktree_path") == self._expected_worktree_path
             ):
-                self._worktree_path_persisted = True
+                self._confirmed_worktree_path = lode["worktree_path"]
                 self._worktree_publication_condition.notify_all()
         if "branch" in lode:
             observed_branch = lode["branch"]
@@ -610,6 +764,7 @@ class BaseRunner:
                 self._expected_lode_branch is not None
                 and observed_branch == self._expected_lode_branch
             ):
+                self._confirmed_lode_branch = observed_branch
                 self._branch_persisted.set()
         if lode.get("state") == "gated":
             self._open_gate()

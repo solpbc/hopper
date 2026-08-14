@@ -125,6 +125,129 @@ def _mock_conn(emitted=None):
     return mock
 
 
+@pytest.fixture
+def confirmation_clock(monkeypatch):
+    """Make timeout confirmation deterministic without real sleeps."""
+    clock = {"monotonic": 0.0, "emit_ms": 2000, "save_ms": 2000}
+
+    monkeypatch.setattr("hopper.runner.time.monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(
+        "hopper.runner.time.sleep",
+        lambda seconds: clock.__setitem__("monotonic", clock["monotonic"] + seconds),
+    )
+    monkeypatch.setattr("hopper.runner.current_time_ms", lambda: clock["emit_ms"])
+    monkeypatch.setattr("hopper.lodes.current_time_ms", lambda: clock["save_ms"])
+    monkeypatch.setattr("hopper.runner.BRANCH_PERSIST_TIMEOUT_SEC", 0)
+    monkeypatch.setattr("hopper.runner.WORKTREE_PUBLICATION_TIMEOUT_SEC", 0)
+    return clock
+
+
+@pytest.fixture
+def make_durable_handshake_case(tmp_path, make_lode, confirmation_clock):
+    """Build a direct runner-to-real-server mutation boundary with delivery suppressed."""
+
+    def make(handshake: str, *, generation: str = "a" * 32):
+        worktree = get_worktree_dir("test-id")
+        worktree.mkdir(parents=True, exist_ok=True)
+        lode = make_lode(
+            id="test-id",
+            project="my-project",
+            branch="",
+            worktree_path=None,
+            state="running",
+            active=True,
+            run_generation=generation,
+            updated_at=1000,
+        )
+        save_lodes([lode])
+        server = Server(tmp_path / "hopper.sock")
+        server.lodes = load_lodes()
+        server.broadcast = MagicMock()
+        ack_conn = MagicMock()
+        server.write_locks[ack_conn] = threading.Lock()
+
+        runner = ProcessRunner(
+            "test-id",
+            server.socket_path,
+            "mill",
+            run_generation=generation,
+        )
+        runner.project_name = "my-project"
+        runner.project_dir = str(tmp_path)
+        runner.lode_branch = "hopper-test-id"
+        connection = MagicMock()
+        runner.connection = connection
+
+        if handshake == "branch":
+            mutation_type = "lode_set_branch"
+            field = "branch"
+            emitted_value = "hopper-test-id"
+        elif handshake == "worktree_path":
+            mutation_type = "lode_set_worktree_path"
+            field = "worktree_path"
+            emitted_value = str(worktree)
+        else:
+            raise AssertionError(f"unknown handshake: {handshake}")
+
+        def dispatch(
+            value: str = emitted_value,
+            *,
+            run_generation: str | None = generation,
+            project: str = "my-project",
+        ) -> None:
+            message = {
+                "type": mutation_type,
+                "lode_id": "test-id",
+                "run_generation": run_generation,
+            }
+            if handshake == "branch":
+                message["branch"] = value
+                conn = None
+            else:
+                message.update(
+                    {
+                        "project": project,
+                        "worktree_path": value,
+                        "ack_requested": True,
+                    }
+                )
+                conn = ack_conn
+            server._handle_mutation(message, conn)
+
+        def emit_to_server(msg_type: str, **payload) -> bool:
+            assert msg_type == mutation_type
+            dispatch(
+                payload[field],
+                run_generation=generation,
+                project=payload.get("project", "my-project"),
+            )
+            return True
+
+        def invoke() -> dict:
+            if handshake == "branch":
+                return runner._persist_lode_branch(emitted_value)
+            return runner._publish_lode_worktree_path(emitted_value)
+
+        return {
+            "handshake": handshake,
+            "field": field,
+            "mutation_type": mutation_type,
+            "emitted_value": emitted_value,
+            "generation": generation,
+            "worktree": worktree,
+            "server": server,
+            "runner": runner,
+            "connection": connection,
+            "ack_conn": ack_conn,
+            "dispatch": dispatch,
+            "emit_to_server": emit_to_server,
+            "invoke": invoke,
+            "clock": confirmation_clock,
+        }
+
+    return make
+
+
 @pytest.fixture(autouse=True)
 def isolate_git_config(monkeypatch):
     """Keep real-git tests independent of user and system configuration."""
@@ -425,6 +548,7 @@ class TestMillStage:
             }
         )
         assert runner._branch_persisted.is_set()
+        assert runner._confirmed_lode_branch == "hopper-test-id"
 
     def test_emits_running_state(self):
         """Mill runner emits running state when Claude starts."""
@@ -771,7 +895,15 @@ class TestMillStage:
 
         with (
             patch("hopper.process.create_worktree", side_effect=create),
-            patch.object(runner, "_persist_lode_branch", return_value=True),
+            patch.object(
+                runner,
+                "_persist_lode_branch",
+                return_value={
+                    "accepted": True,
+                    "reason": "persisted",
+                    "branch": "hopper-test-id",
+                },
+            ),
         ):
             assert runner._establish_lode_worktree() is False
 
@@ -805,41 +937,37 @@ class TestMillStage:
 
         with (
             patch("hopper.process.create_worktree", side_effect=create),
-            patch.object(runner, "_persist_lode_branch", return_value=True),
+            patch.object(
+                runner,
+                "_persist_lode_branch",
+                return_value={
+                    "accepted": True,
+                    "reason": "persisted",
+                    "branch": "hopper-test-id",
+                },
+            ),
         ):
             assert runner._establish_lode_worktree() is True
 
         assert events == ["create", "publish"]
         assert runner.worktree_path_basis == "recorded"
 
-    def test_accepted_worktree_ack_without_broadcast_stops_setup(self):
-        worktree = get_worktree_dir("test-id")
-        worktree.mkdir(parents=True)
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
-        runner.project_name = "my-project"
-        runner.lode_branch = "hopper-test-id"
-        connection = MagicMock()
+    def test_accepted_worktree_ack_without_broadcast_uses_durable_confirmation(
+        self,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case("worktree_path")
+        runner = case["runner"]
+        case["ack_conn"].sendall.side_effect = lambda data: runner._on_server_message(
+            json.loads(data.decode("utf-8"))
+        )
+        runner.connection.emit.side_effect = case["emit_to_server"]
 
-        def accept_without_broadcast(msg_type, **payload):
-            runner._on_server_message(
-                {
-                    "type": "mutation_ack",
-                    "mutation_type": msg_type,
-                    "lode_id": payload["lode_id"],
-                    "accepted": True,
-                    "reason": "accepted",
-                }
-            )
-            return True
+        assert runner._establish_lode_worktree() is True
 
-        connection.emit.side_effect = accept_without_broadcast
-        runner.connection = connection
-
-        with patch("hopper.runner.WORKTREE_PUBLICATION_TIMEOUT_SEC", 0):
-            assert runner._establish_lode_worktree() is False
-
-        assert runner._setup_error is not None
-        assert "persistence_unconfirmed" in runner._setup_error
+        assert runner._setup_error is None
+        assert runner.worktree_path_basis == "recorded"
+        assert runner.worktree_path == Path(load_lodes()[0]["worktree_path"])
 
     def test_crash_after_creation_is_recovered_by_directory_rediscovery(self):
         worktree = get_worktree_dir("test-id")
@@ -855,7 +983,15 @@ class TestMillStage:
 
         with (
             patch("hopper.process.create_worktree", side_effect=create),
-            patch.object(first, "_persist_lode_branch", return_value=True),
+            patch.object(
+                first,
+                "_persist_lode_branch",
+                return_value={
+                    "accepted": True,
+                    "reason": "persisted",
+                    "branch": "hopper-test-id",
+                },
+            ),
         ):
             assert first._establish_lode_worktree() is False
         assert worktree.is_dir()
@@ -1035,19 +1171,72 @@ class TestMillStage:
         )
         mock_persist.assert_not_called()
 
-    def test_unacknowledged_branch_persistence_fails_before_launch(self, tmp_path):
-        """Mill does not launch until its branch update is observed after persistence."""
+    def test_unacknowledged_branch_persistence_uses_durable_confirmation_before_launch(
+        self,
+        tmp_path,
+        make_lode,
+        confirmation_clock,
+    ):
+        """A durable branch update permits launch when its broadcast is withheld."""
         repo_dir = _init_git_repo(tmp_path)
-        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        generation = "a" * 32
+        save_lodes(
+            [
+                make_lode(
+                    id="test-id",
+                    project="my-project",
+                    branch="",
+                    state="running",
+                    active=True,
+                    run_generation=generation,
+                )
+            ]
+        )
+        server = Server(tmp_path / "hopper.sock")
+        server.lodes = load_lodes()
+        runner = ProcessRunner(
+            "test-id",
+            server.socket_path,
+            "mill",
+            run_generation=generation,
+        )
         mock_project = MagicMock(path=str(repo_dir))
         emitted = []
-        connection = _mock_conn(emitted)
+        connection = MagicMock()
+        callback_ref = None
+        ack_conn = MagicMock()
+        server.write_locks[ack_conn] = threading.Lock()
+        ack_conn.sendall.side_effect = lambda data: callback_ref(json.loads(data.decode("utf-8")))
 
-        def emit_without_branch_broadcast(msg_type, **payload):
+        def emit(msg_type, **payload):
             emitted.append((msg_type, payload))
+            if msg_type == "lode_register":
+                return True
+            message = {
+                "type": msg_type,
+                "run_generation": generation,
+                **payload,
+            }
+            server._handle_mutation(
+                message,
+                ack_conn if msg_type == "lode_set_worktree_path" else None,
+            )
             return True
 
-        connection.emit.side_effect = emit_without_branch_broadcast
+        def start(callback=None, on_connect=None):
+            nonlocal callback_ref
+            callback_ref = callback
+            on_connect()
+            callback({"type": "lode_registered", "lode_id": "test-id"})
+
+        def broadcast(message):
+            if message.get("lode", {}).get("worktree_path") is not None:
+                callback_ref(message)
+            return True
+
+        connection.emit.side_effect = emit
+        connection.start.side_effect = start
+        server.broadcast = MagicMock(side_effect=broadcast)
         with (
             patch(
                 "hopper.runner.connect",
@@ -1055,14 +1244,13 @@ class TestMillStage:
             ),
             patch("hopper.runner.HopperConnection", return_value=connection),
             patch("hopper.runner.find_project", return_value=mock_project),
-            patch("hopper.runner.BRANCH_PERSIST_TIMEOUT_SEC", 0),
-            patch.object(runner, "_run_claude") as mock_claude,
+            patch.object(runner, "_run_claude", return_value=(0, None)) as mock_claude,
             patch("hopper.runner.get_current_pane_id", return_value=None),
         ):
             assert runner.run() == 0
 
-        assert runner.lode_branch == ""
-        assert any(
+        assert runner.lode_branch == "hopper-test-id"
+        assert not any(
             msg_type == "lode_set_state"
             and payload["state"] == "error"
             and payload["status"]
@@ -1072,7 +1260,10 @@ class TestMillStage:
             )
             for msg_type, payload in emitted
         )
-        mock_claude.assert_not_called()
+        mock_claude.assert_called_once_with()
+        assert load_lodes()[0]["branch"] == "hopper-test-id"
+        raw = json.loads((tmp_path / "active.jsonl").read_text())
+        assert raw["branch"] == "hopper-test-id"
 
     @pytest.mark.parametrize(
         "detail",
@@ -1131,7 +1322,15 @@ class TestMillStage:
         runner.connection = connection
 
         with (
-            patch.object(runner, "_persist_lode_branch", return_value=True),
+            patch.object(
+                runner,
+                "_persist_lode_branch",
+                return_value={
+                    "accepted": True,
+                    "reason": "persisted",
+                    "branch": "hopper-test-id",
+                },
+            ),
             patch("hopper.process.set_lode_status"),
         ):
             assert runner._setup_mill() is None
@@ -1379,6 +1578,332 @@ class TestMillStage:
 # ---------------------------------------------------------------------------
 # Refine stage tests
 # ---------------------------------------------------------------------------
+
+
+class TestDurableHandshakeConfirmation:
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    def test_scope_ac1_timeout_accepts_fresh_current_generation(
+        self,
+        handshake,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        case["connection"].emit.side_effect = case["emit_to_server"]
+
+        result = case["invoke"]()
+
+        assert result == {
+            "accepted": True,
+            "reason": "durable_confirmed_after_timeout",
+            case["field"]: case["emitted_value"],
+        }
+        persisted = load_lodes()
+        assert persisted[0][case["field"]] == case["emitted_value"]
+        assert persisted[0]["updated_at"] == case["clock"]["emit_ms"]
+        raw = json.loads((case["server"].socket_path.parent / "active.jsonl").read_text())
+        assert raw[case["field"]] == case["emitted_value"]
+        case["connection"].emit.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "adoption_case",
+        ["existing_branch", "created_branch", "worktree_path"],
+    )
+    def test_scope_ac2_process_adopts_durable_value(
+        self,
+        adoption_case,
+        make_durable_handshake_case,
+    ):
+        handshake = "worktree_path" if adoption_case == "worktree_path" else "branch"
+        case = make_durable_handshake_case(handshake)
+        runner = case["runner"]
+        runner.connection.emit.side_effect = case["emit_to_server"]
+
+        if adoption_case == "existing_branch":
+            runner.lode_branch = ""
+            with (
+                patch("hopper.process.current_branch", return_value=case["emitted_value"]),
+                patch.object(runner, "_publish_established_worktree_path", return_value=True),
+            ):
+                assert runner._establish_lode_worktree() is True
+            assert runner.lode_branch == load_lodes()[0]["branch"]
+        elif adoption_case == "created_branch":
+            case["worktree"].rmdir()
+            runner.lode_branch = ""
+
+            def create(_project, path, _branch):
+                path.mkdir(parents=True)
+                return True, None
+
+            with (
+                patch("hopper.process.create_worktree", side_effect=create),
+                patch("hopper.process.set_lode_status"),
+                patch.object(runner, "_publish_established_worktree_path", return_value=True),
+            ):
+                assert runner._establish_lode_worktree() is True
+            assert runner.lode_branch == load_lodes()[0]["branch"]
+        else:
+            runner.worktree_path = case["worktree"]
+            assert runner._publish_established_worktree_path() is True
+            assert runner.worktree_path == Path(load_lodes()[0]["worktree_path"])
+            assert runner.worktree_path_basis == "recorded"
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    def test_scope_ac3_absent_mutation_keeps_existing_startup_failure(
+        self,
+        handshake,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        runner = case["runner"]
+        runner.connection.emit.return_value = True
+        if handshake == "branch":
+            runner.lode_branch = ""
+            with patch("hopper.process.current_branch", return_value=case["emitted_value"]):
+                assert runner._establish_lode_worktree() is False
+            assert runner._setup_error == (
+                "Failed to persist lode branch: hopper-test-id. Retry with: "
+                "hop lode restart test-id"
+            )
+        else:
+            assert runner._establish_lode_worktree() is False
+            assert runner._setup_error == (
+                f"Observed worktree publication failure for {case['worktree']}: "
+                "mutation_ack_timeout. Hopper did not proceed. Inspect with: "
+                "hop lode status test-id; retry with: hop lode restart test-id"
+            )
+        persisted = load_lodes()[0]
+        assert persisted[case["field"]] in {"", None}
+        runner.connection.emit.assert_called_once()
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    def test_scope_ac4_divergent_mutation_keeps_existing_startup_failure(
+        self,
+        handshake,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        runner = case["runner"]
+        case["clock"]["save_ms"] = 1500
+        if handshake == "branch":
+            divergent = "other-branch"
+            case["dispatch"](divergent)
+            runner.lode_branch = ""
+        else:
+            case["dispatch"]()
+            divergent_path = case["worktree"].parent / "other-id"
+            divergent_path.mkdir()
+            persisted = load_lodes()
+            persisted[0]["worktree_path"] = str(divergent_path)
+            save_lodes(persisted)
+        runner.connection.emit.return_value = True
+
+        if handshake == "branch":
+            with patch("hopper.process.current_branch", return_value=case["emitted_value"]):
+                assert runner._establish_lode_worktree() is False
+            assert runner._setup_error == (
+                "Failed to persist lode branch: hopper-test-id. Retry with: "
+                "hop lode restart test-id"
+            )
+        else:
+            assert runner._establish_lode_worktree() is False
+            assert runner._setup_error == (
+                f"Observed worktree publication failure for {case['worktree']}: "
+                "mutation_ack_timeout. Hopper did not proceed. Inspect with: "
+                "hop lode status test-id; retry with: hop lode restart test-id"
+            )
+        assert load_lodes()[0][case["field"]] != case["emitted_value"]
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    @pytest.mark.parametrize("stale_kind", ["prior_generation", "predates_emit"])
+    def test_scope_ac5_matching_stale_record_is_not_confirmed(
+        self,
+        handshake,
+        stale_kind,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        if stale_kind == "prior_generation":
+            old_generation = "b" * 32
+            persisted = load_lodes()
+            persisted[0]["run_generation"] = old_generation
+            save_lodes(persisted)
+            case["server"].lodes = load_lodes()
+            case["dispatch"](run_generation=old_generation)
+        else:
+            case["clock"]["save_ms"] = 1000
+            case["dispatch"]()
+        case["connection"].emit.return_value = True
+
+        with patch("hopper.runner.load_lodes", wraps=load_lodes, create=True) as durable_read:
+            result = case["invoke"]()
+
+        durable_read.assert_called()
+        assert result["accepted"] is False
+        assert result[case["field"]] == case["emitted_value"]
+        assert load_lodes()[0][case["field"]] == case["emitted_value"]
+
+    @pytest.mark.parametrize(
+        ("handshake", "refusal"),
+        [
+            ("branch", "terminal_failure"),
+            ("worktree_path", "terminal_failure"),
+            ("worktree_path", "project_mismatch"),
+        ],
+    )
+    def test_scope_ac6_late_refusal_does_not_confirm_prior_value(
+        self,
+        handshake,
+        refusal,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        case["clock"]["save_ms"] = 1000
+        case["dispatch"]()
+        if refusal == "terminal_failure":
+            persisted = load_lodes()
+            persisted[0]["failure_kind"] = "oom"
+            save_lodes(persisted)
+            case["server"].lodes = load_lodes()
+        else:
+            case["runner"].project_name = "other-project"
+        case["connection"].emit.side_effect = case["emit_to_server"]
+
+        with patch("hopper.runner.load_lodes", wraps=load_lodes, create=True) as durable_read:
+            result = case["invoke"]()
+
+        durable_read.assert_called()
+        assert result["accepted"] is False
+        assert result[case["field"]] == case["emitted_value"]
+        persisted = load_lodes()[0]
+        assert persisted[case["field"]] == case["emitted_value"]
+        assert persisted["updated_at"] < case["clock"]["emit_ms"]
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    def test_scope_ac7_confirmation_makes_no_server_request(
+        self,
+        handshake,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        case["connection"].emit.return_value = True
+
+        with patch("hopper.runner.connect") as snapshot_request:
+            result = case["invoke"]()
+
+        assert result["accepted"] is False
+        snapshot_request.assert_not_called()
+        assert case["connection"].method_calls == [
+            call.emit(
+                case["mutation_type"],
+                **(
+                    {
+                        "lode_id": "test-id",
+                        "branch": case["emitted_value"],
+                    }
+                    if handshake == "branch"
+                    else {
+                        "lode_id": "test-id",
+                        "project": "my-project",
+                        "worktree_path": case["emitted_value"],
+                        "ack_requested": True,
+                    }
+                ),
+            )
+        ]
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    @pytest.mark.parametrize(
+        "error",
+        [
+            PermissionError("denied"),
+            OSError("unreadable"),
+            json.JSONDecodeError("invalid", "{", 0),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
+            RuntimeError("resolution failed"),
+        ],
+        ids=["permission", "oserror", "json", "unicode", "runtime"],
+    )
+    def test_scope_ac8_reader_errors_fail_closed(
+        self,
+        handshake,
+        error,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        case["connection"].emit.return_value = True
+
+        with patch("hopper.runner.load_lodes", side_effect=error):
+            result = case["invoke"]()
+
+        assert result["accepted"] is False
+        assert result[case["field"]] == case["emitted_value"]
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    def test_scope_ac8_unparseable_reader_result_fails_closed(
+        self,
+        handshake,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        case["connection"].emit.return_value = True
+
+        with patch("hopper.runner.load_lodes", return_value={"not": "a lode list"}):
+            result = case["invoke"]()
+
+        assert result["accepted"] is False
+        assert result[case["field"]] == case["emitted_value"]
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    @pytest.mark.parametrize("matching", [True, False], ids=["confirming", "unmatched"])
+    def test_scope_ac8_completed_read_is_evaluated_before_poll_stops(
+        self,
+        handshake,
+        matching,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        if matching:
+            case["dispatch"]()
+        case["connection"].emit.return_value = True
+
+        def slow_read():
+            case["clock"]["monotonic"] = 2.0
+            return load_lodes()
+
+        with patch("hopper.runner.load_lodes", side_effect=slow_read) as durable_read:
+            result = case["invoke"]()
+
+        assert result["accepted"] is matching
+        durable_read.assert_called_once_with()
+
+    @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
+    @pytest.mark.parametrize(
+        "invalid_record",
+        ["non_string_field", "missing_updated_at", "boolean_updated_at", "duplicate_id"],
+    )
+    def test_scope_ac8_unparseable_or_ambiguous_records_fail_closed(
+        self,
+        handshake,
+        invalid_record,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case(handshake)
+        persisted = load_lodes()
+        if invalid_record == "non_string_field":
+            persisted[0][case["field"]] = 1
+        elif invalid_record == "missing_updated_at":
+            persisted[0].pop("updated_at")
+        elif invalid_record == "boolean_updated_at":
+            persisted[0]["updated_at"] = True
+        else:
+            persisted.append(copy.deepcopy(persisted[0]))
+        save_lodes(persisted)
+        case["connection"].emit.return_value = True
+
+        result = case["invoke"]()
+
+        assert result["accepted"] is False
+        assert result[case["field"]] == case["emitted_value"]
 
 
 class TestRefineStage:

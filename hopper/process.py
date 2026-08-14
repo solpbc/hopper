@@ -386,7 +386,8 @@ class ProcessRunner(BaseRunner):
                     print(self._setup_error)
                     logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                     return False
-                if not self._persist_lode_branch(branch):
+                branch_result = self._persist_lode_branch(branch)
+                if not branch_result["accepted"]:
                     self._setup_error = (
                         f"Failed to persist lode branch: {branch}. Retry with: "
                         f"hop lode restart {self.lode_id}"
@@ -394,7 +395,7 @@ class ProcessRunner(BaseRunner):
                     print(self._setup_error)
                     logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                     return False
-                self.lode_branch = branch
+                self.lode_branch = branch_result["branch"]
             if not self._publish_established_worktree_path():
                 return False
             logger.debug(f"worktree reused lode={self.lode_id} path={self.worktree_path}")
@@ -422,14 +423,17 @@ class ProcessRunner(BaseRunner):
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return False
-        if not branch_recorded and not self._persist_lode_branch(branch):
-            self._setup_error = (
-                f"Failed to persist lode branch: {branch}. Retry with: "
-                f"hop lode restart {self.lode_id}"
-            )
-            print(self._setup_error)
-            logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
-            return False
+        if not branch_recorded:
+            branch_result = self._persist_lode_branch(branch)
+            if not branch_result["accepted"]:
+                self._setup_error = (
+                    f"Failed to persist lode branch: {branch}. Retry with: "
+                    f"hop lode restart {self.lode_id}"
+                )
+                print(self._setup_error)
+                logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
+                return False
+            branch = branch_result["branch"]
         self.lode_branch = branch
         if not self._publish_established_worktree_path():
             return False
@@ -453,6 +457,7 @@ class ProcessRunner(BaseRunner):
 
         result = self._publish_lode_worktree_path(str(canonical))
         if result["accepted"]:
+            self.worktree_path = Path(result["worktree_path"])
             self.worktree_path_basis = "recorded"
             return True
         reason = result["reason"]
