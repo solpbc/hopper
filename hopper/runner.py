@@ -232,6 +232,9 @@ def _confirm_durable_lode_mutation(
     expires_at = time.monotonic() + DURABLE_CONFIRMATION_TIMEOUT_SEC
     while True:
         try:
+            # Snapshot replies use the same event loop and per-connection write lock as
+            # the delayed broadcast, so a query can block behind the same stall. The
+            # durable file is the only confirmation path the server cannot block.
             lodes = load_lodes()
         except (OSError, RuntimeError, ValueError):
             return None

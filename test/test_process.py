@@ -1604,6 +1604,27 @@ class TestDurableHandshakeConfirmation:
         assert raw[case["field"]] == case["emitted_value"]
         case["connection"].emit.assert_called_once()
 
+    def test_scope_ac2_worktree_timeout_adopts_server_canonical_path(
+        self,
+        make_durable_handshake_case,
+    ):
+        case = make_durable_handshake_case("worktree_path")
+        emitted_path = str(case["worktree"] / ".." / case["worktree"].name)
+        case["connection"].emit.side_effect = case["emit_to_server"]
+
+        # The ordinary observer matches emitted text exactly, and production callers
+        # never emit noncanonical paths, so this direct case only covers durable timeout.
+        result = case["runner"]._publish_lode_worktree_path(emitted_path)
+
+        durable_path = load_lodes()[0]["worktree_path"]
+        assert result == {
+            "accepted": True,
+            "reason": "durable_confirmed_after_timeout",
+            "worktree_path": durable_path,
+        }
+        assert durable_path == str(case["worktree"].resolve(strict=True))
+        assert result["worktree_path"] != emitted_path
+
     @pytest.mark.parametrize(
         "adoption_case",
         ["existing_branch", "created_branch", "worktree_path"],
@@ -1618,6 +1639,7 @@ class TestDurableHandshakeConfirmation:
         runner = case["runner"]
         runner.connection.emit.side_effect = case["emit_to_server"]
 
+        # Accepted branch values cannot diverge because the server persists them verbatim.
         if adoption_case == "existing_branch":
             runner.lode_branch = ""
             with (
@@ -1646,6 +1668,45 @@ class TestDurableHandshakeConfirmation:
             assert runner._publish_established_worktree_path() is True
             assert runner.worktree_path == Path(load_lodes()[0]["worktree_path"])
             assert runner.worktree_path_basis == "recorded"
+
+    def test_scope_ac2_worktree_caller_adopts_canonical_durable_path(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_durable_handshake_case,
+    ):
+        real_root = tmp_path / "real-worktrees"
+        real_root.mkdir()
+        linked_root = tmp_path / "linked-worktrees"
+        linked_root.symlink_to(real_root, target_is_directory=True)
+        monkeypatch.setattr("hopper.config.worktree_root", lambda: linked_root)
+        case = make_durable_handshake_case("worktree_path")
+        runner = case["runner"]
+        runner.worktree_path = case["worktree"]
+        assumed_path = runner.worktree_path
+        canonical_path = assumed_path.resolve(strict=True)
+        publication = {}
+        original_publish = runner._publish_lode_worktree_path
+
+        def observe_publish(worktree_path):
+            result = original_publish(worktree_path)
+            publication.update(result)
+            return result
+
+        case["ack_conn"].sendall.side_effect = lambda data: runner._on_server_message(
+            json.loads(data.decode("utf-8"))
+        )
+        case["server"].broadcast.side_effect = runner._on_server_message
+        runner.connection.emit.side_effect = case["emit_to_server"]
+
+        with patch.object(runner, "_publish_lode_worktree_path", side_effect=observe_publish):
+            assert runner._publish_established_worktree_path() is True
+
+        durable_path = Path(load_lodes()[0]["worktree_path"])
+        assert publication["reason"] == "persisted"
+        assert runner.worktree_path == canonical_path == durable_path
+        assert runner.worktree_path != assumed_path
+        assert runner.worktree_path_basis == "recorded"
 
     @pytest.mark.parametrize("handshake", ["branch", "worktree_path"])
     def test_scope_ac3_absent_mutation_keeps_existing_startup_failure(
