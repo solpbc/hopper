@@ -1373,7 +1373,7 @@ def test_completion_staging_failure_reports_its_real_phase(socket_path, make_lod
     response = _decode_mock_response(submitter)
     assert response["accepted"] is False
     assert response["reason"] == "output_staging_unavailable"
-    assert response["detail"] == "disk full"
+    assert "disk full" in response["detail"]
     assert actions.load_pending_action(lode_id) is None
 
 
@@ -1421,7 +1421,7 @@ def test_completion_record_failure_reports_persistence_not_ownership(socket_path
     response = _decode_mock_response(submitter)
     assert response["accepted"] is False
     assert response["reason"] == "completion_persistence_unavailable"
-    assert response["detail"] == "disk full"
+    assert "disk full" in response["detail"]
     assert actions.load_pending_action(lode_id) is None
 
 
@@ -7796,6 +7796,96 @@ def test_in_band_action_refusal_projects_only_without_an_action_owner(socket_pat
     before = copy.deepcopy(lode)
     server._set_action_refusal("test-id", "new refusal")
     assert lode == before
+
+
+def test_in_band_action_refusal_reports_divergent_owner_without_persisting(socket_path, make_lode):
+    action_id = "a" * 32
+    owner_action_id = "b" * 32
+    owner_generation = "c" * 32
+    request_generation = "d" * 32
+    server = Server(socket_path)
+    lode = make_lode(
+        id="abcd2345",
+        status="stale progress",
+        run_generation=request_generation,
+        pending_action={
+            "action_id": owner_action_id,
+            "action_type": "completion",
+            "expected_generation": owner_generation,
+            "preserved": {"worktree": True, "branch": True, "stage_session": True},
+        },
+    )
+    server.lodes = [lode]
+    server.action_waiters[action_id] = [(object(), None)]
+
+    with patch.object(server, "_send_response") as send_response:
+        server._send_action_ack(
+            None,
+            outcome="refused",
+            reason="ownership_unavailable",
+            action_id=action_id,
+            action_type="restart",
+            detail="generation ownership is absent",
+            request={
+                "lode_id": lode["id"],
+                "action_id": action_id,
+                "expected_generation": request_generation,
+                "action_type": "restart",
+                "target_disposition": "replacement_spawned",
+                "force_consent": False,
+            },
+        )
+
+    response = send_response.call_args.args[1]
+    assert request_generation in response["detail"]
+    assert owner_generation not in response["detail"]
+    assert owner_generation in response["status"]
+    assert lode["status"] == "stale progress"
+    assert server.broadcast_queue.empty()
+
+
+def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socket_path, make_lode):
+    action_id = "a" * 32
+    request_generation = "d" * 32
+    server = Server(socket_path)
+    lode = make_lode(id="abcd2345", pending_action=None)
+    server.lodes = [lode]
+    request = {
+        "lode_id": lode["id"],
+        "action_id": action_id,
+        "expected_generation": request_generation,
+        "action_type": "restart",
+        "target_disposition": "replacement_spawned",
+        "force_consent": False,
+    }
+
+    server._send_action_ack(
+        None,
+        outcome="refused",
+        reason="ownership_unavailable",
+        action_id=action_id,
+        action_type="restart",
+        detail="generation ownership is absent",
+        request=request,
+    )
+
+    first_status = lode["status"]
+    assert first_status
+    assert first_status.startswith("action refused: ")
+    assert server.broadcast_queue.qsize() == 1
+
+    server._send_action_ack(
+        None,
+        outcome="refused",
+        reason="ownership_unavailable",
+        action_id=action_id,
+        action_type="restart",
+        detail="generation ownership is absent",
+        request=request,
+    )
+
+    assert lode["status"] == first_status
+    assert server.broadcast_queue.qsize() == 1
 
 
 def test_terminate_runner_process_group_waits_for_clean_exit():

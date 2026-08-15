@@ -1709,6 +1709,7 @@ def action_ack_projection(
             if reason == "protocol_upgrade_required"
             else reason.replace("_", " ")
         )
+        explanation = f"{explanation} (refused request generation: {expected_generation or 'none'})"
         response["preserved"] = preserved
         response["recovery"] = {
             "kind": reason,

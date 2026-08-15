@@ -7,10 +7,16 @@ import copy
 import hashlib
 import json
 import os
+import re
 
 import pytest
 
 from hopper import actions
+
+ACTION_ID = "a" * 32
+OWNER_ACTION_ID = "b" * 32
+GEN_A = "c" * 32
+GEN_B = "d" * 32
 
 
 def _process(pid: int, ppid: int, pgid: int) -> dict:
@@ -165,6 +171,79 @@ def _blocked_facts_text(*, truth="not_started") -> str:
         f"Action {'1' * 32} owns generation {'2' * 32} for advance refine; "
         f"containment: {truth}. Preserved: worktree, branch, stage session"
     )
+
+
+def test_action_refusal_attributes_divergent_request_and_owner_generations():
+    response = actions.action_ack_projection(
+        outcome="refused",
+        reason="ownership_unavailable",
+        action_id=ACTION_ID,
+        lode_id="abcd2345",
+        expected_generation=GEN_B,
+        action_type="restart",
+        target_disposition="replacement_spawned",
+        detail="generation ownership is absent",
+        owner={
+            "action_id": OWNER_ACTION_ID,
+            "action_type": "completion",
+            "expected_generation": GEN_A,
+            "preserved": {"worktree": True, "branch": True, "stage_session": True},
+        },
+    )
+
+    detail = response["detail"]
+    status = response["status"]
+    assert GEN_B in detail
+    assert GEN_A not in detail
+    assert status.count(detail) == 1
+    assert GEN_A in status
+    assert response["outcome"] == "refused"
+    assert response["reason"] == "ownership_unavailable"
+    assert "\n" not in detail
+    assert "\n" not in status
+
+
+def test_action_refusal_common_generation_has_no_third_identity():
+    response = actions.action_ack_projection(
+        outcome="refused",
+        reason="ownership_unavailable",
+        action_id=ACTION_ID,
+        lode_id="abcd2345",
+        expected_generation=GEN_B,
+        action_type="restart",
+        target_disposition="replacement_spawned",
+        detail="generation ownership is absent",
+        owner={
+            "action_id": ACTION_ID,
+            "action_type": "completion",
+            "expected_generation": GEN_B,
+            "preserved": {"worktree": True, "branch": True, "stage_session": True},
+        },
+    )
+
+    detail = response["detail"]
+    status = response["status"]
+    assert GEN_B in detail
+    assert set(re.findall(r"[0-9a-f]{32}", status)) - {ACTION_ID} == {GEN_B}
+
+
+def test_action_refusal_composes_without_an_expected_generation():
+    response = actions.action_ack_projection(
+        outcome="refused",
+        reason="ownership_unavailable",
+        action_id=ACTION_ID,
+        lode_id="abcd2345",
+        expected_generation=None,
+        action_type="restart",
+        target_disposition="replacement_spawned",
+        detail=None,
+    )
+
+    detail = response["detail"]
+    status = response["status"]
+    assert isinstance(detail, str) and detail
+    assert isinstance(status, str) and status
+    assert "None" not in detail
 
 
 def _run_ownership() -> dict:
