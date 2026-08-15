@@ -5630,6 +5630,12 @@ def test_stale_socket_without_listener_does_not_block_start(socket_path):
     stale.bind(str(socket_path))
     stale.close()
     stale_inode = socket_path.stat().st_ino
+    # Hold the stale inode allocated so the filesystem cannot recycle its number
+    # for the replacement socket. ext4 hands a just-freed inode number straight
+    # back out, so the comparison below passed only where the temp directory
+    # happened to sit on tmpfs or btrfs.
+    pinned_stale = socket_path.with_name(socket_path.name + ".pinned")
+    os.link(socket_path, pinned_stale)
 
     server = Server(socket_path)
     thread = threading.Thread(target=server.start, daemon=True)
@@ -5642,6 +5648,7 @@ def test_stale_socket_without_listener_does_not_block_start(socket_path):
     finally:
         server.stop()
         thread.join(timeout=2)
+        pinned_stale.unlink(missing_ok=True)
 
 
 def test_server_that_never_bound_cannot_unlink_foreign_socket(socket_path):
