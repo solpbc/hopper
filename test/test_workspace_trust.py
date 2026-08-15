@@ -4,7 +4,9 @@
 """Tests for Hopper-managed Claude workspace trust."""
 
 import json
+import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,8 @@ import pytest
 from hopper import config
 from hopper.workspace_trust import (
     WorkspaceTrustError,
+    _claude_config_lock,
+    _held_for_hint,
     claude_config_path,
     trust_claude_workspace,
 )
@@ -173,3 +177,50 @@ def test_lock_contention_fails_without_writing(tmp_path):
         )
 
     assert not config_path.exists()
+
+
+def test_lock_timeout_reports_how_long_the_lock_has_existed(tmp_path):
+    """An orphaned lock is indistinguishable from a busy one without its age."""
+    config = tmp_path / ".claude.json"
+    lock = tmp_path / ".claude.json.lock"
+    lock.mkdir()
+    old = time.time() - (18 * 3600 + 32 * 60)
+    os.utime(lock, (old, old))
+
+    with pytest.raises(WorkspaceTrustError) as excinfo:
+        with _claude_config_lock(config, timeout_sec=0.0, poll_sec=0.0):
+            pass
+
+    message = str(excinfo.value)
+    assert "18h32m" in message
+    assert "remove this directory" in message
+
+
+def test_lock_timeout_degrades_cleanly_when_age_is_unknowable(tmp_path, monkeypatch):
+    """A diagnostic that cannot be computed must not replace the real error."""
+    config = tmp_path / ".claude.json"
+    lock = tmp_path / ".claude.json.lock"
+    lock.mkdir()
+
+    def refuse(self):
+        raise OSError("stat refused")
+
+    monkeypatch.setattr(Path, "lstat", refuse)
+
+    with pytest.raises(WorkspaceTrustError) as excinfo:
+        with _claude_config_lock(config, timeout_sec=0.0, poll_sec=0.0):
+            pass
+
+    message = str(excinfo.value)
+    assert "timed out waiting for Claude config lock" in message
+    assert "present for" not in message
+
+
+def test_lock_age_hint_ignores_a_future_dated_lock(tmp_path):
+    """A forward clock jump must not manufacture an age."""
+    lock = tmp_path / ".claude.json.lock"
+    lock.mkdir()
+    ahead = time.time() + 10_000
+    os.utime(lock, (ahead, ahead))
+
+    assert _held_for_hint(lock) == ""

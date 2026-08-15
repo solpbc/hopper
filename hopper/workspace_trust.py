@@ -19,6 +19,29 @@ class WorkspaceTrustError(RuntimeError):
     """Raised when Hopper cannot safely persist a Claude workspace trust grant."""
 
 
+def _held_for_hint(lock_path: Path) -> str:
+    """Describe how long a lock has existed, or nothing when that is unknowable.
+
+    Diagnostic only. Hopper never acts on this value: the lock belongs to Claude
+    Code's protocol and records no owner, so age is not evidence of abandonment.
+    It is reported because an orphaned lock is otherwise indistinguishable from a
+    busy one, and the operator is the one who can tell them apart.
+    """
+    try:
+        age = time.time() - lock_path.lstat().st_mtime
+    except OSError:
+        return ""
+    if age < 0:
+        return ""
+    if age < 60:
+        held = f"{int(age)}s"
+    elif age < 3600:
+        held = f"{int(age // 60)}m"
+    else:
+        held = f"{int(age // 3600)}h{int((age % 3600) // 60)}m"
+    return f" (present for {held}; if no claude process holds it, remove this directory)"
+
+
 def claude_config_path(env: Mapping[str, str]) -> Path:
     """Return the global Claude project-state file used by a subprocess environment."""
     config_dir = env.get("CLAUDE_CONFIG_DIR")
@@ -113,6 +136,7 @@ def _claude_config_lock(
             if time.monotonic() >= deadline:
                 raise WorkspaceTrustError(
                     f"timed out waiting for Claude config lock {lock_path}"
+                    f"{_held_for_hint(lock_path)}"
                 ) from None
             time.sleep(poll_sec)
         except OSError as exc:
