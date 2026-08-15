@@ -845,7 +845,7 @@ def test_backlog_promote_success(capsys):
                     ) as mock_promote:
                         assert cmd_backlog(["promote", "abc"]) == 0
 
-    mock_promote.assert_called_once_with(socket_path, "abc123", scope="")
+    mock_promote.assert_called_once_with(socket_path, "abc123", scope="", coder_provider="codex")
     out = capsys.readouterr().out
     assert "Promoted: newlode1" in out
 
@@ -864,7 +864,9 @@ def test_backlog_promote_with_scope(capsys):
                     ) as mock_promote:
                         assert cmd_backlog(["promote", "abc", "custom", "scope"]) == 0
 
-    mock_promote.assert_called_once_with(socket_path, "abc123", scope="custom scope")
+    mock_promote.assert_called_once_with(
+        socket_path, "abc123", scope="custom scope", coder_provider="codex"
+    )
     out = capsys.readouterr().out
     assert "custom scope" in out
 
@@ -1337,6 +1339,76 @@ def test_lode_create_happy(capsys):
     out = capsys.readouterr().out
     assert "abc12345" in out
     assert "myproj" in out
+
+
+def test_lode_create_can_select_grok(capsys):
+    from io import StringIO
+
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch(
+            "hopper.cli.coder_check",
+            return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
+        ),
+        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert cmd_lode(["create", "myproj", "--coder", "grok", "--json"]) == 0
+
+    assert create.call_args.kwargs["coder_provider"] == "grok"
+    assert json.loads(capsys.readouterr().out)["coder"] == "grok"
+
+
+def test_lode_create_refuses_unavailable_grok_before_server_mutation(capsys):
+    from io import StringIO
+
+    project = Project(path="/fake/repo", name="myproj")
+    readiness = {
+        "provider": "grok",
+        "ready": False,
+        "version": "",
+        "error": "grok command not found",
+    }
+    with (
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.cli.coder_check", return_value=readiness),
+        patch("hopper.client.create_lode") as create,
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert cmd_lode(["create", "myproj", "--coder", "grok"]) == 1
+
+    create.assert_not_called()
+    assert capsys.readouterr().out == "error: grok unavailable: grok command not found\n"
+
+
+def test_lode_create_does_not_report_success_when_server_refuses(capsys):
+    from io import StringIO
+
+    project = Project(path="/fake/repo", name="myproj")
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch("hopper.client.create_lode", return_value=None),
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert cmd_lode(["create", "myproj"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: lode was not created\n"
+
+
+def test_coder_check_json_is_machine_readable(capsys):
+    result = {"provider": "grok", "ready": True, "version": "1.0.3", "error": ""}
+    with patch("hopper.cli.coder_check", return_value=result):
+        assert hopper_cli.cmd_coder(["check", "grok", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == result
 
 
 @pytest.mark.parametrize(
@@ -7463,6 +7535,7 @@ def emitted_create_json(monkeypatch, capsys):
         "id": "abcdefgh",
         "project": "journal",
         "host": "local",
+        "coder": "codex",
     }
     return output
 
@@ -7473,7 +7546,7 @@ def test_active_local_project_bypasses_pool_selection():
         patch("hopper.remote.remote_registry") as registry,
         patch("hopper.remote.probe_candidates") as probes,
     ):
-        assert hopper_cli._remote_pool_for_create("journal") is None
+        assert hopper_cli._remote_pool_for_create("journal", "codex") is None
 
     registry.assert_not_called()
     probes.assert_not_called()
@@ -7561,6 +7634,7 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
             "id": "abcdefgh",
             "project": "journal",
             "host": "ready.example",
+            "coder": "codex",
             "unavailable_hosts": [
                 {
                     "host": "down.example",
@@ -7640,7 +7714,7 @@ def test_pooled_create_with_no_eligible_host_refuses_without_create(
     ],
 )
 def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys):
-    valid = {"id": "abcdefgh", "project": "journal", "host": "local"}
+    valid = {"id": "abcdefgh", "project": "journal", "host": "local", "coder": "codex"}
     if case == "nonzero-valid-body":
         outcome = subprocess.CompletedProcess([], 7, stdout=json.dumps(valid), stderr="rejected")
     elif case == "human-text":
@@ -7795,7 +7869,9 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
         mock_remote.return_value = subprocess.CompletedProcess(
             [],
             0,
-            stdout='{"id": "abcdefgh", "project": "journal", "host": "local"}\n',
+            stdout=(
+                '{"id": "abcdefgh", "project": "journal", "host": "local", "coder": "codex"}\n'
+            ),
             stderr="",
         )
         with patch("hopper.cli._remote_pool_for_create", return_value=(selected, [selected])):
@@ -7845,6 +7921,7 @@ def test_lode_create_json(capsys):
         "id": "abc12345",
         "project": "myproj",
         "host": "local",
+        "coder": "codex",
     }
 
 

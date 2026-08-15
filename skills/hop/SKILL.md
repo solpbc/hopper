@@ -36,7 +36,7 @@ Fix login timeout and add regression coverage
 EOF
 ```
 
-`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data.
+`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data. Codex is the default refine-stage coder; add `--coder grok` at creation time to select Grok for that lode. Hopper does not set a Grok model name, so Grok uses the authenticated account's current CLI default.
 
 If `remote.<project>` has a pool and the project is disabled or absent locally,
 `hop implement <project>` probes every pool member concurrently, compares
@@ -76,9 +76,11 @@ complete pool. `hop remote set` refuses active local projects, so disable a
 moved project first.
 
 Pooled readiness depends on `hop project list --json` being installed on every
-remote host. Upgrade the fleet after this version lands. An older host probes as
-unavailable; do not add a compatibility fallback. The remote install contract
-is `$HOME/.local/bin/hop`, installed by `make install-user`.
+remote host. A Grok lode also requires `hop coder check grok --json`; hosts without
+a runnable Grok CLI are excluded before selection. Upgrade the fleet after this
+version lands. An older host probes as unavailable; do not add a compatibility
+fallback. The remote install contract is `$HOME/.local/bin/hop`, installed by
+`make install-user`.
 
 ## Waiting and monitoring
 
@@ -365,7 +367,7 @@ hop gate <<'EOF'                      # pause lode at a review gate
 <review document>
 EOF
 
-hop code <stage>                      # run prompts/<stage>.md via Codex
+hop code <stage>                      # run prompts/<stage>.md via the lode's coder
 ```
 
 `hop processed` submits exact bytes and returns after the server durably accepts
@@ -475,7 +477,7 @@ so a healthy output-silent run is no longer killed with `No output or progress
 for 351s`. Output is still buffered and only the tail is printed after the
 command exits; the heartbeat supplies liveness without changing that contract.
 
-Hopper's liveness model uses pane-diff activity, in-flight Codex exec
+Hopper's liveness model uses pane-diff activity, in-flight coder command
 heartbeats, and descendant-process CPU activity. Pane and heartbeat silence are
 the real foreground signals; descendant CPU can keep a lode `running` while
 background work is active. Heartbeat or CPU activity can carry a quiet stage,
@@ -497,7 +499,7 @@ a 60-minute absolute cap. Command output and descendant CPU count as progress
 on every host; Linux also observes process-tree I/O. A moving artifact download
 can therefore cross 20 minutes while a wedged download still fails. The lode
 error distinguishes inactivity from the absolute cap and includes the bounded
-output tail instead of remaining active at the setup status. Codex bootstrap
+output tail instead of remaining active at the setup status. Coder bootstrap
 is bounded separately.
 
 `hop code` prints a `CODEX TURN FAILED` banner when the backend fails a turn.

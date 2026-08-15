@@ -586,6 +586,69 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
     ]
 
 
+def test_grok_pool_probe_requires_provider_readiness_after_normal_checks(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+):
+    calls = []
+
+    def runner(host, args, *, timeout):
+        calls.append((host, args, timeout))
+        if args[0] == "project":
+            stdout = emitted_project_json
+        elif args[0] == "lode":
+            stdout = emitted_lode_inventory_json
+        else:
+            stdout = json.dumps(
+                {"provider": "grok", "ready": True, "version": "1.0.3", "error": ""}
+            )
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate(
+        "ready.example",
+        "journal",
+        runner,
+        monotonic=lambda: 0.0,
+        coder_provider="grok",
+    )
+
+    assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
+    assert calls[-1][1] == ["coder", "check", "grok", "--json"]
+
+
+def test_grok_pool_probe_excludes_host_without_grok(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+):
+    def runner(_host, args, *, timeout):
+        if args[0] == "project":
+            stdout = emitted_project_json
+        elif args[0] == "lode":
+            stdout = emitted_lode_inventory_json
+        else:
+            stdout = json.dumps(
+                {
+                    "provider": "grok",
+                    "ready": False,
+                    "version": "",
+                    "error": "grok command not found",
+                }
+            )
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    probe = probe_candidate(
+        "missing.example",
+        "journal",
+        runner,
+        monotonic=lambda: 0.0,
+        coder_provider="grok",
+    )
+
+    assert probe.eligible is False
+    assert "grok command not found" in probe.reason
+    assert "hop -H missing.example coder check grok --json" in probe.reason
+
+
 def test_probe_candidate_accepts_project_contract_superset(
     emitted_project_json,
     emitted_lode_inventory_json,
@@ -963,7 +1026,12 @@ def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
                 command, 0, stdout=json.dumps({"lodes": lodes}), stderr=""
             )
         if hop_args[:2] == ["implement", "journal"]:
-            created = {"id": "abcdefgh", "project": "journal", "host": "local"}
+            created = {
+                "id": "abcdefgh",
+                "project": "journal",
+                "host": "local",
+                "coder": "codex",
+            }
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(created), stderr="")
         raise AssertionError(f"unexpected remote hop invocation: {hop_args}")
 

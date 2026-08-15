@@ -23,7 +23,8 @@ Lodes are plain dicts with these fields:
 - oom_scope: str | None - guarded systemd scope unit name (default None)
 - failure_kind: str | None - durable terminal runner failure discriminator (default None)
 - archive_action_id: str | None - action that published this archive (default None)
-- codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
+- coder: dict - refine-stage coding provider and resumable session:
+    {"provider": "codex" | "grok", "session_id": str | None}
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
 - last_pane_activity_at: int | None - timestamp of most recent real pane change (default None)
@@ -46,6 +47,7 @@ import uuid
 from pathlib import Path
 
 from hopper import config
+from hopper.coder import DEFAULT_CODER_PROVIDER, validate_coder_provider
 from hopper.tmux import Liveness, pane_liveness
 
 ID_LEN = 8  # Lode ID length (8 base32 chars)
@@ -415,6 +417,7 @@ def create_lode(
     *,
     lode_id: str | None = None,
     originating_extro_sid: str | None = None,
+    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> dict:
     """Create a new lode, add to list, and create its directory.
 
@@ -426,6 +429,7 @@ def create_lode(
     Returns:
         The newly created lode dict.
     """
+    coder_provider = validate_coder_provider(coder_provider)
     if lode_id is not None:
         if len(lode_id) != ID_LEN or any(character not in ID_ALPHABET for character in lode_id):
             raise ValueError("reserved lode ID has an invalid format")
@@ -460,7 +464,7 @@ def create_lode(
         "failure_kind": None,
         "spawn_disposition": None,
         "archive_action_id": None,
-        "codex_thread_id": None,
+        "coder": {"provider": coder_provider, "session_id": None},
         "last_progress_at": None,
         "last_progress_summary": "",
         "last_pane_activity_at": None,
@@ -646,9 +650,38 @@ def update_lode_worktree_path(lodes: list[dict], lode_id: str, worktree_path: st
     return _update_lode_field(lodes, lode_id, "worktree_path", worktree_path)
 
 
-def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: str) -> dict | None:
-    """Update the codex thread ID on a lode."""
-    return _update_lode_field(lodes, lode_id, "codex_thread_id", codex_thread_id)
+def update_lode_coder_session(
+    lodes: list[dict], lode_id: str, provider: str, session_id: str
+) -> dict | None:
+    """Store a session only when it belongs to the lode's selected coder."""
+    provider = validate_coder_provider(provider)
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        coder = lode.get("coder")
+        if not isinstance(coder, dict) or coder.get("provider") != provider:
+            return None
+        coder["session_id"] = session_id
+        touch(lode)
+        save_lodes(lodes)
+        return lode
+    return None
+
+
+def validate_lode_coder_schema(lodes: list[dict], source: str) -> None:
+    """Fail fast when durable lodes have not been migrated to the coder schema."""
+    for lode in lodes:
+        coder = lode.get("coder")
+        if not isinstance(coder, dict):
+            raise ValueError(
+                f"{source} contains the pre-coder lode schema; "
+                "run scripts/migrate_coder_schema.py before starting Hopper"
+            )
+        provider = coder.get("provider")
+        validate_coder_provider(provider)
+        session_id = coder.get("session_id")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise ValueError(f"{source} contains an invalid coder session_id")
 
 
 def set_lode_claude_started(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:

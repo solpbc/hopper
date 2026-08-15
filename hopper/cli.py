@@ -30,6 +30,7 @@ from hopper import __version__, config
 from hopper import deadline as deadline_utils
 from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
+from hopper.coder import CODER_PROVIDERS, DEFAULT_CODER_PROVIDER, coder_check
 from hopper.lodes import (
     current_time_ms,
     format_age,
@@ -362,6 +363,12 @@ def _extract_create_project(cmd: str, cmd_args: list[str]) -> str | None:
         if arg in ("-f", "--force", "--json"):
             index += 1
             continue
+        if arg == "--coder":
+            index += 2
+            continue
+        if arg.startswith("--coder="):
+            index += 1
+            continue
         if arg.startswith("-"):
             index += 1
             continue
@@ -369,12 +376,23 @@ def _extract_create_project(cmd: str, cmd_args: list[str]) -> str | None:
     return None
 
 
+def _extract_create_coder(cmd: str, cmd_args: list[str]) -> str:
+    """Return the requested coder for create-like commands, before dispatch."""
+    args = cmd_args[1:] if cmd == "lode" and cmd_args[:1] == ["create"] else cmd_args
+    for index, arg in enumerate(args):
+        if arg == "--coder" and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--coder="):
+            return arg.split("=", 1)[1]
+    return DEFAULT_CODER_PROVIDER
+
+
 def _create_wants_json(cmd: str, cmd_args: list[str]) -> bool:
     args = cmd_args[1:] if cmd == "lode" and cmd_args[:1] == ["create"] else cmd_args
     return "--json" in args
 
 
-def _remote_pool_for_create(project: str):
+def _remote_pool_for_create(project: str, coder_provider: str):
     """Probe a configured pool when an active local project does not take precedence."""
     from hopper.projects import find_project
     from hopper.remote import probe_candidates, remote_registry, run_remote, select_candidate
@@ -385,7 +403,7 @@ def _remote_pool_for_create(project: str):
     hosts = remote_registry().get(project)
     if not hosts:
         return None
-    probes = probe_candidates(hosts, project, run_remote)
+    probes = probe_candidates(hosts, project, run_remote, coder_provider=coder_provider)
     return select_candidate(probes), probes
 
 
@@ -414,7 +432,9 @@ def _remote_create_refusal(host: str, project: str, observed: str) -> int:
     return 2
 
 
-def _validate_remote_create_response(result, project: str) -> tuple[dict[str, str] | None, str]:
+def _validate_remote_create_response(
+    result, project: str, coder_provider: str
+) -> tuple[dict[str, str] | None, str]:
     """Validate the authoritative remote-side create JSON before host rewriting."""
     if result.returncode != 0:
         diagnostic = (result.stderr or result.stdout or "").strip()
@@ -424,7 +444,7 @@ def _validate_remote_create_response(result, project: str) -> tuple[dict[str, st
         payload = json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
         return None, "returned malformed JSON"
-    if not isinstance(payload, dict) or set(payload) != {"id", "project", "host"}:
+    if not isinstance(payload, dict) or set(payload) != {"id", "project", "host", "coder"}:
         return None, "returned a response outside the exact create JSON contract"
 
     lode_id = payload.get("id")
@@ -434,7 +454,14 @@ def _validate_remote_create_response(result, project: str) -> tuple[dict[str, st
         return None, f"returned project {payload.get('project')!r}, expected {project!r}"
     if payload.get("host") != "local":
         return None, f"returned host {payload.get('host')!r}, expected 'local'"
-    return {"id": lode_id, "project": project, "host": "local"}, ""
+    if payload.get("coder") != coder_provider:
+        return None, f"returned coder {payload.get('coder')!r}, expected {coder_provider!r}"
+    return {
+        "id": lode_id,
+        "project": project,
+        "host": "local",
+        "coder": coder_provider,
+    }, ""
 
 
 def _run_authoritative_remote_create(
@@ -446,6 +473,7 @@ def _run_authoritative_remote_create(
     stdin_text: str | None,
     json_output: bool,
     unavailable_hosts: list[dict[str, str]],
+    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> int:
     """Run, validate, cache, and only then render one remote create."""
     from hopper.remote import REMOTE_CREATE_TIMEOUT_SEC, run_remote
@@ -467,7 +495,7 @@ def _run_authoritative_remote_create(
     except OSError as error:
         return _remote_create_refusal(host, project, f"failed during transport: {error}")
 
-    payload, failure = _validate_remote_create_response(result, project)
+    payload, failure = _validate_remote_create_response(result, project, coder_provider)
     if payload is None:
         return _remote_create_refusal(host, project, failure)
 
@@ -1601,12 +1629,12 @@ def cmd_gate(args: list[str]) -> int:
     return 0
 
 
-@command("code", "Run a stage prompt via Codex", group="lode")
+@command("code", "Run a stage prompt via the lode's coder", group="lode")
 def cmd_code(args: list[str]) -> int:
-    """Run a stage prompt via Codex, resuming the lode's Codex thread."""
+    """Run a stage prompt by resuming the lode's selected coder session."""
     from hopper.code import run_code
 
-    parser = make_parser("code", "Run a prompts/<stage>.md file via Codex for a lode.")
+    parser = make_parser("code", "Run a prompts/<stage>.md file via the lode's coder.")
     parser.add_argument("stage", help="Stage name (matches prompts/<stage>.md)")
     try:
         parsed = parse_args(parser, args)
@@ -1635,6 +1663,31 @@ def cmd_code(args: list[str]) -> int:
         return 1
 
     return run_code(lode_id, _socket(), parsed.stage, request)
+
+
+@command("coder", "Check coding-provider readiness")
+def cmd_coder(args: list[str]) -> int:
+    """Check a coding provider without invoking a model or requiring authentication."""
+    parser = make_parser("coder", "Check coding-provider readiness")
+    parser.add_argument("action", choices=["check"])
+    parser.add_argument("provider", choices=CODER_PROVIDERS)
+    parser.add_argument("--json", dest="json_output", action="store_true")
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as error:
+        print(f"error: {error}")
+        parser.print_usage()
+        return 1
+    result = coder_check(parsed.provider)
+    if parsed.json_output:
+        print(json.dumps(result))
+    elif result["ready"]:
+        print(f"{parsed.provider} ready: {result['version']}")
+    else:
+        print(f"{parsed.provider} unavailable: {result['error']}")
+    return 0 if result["ready"] else 1
 
 
 @command("backlog", "Manage backlog items")
@@ -1679,6 +1732,12 @@ def cmd_backlog(args: list[str]) -> int:
         "--clear",
         action="store_true",
         help="Clear queued assignment (for queue action)",
+    )
+    parser.add_argument(
+        "--coder",
+        choices=CODER_PROVIDERS,
+        default=DEFAULT_CODER_PROVIDER,
+        help=f"Coder for promote (default: {DEFAULT_CODER_PROVIDER})",
     )
     try:
         parsed = parse_args(parser, args)
@@ -1790,7 +1849,7 @@ def cmd_backlog(args: list[str]) -> int:
             return 1
 
         scope = " ".join(parsed.text[1:]) if len(parsed.text) > 1 else ""
-        lode = promote_backlog(_socket(), item.id, scope=scope)
+        lode = promote_backlog(_socket(), item.id, scope=scope, coder_provider=parsed.coder)
         if lode:
             print(f"Promoted: {lode['id']} [{item.project}] {scope or item.description}")
             return 0
@@ -1954,6 +2013,9 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(f"  host:     {lode.get('host', '')}")
     lines.append(f"  project:  {lode.get('project', '')}")
     lines.append(f"  stage:    {lode.get('stage', '')}")
+    coder = lode.get("coder")
+    if isinstance(coder, dict):
+        lines.append(f"  coder:    {coder.get('provider', '')}")
     lines.append(f"  state:    {lode.get('state', '')}")
     if lode.get("state") == "reconnecting":
         prior_state = lode.get("reconnect_prior_state")
@@ -3125,6 +3187,12 @@ def _tail_text(text: str, lines: int = 10) -> str:
 def _add_create_args(parser):
     """Add lode create arguments to a parser."""
     parser.add_argument("project", help="Project name")
+    parser.add_argument(
+        "--coder",
+        choices=CODER_PROVIDERS,
+        default=DEFAULT_CODER_PROVIDER,
+        help=f"Refine-stage coding provider (default: {DEFAULT_CODER_PROVIDER})",
+    )
     parser.add_argument("-f", "--force", action="store_true", help="Override dirty-repo check")
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     parser.add_argument("--originating-extro-sid", default=None, help=argparse.SUPPRESS)
@@ -3795,6 +3863,11 @@ def cmd_lode(args: list[str]) -> int:
         if project.disabled:
             print(disabled_project_message(project))
             return 1
+        if parsed.coder != DEFAULT_CODER_PROVIDER:
+            readiness = coder_check(parsed.coder)
+            if not readiness["ready"]:
+                print(f"error: {parsed.coder} unavailable: {readiness['error']}")
+                return 1
         if not parsed.force:
             from hopper.git import dirty_status
 
@@ -3822,17 +3895,28 @@ def cmd_lode(args: list[str]) -> int:
             scope,
             spawn=True,
             originating_extro_sid=originating_extro_sid,
+            coder_provider=parsed.coder,
         )
         if getattr(parsed, "json_output", False):
             if not lode:
                 print("error: lode was not created", file=sys.stderr)
                 return 1
-            print(json.dumps({"id": lode["id"], "project": project_name, "host": "local"}))
+            print(
+                json.dumps(
+                    {
+                        "id": lode["id"],
+                        "project": project_name,
+                        "host": "local",
+                        "coder": parsed.coder,
+                    }
+                )
+            )
             return 0
         if lode:
             print(f"Created lode {lode['id']} ({project_name})")
         else:
-            print(f"Created lode for {project_name}")
+            print("error: lode was not created", file=sys.stderr)
+            return 1
         return 0
 
     if subcommand == "pause":
@@ -4809,6 +4893,14 @@ def _main() -> int:
         print_help()
         return 1
 
+    create_project = _extract_create_project(cmd, cmd_args)
+    if create_project is not None:
+        requested_coder = _extract_create_coder(cmd, cmd_args)
+        if requested_coder not in CODER_PROVIDERS:
+            choices = ", ".join(CODER_PROVIDERS)
+            print(f"error: argument --coder: invalid choice: {requested_coder!r} ({choices})")
+            return 1
+
     # Set process title
     setproctitle.setproctitle(f"hop:{cmd}")
 
@@ -4862,6 +4954,7 @@ def _main() -> int:
         stdin_text = _stdin_for_remote(cmd, cmd_args)
         create_project = _extract_create_project(cmd, cmd_args)
         if create_project is not None:
+            coder_provider = _extract_create_coder(cmd, cmd_args)
             return _run_authoritative_remote_create(
                 explicit_host,
                 [cmd, *cmd_args],
@@ -4870,6 +4963,7 @@ def _main() -> int:
                 stdin_text=stdin_text,
                 json_output=_create_wants_json(cmd, cmd_args),
                 unavailable_hosts=[],
+                coder_provider=coder_provider,
             )
         return _run_remote_cli(
             explicit_host,
@@ -4882,7 +4976,8 @@ def _main() -> int:
     if not explicit_host and not _remote_disabled():
         project = _extract_create_project(cmd, cmd_args)
         if project:
-            remote_target = _remote_pool_for_create(project)
+            coder_provider = _extract_create_coder(cmd, cmd_args)
+            remote_target = _remote_pool_for_create(project, coder_provider)
             if remote_target is not None:
                 selected, probes = remote_target
                 unavailable_hosts = _unavailable_host_rows(probes)
@@ -4926,6 +5021,7 @@ def _main() -> int:
                     stdin_text=stdin_text,
                     json_output=json_output,
                     unavailable_hosts=unavailable_hosts,
+                    coder_provider=coder_provider,
                 )
 
     # Dispatch to command handler

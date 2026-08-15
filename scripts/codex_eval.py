@@ -206,6 +206,19 @@ def main():
             "lode_dir": str(lode_dir),
         }
 
+    # Historic metadata predates the explicit provider field and is Codex.
+    # A lode's provider is immutable, so one Grok marker excludes the lode
+    # from this Codex-specific report.
+    all_lode_stats = {
+        lode_id: info
+        for lode_id, info in all_lode_stats.items()
+        if not any(
+            meta.get("coder_provider", "codex") == "grok"
+            for stage in info["stages"].values()
+            for meta in stage["jsons"]
+        )
+    }
+
     # ---------------------------------------------------------------------------
     # Pass 1: Structural Analysis
     # ---------------------------------------------------------------------------

@@ -37,7 +37,8 @@ def _mock_response(
     stage="refine",
     project="my-project",
     scope="build widget",
-    codex_thread_id=THREAD_ID,
+    provider="codex",
+    session_id=THREAD_ID,
 ):
     return {
         "type": "connected",
@@ -46,7 +47,7 @@ def _mock_response(
             "stage": stage,
             "project": project,
             "scope": scope,
-            "codex_thread_id": codex_thread_id,
+            "coder": {"provider": provider, "session_id": session_id},
         },
         "lode_found": True,
     }
@@ -69,23 +70,23 @@ class TestRunCode:
         assert exit_code == 1
         assert "not in refine stage" in capsys.readouterr().out
 
-    def test_missing_codex_thread_id(self, capsys):
-        """Returns 1 with helpful message when codex_thread_id is missing."""
-        with patch("hopper.code.connect", return_value=_mock_response(codex_thread_id=None)):
+    def test_missing_coder_session_id(self, capsys):
+        """Returns 1 with helpful message when the coder session is missing."""
+        with patch("hopper.code.connect", return_value=_mock_response(session_id=None)):
             exit_code = run_code("test-1234", Path("/tmp/test.sock"), "audit", "test request")
 
         assert exit_code == 1
         output = capsys.readouterr().out
-        assert "no Codex thread ID" in output
+        assert "no Codex session ID" in output
         assert "hop refine" in output
 
-    def test_empty_codex_thread_id(self, capsys):
-        """Returns 1 when codex_thread_id is empty string."""
-        with patch("hopper.code.connect", return_value=_mock_response(codex_thread_id="")):
+    def test_empty_coder_session_id(self, capsys):
+        """Returns 1 when the coder session ID is empty."""
+        with patch("hopper.code.connect", return_value=_mock_response(session_id="")):
             exit_code = run_code("test-1234", Path("/tmp/test.sock"), "audit", "test request")
 
         assert exit_code == 1
-        assert "no Codex thread ID" in capsys.readouterr().out
+        assert "no Codex session ID" in capsys.readouterr().out
 
     def test_wrong_cwd(self, tmp_path, monkeypatch, capsys):
         """Returns 1 when cwd doesn't match worktree."""
@@ -137,8 +138,9 @@ class TestRunCode:
             state_calls.append((state, status))
             return True
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
-            assert thread_id == THREAD_ID
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
+            assert provider == "codex"
+            assert session_id == THREAD_ID
             if on_event:
                 on_event({"type": "thread.started"})
                 on_event(
@@ -157,7 +159,7 @@ class TestRunCode:
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", side_effect=mock_set_state),
             patch("hopper.code.set_lode_progress", progress),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -176,11 +178,12 @@ class TestRunCode:
         # Output saved
         assert (session_dir / "audit.out.md").exists()
 
-        # Metadata saved with codex_thread_id
+        # Metadata records the selected provider and session.
         meta = json.loads((session_dir / "audit.json").read_text())
         assert meta["stage"] == "audit"
         assert meta["lode_id"] == "test-sid"
-        assert meta["codex_thread_id"] == THREAD_ID
+        assert meta["coder_provider"] == "codex"
+        assert meta["coder_session_id"] == THREAD_ID
         assert meta["exit_code"] == 0
         assert meta["cmd"] == MOCK_CMD
         assert "turn_failed_message" not in meta
@@ -207,7 +210,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", side_effect=mock_set_state),
-            patch("hopper.code.run_codex", return_value=(1, MOCK_CMD)),
+            patch("hopper.code.run_coder", return_value=(1, MOCK_CMD)),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -233,7 +236,7 @@ class TestRunCode:
             state_calls.append((state, status))
             return True
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
             if on_event:
                 on_event({"type": "turn.failed", "error": {"message": message}})
             return 1, MOCK_CMD
@@ -244,7 +247,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", side_effect=mock_set_state),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -275,7 +278,7 @@ class TestRunCode:
             state_calls.append((state, status))
             return True
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
             if on_event:
                 on_event({"type": "turn.failed", "error": {"message": message}})
             return 1, MOCK_CMD
@@ -286,7 +289,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", side_effect=mock_set_state),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -300,6 +303,49 @@ class TestRunCode:
 
         meta = json.loads((session_dir / "audit.json").read_text())
         assert meta["turn_failed_message"] == message
+
+    def test_grok_failure_uses_provider_status_without_codex_seat_guidance(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+        state_calls = []
+
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, **kwargs):
+            assert provider == "grok"
+            kwargs["on_event"](
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "company account quota exceeded"},
+                }
+            )
+            return 1, ["grok"]
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch(
+                "hopper.code.connect",
+                return_value=_mock_response(provider="grok", session_id="grok-session"),
+            ),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch(
+                "hopper.code.set_lode_state",
+                side_effect=lambda sock, sid, state, status: state_calls.append((state, status)),
+            ),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
+        ):
+            assert run_code("test-sid", Path("/tmp/test.sock"), "audit", "request") == 1
+
+        output = capsys.readouterr().out
+        assert "GROK TURN FAILED" in output
+        assert "one shared account" not in output
+        assert "grok usage limit" in state_calls[-1][1]
+        metadata = json.loads((session_dir / "audit.json").read_text())
+        assert metadata["coder_provider"] == "grok"
+        assert metadata["coder_session_id"] == "grok-session"
 
     def test_server_unreachable(self, capsys):
         """Returns 1 when server connection fails."""
@@ -331,7 +377,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=mock_project),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", return_value=True),
-            patch("hopper.code.run_codex", return_value=(0, MOCK_CMD)),
+            patch("hopper.code.run_coder", return_value=(0, MOCK_CMD)),
         ):
             run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -352,7 +398,7 @@ class TestRunCode:
 
         input_existed = []
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
             # Check that input was already written when codex starts
             input_existed.append((session_dir / "audit.in.md").exists())
             return 0, MOCK_CMD
@@ -363,7 +409,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", return_value=True),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -377,7 +423,7 @@ class TestRunCode:
         worktree.mkdir(parents=True)
         monkeypatch.chdir(worktree)
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -387,7 +433,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", return_value=True),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -407,7 +453,7 @@ class TestRunCode:
         original_content = "existing output\n"
         (session_dir / "audit.out.md").write_text(original_content)
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -417,7 +463,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", return_value=True),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -437,7 +483,7 @@ class TestRunCode:
         (session_dir / "audit.out.md").write_text("existing output\n")
         (session_dir / "audit_1.out.md").write_text("existing output 1\n")
 
-        def mock_run_codex(prompt, cwd, output_file, thread_id, env=None, on_event=None):
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
             Path(output_file).write_text("# Audit Result\nAll good.")
             return 0, MOCK_CMD
 
@@ -447,7 +493,7 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=None),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", return_value=True),
-            patch("hopper.code.run_codex", side_effect=mock_run_codex),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
@@ -512,6 +558,17 @@ class TestSummarizeEvent:
 
     def test_non_dict_input(self):
         assert _summarize_event("not a dict") == ""
+
+    def test_grok_ignores_high_volume_incremental_events(self):
+        for event_type in ("available_commands", "thought", "text", "usage"):
+            assert _summarize_event({"type": event_type}, "grok") == ""
+
+    def test_grok_reports_tool_and_terminal_events(self):
+        assert _summarize_event({"type": "tool_call", "toolName": "bash"}, "grok") == "grok: bash"
+        assert (
+            _summarize_event({"type": "end", "usage": {"outputTokens": 42}}, "grok")
+            == "grok turn done (42 tok)"
+        )
 
 
 class TestProgressHeartbeat:
@@ -752,3 +809,20 @@ class TestExecHeartbeat:
         )
 
         assert hb.summary(2_000) is None
+
+    def test_grok_tool_call_uses_same_command_heartbeat_semantics(self, monkeypatch):
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: 1_000)
+        hb = ExecHeartbeat(lambda summary: None, provider="grok")
+        hb.on_event(
+            {
+                "type": "tool_call",
+                "toolCallId": "tool-1",
+                "toolName": "bash",
+                "status": "pending",
+                "rawInput": {"command": "make ci"},
+            }
+        )
+
+        assert hb.summary(4_000) == "grok: running make ci (3s)"
+        hb.on_event({"type": "tool_call_update", "toolCallId": "tool-1", "status": "completed"})
+        assert hb.summary(5_000) is None

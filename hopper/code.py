@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 sol pbc
 
-"""Code runner - runs a prompt via Codex, resuming the lode's Codex thread."""
+"""Code runner - runs a prompt by resuming a lode's selected coder session."""
 
 import json
 import logging
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from hopper import prompt
 from hopper.client import connect, set_lode_progress, set_lode_state
-from hopper.codex import run_codex, turn_failed_message
+from hopper.coder import coder_failure_message, run_coder, validate_coder_provider
 from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir, get_worktree_dir
 from hopper.projects import find_project
 
@@ -23,7 +23,7 @@ EXEC_HEARTBEAT_COMMAND_CHARS = 60
 
 TURN_FAILED_BANNER = """\
 ============================================================
-CODEX TURN FAILED
+{provider} TURN FAILED
 {message}
 ============================================================
 """
@@ -44,8 +44,11 @@ Do ONE of the following instead:
 """
 
 
-def _is_quota_message(message: str) -> bool:
-    return "usage limit" in message.lower()
+def _is_quota_message(provider: str, message: str) -> bool:
+    lowered = message.lower()
+    if provider == "codex":
+        return "usage limit" in lowered
+    return "usage limit" in lowered or "quota" in lowered or "rate limit" in lowered
 
 
 def truncate_progress_command(command: str) -> str:
@@ -119,19 +122,26 @@ class ProgressHeartbeat:
 
 
 class ExecHeartbeat(ProgressHeartbeat):
-    """Emit synthetic progress while a Codex command execution is in flight."""
+    """Emit synthetic progress while a coder command execution is in flight."""
 
     def __init__(
-        self, emit: Callable[[str], object], interval: float = HEARTBEAT_INTERVAL_SEC
+        self,
+        emit: Callable[[str], object],
+        interval: float = HEARTBEAT_INTERVAL_SEC,
+        provider: str = "codex",
     ) -> None:
+        self.provider = validate_coder_provider(provider)
         self._in_flight: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
         super().__init__(emit, self.summary, interval)
 
     def on_event(self, event) -> None:
-        """Track command_execution item lifetime from Codex events."""
+        """Track provider command execution lifetime from stream events."""
         try:
             if not isinstance(event, dict):
+                return
+            if self.provider == "grok":
+                self._on_grok_event(event)
                 return
             item = event.get("item")
             if not isinstance(item, dict):
@@ -150,6 +160,25 @@ class ExecHeartbeat(ProgressHeartbeat):
         except Exception:
             logger.debug("exec heartbeat event handling failed", exc_info=True)
 
+    def _on_grok_event(self, event: dict) -> None:
+        event_type = event.get("type")
+        tool_call_id = event.get("toolCallId")
+        if not tool_call_id:
+            return
+        if event_type == "tool_call":
+            raw_input = event.get("rawInput")
+            command = raw_input.get("command", "") if isinstance(raw_input, dict) else ""
+            if not command:
+                command = str(event.get("toolName") or event.get("kind") or "tool")
+            with self._lock:
+                self._in_flight[tool_call_id] = (str(command), current_time_ms())
+        elif event_type == "tool_call_update" and event.get("status") not in {
+            "pending",
+            "running",
+        }:
+            with self._lock:
+                self._in_flight.pop(tool_call_id, None)
+
     def summary(self, now_ms: int) -> str | None:
         """Return the current in-flight command summary, if any."""
         try:
@@ -159,17 +188,35 @@ class ExecHeartbeat(ProgressHeartbeat):
                 command, started_ms = max(self._in_flight.values(), key=lambda value: value[1])
             cmd = truncate_progress_command(command)
             elapsed = (now_ms - started_ms) // 1000
-            return f"codex: running {cmd} ({elapsed}s)"
+            return f"{self.provider}: running {cmd} ({elapsed}s)"
         except Exception:
             logger.debug("exec heartbeat summary failed", exc_info=True)
             return None
 
 
-def _summarize_event(event: dict) -> str:
-    """Summarize a Codex JSON event into a short progress label."""
+def _summarize_event(event: dict, provider: str = "codex") -> str:
+    """Summarize a provider event using the existing Codex progress semantics."""
     if not isinstance(event, dict):
         return ""
+    provider = validate_coder_provider(provider)
     event_type = event.get("type") or "event"
+    if provider == "grok":
+        if event_type in {"available_commands", "thought", "text", "usage"}:
+            return ""
+        if event_type == "tool_call":
+            return f"grok: {event.get('toolName') or event.get('kind') or 'tool'}"
+        if event_type == "tool_call_update":
+            return ""
+        if event_type == "end":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                output_tokens = usage.get("outputTokens") or usage.get("output_tokens")
+                if isinstance(output_tokens, int):
+                    return f"grok turn done ({output_tokens} tok)"
+            return "grok turn done"
+        if event_type in {"error", "turn.failed"}:
+            return "grok: turn failed"
+        return ""
     if event_type == "thread.started":
         return "codex session started"
     if event_type == "turn.started":
@@ -191,11 +238,11 @@ def _summarize_event(event: dict) -> str:
 
 
 def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> int:
-    """Run a stage prompt via Codex for a refine-stage lode.
+    """Run a stage prompt through the selected coder for a refine-stage lode.
 
-    Resumes the lode's Codex thread so that context accumulates across
+    Resumes the lode's coder session so that context accumulates across
     stages. Validates the prompt exists, lode is in refine stage,
-    cwd matches the lode worktree, and a Codex thread ID is present.
+    cwd matches the lode worktree, and a coder session ID is present.
     Saves artifacts (<stage>.in.md, <stage>.out.md, <stage>.json) to the
     lode directory and prints the output to stdout.
 
@@ -224,12 +271,21 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         print(f"Lode {lode_id} is not in refine stage.")
         return 1
 
-    # Validate Codex thread ID exists
-    codex_thread_id = lode_data.get("codex_thread_id")
-    if not codex_thread_id:
-        print(f"Lode {lode_id} has no Codex thread ID.")
-        print("The Codex session is bootstrapped during 'hop refine' first run.")
-        print("Re-run 'hop refine' to bootstrap the Codex session.")
+    coder = lode_data.get("coder")
+    if not isinstance(coder, dict):
+        print(f"Lode {lode_id} has invalid coder configuration.")
+        return 1
+    try:
+        provider = validate_coder_provider(coder.get("provider"))
+    except ValueError as error:
+        print(f"Lode {lode_id} has invalid coder configuration: {error}")
+        return 1
+    session_id = coder.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        label = provider.capitalize()
+        print(f"Lode {lode_id} has no {label} session ID.")
+        print(f"The {label} session is bootstrapped during 'hop refine' first run.")
+        print("Re-run 'hop refine' to bootstrap the coder session.")
         return 1
 
     # Validate cwd is the lode worktree
@@ -275,22 +331,22 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     # Set state to stage name while running
     set_lode_state(socket_path, lode_id, stage_name, f"Running {stage_name}")
 
-    # Run codex (resume existing thread)
+    # Resume the existing provider session.
     output_path = lode_dir / f"{suffix}.out.md"
     started_at = current_time_ms()
-    hb = ExecHeartbeat(lambda s: set_lode_progress(socket_path, lode_id, s))
+    hb = ExecHeartbeat(lambda s: set_lode_progress(socket_path, lode_id, s), provider=provider)
     captured = {"turn_failed": None}
 
     def _on_event(event):
         hb.on_event(event)
         try:
-            summary = _summarize_event(event)
+            summary = _summarize_event(event, provider)
             if summary:
                 set_lode_progress(socket_path, lode_id, summary)
         except Exception:
             logger.debug("progress heartbeat failed", exc_info=True)
         try:
-            msg = turn_failed_message(event)
+            msg = coder_failure_message(provider, event)
             if msg:
                 captured["turn_failed"] = msg
         except Exception:
@@ -298,11 +354,12 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
 
     hb.start()
     try:
-        exit_code, cmd = run_codex(
+        exit_code, cmd = run_coder(
+            provider,
             prompt_text,
             str(cwd),
             str(output_path),
-            codex_thread_id,
+            session_id,
             on_event=_on_event,
         )
     finally:
@@ -314,7 +371,8 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     metadata = {
         "stage": stage_name,
         "lode_id": lode_id,
-        "codex_thread_id": codex_thread_id,
+        "coder_provider": provider,
+        "coder_session_id": session_id,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_ms": finished_at - started_at,
@@ -331,18 +389,18 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     if exit_code == 0:
         status = f"{stage_name} ran for {duration}"
     elif turn_failed:
-        if _is_quota_message(turn_failed):
-            status = f"{stage_name} failed: codex usage limit"
+        if _is_quota_message(provider, turn_failed):
+            status = f"{stage_name} failed: {provider} usage limit"
         else:
-            status = f"{stage_name} failed: codex turn failed"
+            status = f"{stage_name} failed: {provider} turn failed"
     else:
         status = f"{stage_name} failed after {duration}"
     set_lode_state(socket_path, lode_id, "running", status)
 
     # Print output if it was written
     if turn_failed and exit_code != 0:
-        print(TURN_FAILED_BANNER.format(message=turn_failed))
-        if _is_quota_message(turn_failed):
+        print(TURN_FAILED_BANNER.format(provider=provider.upper(), message=turn_failed))
+        if provider == "codex" and _is_quota_message(provider, turn_failed):
             print(QUOTA_GUIDANCE)
     elif output_path.exists():
         content = output_path.read_text()

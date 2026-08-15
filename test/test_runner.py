@@ -98,7 +98,7 @@ class TestBaseRunnerRegistration:
             patch.object(runner, "_setup") as setup,
             patch.object(runner, "_run_claude") as run_model,
             patch("hopper.process._run_setup_command") as setup_command,
-            patch("hopper.process.bootstrap_codex") as codex_bootstrap,
+            patch("hopper.process.bootstrap_coder") as codex_bootstrap,
             patch("hopper.runner.subprocess.Popen") as claude_popen,
         ):
             assert runner.run() == 1

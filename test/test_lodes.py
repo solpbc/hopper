@@ -56,11 +56,12 @@ from hopper.lodes import (
     touch,
     unarchive_lode,
     update_lode_branch,
-    update_lode_codex_thread,
+    update_lode_coder_session,
     update_lode_stage,
     update_lode_state,
     update_lode_title,
     update_lode_worktree_path,
+    validate_lode_coder_schema,
 )
 from hopper.tmux import Liveness
 
@@ -92,7 +93,7 @@ def test_lode_dict_json_roundtrip():
         "scope": "",
         "status": "",
         "title": "",
-        "codex_thread_id": None,
+        "coder": {"provider": "codex", "session_id": None},
         "backlog": None,
     }
     serialized = json.dumps(lode)
@@ -132,29 +133,29 @@ def test_archive_lode_for_action_reconciles_append_before_active_remove(
     assert len(load_archived_lodes()) == 1
 
 
-def test_lode_dict_includes_codex_thread_id():
-    """Lode dict includes codex_thread_id field."""
+def test_lode_dict_includes_coder_session():
+    """Lode dict includes its coder provider and session."""
     lode = {
         "id": "abc12345",
         "stage": "refine",
         "created_at": 1000,
-        "codex_thread_id": "codex-uuid-1234",
+        "coder": {"provider": "codex", "session_id": "codex-uuid-1234"},
     }
-    assert lode["codex_thread_id"] == "codex-uuid-1234"
+    assert lode["coder"] == {"provider": "codex", "session_id": "codex-uuid-1234"}
 
 
-def test_lode_codex_thread_id_roundtrip():
-    """codex_thread_id survives json roundtrip."""
+def test_lode_coder_session_roundtrip():
+    """Coder selection and session survive a JSON roundtrip."""
     lode = {
         "id": "abc12345",
         "stage": "refine",
         "created_at": 1000,
         "updated_at": 1000,
         "state": "running",
-        "codex_thread_id": "thread-xyz",
+        "coder": {"provider": "grok", "session_id": "thread-xyz"},
     }
     restored = json.loads(json.dumps(lode))
-    assert restored["codex_thread_id"] == "thread-xyz"
+    assert restored["coder"] == {"provider": "grok", "session_id": "thread-xyz"}
 
 
 def test_load_lodes_empty(temp_config):
@@ -208,6 +209,7 @@ def test_create_lode(temp_config):
     assert lode["failure_kind"] is None
     assert lode["spawn_disposition"] is None
     assert lode["archive_action_id"] is None
+    assert lode["coder"] == {"provider": "codex", "session_id": None}
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
@@ -230,6 +232,27 @@ def test_create_lode(temp_config):
     assert len(loaded) == 1
     assert loaded[0]["id"] == lode["id"]
     assert loaded[0]["project"] == "test-project"
+
+
+def test_create_lode_can_select_grok(temp_config):
+    lode = create_lode([], "test-project", coder_provider="grok")
+
+    assert lode["coder"] == {"provider": "grok", "session_id": None}
+
+
+def test_create_lode_rejects_unknown_coder_before_writing(temp_config):
+    lodes = []
+
+    with pytest.raises(ValueError, match="codex, grok"):
+        create_lode(lodes, "test-project", coder_provider="other")
+
+    assert lodes == []
+    assert not (temp_config / "active.jsonl").exists()
+
+
+def test_validate_lode_coder_schema_names_migration_for_old_records():
+    with pytest.raises(ValueError, match="migrate_coder_schema.py"):
+        validate_lode_coder_schema([{"id": "oldlode1", "codex_thread_id": None}], "active")
 
 
 def test_terminal_failure_statuses_have_one_formatter():
@@ -963,8 +986,8 @@ def test_update_lode_branch(temp_config):
     assert loaded[0]["branch"] == "hopper-testid11-auth-flow"
 
 
-def test_update_lode_codex_thread(temp_config):
-    """update_lode_codex_thread changes thread ID and touches timestamp."""
+def test_update_lode_coder_session(temp_config):
+    """update_lode_coder_session changes session ID and touches timestamp."""
     lodes_list = [
         {
             "id": "testid11",
@@ -972,25 +995,38 @@ def test_update_lode_codex_thread(temp_config):
             "created_at": 1000,
             "updated_at": 1000,
             "state": "running",
-            "codex_thread_id": None,
+            "coder": {"provider": "grok", "session_id": None},
         }
     ]
     save_lodes(lodes_list)
 
-    updated = update_lode_codex_thread(lodes_list, "testid11", "thread-123")
+    updated = update_lode_coder_session(lodes_list, "testid11", "grok", "thread-123")
 
     assert updated is not None
-    assert updated["codex_thread_id"] == "thread-123"
+    assert updated["coder"]["session_id"] == "thread-123"
     assert updated["updated_at"] > 1000
 
     loaded = load_lodes()
-    assert loaded[0]["codex_thread_id"] == "thread-123"
+    assert loaded[0]["coder"]["session_id"] == "thread-123"
 
 
-def test_update_lode_codex_thread_not_found(temp_config):
-    """update_lode_codex_thread returns None for unknown lode."""
-    result = update_lode_codex_thread([], "nonexistent", "thread-123")
+def test_update_lode_coder_session_not_found(temp_config):
+    """update_lode_coder_session returns None for unknown lode."""
+    result = update_lode_coder_session([], "nonexistent", "codex", "thread-123")
     assert result is None
+
+
+def test_update_lode_coder_session_rejects_provider_mismatch(temp_config):
+    lodes_list = [
+        {
+            "id": "testid11",
+            "updated_at": 1000,
+            "coder": {"provider": "codex", "session_id": None},
+        }
+    ]
+
+    assert update_lode_coder_session(lodes_list, "testid11", "grok", "session") is None
+    assert lodes_list[0]["coder"]["session_id"] is None
 
 
 def test_set_lode_claude_started(temp_config):

@@ -1,11 +1,12 @@
 # hopper
 
-Hopper pairs Claude Code and Codex in a staged feature-delivery workflow.
+Hopper pairs Claude Code with a selectable coding CLI in a staged feature-delivery workflow.
 
 ## What it does
 Hopper runs a dual-agent workflow through a terminal dashboard inside tmux.
 Claude Code handles scoping in `mill` and landing in `ship`.
-Codex handles implementation in `refine` via `hop code`.
+Codex handles implementation in `refine` by default; a lode can select Grok instead.
+`hop code` resumes the coding provider selected when the lode was created.
 Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a background server persisting state over a Unix socket and broadcasting updates to the TUI.
 
 ## Prerequisites
@@ -13,6 +14,7 @@ Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a backgroun
 - tmux
 - uv (Python package manager)
 - git
+- Codex CLI, or Grok CLI for lodes created with `--coder grok`
 
 ## Install
 ```bash
@@ -41,6 +43,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop backlog` | Manage backlog items |
 | `hop lode` | Manage lodes |
 | `hop implement` | Create a lode for an implementation request |
+| `hop coder` | Check whether a coding provider is installed and runnable |
 | `hop ping` | Check if server is running |
 
 **Inside a lode**
@@ -49,7 +52,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop status` | Show or update lode status |
 | `hop processed` | Durably submit stage output; return after acceptance |
 | `hop gate` | Pause lode at a review gate |
-| `hop code` | Run a stage prompt via Codex |
+| `hop code` | Run a stage prompt via the lode's selected coding provider |
 
 **Aliases**
 | Command | Description |
@@ -62,6 +65,17 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop watch` | Exact alias for `hop wait` |
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
+
+Codex remains the creation default. Select Grok per lode with any create alias:
+
+```bash
+cat scope.md | hop implement myproject --coder grok
+hop coder check grok --json
+```
+
+Hopper does not pass a Grok model name, so the CLI uses the current default model
+available to the authenticated account. Hopper disables Grok auto-update during a
+lode run; update the installed CLI through the normal host provisioning process.
 
 Run `hop wait ID` or `hop watch ID` as a bare command and read the complete final
 record, not only its exit code. Every record explains why supervision ended and
@@ -110,6 +124,8 @@ and never tries another host after a create attempt. These probes require `hop
 project list --json` on every remote host. Upgrade the fleet when deploying this
 version. An older host is unavailable to pooled creation; there is no
 compatibility fallback.
+For `--coder grok`, readiness also requires `hop coder check grok --json`; a host
+without a runnable Grok CLI is excluded before Hopper selects a destination.
 
 After creation, Hopper stores a resident route from the lode ID to its resident
 host. That route survives pool replacement or removal, so status, waiting, pane
@@ -147,7 +163,8 @@ retrying. Once accepted, the server closes the owned pane, proves the recorded
 runner containment is empty, and publishes the terminal stage disposition.
 
 ## Key concepts
-**Lode** -- a Claude Code session with a unique ID, workflow stage, status, and associated tmux window.
+**Lode** -- a Claude Code session with a unique ID, selected refine-stage coder,
+workflow stage, status, and associated tmux window.
 
 **Stage** -- workflow position: mill (scoping), refine (implementing), or ship (merging back to main).
 
@@ -169,6 +186,20 @@ CLI (hop)
 ```
 
 User input flows through the TUI to mutate lode state, which the server broadcasts back for re-render.
+
+### Coder schema migration
+
+This release replaces the stored `codex_thread_id` field with a per-lode `coder`
+record. Stop the Hopper server, inspect the migration, then apply it before starting
+the new server:
+
+```bash
+.venv/bin/python scripts/migrate_coder_schema.py
+.venv/bin/python scripts/migrate_coder_schema.py --apply
+```
+
+The apply step validates active and archived stores before writing, creates
+`*.pre-coder-schema` recovery copies, and rewrites each JSONL store atomically.
 
 ## Development
 ```bash

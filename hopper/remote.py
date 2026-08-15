@@ -23,6 +23,7 @@ from typing import Literal, TypeVar
 
 from hopper import config
 from hopper import deadline as deadline_utils
+from hopper.coder import DEFAULT_CODER_PROVIDER, validate_coder_provider
 from hopper.lodes import current_time_ms, is_canonical_lode_id
 
 REMOTE_CONFIG_PREFIX = "remote."
@@ -575,8 +576,10 @@ def probe_candidate(
     runner: RemoteRunner,
     *,
     monotonic: Callable[[], float] = time.monotonic,
+    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> CandidateProbe:
     """Probe one pool member within one shared per-candidate deadline."""
+    coder_provider = validate_coder_provider(coder_provider)
     started = monotonic()
     project_args = ["project", "list", "--json"]
     payload, failure = _run_candidate_probe(
@@ -614,6 +617,47 @@ def probe_candidate(
     if failure is not None:
         return failure
     assert load is not None
+    if coder_provider != DEFAULT_CODER_PROVIDER:
+        remaining = REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC - (monotonic() - started)
+        coder_args = ["coder", "check", coder_provider, "--json"]
+        if remaining <= 0:
+            return _unavailable(
+                host,
+                "candidate deadline expired before coder readiness",
+                coder_args,
+            )
+        payload, failure = _run_candidate_probe(
+            host,
+            coder_args,
+            label=f"{coder_provider} readiness",
+            timeout=remaining,
+            runner=runner,
+        )
+        if failure is not None:
+            return failure
+        assert payload is not None
+        if set(payload) != {"provider", "ready", "version", "error"}:
+            return _unavailable(
+                host,
+                f"{coder_provider} readiness violated its JSON contract",
+                coder_args,
+            )
+        if payload.get("provider") != coder_provider or not isinstance(payload.get("ready"), bool):
+            return _unavailable(
+                host,
+                f"{coder_provider} readiness contained invalid identity or status",
+                coder_args,
+            )
+        if not payload["ready"]:
+            detail = payload.get("error")
+            reason = detail if isinstance(detail, str) and detail else "provider is unavailable"
+            return _unavailable(host, f"{coder_provider} is unavailable: {reason}", coder_args)
+        if not isinstance(payload.get("version"), str) or not isinstance(payload.get("error"), str):
+            return _unavailable(
+                host,
+                f"{coder_provider} readiness contained invalid diagnostics",
+                coder_args,
+            )
     return CandidateProbe(host=host, eligible=True, load=load, reason=None)
 
 
@@ -623,11 +667,13 @@ def probe_candidates(
     runner: RemoteRunner,
     *,
     monotonic: Callable[[], float] = time.monotonic,
+    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> list[CandidateProbe]:
     """Probe unique pool members concurrently under one aggregate deadline."""
+    coder_provider = validate_coder_provider(coder_provider)
     return _bounded_host_fanout(
         hosts,
-        lambda host: probe_candidate(host, project, runner),
+        lambda host: probe_candidate(host, project, runner, coder_provider=coder_provider),
         lambda host, error: _unavailable(
             host,
             f"candidate probe failed unexpectedly: {error}",

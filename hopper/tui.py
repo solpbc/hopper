@@ -34,6 +34,7 @@ from textual.widgets.option_list import Option
 
 from hopper.backlog import BacklogItem
 from hopper.claude import switch_to_pane
+from hopper.coder import DEFAULT_CODER_PROVIDER, coder_check
 from hopper.git import get_diff_stat
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
@@ -452,6 +453,11 @@ class TextInputScreen(ModalScreen):
         if event.button.id == "btn-cancel":
             self.dismiss(None)
             return
+        if event.button.id == "btn-coder":
+            provider = getattr(self, "coder_provider", DEFAULT_CODER_PROVIDER)
+            self.coder_provider = "grok" if provider == "codex" else "codex"
+            event.button.label = f"Coder: {self.coder_provider.capitalize()}"
+            return
         self._try_submit(event.button)
 
     def on_submit(self, button: Button, text: str) -> None:
@@ -467,15 +473,17 @@ class ScopeInputScreen(TextInputScreen):
     def __init__(self, project_name: str) -> None:
         super().__init__()
         self.MODAL_TITLE = f"Describe {project_name.capitalize()} Task Scope"
+        self.coder_provider = DEFAULT_CODER_PROVIDER
 
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
         yield Button("Backlog", id="btn-backlog", variant="default")
         yield Button("Start", id="btn-start", variant="primary")
+        yield Button("Coder: Codex", id="btn-coder", variant="default")
 
     def on_submit(self, button: Button, text: str) -> None:
         action = "start" if button.id == "btn-start" else "backlog"
-        self.dismiss((text, action))
+        self.dismiss((text, action, self.coder_provider))
 
 
 class BacklogInputScreen(TextInputScreen):
@@ -496,14 +504,19 @@ class BacklogEditScreen(TextInputScreen):
 
     MODAL_TITLE = "Edit Backlog Item"
 
+    def __init__(self, initial_text: str = "") -> None:
+        super().__init__(initial_text=initial_text)
+        self.coder_provider = DEFAULT_CODER_PROVIDER
+
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
         yield Button("Promote", id="btn-promote", variant="default")
         yield Button("Save", id="btn-save", variant="primary")
+        yield Button("Coder: Codex", id="btn-coder", variant="default")
 
     def on_submit(self, button: Button, text: str) -> None:
         action = "promote" if button.id == "btn-promote" else "save"
-        self.dismiss((action, text))
+        self.dismiss((action, text, self.coder_provider))
 
 
 class MillReviewScreen(TextInputScreen):
@@ -1926,10 +1939,10 @@ class HopperApp(App):
             if self.server:
                 self.server.enqueue({"type": "projects_reload"})
 
-            def on_scope_entered(result: tuple[str, str] | None) -> None:
+            def on_scope_entered(result: tuple[str, str, str] | None) -> None:
                 if result is None:
                     return  # Cancelled
-                scope, action = result
+                scope, action, coder_provider = result
                 if action == "backlog":
                     if self.server:
                         self.server.enqueue(
@@ -1940,6 +1953,14 @@ class HopperApp(App):
                             }
                         )
                 else:
+                    if coder_provider != DEFAULT_CODER_PROVIDER:
+                        readiness = coder_check(coder_provider)
+                        if not readiness["ready"]:
+                            self.notify(
+                                f"{coder_provider.capitalize()} unavailable: {readiness['error']}",
+                                severity="error",
+                            )
+                            return
                     if self.server:
                         self.server.enqueue(
                             {
@@ -1947,6 +1968,7 @@ class HopperApp(App):
                                 "project": project.name,
                                 "scope": scope,
                                 "spawn": True,
+                                "coder_provider": coder_provider,
                             }
                         )
 
@@ -2208,10 +2230,10 @@ class HopperApp(App):
         if not item:
             return
 
-        def on_edit_result(result: tuple[str, str] | None) -> None:
+        def on_edit_result(result: tuple[str, str, str] | None) -> None:
             if result is None:
                 return  # Cancelled
-            action, text = result
+            action, text, coder_provider = result
             if action == "save":
                 if self.server:
                     self.server.enqueue(
@@ -2222,12 +2244,21 @@ class HopperApp(App):
                         }
                     )
             elif action == "promote":
+                if coder_provider != DEFAULT_CODER_PROVIDER:
+                    readiness = coder_check(coder_provider)
+                    if not readiness["ready"]:
+                        self.notify(
+                            f"{coder_provider.capitalize()} unavailable: {readiness['error']}",
+                            severity="error",
+                        )
+                        return
                 if self.server:
                     self.server.enqueue(
                         {
                             "type": "lode_promote_backlog",
                             "item_id": item_id,
                             "scope": text,
+                            "coder_provider": coder_provider,
                         }
                     )
 

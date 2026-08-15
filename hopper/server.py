@@ -44,6 +44,7 @@ from hopper.client import (
     RUN_GENERATION_ENV,
     RUNNER_MUTATION_TYPES,
 )
+from hopper.coder import DEFAULT_CODER_PROVIDER, coder_check, validate_coder_provider
 from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
@@ -68,12 +69,13 @@ from hopper.lodes import (
     touch,
     unarchive_lode,
     update_lode_branch,
-    update_lode_codex_thread,
+    update_lode_coder_session,
     update_lode_stage,
     update_lode_state,
     update_lode_status,
     update_lode_title,
     update_lode_worktree_path,
+    validate_lode_coder_schema,
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
@@ -3627,6 +3629,7 @@ class Server:
                         selected.project,
                         selected.description,
                         lode_id=promoted_id,
+                        coder_provider=source["coder"]["provider"],
                     )
                 except (OSError, RuntimeError, ValueError) as error:
                     self._block_action(record, "backlog", "cleanup", str(error))
@@ -4677,6 +4680,8 @@ class Server:
         self._log_handler = handler
         self.lodes = load_lodes()
         self.archived_lodes = load_archived_lodes()
+        validate_lode_coder_schema(self.lodes, "active.jsonl")
+        validate_lode_coder_schema(self.archived_lodes, "archived.jsonl")
         self.backlog = load_backlog()
         self.projects = get_active_projects()
 
@@ -5084,7 +5089,12 @@ class Server:
         elif msg_type == "archived_list":
             self._send_response(conn, {"type": "archived_list", "lodes": self.archived_lodes})
 
-    def _promote_backlog_item(self, item: BacklogItem, scope: str = "") -> dict | None:
+    def _promote_backlog_item(
+        self,
+        item: BacklogItem,
+        scope: str = "",
+        coder_provider: str = DEFAULT_CODER_PROVIDER,
+    ) -> dict | None:
         """Promote a backlog item to a lode. Returns the new lode dict."""
         proj = find_project(item.project)
         if proj and proj.disabled:
@@ -5094,7 +5104,12 @@ class Server:
                 item.project,
             )
             return None
-        lode = create_lode(self.lodes, item.project, scope or item.description)
+        lode = create_lode(
+            self.lodes,
+            item.project,
+            scope or item.description,
+            coder_provider=coder_provider,
+        )
         lode["backlog"] = item.to_dict()
         save_lodes(self.lodes)
         logger.info(f"Lode {lode['id']} promoted from backlog {item.id}")
@@ -5387,6 +5402,20 @@ class Server:
             project = message.get("project", "")
             scope = message.get("scope", "")
             originating_extro_sid = message.get("originating_extro_sid")
+            try:
+                coder_provider = validate_coder_provider(
+                    message.get("coder_provider", DEFAULT_CODER_PROVIDER)
+                )
+            except ValueError as error:
+                if conn:
+                    self._send_response(conn, {"type": "error", "error": str(error)})
+                return
+            if coder_provider != DEFAULT_CODER_PROVIDER:
+                readiness = coder_check(coder_provider)
+                if not readiness["ready"]:
+                    if conn:
+                        self._send_response(conn, {"type": "error", "error": readiness["error"]})
+                    return
             proj = find_project(project)
             if proj and proj.disabled:
                 logger.warning("Refusing to create lode for disabled project %s", project)
@@ -5401,6 +5430,7 @@ class Server:
                 project,
                 scope,
                 originating_extro_sid=originating_extro_sid,
+                coder_provider=coder_provider,
             )
             backlog_data = message.get("backlog")
             if backlog_data:
@@ -5627,13 +5657,14 @@ class Server:
                     logger.info(f"Lode {lode_id} worktree_path={worktree_path}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
-        elif msg_type == "lode_set_codex_thread":
+        elif msg_type == "lode_set_coder_session":
             lode_id = message.get("lode_id")
-            thread_id = message.get("codex_thread_id")
-            if lode_id and thread_id:
-                lode = update_lode_codex_thread(self.lodes, lode_id, thread_id)
+            provider = message.get("provider")
+            session_id = message.get("session_id")
+            if lode_id and provider and session_id:
+                lode = update_lode_coder_session(self.lodes, lode_id, provider, session_id)
                 if lode:
-                    logger.info(f"Lode {lode_id} codex_thread={thread_id}")
+                    logger.info(f"Lode {lode_id} coder={provider} session={session_id}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_claude_started":
@@ -5824,6 +5855,22 @@ class Server:
             # Compound: create lode from backlog item, remove backlog item
             item_id = message.get("item_id", "")
             scope = message.get("scope", "")
+            try:
+                coder_provider = validate_coder_provider(
+                    message.get("coder_provider", DEFAULT_CODER_PROVIDER)
+                )
+            except ValueError as error:
+                if conn:
+                    self._send_response(conn, {"type": "promote_error", "error": str(error)})
+                return
+            if coder_provider != DEFAULT_CODER_PROVIDER:
+                readiness = coder_check(coder_provider)
+                if not readiness["ready"]:
+                    if conn:
+                        self._send_response(
+                            conn, {"type": "promote_error", "error": readiness["error"]}
+                        )
+                    return
             item = find_backlog_by_prefix(self.backlog, item_id)
             if not item:
                 if conn:
@@ -5833,7 +5880,7 @@ class Server:
                     )
             else:
                 try:
-                    lode = self._promote_backlog_item(item, scope)
+                    lode = self._promote_backlog_item(item, scope, coder_provider)
                     if lode and conn:
                         self._send_response(conn, {"type": "lode_promoted", "lode": lode})
                     elif conn:
@@ -5889,6 +5936,8 @@ class Server:
             self.projects = get_active_projects()
             self.lodes = load_lodes()
             self.archived_lodes = load_archived_lodes()
+            validate_lode_coder_schema(self.lodes, "active.jsonl")
+            validate_lode_coder_schema(self.archived_lodes, "archived.jsonl")
             self.backlog = load_backlog()
             logger.info("Projects and lodes reloaded from disk")
 

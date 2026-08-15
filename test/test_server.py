@@ -5350,6 +5350,49 @@ def test_lode_create_preserves_originating_extro_sid_over_socket(socket_path, se
     assert persisted["originating_extro_sid"] == "extro-session-1"
 
 
+def test_lode_create_persists_selected_grok_provider(socket_path, server, temp_config):
+    with patch(
+        "hopper.server.coder_check",
+        return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
+    ):
+        created = request_lode_creation(
+            socket_path,
+            "project-a",
+            "scope-a",
+            spawn=False,
+            coder_provider="grok",
+        )
+
+    assert created["coder"] == {"provider": "grok", "session_id": None}
+    persisted = json.loads((temp_config / "active.jsonl").read_text().strip())
+    assert persisted["coder"] == {"provider": "grok", "session_id": None}
+
+
+def test_lode_create_refuses_grok_before_durable_creation_when_cli_missing(
+    socket_path, server, temp_config
+):
+    with patch(
+        "hopper.server.coder_check",
+        return_value={
+            "provider": "grok",
+            "ready": False,
+            "version": "",
+            "error": "grok command not found",
+        },
+    ):
+        created = request_lode_creation(
+            socket_path,
+            "project-a",
+            "scope-a",
+            spawn=False,
+            coder_provider="grok",
+        )
+
+    assert created is None
+    assert server.lodes == []
+    assert (temp_config / "active.jsonl").read_text() == ""
+
+
 def test_concurrent_lode_create_responses_are_causally_bound(
     socket_path, server, temp_config, monkeypatch
 ):
@@ -5368,6 +5411,7 @@ def test_concurrent_lode_create_responses_are_causally_bound(
         scope="",
         *,
         originating_extro_sid=None,
+        coder_provider="codex",
     ):
         if scope == "scope-a":
             a_create_started.set()
@@ -5379,6 +5423,7 @@ def test_concurrent_lode_create_responses_are_causally_bound(
             project,
             scope,
             originating_extro_sid=originating_extro_sid,
+            coder_provider=coder_provider,
         )
 
     def observed_enqueue(message, conn=None):
@@ -8692,8 +8737,8 @@ def test_server_disconnects_stale_client_on_reconnect(
     client2.close()
 
 
-def test_server_handles_lode_set_codex_thread(socket_path, server, temp_config, make_lode):
-    """Server handles lode_set_codex_thread message."""
+def test_server_handles_lode_set_coder_session(socket_path, server, temp_config, make_lode):
+    """Server handles lode_set_coder_session message."""
     lode = make_lode(id="test-id", stage="refine", state="running")
     server.lodes = [lode]
     save_lodes(server.lodes)
@@ -8709,12 +8754,13 @@ def test_server_handles_lode_set_codex_thread(socket_path, server, temp_config, 
             break
         time.sleep(0.1)
 
-    # Send lode_set_codex_thread message
+    # Send lode_set_coder_session message
     msg = _runner_message(
         server,
-        "lode_set_codex_thread",
+        "lode_set_coder_session",
         "test-id",
-        codex_thread_id="codex-uuid-1234",
+        provider="codex",
+        session_id="codex-uuid-1234",
     )
     client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
 
@@ -8724,10 +8770,10 @@ def test_server_handles_lode_set_codex_thread(socket_path, server, temp_config, 
 
     assert response["type"] == "lode_updated"
     assert response["lode"]["id"] == "test-id"
-    assert response["lode"]["codex_thread_id"] == "codex-uuid-1234"
+    assert response["lode"]["coder"]["session_id"] == "codex-uuid-1234"
 
     # Server's lode should be updated
-    assert server.lodes[0]["codex_thread_id"] == "codex-uuid-1234"
+    assert server.lodes[0]["coder"]["session_id"] == "codex-uuid-1234"
 
     client.close()
 
@@ -10431,7 +10477,10 @@ class TestOomLifecycle:
             ("lode_set_progress", {"summary": "stale"}),
             ("lode_set_title", {"title": "stale"}),
             ("lode_set_branch", {"branch": "stale"}),
-            ("lode_set_codex_thread", {"codex_thread_id": "stale"}),
+            (
+                "lode_set_coder_session",
+                {"provider": "codex", "session_id": "stale"},
+            ),
             ("lode_set_claude_started", {"claude_stage": "mill"}),
         ],
     )

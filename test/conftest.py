@@ -74,7 +74,7 @@ def make_lode():
             "failure_kind": None,
             "spawn_disposition": None,
             "archive_action_id": None,
-            "codex_thread_id": None,
+            "coder": {"provider": "codex", "session_id": None},
             "last_progress_at": None,
             "last_progress_summary": "",
             "last_pane_activity_at": None,

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from hopper import deadline as deadline_utils
+from hopper.coder import DEFAULT_CODER_PROVIDER, validate_coder_provider
 from hopper.lodes import current_time_ms
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ RUNNER_MUTATION_TYPES = frozenset(
         "lode_set_title",
         "lode_set_branch",
         "lode_set_worktree_path",
-        "lode_set_codex_thread",
+        "lode_set_coder_session",
         "lode_set_claude_started",
     }
 )
@@ -579,8 +580,10 @@ def create_lode(
     timeout: float = 5.0,
     *,
     originating_extro_sid: str | None = None,
+    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> dict | None:
     """Create a new lode via the server. Returns the created lode dict or None."""
+    coder_provider = validate_coder_provider(coder_provider)
     response = send_message(
         socket_path,
         {
@@ -589,6 +592,7 @@ def create_lode(
             "scope": scope,
             "spawn": spawn,
             "originating_extro_sid": originating_extro_sid,
+            "coder_provider": coder_provider,
         },
         timeout=timeout,
         wait_for_response=True,
@@ -1029,24 +1033,31 @@ def set_lode_title(socket_path: Path, lode_id: str, title: str, timeout: float =
     return _fire_and_forget(socket_path, msg, timeout)
 
 
-def set_codex_thread_id(
-    socket_path: Path, lode_id: str, codex_thread_id: str, timeout: float = 2.0
+def set_coder_session(
+    socket_path: Path,
+    lode_id: str,
+    provider: str,
+    session_id: str,
+    timeout: float = 2.0,
 ) -> bool:
-    """Set a lode's Codex thread ID (fire-and-forget).
+    """Set a lode's selected coder session ID (fire-and-forget).
 
     Args:
         socket_path: Path to the Unix socket
         lode_id: The lode ID to update
-        codex_thread_id: The Codex thread UUID to store
+        provider: The lode's selected coder provider
+        session_id: The provider session UUID to store
         timeout: Connection timeout in seconds
 
     Returns:
         True if message was sent successfully, False otherwise
     """
+    provider = validate_coder_provider(provider)
     msg = {
-        "type": "lode_set_codex_thread",
+        "type": "lode_set_coder_session",
         "lode_id": lode_id,
-        "codex_thread_id": codex_thread_id,
+        "provider": provider,
+        "session_id": session_id,
         "ts": current_time_ms(),
     }
     return _fire_and_forget(socket_path, msg, timeout)
@@ -1106,12 +1117,16 @@ def promote_backlog(
     item_id: str,
     scope: str = "",
     timeout: float = 5.0,
+    *,
+    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> dict | None:
     """Promote a backlog item to a lode via the server. Returns the created lode dict or None."""
+    coder_provider = validate_coder_provider(coder_provider)
     msg: dict = {
         "type": "lode_promote_backlog",
         "item_id": item_id,
         "ts": current_time_ms(),
+        "coder_provider": coder_provider,
     }
     if scope:
         msg["scope"] = scope

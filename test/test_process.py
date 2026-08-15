@@ -67,6 +67,7 @@ def _mock_response(stage="mill", state="new", active=False, project="", claude=N
         "project": project,
         "stage": stage,
         "scope": extra.get("scope", ""),
+        "coder": {"provider": "codex", "session_id": None},
         "claude": claude or _claude_sessions(),
     }
     lode.update(extra)
@@ -794,7 +795,7 @@ class TestMillStage:
         refine.connection = refine_connection
         with (
             patch("hopper.process.create_worktree") as mock_create,
-            patch.object(refine, "_bootstrap_codex", return_value=None) as mock_bootstrap,
+            patch.object(refine, "_bootstrap_coder", return_value=None) as mock_bootstrap,
         ):
             assert refine._setup_refine() is None
 
@@ -2027,11 +2028,13 @@ class TestRefineStage:
             patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
             patch(
-                "hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)
+                "hopper.process.bootstrap_coder", return_value=(0, "codex-thread-abc", None)
             ) as mock_boot,
             patch(
-                "hopper.process.set_codex_thread_id",
-                side_effect=lambda s, sid, tid: codex_calls.append((sid, tid)),
+                "hopper.process.set_coder_session",
+                side_effect=lambda s, sid, provider, session: codex_calls.append(
+                    (sid, provider, session)
+                ),
             ),
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
@@ -2042,9 +2045,34 @@ class TestRefineStage:
 
         assert exit_code == 0
         mock_boot.assert_called_once()
-        assert codex_calls == [("test-id", "codex-thread-abc")]
+        assert codex_calls == [("test-id", "codex", "codex-thread-abc")]
         cmd = mock_popen.call_args[0][0]
         assert "--session-id" in cmd
+
+    def test_grok_lode_bootstraps_grok_and_persists_matching_session(self, tmp_path):
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
+        runner.worktree_path = tmp_path
+        runner._load_lode_data(
+            {
+                "stage": "refine",
+                "coder": {"provider": "grok", "session_id": None},
+            }
+        )
+        with (
+            patch("hopper.process.prompt.load", return_value="code prompt"),
+            patch(
+                "hopper.process.bootstrap_coder",
+                return_value=(0, "grok-session-abc", None),
+            ) as bootstrap,
+            patch("hopper.process.set_lode_status"),
+            patch("hopper.process.set_coder_session") as persist,
+        ):
+            assert runner._bootstrap_coder() is None
+
+        bootstrap.assert_called_once_with("grok", "code prompt", str(tmp_path), env=None)
+        persist.assert_called_once_with(
+            Path("/tmp/test.sock"), "test-id", "grok", "grok-session-abc"
+        )
 
     def test_first_run_emits_setup_status(self, tmp_path):
         """First-run refine emits setup status updates in order."""
@@ -2065,8 +2093,8 @@ class TestRefineStage:
             patch("hopper.process._make_install_target", return_value="install"),
             patch("hopper.process._run_make_install", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
-            patch("hopper.process.set_codex_thread_id", return_value=True),
+            patch("hopper.process.bootstrap_coder", return_value=(0, "codex-thread-abc", None)),
+            patch("hopper.process.set_coder_session", return_value=True),
             patch("hopper.process.set_lode_status") as mock_status,
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),
@@ -2099,8 +2127,8 @@ class TestRefineStage:
             patch("hopper.process._make_install_target", return_value="hopper-install"),
             patch("hopper.process._run_make_install", return_value=(True, None)) as mock_install,
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
-            patch("hopper.process.set_codex_thread_id", return_value=True),
+            patch("hopper.process.bootstrap_coder", return_value=(0, "codex-thread-abc", None)),
+            patch("hopper.process.set_coder_session", return_value=True),
             patch("hopper.process.set_lode_status") as mock_status,
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),
@@ -2169,8 +2197,8 @@ class TestRefineStage:
             patch("hopper.process._has_makefile", return_value=False),
             patch("hopper.process._run_make_install") as mock_make_install,
             patch("hopper.process.prompt.load", return_value="loaded prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(0, "codex-thread-abc", None)),
-            patch("hopper.process.set_codex_thread_id", return_value=True),
+            patch("hopper.process.bootstrap_coder", return_value=(0, "codex-thread-abc", None)),
+            patch("hopper.process.set_coder_session", return_value=True),
             patch("hopper.process.set_lode_status"),
             patch("subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)),
             patch("hopper.runner.get_current_pane_id", return_value=None),
@@ -2203,7 +2231,7 @@ class TestRefineStage:
             patch("hopper.runner.find_project", return_value=mock_project),
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree") as mock_wt,
-            patch("hopper.process.bootstrap_codex", return_value=(0, "unused", None)) as mock_boot,
+            patch("hopper.process.bootstrap_coder", return_value=(0, "unused", None)) as mock_boot,
             patch(
                 "subprocess.Popen", return_value=MagicMock(returncode=0, stderr=None)
             ) as mock_popen,
@@ -2485,7 +2513,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(1, None, None)),
+            patch("hopper.process.bootstrap_coder", return_value=(1, None, None)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -2516,7 +2544,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(1, None, message)),
+            patch("hopper.process.bootstrap_coder", return_value=(1, None, message)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
@@ -2545,7 +2573,7 @@ class TestRefineStage:
             patch("hopper.process.get_lode_dir", return_value=session_dir),
             patch("hopper.process.create_worktree", return_value=(True, None)),
             patch("hopper.process.prompt.load", return_value="prompt"),
-            patch("hopper.process.bootstrap_codex", return_value=(124, None, None)),
+            patch("hopper.process.bootstrap_coder", return_value=(124, None, None)),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()) as MockConn,
             patch("hopper.runner.get_current_pane_id", return_value="%0"),
         ):
