@@ -105,6 +105,9 @@ def test_new_window_lost_identity_never_proves_live_pane_absent():
                 _tmux_result(),
                 _tmux_result(stdout="%9\n"),
                 _tmux_result(returncode=1, stderr="wait failed"),
+                # A failed wait now consults the pane tag; no pane reports this
+                # action, so the outcome must still be UNKNOWN.
+                _tmux_result(),
                 _tmux_result(),
             ],
             (WindowSpawnOutcome.UNKNOWN, None),
@@ -815,3 +818,53 @@ def test_pane_needs_answer_ignores_an_ordinary_composer():
     assert pane_needs_answer("") is False
     # Numbered prose without selector chrome is not a prompt.
     assert pane_needs_answer("❯ 1. first item\n❯ 2. second item\n") is False
+
+
+def _receipt(action_id="a" * 32):
+    return {
+        "path": f"/tmp/{action_id}.json",
+        "action_id": action_id,
+        "source_lode_id": "abc12345",
+        "target_lode_id": "abc12345",
+        "target_generation": "b" * 32,
+    }
+
+
+@pytest.mark.parametrize(
+    ("tagged", "expected"),
+    [
+        (["%17"], (WindowSpawnOutcome.SPAWNED, "%17")),
+        ([], (WindowSpawnOutcome.UNKNOWN, None)),
+        (None, (WindowSpawnOutcome.UNKNOWN, None)),
+        (["%99"], (WindowSpawnOutcome.UNKNOWN, None)),
+        (["%17", "%99"], (WindowSpawnOutcome.UNKNOWN, None)),
+    ],
+    ids=[
+        "our-pane-tagged-is-proof",
+        "no-pane-tagged-stays-unknown",
+        "tmux-unreadable-stays-unknown",
+        "other-pane-tagged-stays-unknown",
+        "ambiguous-tags-stay-unknown",
+    ],
+)
+def test_failed_receipt_wait_consults_the_pane_tag_before_giving_up(tagged, expected):
+    """A failed wait is a lost notification, not proof the pane was never claimed.
+
+    The bootstrap tags its pane and fsyncs its receipt before releasing the lock, so
+    tmux can still answer which pane carries the action tag. Only our exact pane counts;
+    an unreadable tmux stays UNKNOWN.
+    """
+    results = [
+        _tmux_result(),  # wait-for -L : acquire
+        _tmux_result(stdout="%17\n"),  # new-window returns the pane id
+        _tmux_result(returncode=1, stderr="wait failed"),  # wait-for -L : receipt wait
+        _tmux_result(),  # wait-for -U : release
+    ]
+    with (
+        patch("hopper.tmux.subprocess.run", side_effect=results),
+        patch("hopper.tmux.completion_action_panes", return_value=tagged) as lookup,
+    ):
+        outcome = new_window("hop process abc12345", background=True, spawn_receipt=_receipt())
+
+    assert outcome == expected
+    lookup.assert_called_once_with("a" * 32)

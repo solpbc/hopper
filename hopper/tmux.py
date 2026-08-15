@@ -397,6 +397,19 @@ def new_window(
                     )
                     if waited.returncode != 0:
                         logger.error(f"tmux spawn receipt wait failed: {waited.stderr.strip()}")
+                        # The lock is only a notification. The bootstrap tags its own
+                        # pane and fsyncs the receipt *before* releasing it, so a failed
+                        # wait says nothing about whether the pane was claimed. Ask tmux
+                        # which pane carries this action's tag instead of discarding a
+                        # pane id already in hand. Anything short of exactly our pane —
+                        # including tmux being unreadable — stays UNKNOWN.
+                        tagged = completion_action_panes(spawn_receipt["action_id"])
+                        if tagged == [pane_id]:
+                            logger.info(
+                                "tmux spawn receipt confirmed by pane tag after failed wait: %s",
+                                pane_id,
+                            )
+                            outcome = (WindowSpawnOutcome.SPAWNED, pane_id)
                     else:
                         outcome = (WindowSpawnOutcome.SPAWNED, pane_id)
     except FileNotFoundError:
