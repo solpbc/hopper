@@ -4537,8 +4537,19 @@ def test_completion_spawn_adopts_only_the_fsynced_receipt_pane(socket_path, make
     assert actions.load_pending_action(record["lode_id"])["spawn"]["pane_id"] == "%9"
 
 
+@pytest.mark.parametrize(
+    ("source_coder", "expected_promoted_coder"),
+    [
+        (None, None),
+        (
+            {"provider": "grok", "session_id": "source-session"},
+            {"provider": "grok", "session_id": None},
+        ),
+    ],
+    ids=["default-codex", "grok"],
+)
 def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
-    socket_path, make_lode, monkeypatch
+    socket_path, make_lode, monkeypatch, source_coder, expected_promoted_coder
 ):
     record = _pending_completion_record(stage="ship")
     for marker_name in (
@@ -4563,6 +4574,7 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
     )
     actions.write_pending_action(record)
     server = Server(socket_path)
+    source_fields = {"coder": source_coder} if source_coder is not None else {}
     server.lodes = [
         make_lode(
             id=record["lode_id"],
@@ -4570,6 +4582,7 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
             stage="ship",
             state="teardown",
             run_generation=record["expected_generation"],
+            **source_fields,
         )
     ]
     server.backlog = [
@@ -4586,6 +4599,10 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
     assert server.archived_lodes[0]["archive_action_id"] == record["action_id"]
     promoted = next(lode for lode in server.lodes if lode["id"] == "bcde2345")
     assert promoted["backlog"]["id"] == "first001"
+    if expected_promoted_coder is None:
+        assert "coder" not in promoted
+    else:
+        assert promoted["coder"] == expected_promoted_coder
     assert [item.id for item in server.backlog] == ["second01"]
     assert server.backlog[0].queued == promoted["id"]
     assert record["ship"]["backlog"]["selected_item_id"] == "first001"
