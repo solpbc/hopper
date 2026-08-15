@@ -44,7 +44,12 @@ from hopper.client import (
     RUN_GENERATION_ENV,
     RUNNER_MUTATION_TYPES,
 )
-from hopper.coder import DEFAULT_CODER_PROVIDER, coder_check, validate_coder_provider
+from hopper.coder import (
+    CODER_PROVIDERS,
+    DEFAULT_CODER_PROVIDER,
+    coder_check,
+    validate_coder_provider,
+)
 from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
@@ -59,6 +64,7 @@ from hopper.lodes import (
     is_terminal_failure_kind,
     load_archived_lodes,
     load_lodes,
+    lode_coder,
     reserve_lode_id,
     reset_lode_claude_stage,
     resolve_worktree_path,
@@ -70,12 +76,13 @@ from hopper.lodes import (
     unarchive_lode,
     update_lode_branch,
     update_lode_coder_session,
+    update_lode_codex_thread,
     update_lode_stage,
     update_lode_state,
     update_lode_status,
     update_lode_title,
     update_lode_worktree_path,
-    validate_lode_coder_schema,
+    validate_lode_coder_data,
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
@@ -3629,7 +3636,7 @@ class Server:
                         selected.project,
                         selected.description,
                         lode_id=promoted_id,
-                        coder_provider=source["coder"]["provider"],
+                        coder_provider=lode_coder(source)[0],
                     )
                 except (OSError, RuntimeError, ValueError) as error:
                     self._block_action(record, "backlog", "cleanup", str(error))
@@ -4680,8 +4687,8 @@ class Server:
         self._log_handler = handler
         self.lodes = load_lodes()
         self.archived_lodes = load_archived_lodes()
-        validate_lode_coder_schema(self.lodes, "active.jsonl")
-        validate_lode_coder_schema(self.archived_lodes, "archived.jsonl")
+        validate_lode_coder_data(self.lodes, "active.jsonl")
+        validate_lode_coder_data(self.archived_lodes, "archived.jsonl")
         self.backlog = load_backlog()
         self.projects = get_active_projects()
 
@@ -4751,7 +4758,16 @@ class Server:
             self._unlink_owned_socket()
 
     # Message types that only read state and send a response (safe from any thread)
-    _READ_ONLY_TYPES = frozenset({"connect", "ping", "lode_list", "backlog_list", "archived_list"})
+    _READ_ONLY_TYPES = frozenset(
+        {
+            "connect",
+            "ping",
+            "coder_capabilities",
+            "lode_list",
+            "backlog_list",
+            "archived_list",
+        }
+    )
 
     def _handle_client(self, conn: socket.socket) -> None:
         """Handle a client connection.
@@ -5077,6 +5093,12 @@ class Server:
             self._send_response(
                 conn,
                 {"type": "pong", "pid": os.getpid(), "started_at": self.started_at},
+            )
+
+        elif msg_type == "coder_capabilities":
+            self._send_response(
+                conn,
+                {"type": "coder_capabilities", "providers": list(CODER_PROVIDERS)},
             )
 
         elif msg_type == "lode_list":
@@ -5657,12 +5679,25 @@ class Server:
                     logger.info(f"Lode {lode_id} worktree_path={worktree_path}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
+        elif msg_type == "lode_set_codex_thread":
+            lode_id = message.get("lode_id")
+            thread_id = message.get("codex_thread_id")
+            if lode_id and thread_id:
+                lode = update_lode_codex_thread(self.lodes, lode_id, thread_id)
+                if lode:
+                    logger.info(f"Lode {lode_id} codex_thread={thread_id}")
+                    self.broadcast({"type": "lode_updated", "lode": lode})
+
         elif msg_type == "lode_set_coder_session":
             lode_id = message.get("lode_id")
             provider = message.get("provider")
             session_id = message.get("session_id")
             if lode_id and provider and session_id:
-                lode = update_lode_coder_session(self.lodes, lode_id, provider, session_id)
+                try:
+                    lode = update_lode_coder_session(self.lodes, lode_id, provider, session_id)
+                except ValueError as error:
+                    logger.warning("Refusing invalid coder session mutation: %s", error)
+                    return
                 if lode:
                     logger.info(f"Lode {lode_id} coder={provider} session={session_id}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
@@ -5936,8 +5971,8 @@ class Server:
             self.projects = get_active_projects()
             self.lodes = load_lodes()
             self.archived_lodes = load_archived_lodes()
-            validate_lode_coder_schema(self.lodes, "active.jsonl")
-            validate_lode_coder_schema(self.archived_lodes, "archived.jsonl")
+            validate_lode_coder_data(self.lodes, "active.jsonl")
+            validate_lode_coder_data(self.archived_lodes, "archived.jsonl")
             self.backlog = load_backlog()
             logger.info("Projects and lodes reloaded from disk")
 

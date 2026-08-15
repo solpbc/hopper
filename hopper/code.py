@@ -13,7 +13,13 @@ from pathlib import Path
 from hopper import prompt
 from hopper.client import connect, set_lode_progress, set_lode_state
 from hopper.coder import coder_failure_message, run_coder, validate_coder_provider
-from hopper.lodes import current_time_ms, format_duration_ms, get_lode_dir, get_worktree_dir
+from hopper.lodes import (
+    current_time_ms,
+    format_duration_ms,
+    get_lode_dir,
+    get_worktree_dir,
+    lode_coder,
+)
 from hopper.projects import find_project
 
 logger = logging.getLogger(__name__)
@@ -271,21 +277,19 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         print(f"Lode {lode_id} is not in refine stage.")
         return 1
 
-    coder = lode_data.get("coder")
-    if not isinstance(coder, dict):
-        print(f"Lode {lode_id} has invalid coder configuration.")
-        return 1
     try:
-        provider = validate_coder_provider(coder.get("provider"))
+        provider, session_id = lode_coder(lode_data)
     except ValueError as error:
         print(f"Lode {lode_id} has invalid coder configuration: {error}")
         return 1
-    session_id = coder.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
+    if not session_id:
         label = provider.capitalize()
         print(f"Lode {lode_id} has no {label} session ID.")
         print(f"The {label} session is bootstrapped during 'hop refine' first run.")
-        print("Re-run 'hop refine' to bootstrap the coder session.")
+        if provider == "codex":
+            print("Re-run 'hop refine' to bootstrap the Codex session.")
+        else:
+            print("Re-run 'hop refine' to bootstrap the coder session.")
         return 1
 
     # Validate cwd is the lode worktree
@@ -371,14 +375,17 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     metadata = {
         "stage": stage_name,
         "lode_id": lode_id,
-        "coder_provider": provider,
-        "coder_session_id": session_id,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_ms": finished_at - started_at,
         "exit_code": exit_code,
         "cmd": cmd,
     }
+    if provider == "codex":
+        metadata["codex_thread_id"] = session_id
+    else:
+        metadata["coder_provider"] = provider
+        metadata["coder_session_id"] = session_id
     if turn_failed:
         metadata["turn_failed_message"] = turn_failed
     meta_path = lode_dir / f"{suffix}.json"

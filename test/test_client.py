@@ -22,6 +22,7 @@ from hopper.client import (
     archive_lode,
     complete_lode,
     connect,
+    create_lode,
     get_gate,
     kill_lode,
     list_archived_lodes,
@@ -30,6 +31,7 @@ from hopper.client import (
     pause_lode,
     ping,
     probe_server,
+    promote_backlog,
     read_archived_lodes,
     read_lode_snapshot,
     read_lodes,
@@ -106,6 +108,49 @@ def _exchange_with_responder(socket_path, responder, *, wait=True, timeout=0.2, 
     return result, requests[0]
 
 
+def test_default_coder_preserves_existing_create_wire_contract(monkeypatch, socket_path):
+    sent = []
+
+    def respond(_socket_path, message, **kwargs):
+        sent.append((message, kwargs))
+        return {"type": "lode_created", "lode": {"id": "abc12345"}}
+
+    monkeypatch.setattr("hopper.client.send_message", respond)
+
+    assert create_lode(socket_path, "project-a", "scope-a", spawn=False) == {"id": "abc12345"}
+    assert sent == [
+        (
+            {
+                "type": "lode_create",
+                "project": "project-a",
+                "scope": "scope-a",
+                "spawn": False,
+                "originating_extro_sid": None,
+            },
+            {"timeout": 5.0, "wait_for_response": True},
+        )
+    ]
+
+
+def test_default_coder_preserves_existing_backlog_promote_wire_contract(monkeypatch, socket_path):
+    sent = []
+
+    def respond(_socket_path, message, **kwargs):
+        sent.append((message, kwargs))
+        return {"type": "lode_promoted", "lode": {"id": "abc12345"}}
+
+    monkeypatch.setattr("hopper.client.send_message", respond)
+    monkeypatch.setattr("hopper.client.current_time_ms", lambda: 123)
+
+    assert promote_backlog(socket_path, "backlog1") == {"id": "abc12345"}
+    assert sent == [
+        (
+            {"type": "lode_promote_backlog", "item_id": "backlog1", "ts": 123},
+            {"timeout": 5.0, "wait_for_response": True},
+        )
+    ]
+
+
 @pytest.fixture
 def server(socket_path):
     """Start a server in a background thread."""
@@ -147,6 +192,17 @@ def test_connect_failure_no_server(socket_path):
     """Connect returns None when server not running."""
     result = connect(socket_path, timeout=0.5)
     assert result is None
+
+
+def test_server_advertises_additive_coder_capability(server, socket_path):
+    response = send_message(
+        socket_path,
+        {"type": "coder_capabilities"},
+        wait_for_response=True,
+    )
+
+    assert response["type"] == "coder_capabilities"
+    assert response["providers"] == ["codex", "grok"]
 
 
 def test_connect_with_tmux_location(server_with_tmux, socket_path):

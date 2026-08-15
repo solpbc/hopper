@@ -2777,7 +2777,6 @@ async def test_backlog_promote_creates_session(monkeypatch, temp_config):
                 "type": "lode_promote_backlog",
                 "item_id": "bl111111",
                 "scope": "Promote me",
-                "coder_provider": "codex",
             }
         ]
 

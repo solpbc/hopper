@@ -40,6 +40,11 @@ def _mock_response(
     provider="codex",
     session_id=THREAD_ID,
 ):
+    coder_data = (
+        {"codex_thread_id": session_id}
+        if provider == "codex"
+        else {"coder": {"provider": provider, "session_id": session_id}}
+    )
     return {
         "type": "connected",
         "tmux": None,
@@ -47,7 +52,7 @@ def _mock_response(
             "stage": stage,
             "project": project,
             "scope": scope,
-            "coder": {"provider": provider, "session_id": session_id},
+            **coder_data,
         },
         "lode_found": True,
     }
@@ -178,12 +183,13 @@ class TestRunCode:
         # Output saved
         assert (session_dir / "audit.out.md").exists()
 
-        # Metadata records the selected provider and session.
+        # Existing Codex metadata remains byte-shape compatible.
         meta = json.loads((session_dir / "audit.json").read_text())
         assert meta["stage"] == "audit"
         assert meta["lode_id"] == "test-sid"
-        assert meta["coder_provider"] == "codex"
-        assert meta["coder_session_id"] == THREAD_ID
+        assert meta["codex_thread_id"] == THREAD_ID
+        assert "coder_provider" not in meta
+        assert "coder_session_id" not in meta
         assert meta["exit_code"] == 0
         assert meta["cmd"] == MOCK_CMD
         assert "turn_failed_message" not in meta

@@ -36,6 +36,7 @@ RUNNER_MUTATION_TYPES = frozenset(
         "lode_set_title",
         "lode_set_branch",
         "lode_set_worktree_path",
+        "lode_set_codex_thread",
         "lode_set_coder_session",
         "lode_set_claude_started",
     }
@@ -584,16 +585,33 @@ def create_lode(
 ) -> dict | None:
     """Create a new lode via the server. Returns the created lode dict or None."""
     coder_provider = validate_coder_provider(coder_provider)
+    if coder_provider != DEFAULT_CODER_PROVIDER:
+        capabilities = send_message(
+            socket_path,
+            {"type": "coder_capabilities"},
+            timeout=timeout,
+            wait_for_response=True,
+        )
+        providers = capabilities.get("providers") if capabilities else None
+        if (
+            not capabilities
+            or capabilities.get("type") != "coder_capabilities"
+            or not isinstance(providers, list)
+            or coder_provider not in providers
+        ):
+            return None
+    message = {
+        "type": "lode_create",
+        "project": project,
+        "scope": scope,
+        "spawn": spawn,
+        "originating_extro_sid": originating_extro_sid,
+    }
+    if coder_provider != DEFAULT_CODER_PROVIDER:
+        message["coder_provider"] = coder_provider
     response = send_message(
         socket_path,
-        {
-            "type": "lode_create",
-            "project": project,
-            "scope": scope,
-            "spawn": spawn,
-            "originating_extro_sid": originating_extro_sid,
-            "coder_provider": coder_provider,
-        },
+        message,
         timeout=timeout,
         wait_for_response=True,
     )
@@ -1033,6 +1051,19 @@ def set_lode_title(socket_path: Path, lode_id: str, title: str, timeout: float =
     return _fire_and_forget(socket_path, msg, timeout)
 
 
+def set_codex_thread_id(
+    socket_path: Path, lode_id: str, codex_thread_id: str, timeout: float = 2.0
+) -> bool:
+    """Set a lode's Codex thread ID using the existing runner protocol."""
+    msg = {
+        "type": "lode_set_codex_thread",
+        "lode_id": lode_id,
+        "codex_thread_id": codex_thread_id,
+        "ts": current_time_ms(),
+    }
+    return _fire_and_forget(socket_path, msg, timeout)
+
+
 def set_coder_session(
     socket_path: Path,
     lode_id: str,
@@ -1053,6 +1084,8 @@ def set_coder_session(
         True if message was sent successfully, False otherwise
     """
     provider = validate_coder_provider(provider)
+    if provider == DEFAULT_CODER_PROVIDER:
+        return set_codex_thread_id(socket_path, lode_id, session_id, timeout)
     msg = {
         "type": "lode_set_coder_session",
         "lode_id": lode_id,
@@ -1126,8 +1159,9 @@ def promote_backlog(
         "type": "lode_promote_backlog",
         "item_id": item_id,
         "ts": current_time_ms(),
-        "coder_provider": coder_provider,
     }
+    if coder_provider != DEFAULT_CODER_PROVIDER:
+        msg["coder_provider"] = coder_provider
     if scope:
         msg["scope"] = scope
     response = send_message(socket_path, msg, timeout=timeout, wait_for_response=True)

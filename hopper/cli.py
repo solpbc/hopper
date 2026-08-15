@@ -38,6 +38,7 @@ from hopper.lodes import (
     get_worktree_dir,
     is_canonical_lode_id,
     is_terminal_failure_kind,
+    lode_coder,
     lode_icon,
     lode_status_for_display,
     lode_with_status_annotations,
@@ -432,9 +433,7 @@ def _remote_create_refusal(host: str, project: str, observed: str) -> int:
     return 2
 
 
-def _validate_remote_create_response(
-    result, project: str, coder_provider: str
-) -> tuple[dict[str, str] | None, str]:
+def _validate_remote_create_response(result, project: str) -> tuple[dict[str, str] | None, str]:
     """Validate the authoritative remote-side create JSON before host rewriting."""
     if result.returncode != 0:
         diagnostic = (result.stderr or result.stdout or "").strip()
@@ -444,7 +443,7 @@ def _validate_remote_create_response(
         payload = json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
         return None, "returned malformed JSON"
-    if not isinstance(payload, dict) or set(payload) != {"id", "project", "host", "coder"}:
+    if not isinstance(payload, dict) or set(payload) != {"id", "project", "host"}:
         return None, "returned a response outside the exact create JSON contract"
 
     lode_id = payload.get("id")
@@ -454,14 +453,7 @@ def _validate_remote_create_response(
         return None, f"returned project {payload.get('project')!r}, expected {project!r}"
     if payload.get("host") != "local":
         return None, f"returned host {payload.get('host')!r}, expected 'local'"
-    if payload.get("coder") != coder_provider:
-        return None, f"returned coder {payload.get('coder')!r}, expected {coder_provider!r}"
-    return {
-        "id": lode_id,
-        "project": project,
-        "host": "local",
-        "coder": coder_provider,
-    }, ""
+    return {"id": lode_id, "project": project, "host": "local"}, ""
 
 
 def _run_authoritative_remote_create(
@@ -473,7 +465,6 @@ def _run_authoritative_remote_create(
     stdin_text: str | None,
     json_output: bool,
     unavailable_hosts: list[dict[str, str]],
-    coder_provider: str = DEFAULT_CODER_PROVIDER,
 ) -> int:
     """Run, validate, cache, and only then render one remote create."""
     from hopper.remote import REMOTE_CREATE_TIMEOUT_SEC, run_remote
@@ -495,7 +486,7 @@ def _run_authoritative_remote_create(
     except OSError as error:
         return _remote_create_refusal(host, project, f"failed during transport: {error}")
 
-    payload, failure = _validate_remote_create_response(result, project, coder_provider)
+    payload, failure = _validate_remote_create_response(result, project)
     if payload is None:
         return _remote_create_refusal(host, project, failure)
 
@@ -2013,9 +2004,12 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(f"  host:     {lode.get('host', '')}")
     lines.append(f"  project:  {lode.get('project', '')}")
     lines.append(f"  stage:    {lode.get('stage', '')}")
-    coder = lode.get("coder")
-    if isinstance(coder, dict):
-        lines.append(f"  coder:    {coder.get('provider', '')}")
+    if "coder" in lode:
+        try:
+            coder_provider, _session_id = lode_coder(lode)
+            lines.append(f"  coder:    {coder_provider}")
+        except ValueError:
+            lines.append("  coder:    INVALID")
     lines.append(f"  state:    {lode.get('state', '')}")
     if lode.get("state") == "reconnecting":
         prior_state = lode.get("reconnect_prior_state")
@@ -3907,7 +3901,6 @@ def cmd_lode(args: list[str]) -> int:
                         "id": lode["id"],
                         "project": project_name,
                         "host": "local",
-                        "coder": parsed.coder,
                     }
                 )
             )
@@ -4954,7 +4947,6 @@ def _main() -> int:
         stdin_text = _stdin_for_remote(cmd, cmd_args)
         create_project = _extract_create_project(cmd, cmd_args)
         if create_project is not None:
-            coder_provider = _extract_create_coder(cmd, cmd_args)
             return _run_authoritative_remote_create(
                 explicit_host,
                 [cmd, *cmd_args],
@@ -4963,7 +4955,6 @@ def _main() -> int:
                 stdin_text=stdin_text,
                 json_output=_create_wants_json(cmd, cmd_args),
                 unavailable_hosts=[],
-                coder_provider=coder_provider,
             )
         return _run_remote_cli(
             explicit_host,
@@ -5021,7 +5012,6 @@ def _main() -> int:
                     stdin_text=stdin_text,
                     json_output=json_output,
                     unavailable_hosts=unavailable_hosts,
-                    coder_provider=coder_provider,
                 )
 
     # Dispatch to command handler

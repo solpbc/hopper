@@ -23,7 +23,7 @@ from hopper.client import (
     set_lode_state,
     set_lode_status,
 )
-from hopper.coder import bootstrap_coder, validate_coder_provider
+from hopper.coder import bootstrap_coder
 from hopper.git import (
     create_worktree,
     current_branch,
@@ -31,7 +31,7 @@ from hopper.git import (
     is_dirty,
     quarantine_dirty_repo,
 )
-from hopper.lodes import get_lode_dir, get_worktree_dir, resolve_worktree_path
+from hopper.lodes import get_lode_dir, get_worktree_dir, lode_coder, resolve_worktree_path
 from hopper.runner import BaseRunner, _descendant_pids, _sum_descendant_cpu_ms
 
 logger = logging.getLogger(__name__)
@@ -354,10 +354,7 @@ class ProcessRunner(BaseRunner):
         self.stage = lode_data.get("stage", "")
         self.scope = lode_data.get("scope", "")
         self.lode_branch = lode_data.get("branch", "")
-        coder = lode_data.get("coder")
-        if not isinstance(coder, dict):
-            raise ValueError("lode is missing coder configuration")
-        self.coder_provider = validate_coder_provider(coder.get("provider"))
+        self.coder_provider, _session_id = lode_coder(lode_data)
 
     def _setup(self) -> int | None:
         logger.debug(f"setup dispatching lode={self.lode_id} stage={self.stage}")
@@ -737,9 +734,12 @@ class ProcessRunner(BaseRunner):
         )
 
         if exit_code == 127:
-            self._setup_error = (
-                f"{provider} command not found. Install {provider} to use this lode's coder."
-            )
+            if provider == "codex":
+                self._setup_error = "codex command not found. Install codex to use code features."
+            else:
+                self._setup_error = (
+                    f"{provider} command not found. Install {provider} to use this lode's coder."
+                )
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
@@ -757,7 +757,10 @@ class ProcessRunner(BaseRunner):
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
         if not session_id:
-            self._setup_error = f"Failed to read {label} session ID from bootstrap."
+            if provider == "codex":
+                self._setup_error = "Failed to capture Codex session ID from bootstrap."
+            else:
+                self._setup_error = f"Failed to read {label} session ID from bootstrap."
             print(self._setup_error)
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1

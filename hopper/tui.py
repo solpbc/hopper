@@ -1962,15 +1962,15 @@ class HopperApp(App):
                             )
                             return
                     if self.server:
-                        self.server.enqueue(
-                            {
-                                "type": "lode_create",
-                                "project": project.name,
-                                "scope": scope,
-                                "spawn": True,
-                                "coder_provider": coder_provider,
-                            }
-                        )
+                        message = {
+                            "type": "lode_create",
+                            "project": project.name,
+                            "scope": scope,
+                            "spawn": True,
+                        }
+                        if coder_provider != DEFAULT_CODER_PROVIDER:
+                            message["coder_provider"] = coder_provider
+                        self.server.enqueue(message)
 
             self.push_screen(ScopeInputScreen(project.name), on_scope_entered)
 
@@ -2253,14 +2253,14 @@ class HopperApp(App):
                         )
                         return
                 if self.server:
-                    self.server.enqueue(
-                        {
-                            "type": "lode_promote_backlog",
-                            "item_id": item_id,
-                            "scope": text,
-                            "coder_provider": coder_provider,
-                        }
-                    )
+                    message = {
+                        "type": "lode_promote_backlog",
+                        "item_id": item_id,
+                        "scope": text,
+                    }
+                    if coder_provider != DEFAULT_CODER_PROVIDER:
+                        message["coder_provider"] = coder_provider
+                    self.server.enqueue(message)
 
         self.push_screen(BacklogEditScreen(initial_text=item.description), on_edit_result)
 

@@ -67,7 +67,7 @@ def _mock_response(stage="mill", state="new", active=False, project="", claude=N
         "project": project,
         "stage": stage,
         "scope": extra.get("scope", ""),
-        "coder": {"provider": "codex", "session_id": None},
+        "codex_thread_id": None,
         "claude": claude or _claude_sessions(),
     }
     lode.update(extra)

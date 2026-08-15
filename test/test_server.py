@@ -5368,6 +5368,52 @@ def test_lode_create_persists_selected_grok_provider(socket_path, server, temp_c
     assert persisted["coder"] == {"provider": "grok", "session_id": None}
 
 
+def test_grok_create_refuses_before_mutation_when_server_lacks_provider_protocol(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def old_server_response(_socket_path, message, **_kwargs):
+        calls.append(message)
+        return None
+
+    monkeypatch.setattr(hopper_client, "send_message", old_server_response)
+
+    created = request_lode_creation(
+        tmp_path / "old-server.sock",
+        "project-a",
+        "scope-a",
+        spawn=False,
+        coder_provider="grok",
+    )
+
+    assert created is None
+    assert [message["type"] for message in calls] == ["coder_capabilities"]
+
+
+@pytest.mark.parametrize("providers", [None, "grok", [1]])
+def test_grok_create_refuses_malformed_provider_capabilities(tmp_path, monkeypatch, providers):
+    calls = []
+
+    def malformed_response(_socket_path, message, **_kwargs):
+        calls.append(message)
+        return {"type": "coder_capabilities", "providers": providers}
+
+    monkeypatch.setattr(hopper_client, "send_message", malformed_response)
+
+    assert (
+        request_lode_creation(
+            tmp_path / "bad-server.sock",
+            "project-a",
+            "scope-a",
+            spawn=False,
+            coder_provider="grok",
+        )
+        is None
+    )
+    assert [message["type"] for message in calls] == ["coder_capabilities"]
+
+
 def test_lode_create_refuses_grok_before_durable_creation_when_cli_missing(
     socket_path, server, temp_config
 ):
@@ -8737,8 +8783,8 @@ def test_server_disconnects_stale_client_on_reconnect(
     client2.close()
 
 
-def test_server_handles_lode_set_coder_session(socket_path, server, temp_config, make_lode):
-    """Server handles lode_set_coder_session message."""
+def test_server_handles_legacy_lode_set_codex_thread(socket_path, server, temp_config, make_lode):
+    """Server preserves the existing Codex runner mutation contract."""
     lode = make_lode(id="test-id", stage="refine", state="running")
     server.lodes = [lode]
     save_lodes(server.lodes)
@@ -8754,13 +8800,12 @@ def test_server_handles_lode_set_coder_session(socket_path, server, temp_config,
             break
         time.sleep(0.1)
 
-    # Send lode_set_coder_session message
+    # Send the pre-Grok Codex mutation shape.
     msg = _runner_message(
         server,
-        "lode_set_coder_session",
+        "lode_set_codex_thread",
         "test-id",
-        provider="codex",
-        session_id="codex-uuid-1234",
+        codex_thread_id="codex-uuid-1234",
     )
     client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
 
@@ -8770,12 +8815,76 @@ def test_server_handles_lode_set_coder_session(socket_path, server, temp_config,
 
     assert response["type"] == "lode_updated"
     assert response["lode"]["id"] == "test-id"
-    assert response["lode"]["coder"]["session_id"] == "codex-uuid-1234"
+    assert response["lode"]["codex_thread_id"] == "codex-uuid-1234"
+    assert "coder" not in response["lode"]
 
     # Server's lode should be updated
-    assert server.lodes[0]["coder"]["session_id"] == "codex-uuid-1234"
+    assert server.lodes[0]["codex_thread_id"] == "codex-uuid-1234"
 
     client.close()
+
+
+def test_server_handles_lode_set_coder_session(socket_path, server, temp_config, make_lode):
+    """Server stores the additive Grok session mutation."""
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="running",
+        coder={"provider": "grok", "session_id": None},
+    )
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(socket_path))
+    client.settimeout(2.0)
+    for _ in range(50):
+        if len(server.clients) > 0:
+            break
+        time.sleep(0.1)
+
+    msg = _runner_message(
+        server,
+        "lode_set_coder_session",
+        "test-id",
+        provider="grok",
+        session_id="grok-uuid-1234",
+    )
+    client.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+
+    data = client.recv(4096).decode("utf-8")
+    response = json.loads(data.strip().split("\n")[0])
+
+    assert response["lode"]["coder"]["session_id"] == "grok-uuid-1234"
+    assert server.lodes[0]["coder"]["session_id"] == "grok-uuid-1234"
+
+    client.close()
+
+
+def test_server_refuses_invalid_coder_session_provider(server, make_lode, caplog):
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="running",
+        coder={"provider": "grok", "session_id": None},
+    )
+    server.lodes = [lode]
+    before = copy.deepcopy(lode)
+
+    with caplog.at_level(logging.WARNING):
+        server._handle_mutation(
+            _runner_message(
+                server,
+                "lode_set_coder_session",
+                "test-id",
+                provider="invalid",
+                session_id="session-123",
+            ),
+            None,
+        )
+
+    assert lode == {**before, "run_generation": TEST_RUN_GENERATION}
+    assert "Refusing invalid coder session mutation" in caplog.text
 
 
 def test_server_handles_lode_set_claude_started(socket_path, server, temp_config, make_lode):

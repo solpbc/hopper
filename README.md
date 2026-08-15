@@ -187,20 +187,6 @@ CLI (hop)
 
 User input flows through the TUI to mutate lode state, which the server broadcasts back for re-render.
 
-### Coder schema migration
-
-This release replaces the stored `codex_thread_id` field with a per-lode `coder`
-record. Stop the Hopper server, inspect the migration, then apply it before starting
-the new server:
-
-```bash
-.venv/bin/python scripts/migrate_coder_schema.py
-.venv/bin/python scripts/migrate_coder_schema.py --apply
-```
-
-The apply step validates active and archived stores before writing, creates
-`*.pre-coder-schema` recovery copies, and rewrites each JSONL store atomically.
-
 ## Development
 ```bash
 make install    # Install in editable mode with dev dependencies

@@ -1360,7 +1360,11 @@ def test_lode_create_can_select_grok(capsys):
         assert cmd_lode(["create", "myproj", "--coder", "grok", "--json"]) == 0
 
     assert create.call_args.kwargs["coder_provider"] == "grok"
-    assert json.loads(capsys.readouterr().out)["coder"] == "grok"
+    assert json.loads(capsys.readouterr().out) == {
+        "id": "abc12345",
+        "project": "myproj",
+        "host": "local",
+    }
 
 
 def test_lode_create_refuses_unavailable_grok_before_server_mutation(capsys):
@@ -1385,7 +1389,7 @@ def test_lode_create_refuses_unavailable_grok_before_server_mutation(capsys):
     assert capsys.readouterr().out == "error: grok unavailable: grok command not found\n"
 
 
-def test_lode_create_does_not_report_success_when_server_refuses(capsys):
+def test_grok_lode_create_does_not_report_success_when_server_refuses(capsys):
     from io import StringIO
 
     project = Project(path="/fake/repo", name="myproj")
@@ -1393,10 +1397,14 @@ def test_lode_create_does_not_report_success_when_server_refuses(capsys):
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.projects.find_project", return_value=project),
         patch("hopper.git.dirty_status", return_value=""),
+        patch(
+            "hopper.cli.coder_check",
+            return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
+        ),
         patch("hopper.client.create_lode", return_value=None),
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
-        assert cmd_lode(["create", "myproj"]) == 1
+        assert cmd_lode(["create", "myproj", "--coder", "grok"]) == 1
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -6587,6 +6595,15 @@ def test_format_lode_line_shows_spawn_refusal():
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)
 
 
+def test_format_lode_detail_does_not_add_coder_to_default_lodes(make_lode):
+    assert "  coder:" not in format_lode_detail(make_lode())
+
+
+def test_format_lode_detail_shows_nondefault_coder(make_lode):
+    lode = make_lode(coder={"provider": "grok", "session_id": None})
+    assert "  coder:    grok" in format_lode_detail(lode)
+
+
 def test_format_lode_reconnecting_is_pending_with_prior_diagnostics(make_lode):
     status = "Runner pane %8 survived server replacement; waiting for registration"
     lode = make_lode(
@@ -7535,7 +7552,6 @@ def emitted_create_json(monkeypatch, capsys):
         "id": "abcdefgh",
         "project": "journal",
         "host": "local",
-        "coder": "codex",
     }
     return output
 
@@ -7634,7 +7650,6 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
             "id": "abcdefgh",
             "project": "journal",
             "host": "ready.example",
-            "coder": "codex",
             "unavailable_hosts": [
                 {
                     "host": "down.example",
@@ -7714,7 +7729,7 @@ def test_pooled_create_with_no_eligible_host_refuses_without_create(
     ],
 )
 def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys):
-    valid = {"id": "abcdefgh", "project": "journal", "host": "local", "coder": "codex"}
+    valid = {"id": "abcdefgh", "project": "journal", "host": "local"}
     if case == "nonzero-valid-body":
         outcome = subprocess.CompletedProcess([], 7, stdout=json.dumps(valid), stderr="rejected")
     elif case == "human-text":
@@ -7869,9 +7884,7 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
         mock_remote.return_value = subprocess.CompletedProcess(
             [],
             0,
-            stdout=(
-                '{"id": "abcdefgh", "project": "journal", "host": "local", "coder": "codex"}\n'
-            ),
+            stdout='{"id": "abcdefgh", "project": "journal", "host": "local"}\n',
             stderr="",
         )
         with patch("hopper.cli._remote_pool_for_create", return_value=(selected, [selected])):
@@ -7921,7 +7934,6 @@ def test_lode_create_json(capsys):
         "id": "abc12345",
         "project": "myproj",
         "host": "local",
-        "coder": "codex",
     }
 
 

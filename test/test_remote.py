@@ -1030,7 +1030,6 @@ def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
                 "id": "abcdefgh",
                 "project": "journal",
                 "host": "local",
-                "coder": "codex",
             }
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(created), stderr="")
         raise AssertionError(f"unexpected remote hop invocation: {hop_args}")
