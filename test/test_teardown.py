@@ -62,6 +62,21 @@ def _containment_record(mode: str, *, state="not_started") -> dict:
     }
 
 
+def _expired_grace(mode: str, *, action_type: str = "completion", start=1_000_000_000) -> dict:
+    """A record whose grace budget has already run out.
+
+    Escalation is reached the way production reaches it — the waiting budget
+    expired — rather than by a per-action-type bypass. Grace is not a sleep: it
+    polls until the cgroup empties, so a test that wants escalation must expire
+    the budget, not opt out of it.
+    """
+    record = _containment_record(mode, state="grace")
+    record["action_type"] = action_type
+    record["containment"]["started_monotonic_ns"] = start - 1
+    record["containment"]["deadline_monotonic_ns"] = start - 1
+    return record
+
+
 def _observe(record: dict, handles: dict, *, now_ns, poll, host_boot_identity="boot-one"):
     return teardown.observe_containment(
         record,
@@ -1152,8 +1167,7 @@ def test_strict_containment_proves_all_three_surfaces_without_signalling():
 )
 def test_each_strict_surface_must_be_absent_before_proof(cgroup, supervisor, pane_root):
     clock, now_ns, poll = _fake_clock()
-    record = _containment_record("linux-strict")
-    record["action_type"] = "kill"
+    record = _expired_grace("linux-strict")
 
     result = _observe(
         record,
@@ -1185,8 +1199,7 @@ def test_containment_waiting_budget_is_materialized_before_worker_polling():
 
 def test_kill_action_escalates_despite_ambiguity_and_arms_verification_budget():
     clock, now_ns, poll = _fake_clock()
-    record = _containment_record("linux-strict")
-    record["action_type"] = "kill"
+    record = _expired_grace("linux-strict", action_type="kill")
 
     result = _observe(
         record,
@@ -1581,3 +1594,54 @@ def test_charged_observation_and_force_costs_still_receive_a_full_force_budget(l
     assert result["state"] == "proven"
     assert result["result"] == "linux-strict-killed-empty"
     assert result["deadline_monotonic_ns"] == pending["deadline_monotonic_ns"]
+
+
+def test_explicit_kill_honours_grace_and_proves_without_forcing():
+    """A kill waits for the closed PTY to drain instead of going straight to SIGKILL.
+
+    The pane is already closed by the time containment starts, so a runner that
+    exits cleanly empties the cgroup during grace. Escalating immediately would
+    SIGKILL a process that was about to release everything it held.
+    """
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("linux-strict", state="pane_close_pending")
+    record["action_type"] = "kill"
+    record["containment"] = teardown.start_containment(record, now_ns=now_ns)
+    assert record["containment"]["state"] == "grace"
+
+    observations = ["populated", "populated", "empty"]
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": lambda: observations.pop(0),
+            "observe_supervisor": lambda: "gone",
+            "observe_pane_root": lambda: "gone",
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "proven"
+    # proven by draining, not by killing — the killed-empty label is the other path
+    assert result["result"] == "linux-strict-empty"
+    assert clock["polls"], "a kill must actually wait during grace"
+
+
+def test_explicit_kill_still_escalates_when_the_runner_will_not_exit():
+    """Grace is a ceiling, not a promise: a wedged runner is still force-killed."""
+    clock, now_ns, poll = _fake_clock()
+    record = _expired_grace("linux-strict", action_type="kill")
+
+    result = _observe(
+        record,
+        {
+            "observe_cgroup": lambda: "populated",
+            "observe_supervisor": lambda: "alive",
+            "observe_pane_root": lambda: "alive",
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+
+    assert result["state"] == "kill_pending"

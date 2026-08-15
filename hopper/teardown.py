@@ -1246,7 +1246,13 @@ def _observe_strict(
         current = now_ns()
 
         if containment["state"] == "grace":
-            if record["action_type"] == "kill" or current >= deadline:
+            # Every teardown gets the grace it was armed with, including an explicit
+            # kill. The pane's PTY is already closed by this point, so grace is not a
+            # sleep — it polls until the cgroup empties and escalates the moment it
+            # does not. Honouring it costs nothing when the runner exits cleanly, and
+            # skipping it means SIGKILL reaches a process that never got to release
+            # anything it held.
+            if current >= deadline:
                 return arm_phase(containment, "kill_pending", now_ns=now_ns)
             if programming_errors:
                 return _blocked(containment, programming_errors[0])
