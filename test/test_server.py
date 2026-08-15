@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import queue
-import signal
 import socket
 import subprocess
 import sys
@@ -7893,92 +7892,6 @@ def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socke
 
     assert lode["status"] == first_status
     assert server.broadcast_queue.qsize() == 1
-
-
-def test_terminate_runner_process_group_waits_for_clean_exit():
-    """A normal pause terminates the whole pane group and waits for its exit."""
-    with (
-        patch("hopper.server.os.getpgid", return_value=4567),
-        patch("hopper.server.os.getpgrp", return_value=7654),
-        patch("hopper.server.os.killpg") as mock_killpg,
-        patch("hopper.server._process_group_exited", return_value=True) as mock_exited,
-    ):
-        assert hopper_server._terminate_runner_process_group(12345) is True
-
-    mock_killpg.assert_called_once_with(4567, signal.SIGTERM)
-    mock_exited.assert_called_once_with(4567, hopper_server.PAUSE_TERM_GRACE_SEC)
-
-
-def test_terminate_runner_process_group_uses_pre_resolved_group():
-    """Force restart never resolves a corroborated pane identity a second time."""
-    with (
-        patch("hopper.server.os.getpgid") as mock_getpgid,
-        patch("hopper.server.os.getpgrp", return_value=7654),
-        patch("hopper.server.os.killpg") as mock_killpg,
-        patch("hopper.server._process_group_exited", return_value=True),
-    ):
-        assert hopper_server._terminate_runner_process_group(12345, process_group=4567) is True
-
-    mock_getpgid.assert_not_called()
-    mock_killpg.assert_called_once_with(4567, signal.SIGTERM)
-
-
-@pytest.mark.parametrize(
-    ("group_lookups", "expected"),
-    [
-        ([4567, 4567], 4567),
-        ([4567, 7654], None),
-        ([4567, ProcessLookupError()], None),
-    ],
-)
-def test_corroborated_runner_process_group(group_lookups, expected):
-    """Runner and pane identities are resolved together and failures close the path."""
-    with patch("hopper.server.os.getpgid", side_effect=group_lookups) as mock_getpgid:
-        assert hopper_server._corroborated_runner_process_group(1415, 2424) == expected
-
-    assert mock_getpgid.call_args_list == [((1415,),), ((2424,),)]
-
-
-def test_terminate_runner_process_group_hard_kills_after_grace():
-    """A runner that ignores SIGTERM is killed before pause can acknowledge success."""
-    with (
-        patch("hopper.server.os.getpgid", return_value=4567),
-        patch("hopper.server.os.getpgrp", return_value=7654),
-        patch("hopper.server.os.killpg") as mock_killpg,
-        patch("hopper.server._process_group_exited", side_effect=[False, True]) as mock_exited,
-    ):
-        assert hopper_server._terminate_runner_process_group(12345) is True
-
-    assert mock_killpg.call_args_list == [
-        ((4567, signal.SIGTERM),),
-        ((4567, signal.SIGKILL),),
-    ]
-    assert mock_exited.call_args_list == [
-        ((4567, hopper_server.PAUSE_TERM_GRACE_SEC),),
-        ((4567, hopper_server.PAUSE_KILL_GRACE_SEC),),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("process_table", "expected"),
-    [
-        (" 4567 S\n 4567 Z\n 7654 R\n", True),
-        (" 4567 Z\n 7654 R\n", False),
-        (" 7654 R\n", False),
-    ],
-)
-def test_process_group_liveness_ignores_zombies(process_table, expected):
-    """Exited runners cannot block pause merely because their parent has not reaped them."""
-    result = subprocess.CompletedProcess([], 0, stdout=process_table, stderr="")
-    with patch("hopper.server.subprocess.run", return_value=result) as mock_run:
-        assert hopper_server._process_group_has_live_members(4567) is expected
-
-    mock_run.assert_called_once_with(
-        ["ps", "-axo", "pgid=,stat="],
-        capture_output=True,
-        text=True,
-        timeout=hopper_server.PROCESS_GROUP_STATUS_TIMEOUT_SEC,
-    )
 
 
 def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config, make_lode):

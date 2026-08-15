@@ -109,9 +109,6 @@ HELD_RUNNER_MUTATION_TYPES = RUNNER_MUTATION_TYPES - {
     "lode_supervisor_register",
 }
 LISTEN_BACKLOG = 64
-PAUSE_TERM_GRACE_SEC = 0.75
-PAUSE_KILL_GRACE_SEC = 0.5
-PAUSE_PROCESS_POLL_SEC = 0.02
 PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
 GUARDED_DISCONNECT_HOLD_SEC = 60.0
 assert oom.SCOPE_RESULT_SETTLE_SEC < GUARDED_DISCONNECT_HOLD_SEC
@@ -630,116 +627,6 @@ def _containment_phase_for_cursor(cursor: str) -> str | None:
     if cursor in {"kill_pending", "verify_after_kill"}:
         return "force_killing"
     return None
-
-
-def _process_group_has_live_members(process_group: int) -> bool | None:
-    """Return whether a process group has non-zombie members, or None if unknown."""
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pgid=,stat="],
-            capture_output=True,
-            text=True,
-            timeout=PROCESS_GROUP_STATUS_TIMEOUT_SEC,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        logger.error("cannot inspect runner process group %s: %s", process_group, error)
-        return None
-    if result.returncode != 0:
-        logger.error(
-            "cannot inspect runner process group %s: ps exited %s: %s",
-            process_group,
-            result.returncode,
-            result.stderr.strip(),
-        )
-        return None
-
-    for line in result.stdout.splitlines():
-        fields = line.split(maxsplit=1)
-        if len(fields) != 2:
-            continue
-        raw_group, status = fields
-        try:
-            member_group = int(raw_group)
-        except ValueError:
-            continue
-        if member_group == process_group and not status.startswith("Z"):
-            return True
-    return False
-
-
-def _process_group_exited(process_group: int, timeout: float) -> bool:
-    """Wait until a process group has no live members, failing closed when unknown."""
-    deadline = time.monotonic() + timeout
-    while True:
-        live_members = _process_group_has_live_members(process_group)
-        if live_members is False:
-            return True
-        if live_members is None:
-            return False
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(PAUSE_PROCESS_POLL_SEC, remaining))
-
-
-def _terminate_runner_process_group(pid: int, *, process_group: int | None = None) -> bool:
-    """Terminate a runner and every child that can retain its Claude session."""
-    if process_group is None:
-        try:
-            process_group = os.getpgid(pid)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            logger.error("cannot inspect runner pid %s: permission denied", pid)
-            return False
-
-    if process_group == os.getpgrp():
-        logger.error(
-            "refusing to terminate runner pid %s in hopper server process group %s",
-            pid,
-            process_group,
-        )
-        return False
-
-    for shutdown_signal, grace in (
-        (signal.SIGTERM, PAUSE_TERM_GRACE_SEC),
-        (signal.SIGKILL, PAUSE_KILL_GRACE_SEC),
-    ):
-        try:
-            os.killpg(process_group, shutdown_signal)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            logger.error("cannot signal runner process group %s: permission denied", process_group)
-            return False
-        if _process_group_exited(process_group, grace):
-            return True
-
-    logger.error("runner process group %s remained alive after SIGKILL", process_group)
-    return False
-
-
-def _corroborated_runner_process_group(runner_pid: int, pane_pid: int) -> int | None:
-    """Resolve the shared process group for a registered runner and pane owner."""
-    try:
-        runner_group = os.getpgid(runner_pid)
-        if runner_group == os.getpgid(pane_pid):
-            return runner_group
-    except (OSError, TypeError):
-        pass
-    return None
-
-
-def _runner_process_exited(pid: int) -> bool:
-    """Return whether a registered runner PID is definitely gone."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except (OSError, TypeError):
-        return False
-    return False
 
 
 def _clear_spawn_refusal(lode: dict, *, clear_status: bool = True) -> bool:
