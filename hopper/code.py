@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from hopper import prompt
-from hopper.client import connect, set_lode_progress, set_lode_state
+from hopper.client import connect, set_lode_progress, set_lode_state, set_lode_status
 from hopper.coder import coder_failure_message, run_coder, validate_coder_provider
 from hopper.lodes import (
     current_time_ms,
@@ -332,8 +332,7 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     input_path = lode_dir / f"{suffix}.in.md"
     _atomic_write(input_path, prompt_text)
 
-    # Set state to stage name while running
-    set_lode_state(socket_path, lode_id, stage_name, f"Running {stage_name}")
+    set_lode_status(socket_path, lode_id, f"Running {stage_name}")
 
     # Resume the existing provider session.
     output_path = lode_dir / f"{suffix}.out.md"

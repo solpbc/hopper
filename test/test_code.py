@@ -137,6 +137,7 @@ class TestRunCode:
         monkeypatch.chdir(worktree)
 
         state_calls = []
+        status_calls = []
         progress = MagicMock(return_value=True)
 
         def mock_set_state(sock, sid, state, status):
@@ -163,15 +164,19 @@ class TestRunCode:
             patch("hopper.code.find_project", return_value=mock_project),
             patch("hopper.code.get_lode_dir", return_value=session_dir),
             patch("hopper.code.set_lode_state", side_effect=mock_set_state),
+            patch(
+                "hopper.code.set_lode_status",
+                side_effect=lambda sock, sid, status: status_calls.append(status),
+            ),
             patch("hopper.code.set_lode_progress", progress),
             patch("hopper.code.run_coder", side_effect=mock_run_coder),
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "test request")
 
         assert exit_code == 0
-        assert state_calls[0] == ("audit", "Running audit")
-        assert state_calls[1][0] == "running"
-        assert "audit ran for" in state_calls[1][1]
+        assert status_calls == ["Running audit"]
+        assert state_calls[0][0] == "running"
+        assert "audit ran for" in state_calls[0][1]
 
         output = capsys.readouterr().out
         assert "Audit Result" in output
