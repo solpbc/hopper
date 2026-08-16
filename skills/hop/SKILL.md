@@ -185,8 +185,7 @@ hop lode
 hop lode list
 hop lode list -a             # archived, newest 20
 hop lode list -a --offset 20 # the next 20 older
-hop lode list -a -n 100      # a bigger page
-hop lode list -a -n 0        # every archived row, however many that is
+hop lode list -a -n 100      # a bigger page (max 200)
 hop lode list -p PROJECT     # filter by project name
 hop lode list --json
 hop lode list --all-hosts    # aggregate local and all pool hosts
@@ -196,15 +195,29 @@ hop list                     # alias for lode list (same flags)
 **The archive is paged; the active list is not.** `-a` returns the newest 20
 rows and nothing else, because the archive only grows — on the busiest host it
 is 3,400+ rows and 30 MB, which the whole listing used to try to carry across
-the socket in one 2-second budget and fail. Every archived listing prints which
-slice of what it is showing on stderr (`Showing archived 1-20 of 3456, newest
-first`) and the exact command for the next page. `-n`/`--limit` resizes the
-page, `--offset` walks backwards through older rows, and `-n 0` asks for
-everything. In JSON, `total` is the whole filtered archive and `offset`/`limit`
-are the page that was cut; `total` is `null` under `--all-hosts`, where no
-single source knows the fleet's count. ⚠ A server older than paged listing
-answers `Lode listing unavailable`; restart it after pulling rather than
-reading a partial page as the whole archive.
+the socket and fail. Every archived listing prints which slice of what it is
+showing on stderr (`Showing archived 1-20 of 3456, newest first`) and the exact
+command for the next page. `-n`/`--limit` resizes the page and `--offset` walks
+backwards through older rows. In JSON, `total` is the whole filtered archive
+and `offset`/`limit` are the page that was cut; `total` is `null` under
+`--all-hosts`, where no single source knows the fleet's count.
+
+⛔ **There is no "give me everything" flag, and `--limit` is capped at 200 — this
+is a real bound, not an ergonomic default.** The server sends the whole response
+under its own 2.0-second socket timeout, so an oversized payload is delivered
+*partially* and the next broadcast is spliced onto the fragment. Measured on
+fedora: 200 rows is 4.1 MB in 0.53s, 400 rows is 7.0 MB in 1.47s, **500 rows
+fails** — and a loaded host reaches that cliff sooner. Walk the archive with
+`--offset` instead. (Mechanism and the deferred server-side fix:
+`cto/workspace/hop-hopper-archived-listing-and-archive-contract.md` in the extro
+repo.)
+
+⚠ `--offset` is refused with `--all-hosts`, because serving it would require
+every host to send offset+limit rows — the oversized response the cap exists to
+prevent. Page one host at a time with `hop -H <host>`.
+
+⚠ A server older than paged listing answers `Lode listing unavailable`; restart
+it after pulling rather than reading a partial page as the whole archive.
 
 A single-source `hop lode list -p PROJECT` refuses when that project has a
 configured remote pool because the local server cannot vouch for the complete

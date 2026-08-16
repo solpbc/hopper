@@ -3234,16 +3234,37 @@ def _create_alias_help(cmd_name: str, description: str, args: list[str]) -> int 
 
 
 ARCHIVED_PAGE_DEFAULT = 20
+# Measured on the fleet's largest archive (fedora, 3,456 rows): 200 rows is
+# 4.1 MB delivered in 0.53s, 400 rows is 7.0 MB in 1.47s, and 500 rows fails.
+# The cliff is the SERVER's own 2.0s socket timeout -- `sendall` on a payload
+# far larger than the socket buffer raises TimeoutError after delivering part
+# of the data, and the next broadcast is spliced onto the fragment. So a page
+# is capped rather than merely defaulted, with ~4x margin against a deadline
+# that arrives sooner on a loaded host. There is deliberately no "give me
+# everything" escape: it re-creates exactly that send.
+ARCHIVED_PAGE_MAX = 200
 
 
-def _page_count(value: str) -> int:
-    """Parse one non-negative page bound, where zero means no bound."""
+def _page_offset(value: str) -> int:
+    """Parse one non-negative page offset."""
     try:
         count = int(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("must be a whole number") from error
     if count < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
+    return count
+
+
+def _page_count(value: str) -> int:
+    """Parse one page size within the bound a single response can carry."""
+    count = _page_offset(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    if count > ARCHIVED_PAGE_MAX:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {ARCHIVED_PAGE_MAX}; walk further with --offset"
+        )
     return count
 
 
@@ -3271,10 +3292,8 @@ def _archived_page_summary(
     of_total = f" of {total}" if total is not None else ""
     summary = f"Showing archived {first}-{last}{of_total}{scope}, newest first."
     more = last < total if total is not None else shown == limit
-    if limit is not None and more:
+    if limit is not None and more and not all_hosts:
         args = ["hop", "lode", "list", "--archived"]
-        if all_hosts:
-            args.append("--all-hosts")
         if project:
             args.extend(["--project", project])
         if limit != ARCHIVED_PAGE_DEFAULT:
@@ -3295,13 +3314,13 @@ def _add_lode_list_args(parser: argparse.ArgumentParser) -> None:
         type=_page_count,
         default=None,
         help=(
-            f"Rows to show, newest first (archived default: {ARCHIVED_PAGE_DEFAULT}; "
-            "0 means every row)"
+            f"Rows to show, newest first (archived default: {ARCHIVED_PAGE_DEFAULT}, "
+            f"max {ARCHIVED_PAGE_MAX})"
         ),
     )
     parser.add_argument(
         "--offset",
-        type=_page_count,
+        type=_page_offset,
         default=0,
         help="Skip this many of the newest rows first, to page through older ones",
     )
@@ -3791,17 +3810,23 @@ def cmd_lode(args: list[str]) -> int:
         # archive only grows, so it is the one that needs a page by default.
         requested_limit = getattr(parsed, "limit", None)
         page_limit = (
-            ARCHIVED_PAGE_DEFAULT if archived and requested_limit is None else (requested_limit)
+            ARCHIVED_PAGE_DEFAULT if archived and requested_limit is None else requested_limit
         )
-        if page_limit == 0:
-            page_limit = None
         page_offset = getattr(parsed, "offset", 0) or 0
-        # Every host must supply enough rows to build the merged page, because
-        # the newest 20 of the fleet is not the newest 20 of any one host.
+        # Each source is asked for one page and the merge takes the newest of
+        # what came back, so an offset would have to be served by every host
+        # sending offset+limit rows -- the oversized response this bound exists
+        # to prevent. Walk a single host instead.
+        if archived and all_hosts and page_offset:
+            print(
+                "error: --offset is not supported with --all-hosts; page one host at a time, "
+                "e.g. hop -H <host> lode list --archived --offset "
+                f"{page_offset}",
+                file=sys.stderr,
+            )
+            return 1
         source_offset = 0 if all_hosts else page_offset
-        source_limit = (
-            None if page_limit is None else (page_offset + page_limit if all_hosts else page_limit)
-        )
+        source_limit = page_limit
 
         def prepare_local_lodes(rows: list[dict]) -> list[dict]:
             rows = list(rows)
@@ -3842,7 +3867,8 @@ def cmd_lode(args: list[str]) -> int:
                 print(
                     "Lode listing unavailable: the server response was missing or malformed; "
                     + (
-                        "if the server predates paged archive listing, restart it after pulling"
+                        "if the server predates paged archive listing, restart it after "
+                        "pulling; if it does not, retry with a smaller --limit"
                         if archived
                         else "retry with: hop lode list --json"
                     ),
@@ -3858,7 +3884,7 @@ def cmd_lode(args: list[str]) -> int:
             remote_args = ["lode", "list", "--json"]
             if archived:
                 remote_args.append("--archived")
-                remote_args.extend(["--limit", str(source_limit or 0)])
+                remote_args.extend(["--limit", str(source_limit)])
             if project_filter:
                 remote_args.extend(["--project", project_filter])
             hosts = _remote_hosts()
@@ -3921,7 +3947,6 @@ def cmd_lode(args: list[str]) -> int:
                 # Each source returned its own newest rows; the fleet's page is
                 # the merge, so it can only be cut once every source is in.
                 lodes.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
-                lodes = lodes[page_offset:]
                 if page_limit is not None:
                     lodes = lodes[:page_limit]
         print(f"Searched lode sources: {', '.join(searched_sources)}", file=sys.stderr)

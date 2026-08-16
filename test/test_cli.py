@@ -26,6 +26,7 @@ import hopper.wait as hopper_wait
 from hopper import __version__, actions, config
 from hopper.cli import (
     ARCHIVED_PAGE_DEFAULT,
+    ARCHIVED_PAGE_MAX,
     HELP_SKILL_REMINDER,
     _CheckProgress,
     _socket,
@@ -1122,16 +1123,38 @@ def test_lode_list_archived_last_page_offers_no_next_page(capsys):
     assert "Older:" not in err
 
 
-def test_lode_list_archived_zero_limit_asks_for_every_row(capsys):
-    rows = [_archived_row(index) for index in range(3)]
+def test_lode_list_archived_refuses_a_page_larger_than_one_response_carries(capsys):
+    # There is deliberately no "give me everything" escape: on the fleet's
+    # largest archive a 500-row page is an oversized send that fails, and a
+    # 2026-08-12 findings record ruled that escape unsafe until the server's
+    # partial-send defect is fixed.
+    assert cmd_lode(["list", "-a", "--limit", str(ARCHIVED_PAGE_MAX + 1)]) == 1
+    assert cmd_lode(["list", "-a", "--limit", "0"]) == 1
+
+
+def test_lode_list_archived_accepts_the_maximum_page(capsys):
+    rows = [_archived_row(index) for index in range(ARCHIVED_PAGE_MAX)]
     with (
         patch("hopper.cli.require_server", return_value=None),
-        patch("hopper.client.read_archived_lodes", return_value=(rows, 3)) as read,
+        patch("hopper.client.read_archived_lodes", return_value=(rows, 3456)) as read,
     ):
-        assert cmd_lode(["list", "-a", "--limit", "0"]) == 0
+        assert cmd_lode(["list", "-a", "--limit", str(ARCHIVED_PAGE_MAX)]) == 0
 
-    assert read.call_args.kwargs["limit"] is None
-    assert "Older:" not in capsys.readouterr().err
+    assert read.call_args.kwargs["limit"] == ARCHIVED_PAGE_MAX
+
+
+def test_lode_list_archived_all_hosts_refuses_an_offset(capsys):
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes") as read,
+        patch("hopper.remote.remote_registry", return_value={}),
+    ):
+        assert cmd_lode(["list", "-a", "--all-hosts", "--offset", "20"]) == 1
+
+    read.assert_not_called()
+    err = capsys.readouterr().err
+    assert "--offset is not supported with --all-hosts" in err
+    assert "hop -H <host> lode list --archived --offset 20" in err
 
 
 def test_lode_list_archived_reports_paging_past_the_end(capsys):
