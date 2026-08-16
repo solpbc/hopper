@@ -266,7 +266,8 @@ class TestRunCode:
         assert exit_code == 1
         assert "CODEX TURN FAILED" in output
         assert message in output
-        assert "one shared account used by every hopper host" in output
+        assert "does not establish that the account is exhausted" in output
+        assert "Verify the affected host/account before retrying" in output
         assert state_calls[-1][0] == "running"
         assert "codex usage limit" in state_calls[-1][1]
 
@@ -308,7 +309,7 @@ class TestRunCode:
         assert exit_code == 1
         assert "CODEX TURN FAILED" in output
         assert message in output
-        assert "one shared account used by every hopper host" not in output
+        assert "Verify the affected host/account before retrying" not in output
         assert state_calls[-1][0] == "running"
         assert "codex turn failed" in state_calls[-1][1]
 

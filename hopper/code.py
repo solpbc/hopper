@@ -35,18 +35,16 @@ TURN_FAILED_BANNER = """\
 """
 
 QUOTA_GUIDANCE = """\
-The Codex seat is one shared account used by every hopper host: a
-usage-limit failure is fleet-wide, not specific to this lode or machine.
-Do NOT retry `hop code` and do NOT spend time diagnosing the dispatcher —
-it will keep failing until the usage window resets. (The reset time
-quoted above can be pessimistic; the seat may recover earlier.)
+Codex reported a usage-limit error for the account configured on this host.
+This does not establish that the account is exhausted or that any other host
+is affected. Verify the affected host/account before retrying.
 
-Do ONE of the following instead:
+If the limit is confirmed, do one of the following:
 1. Implement this stage directly yourself, honoring the same review bar
    and test gates the stage prompt requires, then continue the normal
    stage flow.
 2. If direct implementation is not possible, record the block with
-   `hop status "codex usage limit - waiting for reset"` and stop.
+   `hop status "codex usage limit on this host/account"` and stop.
 """
 
 
