@@ -25,7 +25,6 @@ from hopper.client import (
     create_lode,
     get_gate,
     kill_lode,
-    list_archived_lodes,
     list_lodes,
     lode_exists,
     pause_lode,
@@ -257,23 +256,46 @@ def test_lode_list_wrappers_preserve_unavailable(socket_path, response):
 
 
 @pytest.mark.parametrize("lodes", [[], [{"id": "archived-id"}]])
-def test_read_archived_lodes_preserves_valid_lists(socket_path, lodes):
-    response = {"type": "archived_list", "lodes": lodes}
+def test_read_archived_lodes_returns_the_page_and_its_total(socket_path, lodes):
+    response = {"type": "archived_list", "lodes": lodes, "total": 41}
     with patch("hopper.client.send_message", return_value=response):
-        assert read_archived_lodes(socket_path) == lodes
+        assert read_archived_lodes(socket_path) == (lodes, 41)
+
+
+def test_read_archived_lodes_sends_the_requested_page_bounds(socket_path):
+    response = {"type": "archived_list", "lodes": [], "total": 0}
+    with patch("hopper.client.send_message", return_value=response) as send:
+        read_archived_lodes(socket_path, limit=20, offset=40, project="solstone-journal")
+    assert send.call_args.args[1] == {
+        "type": "archived_list",
+        "offset": 40,
+        "limit": 20,
+        "project": "solstone-journal",
+    }
+
+
+def test_read_archived_lodes_omits_an_absent_limit_and_project(socket_path):
+    response = {"type": "archived_list", "lodes": [], "total": 0}
+    with patch("hopper.client.send_message", return_value=response) as send:
+        read_archived_lodes(socket_path)
+    assert send.call_args.args[1] == {"type": "archived_list", "offset": 0}
 
 
 def test_read_archived_lodes_returns_none_when_unreachable(socket_path):
     with patch("hopper.client.send_message", return_value=None):
         assert read_archived_lodes(socket_path) is None
-        assert list_archived_lodes(socket_path) is None
 
 
 @pytest.mark.parametrize(
     "response",
     [
-        {"type": "wrong", "lodes": []},
-        {"type": "archived_list", "lodes": "not-a-list"},
+        {"type": "wrong", "lodes": [], "total": 0},
+        {"type": "archived_list", "lodes": "not-a-list", "total": 0},
+        # A server too old to page reports no total, and its rows are the whole
+        # archive in file order -- never the page that was asked for.
+        {"type": "archived_list", "lodes": [{"id": "a"}]},
+        {"type": "archived_list", "lodes": [{"id": "a"}], "total": "many"},
+        {"type": "archived_list", "lodes": [{"id": "a"}, {"id": "b"}], "total": 1},
     ],
 )
 def test_read_archived_lodes_rejects_malformed_response(socket_path, response):

@@ -25,6 +25,7 @@ import hopper.code as hopper_code
 import hopper.wait as hopper_wait
 from hopper import __version__, actions, config
 from hopper.cli import (
+    ARCHIVED_PAGE_DEFAULT,
     HELP_SKILL_REMINDER,
     _CheckProgress,
     _socket,
@@ -1053,10 +1054,140 @@ def test_lode_list_disconnected_icon(capsys):
 def test_lode_list_archived_empty(capsys):
     """List --archived with no lodes prints empty message."""
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.list_archived_lodes", return_value=[]):
+        with patch("hopper.client.read_archived_lodes", return_value=([], 0)):
             assert cmd_lode(["list", "-a"]) == 0
     out = capsys.readouterr().out
     assert "No archived lodes" in out
+
+
+def _archived_row(index: int) -> dict:
+    """Build one archived row whose recency is its index."""
+    return {
+        "id": f"arch{index:04d}",
+        "stage": "shipped",
+        "state": "shipped",
+        "active": False,
+        "project": "proj-a",
+        "title": "",
+        "status": "Done",
+        "updated_at": 1000 + index,
+        "created_at": 900 + index,
+    }
+
+
+def test_lode_list_archived_asks_the_server_for_one_default_page(capsys):
+    rows = [_archived_row(index) for index in range(ARCHIVED_PAGE_DEFAULT)]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes", return_value=(rows, 3456)) as read,
+    ):
+        assert cmd_lode(["list", "-a"]) == 0
+
+    assert read.call_args.kwargs["limit"] == ARCHIVED_PAGE_DEFAULT
+    assert read.call_args.kwargs["offset"] == 0
+    err = capsys.readouterr().err
+    assert f"Showing archived 1-{ARCHIVED_PAGE_DEFAULT} of 3456" in err
+    assert f"Older: hop lode list --archived --offset {ARCHIVED_PAGE_DEFAULT}" in err
+
+
+def test_lode_list_archived_pages_forward_from_an_offset(capsys):
+    rows = [_archived_row(index) for index in range(5)]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes", return_value=(rows, 3456)) as read,
+    ):
+        assert cmd_lode(["list", "-a", "--limit", "5", "--offset", "40"]) == 0
+
+    assert read.call_args.kwargs == {
+        "limit": 5,
+        "offset": 40,
+        "project": None,
+        "timeout": 2.0,
+    }
+    err = capsys.readouterr().err
+    assert "Showing archived 41-45 of 3456" in err
+    assert "Older: hop lode list --archived --limit 5 --offset 45" in err
+
+
+def test_lode_list_archived_last_page_offers_no_next_page(capsys):
+    rows = [_archived_row(index) for index in range(2)]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes", return_value=(rows, 2)),
+    ):
+        assert cmd_lode(["list", "-a"]) == 0
+
+    err = capsys.readouterr().err
+    assert "Showing archived 1-2 of 2" in err
+    assert "Older:" not in err
+
+
+def test_lode_list_archived_zero_limit_asks_for_every_row(capsys):
+    rows = [_archived_row(index) for index in range(3)]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes", return_value=(rows, 3)) as read,
+    ):
+        assert cmd_lode(["list", "-a", "--limit", "0"]) == 0
+
+    assert read.call_args.kwargs["limit"] is None
+    assert "Older:" not in capsys.readouterr().err
+
+
+def test_lode_list_archived_reports_paging_past_the_end(capsys):
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes", return_value=([], 12)),
+    ):
+        assert cmd_lode(["list", "-a", "--offset", "40"]) == 0
+
+    err = capsys.readouterr().err
+    assert "No archived lodes, past the newest 40." in err
+
+
+def test_lode_list_archived_json_carries_its_page_bounds(capsys):
+    rows = [_archived_row(index) for index in range(2)]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_archived_lodes", return_value=(rows, 3456)),
+    ):
+        assert cmd_lode(["list", "-a", "--limit", "2", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 3456
+    assert payload["offset"] == 0
+    assert payload["limit"] == 2
+    assert len(payload["lodes"]) == 2
+
+
+def test_lode_list_active_is_not_paged(capsys):
+    rows = [
+        {
+            "id": "act00001",
+            "stage": "mill",
+            "state": "running",
+            "active": True,
+            "project": "proj-a",
+            "title": "",
+            "status": "",
+            "updated_at": 1000,
+            "created_at": 900,
+        }
+    ]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.list_lodes", return_value=rows),
+    ):
+        assert cmd_lode(["list"]) == 0
+
+    captured = capsys.readouterr()
+    assert "act00001" in captured.out
+    assert "Showing archived" not in captured.err
+
+
+@pytest.mark.parametrize("bad", ["-1", "twenty", "1.5"])
+def test_lode_list_rejects_a_nonsense_page_bound(bad, capsys):
+    assert cmd_lode(["list", "-a", "--limit", bad]) == 1
 
 
 def test_lode_list_archived_sorted(capsys):
@@ -1086,7 +1217,7 @@ def test_lode_list_archived_sorted(capsys):
         },
     ]
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.list_archived_lodes", return_value=lodes):
+        with patch("hopper.client.read_archived_lodes", return_value=(lodes, len(lodes))):
             assert cmd_lode(["list", "--archived"]) == 0
     out = capsys.readouterr().out
     lines = [line for line in out.strip().split("\n") if line.strip()]
@@ -1175,7 +1306,7 @@ def test_lode_list_archived_project_filter(capsys):
         },
     ]
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.list_archived_lodes", return_value=lodes):
+        with patch("hopper.client.read_archived_lodes", return_value=(lodes, len(lodes))):
             assert cmd_lode(["list", "-a", "-p", "hopper"]) == 0
     out = capsys.readouterr().out
     assert "hop00001" in out
@@ -1197,7 +1328,7 @@ def test_lode_list_project_pool_refuses_single_source(disabled, extra_args, caps
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.list_lodes") as active_list,
-        patch("hopper.client.list_archived_lodes") as archived_list,
+        patch("hopper.client.read_archived_lodes") as archived_list,
         patch("hopper.remote.run_remote") as remote,
     ):
         assert cmd_lode(["list", "--project", "journal", *extra_args]) == 2
@@ -2538,7 +2669,7 @@ def test_lode_kill_archived(capsys):
 def test_lode_kill_not_found(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("absent", None)):
-            with patch("hopper.client.list_archived_lodes", return_value=[]):
+            with patch("hopper.client.read_archived_lodes", return_value=([], 0)):
                 rc = cmd_lode(["kill", "missing"])
 
     assert rc == 1
@@ -5746,7 +5877,7 @@ def test_list_archived_flag(capsys):
         }
     ]
     with patch("hopper.cli.require_server", return_value=None):
-        with patch("hopper.client.list_archived_lodes", return_value=lodes):
+        with patch("hopper.client.read_archived_lodes", return_value=(lodes, len(lodes))):
             assert cmd_list(["-a"]) == 0
     out = capsys.readouterr().out
     assert "old001" in out
@@ -6593,6 +6724,63 @@ def test_format_lode_line_shows_spawn_refusal():
     }
 
     assert "spawn refused: tmux unreachable" in format_lode_line(lode)
+
+
+def _archived_gated_lode(make_lode):
+    """An archived row that kept every live-looking field it held when parked.
+
+    This is `ubstskfw` in shape: archived 2026-08-07, still carrying active,
+    a pane, a gate and a park record, and read on 2026-08-15 as a live wedge.
+    """
+    return make_lode(
+        id="ubstskfw",
+        stage="mill",
+        state="gated",
+        active=True,
+        archived=True,
+        archived_at=1786128409671,
+        tmux_pane="%1322",
+        recovery={
+            "parked_at": 1786058953261,
+            "state": "gated",
+            "stage": "mill",
+            "branch": "hopper-ubstskfw",
+            "reason": "no pane output, heartbeat, or CPU activity for 351s",
+        },
+    )
+
+
+def test_format_lode_detail_never_reports_an_archived_lode_as_active(make_lode):
+    detail = format_lode_detail(_archived_gated_lode(make_lode))
+    assert "  archived: yes" in detail
+    assert "  active:   no (archived)" in detail
+    assert "  active:   yes" not in detail
+
+
+def test_format_lode_detail_hides_the_stale_pane_of_an_archived_lode(make_lode):
+    assert "  pane:     %1322" not in format_lode_detail(_archived_gated_lode(make_lode))
+
+
+def test_format_lode_detail_does_not_call_an_archived_agent_alive(make_lode):
+    detail = format_lode_detail(_archived_gated_lode(make_lode))
+    assert "    agent:     gone; the lode was archived" in detail
+    assert "alive, NOT terminated" not in detail
+
+
+def test_format_lode_detail_offers_no_gate_review_on_an_archived_lode(make_lode):
+    assert "Gate blocked" not in format_lode_detail(_archived_gated_lode(make_lode))
+
+
+def test_format_lode_detail_still_reports_a_live_gated_lode_as_live(make_lode):
+    lode = _archived_gated_lode(make_lode)
+    lode["archived"] = False
+    del lode["archived_at"]
+    detail = format_lode_detail(lode)
+    assert "  archived:" not in detail
+    assert "  active:   yes" in detail
+    assert "  pane:     %1322" in detail
+    assert "    agent:     alive, NOT terminated" in detail
+    assert "Gate blocked. Review with: hop gate show ubstskfw" in detail
 
 
 def test_format_lode_detail_does_not_add_coder_to_default_lodes(make_lode):
@@ -8007,6 +8195,41 @@ def test_lode_peek_plain_text(capsys):
                 assert cmd_lode(["peek", "abc123", "-n", "2"]) == 0
 
     assert capsys.readouterr().out == "two\nthree\n"
+
+
+def test_lode_peek_reports_a_dead_pane_on_a_live_lode_with_its_live_fields(capsys):
+    lode = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "gated"}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.cli.capture_pane", return_value=None),
+    ):
+        assert cmd_lode(["peek", "abc123"]) == 1
+
+    assert capsys.readouterr().out == ("pane %1 no longer exists (lode active=True, state=gated)\n")
+
+
+def test_lode_peek_does_not_quote_the_frozen_fields_of_an_archived_lode(capsys):
+    # `active` and `state` stop being observations the moment a row is
+    # archived; quoting them raw reported `ubstskfw` as a live gated lode.
+    lode = {
+        "id": "ubstskfw",
+        "tmux_pane": "%1322",
+        "active": True,
+        "state": "gated",
+        "archived": True,
+        "archived_at": 1786128409671,
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.cli.capture_pane", return_value=None),
+    ):
+        assert cmd_lode(["peek", "ubstskfw"]) == 1
+
+    out = capsys.readouterr().out
+    assert "lode archived" in out
+    assert "active=True" not in out
 
 
 def test_lode_nudge_routes_through_server(capsys):

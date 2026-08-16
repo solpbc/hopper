@@ -5253,6 +5253,71 @@ def test_parallel_lode_snapshots_do_not_write_state(socket_path, server, temp_co
     broadcast.assert_not_called()
 
 
+def _archived_page(server, make_lode, **request):
+    """Ask the server for one archived page the way the client does."""
+    server.archived_lodes = [
+        make_lode(
+            id=f"arch{index:04d}", project="proj-a" if index % 2 else "proj-b", updated_at=index
+        )
+        for index in range(50)
+    ]
+    return server._archived_list_page({"type": "archived_list", **request})
+
+
+def test_archived_page_returns_the_newest_rows_first(server, make_lode):
+    page = _archived_page(server, make_lode, limit=5)
+    assert [lode["id"] for lode in page["lodes"]] == [
+        "arch0049",
+        "arch0048",
+        "arch0047",
+        "arch0046",
+        "arch0045",
+    ]
+    assert page["total"] == 50
+    assert page["offset"] == 0
+    assert page["limit"] == 5
+
+
+def test_archived_page_offset_walks_backwards_without_gaps_or_repeats(server, make_lode):
+    first = _archived_page(server, make_lode, limit=5)
+    second = _archived_page(server, make_lode, limit=5, offset=5)
+    assert [lode["id"] for lode in second["lodes"]] == [
+        "arch0044",
+        "arch0043",
+        "arch0042",
+        "arch0041",
+        "arch0040",
+    ]
+    assert not {lode["id"] for lode in first["lodes"]} & {lode["id"] for lode in second["lodes"]}
+
+
+def test_archived_page_total_counts_the_filtered_archive_not_the_page(server, make_lode):
+    page = _archived_page(server, make_lode, limit=3, project="proj-a")
+    assert len(page["lodes"]) == 3
+    assert page["total"] == 25
+    assert all(lode["project"] == "proj-a" for lode in page["lodes"])
+
+
+def test_archived_page_without_a_limit_still_returns_every_row(server, make_lode):
+    # An older CLI names no bounds and must keep the answer it was written for.
+    page = _archived_page(server, make_lode)
+    assert len(page["lodes"]) == 50
+    assert page["limit"] is None
+
+
+@pytest.mark.parametrize("limit", [-1, "20", 20.0, True, None])
+def test_archived_page_refuses_an_untrustworthy_bound(server, make_lode, limit):
+    page = _archived_page(server, make_lode, limit=limit)
+    assert len(page["lodes"]) == 50
+    assert page["limit"] is None
+
+
+def test_archived_page_past_the_end_is_empty_and_still_reports_the_total(server, make_lode):
+    page = _archived_page(server, make_lode, limit=5, offset=500)
+    assert page["lodes"] == []
+    assert page["total"] == 50
+
+
 def test_large_archive_snapshot_is_one_bounded_request(socket_path, server, make_lode, monkeypatch):
     target = make_lode(id="target-archive", stage="shipped", status="legacy archived")
     server.archived_lodes = [
@@ -5260,9 +5325,7 @@ def test_large_archive_snapshot_is_one_bounded_request(socket_path, server, make
         target,
     ]
     read_archived = MagicMock(side_effect=AssertionError("bounded snapshot must not read archive"))
-    list_archived = MagicMock(side_effect=AssertionError("bounded snapshot must not list archive"))
     monkeypatch.setattr(hopper_client, "read_archived_lodes", read_archived)
-    monkeypatch.setattr(hopper_client, "list_archived_lodes", list_archived)
 
     with patch.object(
         hopper_client,
@@ -5279,7 +5342,6 @@ def test_large_archive_snapshot_is_one_bounded_request(socket_path, server, make
         wait_for_response=True,
     )
     read_archived.assert_not_called()
-    list_archived.assert_not_called()
 
 
 def test_lode_snapshot_serializes_with_archive_transition(

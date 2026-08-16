@@ -2098,8 +2098,17 @@ def format_lode_detail(lode: dict) -> str:
     lines.append(f"  created:  {created_age} ago")
     lines.append(f"  updated:  {updated_age} ago")
     lines.append(f"  activity: {activity_text}")
-    lines.append(f"  active:   {'yes' if lode.get('active') else 'no'}")
-    if lode.get("active") and lode.get("tmux_pane"):
+    # An archived row keeps whatever `active`, pane and gate fields it held the
+    # moment it was archived, and nothing clears them. Rendering those as
+    # current invented a live wedged lode that had been archived for eight days
+    # (`ubstskfw`, 2026-08-15), so archived wins over every one of them here.
+    archived_row = bool(lode.get("archived")) or isinstance(lode.get("archived_at"), int)
+    if archived_row:
+        lines.append("  archived: yes — this lode is retired; the fields below are as-archived")
+    lines.append(
+        f"  active:   {'no (archived)' if archived_row else 'yes' if lode.get('active') else 'no'}"
+    )
+    if not archived_row and lode.get("active") and lode.get("tmux_pane"):
         lines.append(f"  pane:     {lode['tmux_pane']}")
     recovery = lode.get("recovery")
     if recovery:
@@ -2118,13 +2127,18 @@ def format_lode_detail(lode: dict) -> str:
             # above is only the last thing anything wrote, and a later write --
             # `hop gate feedback` sets `running` -- outlives the park silently.
             lines.append(f"    parked:    {_age_phrase(recovery['parked_at'])}")
-            agent = "terminated" if recovery.get("terminated") else "alive, NOT terminated"
+            if archived_row:
+                agent = "gone; the lode was archived"
+            elif recovery.get("terminated"):
+                agent = "terminated"
+            else:
+                agent = "alive, NOT terminated"
             lines.append(f"    agent:     {agent}")
         lines.append(f"    stage:     {recovery.get('stage', '')}")
         lines.append(f"    branch:    {recovery.get('branch') or 'unavailable'}")
         lines.append(f"    worktree:  {recovery.get('worktree_path') or 'unavailable'}")
         lines.append(f"    reason:    {recovery.get('reason', '')}")
-    if lode.get("state") == "gated":
+    if lode.get("state") == "gated" and not archived_row:
         lines.append("")
         lines.append(f"Gate blocked. Review with: hop gate show {lode.get('id', '')}")
     return "\n".join(lines)
@@ -3219,11 +3233,78 @@ def _create_alias_help(cmd_name: str, description: str, args: list[str]) -> int 
     return None
 
 
+ARCHIVED_PAGE_DEFAULT = 20
+
+
+def _page_count(value: str) -> int:
+    """Parse one non-negative page bound, where zero means no bound."""
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a whole number") from error
+    if count < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return count
+
+
+def _archived_page_summary(
+    *,
+    shown: int,
+    offset: int,
+    limit: int | None,
+    total: int | None,
+    project: str | None,
+    all_hosts: bool,
+) -> str:
+    """Describe which slice of the archive was shown, and how to see older rows.
+
+    A page that names no total reads exactly like a complete answer. Say the
+    slice, say the whole where it is known, and print the next page's command
+    whenever another page can exist.
+    """
+    scope = f" for project {project}" if project else ""
+    if shown == 0:
+        past = f", past the newest {offset}" if offset else ""
+        return f"No archived lodes{scope}{past}."
+    first = offset + 1
+    last = offset + shown
+    of_total = f" of {total}" if total is not None else ""
+    summary = f"Showing archived {first}-{last}{of_total}{scope}, newest first."
+    more = last < total if total is not None else shown == limit
+    if limit is not None and more:
+        args = ["hop", "lode", "list", "--archived"]
+        if all_hosts:
+            args.append("--all-hosts")
+        if project:
+            args.extend(["--project", project])
+        if limit != ARCHIVED_PAGE_DEFAULT:
+            args.extend(["--limit", str(limit)])
+        args.extend(["--offset", str(last)])
+        summary += f" Older: {shlex.join(args)}"
+    return summary
+
+
 def _add_lode_list_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared lode-list arguments to the command and its alias."""
     parser.add_argument("-a", "--archived", action="store_true", help="Show archived lodes")
     parser.add_argument("-p", "--project", help="Filter by project name")
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=_page_count,
+        default=None,
+        help=(
+            f"Rows to show, newest first (archived default: {ARCHIVED_PAGE_DEFAULT}; "
+            "0 means every row)"
+        ),
+    )
+    parser.add_argument(
+        "--offset",
+        type=_page_count,
+        default=0,
+        help="Skip this many of the newest rows first, to page through older ones",
+    )
     parser.add_argument(
         "--all-hosts",
         action="store_true",
@@ -3706,6 +3787,22 @@ def cmd_lode(args: list[str]) -> int:
 
         searched_sources = ["local"]
 
+        # The active list is bounded by how many lodes can run at once; the
+        # archive only grows, so it is the one that needs a page by default.
+        requested_limit = getattr(parsed, "limit", None)
+        page_limit = (
+            ARCHIVED_PAGE_DEFAULT if archived and requested_limit is None else (requested_limit)
+        )
+        if page_limit == 0:
+            page_limit = None
+        page_offset = getattr(parsed, "offset", 0) or 0
+        # Every host must supply enough rows to build the merged page, because
+        # the newest 20 of the fleet is not the newest 20 of any one host.
+        source_offset = 0 if all_hosts else page_offset
+        source_limit = (
+            None if page_limit is None else (page_offset + page_limit if all_hosts else page_limit)
+        )
+
         def prepare_local_lodes(rows: list[dict]) -> list[dict]:
             rows = list(rows)
             if archived:
@@ -3717,33 +3814,42 @@ def cmd_lode(args: list[str]) -> int:
                 rows = [lode for lode in rows if lode.get("project") == project_filter]
             return rows
 
-        def read_local_lodes(timeout: float) -> list[dict] | None:
-            if all_hosts:
-                rows = (
-                    client.read_archived_lodes(socket_path, timeout=timeout)
-                    if archived
-                    else client.read_lodes(socket_path, timeout=timeout)
+        def read_local_lodes(timeout: float) -> tuple[list[dict], int | None] | None:
+            """Read this server's rows and, for the archive, its unpaged total."""
+            total: int | None = None
+            if archived:
+                page = client.read_archived_lodes(
+                    socket_path,
+                    timeout=timeout,
+                    limit=source_limit,
+                    offset=source_offset,
+                    project=project_filter,
                 )
+                if page is None:
+                    return None
+                rows, total = page
             else:
-                rows = (
-                    client.list_archived_lodes(socket_path, timeout=timeout)
-                    if archived
-                    else client.list_lodes(socket_path, timeout=timeout)
-                )
+                rows = client.list_lodes(socket_path, timeout=timeout)
             validated = validate_lode_records(rows, canonical_ids=False)
-            return None if validated is None else prepare_local_lodes(validated)
+            return None if validated is None else (prepare_local_lodes(validated), total)
 
+        local_total: int | None = None
         if all_hosts:
             lodes = []
         else:
-            local_rows = read_local_lodes(2.0)
-            if local_rows is None:
+            local_page = read_local_lodes(2.0)
+            if local_page is None:
                 print(
                     "Lode listing unavailable: the server response was missing or malformed; "
-                    "retry with: hop lode list --json",
+                    + (
+                        "if the server predates paged archive listing, restart it after pulling"
+                        if archived
+                        else "retry with: hop lode list --json"
+                    ),
                     file=sys.stderr,
                 )
                 return 2
+            local_rows, local_total = local_page
             lodes = [dict(lode) for lode in local_rows]
         unavailable_hosts: list[dict[str, str]] = []
         if all_hosts:
@@ -3752,6 +3858,7 @@ def cmd_lode(args: list[str]) -> int:
             remote_args = ["lode", "list", "--json"]
             if archived:
                 remote_args.append("--archived")
+                remote_args.extend(["--limit", str(source_limit or 0)])
             if project_filter:
                 remote_args.extend(["--project", project_filter])
             hosts = _remote_hosts()
@@ -3779,8 +3886,8 @@ def cmd_lode(args: list[str]) -> int:
                             f"{LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC:g}s; retry or stop it if wedged"
                         ),
                     )
-                rows = read_local_lodes(local_timeout)
-                if rows is None:
+                page = read_local_lodes(local_timeout)
+                if page is None:
                     return subprocess.CompletedProcess(
                         [],
                         1,
@@ -3790,6 +3897,7 @@ def cmd_lode(args: list[str]) -> int:
                             "retry with: hop lode list --json"
                         ),
                     )
+                rows, _total = page
                 return subprocess.CompletedProcess(
                     [],
                     0,
@@ -3809,10 +3917,33 @@ def cmd_lode(args: list[str]) -> int:
                     stamped = dict(remote_lode)
                     stamped["host"] = discovery.host
                     lodes.append(stamped)
+            if archived:
+                # Each source returned its own newest rows; the fleet's page is
+                # the merge, so it can only be cut once every source is in.
+                lodes.sort(key=lambda lode: lode.get("updated_at", 0), reverse=True)
+                lodes = lodes[page_offset:]
+                if page_limit is not None:
+                    lodes = lodes[:page_limit]
         print(f"Searched lode sources: {', '.join(searched_sources)}", file=sys.stderr)
+        if archived:
+            print(
+                _archived_page_summary(
+                    shown=len(lodes),
+                    offset=page_offset,
+                    limit=page_limit,
+                    total=local_total,
+                    project=project_filter,
+                    all_hosts=all_hosts,
+                ),
+                file=sys.stderr,
+            )
         if getattr(parsed, "json_output", False):
             lodes = [lode_with_status_annotations(lode) for lode in lodes]
             payload = {"lodes": lodes}
+            if archived:
+                payload["offset"] = page_offset
+                payload["limit"] = page_limit
+                payload["total"] = local_total
             if all_hosts:
                 payload["unavailable_hosts"] = unavailable_hosts
             print(json.dumps(payload, indent=2))
@@ -4437,10 +4568,13 @@ def cmd_lode(args: list[str]) -> int:
             pane = lode.get("tmux_pane")
             pane_text = capture_pane(pane, plain=True) if pane else None
             if pane_text is None:
-                print(
-                    f"pane {pane or '<unknown>'} no longer exists "
-                    f"(lode active={lode.get('active')}, state={lode.get('state')})"
-                )
+                # `active` and `state` are frozen at archive time, so quoting
+                # them raw on an archived lode reports a retired row as live.
+                if lode.get("archived") or isinstance(lode.get("archived_at"), int):
+                    condition = "lode archived; its recorded pane and state are as-archived"
+                else:
+                    condition = f"lode active={lode.get('active')}, state={lode.get('state')}"
+                print(f"pane {pane or '<unknown>'} no longer exists ({condition})")
                 return 1
             lines = max(1, parsed.lines)
             print("\n".join(pane_text.splitlines()[-lines:]))

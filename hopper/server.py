@@ -1015,6 +1015,19 @@ def _log_state_change(lode_id: str, state: str, status: str, via: str) -> None:
     logger.info(f"Lode {lode_id} state={state} status={status} via={via}")
 
 
+def _page_bound(value: object, *, default: int | None) -> int | None:
+    """Read one non-negative page bound off the wire, or fall back to a default.
+
+    A bound is either absent or trustworthy: `True` is an `int` in Python and a
+    float is not a row count, so both are rejected rather than coerced. A
+    rejected bound falls back to the default, never to a silently different
+    page.
+    """
+    if type(value) is not int or value < 0:
+        return default
+    return value
+
+
 def get_git_hash() -> str | None:
     """Get the short git hash of the current HEAD."""
     try:
@@ -5109,7 +5122,33 @@ class Server:
             self._send_response(conn, {"type": "backlog_list", "items": items_data})
 
         elif msg_type == "archived_list":
-            self._send_response(conn, {"type": "archived_list", "lodes": self.archived_lodes})
+            self._send_response(conn, self._archived_list_page(message))
+
+    def _archived_list_page(self, msg: dict) -> dict:
+        """Return one newest-first page of archived lodes plus the unpaged total.
+
+        The page is cut here rather than in the CLI because the archive grows
+        without bound and the whole list crosses the socket either way. A
+        request that names no limit is an older CLI and still receives every
+        row, which is the behaviour it was written against.
+        """
+        rows: list[dict] = self.archived_lodes
+        project = msg.get("project")
+        if isinstance(project, str) and project:
+            rows = [lode for lode in rows if lode.get("project") == project]
+        total = len(rows)
+        offset = _page_bound(msg.get("offset"), default=0)
+        limit = _page_bound(msg.get("limit"), default=None)
+        page = sorted(rows, key=lambda lode: lode.get("updated_at") or 0, reverse=True)[offset:]
+        if limit is not None:
+            page = page[:limit]
+        return {
+            "type": "archived_list",
+            "lodes": page,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
 
     def _promote_backlog_item(
         self,

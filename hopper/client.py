@@ -554,23 +554,45 @@ def list_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
     return read_lodes(socket_path, timeout=timeout)
 
 
-def read_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
-    """Read archived lodes, preserving an unreachable server as None."""
+def read_archived_lodes(
+    socket_path: Path,
+    timeout: float = 2.0,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+    project: str | None = None,
+) -> tuple[list[dict], int] | None:
+    """Read one newest-first page of archived lodes and the unpaged total.
+
+    Returns None for an unreachable or malformed server, which is never the
+    same answer as an empty archive. The total counts every archived row the
+    filter admits, not the rows on this page, so a caller can say which slice
+    of what it is showing.
+    """
+    message: dict = {"type": "archived_list", "offset": offset}
+    if limit is not None:
+        message["limit"] = limit
+    if project:
+        message["project"] = project
     response = send_message(
         socket_path,
-        {"type": "archived_list"},
+        message,
         timeout=timeout,
         wait_for_response=True,
     )
-    if response and response.get("type") == "archived_list":
-        lodes = response.get("lodes")
-        return lodes if isinstance(lodes, list) else None
-    return None
-
-
-def list_archived_lodes(socket_path: Path, timeout: float = 2.0) -> list[dict] | None:
-    """List archived lodes without collapsing an unavailable server to empty."""
-    return read_archived_lodes(socket_path, timeout=timeout)
+    if not response or response.get("type") != "archived_list":
+        return None
+    lodes = response.get("lodes")
+    if not isinstance(lodes, list):
+        return None
+    total = response.get("total")
+    if type(total) is not int or total < offset + len(lodes):
+        # A server that cannot report a total did not honour the page bounds
+        # either, so its rows are the whole archive in file order. Report that
+        # as unavailable rather than rendering a silently wrong slice: the
+        # caller's recovery is to restart the server on the current build.
+        return None
+    return lodes, total
 
 
 def create_lode(

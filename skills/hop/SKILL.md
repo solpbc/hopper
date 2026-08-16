@@ -183,12 +183,28 @@ List active lodes (`hop lode` defaults to `list`):
 ```bash
 hop lode
 hop lode list
-hop lode list -a          # include archived
-hop lode list -p PROJECT  # filter by project name
+hop lode list -a             # archived, newest 20
+hop lode list -a --offset 20 # the next 20 older
+hop lode list -a -n 100      # a bigger page
+hop lode list -a -n 0        # every archived row, however many that is
+hop lode list -p PROJECT     # filter by project name
 hop lode list --json
-hop lode list --all-hosts # aggregate local and all pool hosts
-hop list                  # alias for lode list (same flags)
+hop lode list --all-hosts    # aggregate local and all pool hosts
+hop list                     # alias for lode list (same flags)
 ```
+
+**The archive is paged; the active list is not.** `-a` returns the newest 20
+rows and nothing else, because the archive only grows — on the busiest host it
+is 3,400+ rows and 30 MB, which the whole listing used to try to carry across
+the socket in one 2-second budget and fail. Every archived listing prints which
+slice of what it is showing on stderr (`Showing archived 1-20 of 3456, newest
+first`) and the exact command for the next page. `-n`/`--limit` resizes the
+page, `--offset` walks backwards through older rows, and `-n 0` asks for
+everything. In JSON, `total` is the whole filtered archive and `offset`/`limit`
+are the page that was cut; `total` is `null` under `--all-hosts`, where no
+single source knows the fleet's count. ⚠ A server older than paged listing
+answers `Lode listing unavailable`; restart it after pulling rather than
+reading a partial page as the whole archive.
 
 A single-source `hop lode list -p PROJECT` refuses when that project has a
 configured remote pool because the local server cannot vouch for the complete
@@ -220,6 +236,16 @@ records include `status_display`, the human-facing derived status, and
 `pane_liveness`, which is `alive`, `gone`, `unknown`, or `not_probed`. The existing
 `status` field remains the stored string; consumers opt into the derived view through
 `status_display`.
+
+**An archived lode says so, and its live-looking fields are as-archived.**
+`active`, `tmux_pane`, `state` and the park record are frozen at archive time
+and nothing clears them, so `hop lode status` on an archived row prints
+`archived: yes`, reports `active: no (archived)`, drops the stale pane, says the
+agent is `gone; the lode was archived`, and offers no gate review. `hop lode
+peek` names the archived condition instead of quoting the frozen fields. ⛔ Read
+an archived row as a record of what happened, never as a live lode needing
+recovery — an archived-eight-days row was reported and triaged as a live wedge
+on 2026-08-15 exactly because these fields rendered as current.
 
 `hop lode status` also prints an `unpushed:` line whenever the lode still has a
 worktree. It is the number of commits that exist **only** in that worktree, reachable

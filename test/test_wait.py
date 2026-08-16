@@ -699,12 +699,6 @@ def test_read_due_locals_uses_one_bounded_snapshot(
         "read_archived_lodes",
         MagicMock(side_effect=AssertionError("wait must not scan archived lodes")),
     )
-    monkeypatch.setattr(
-        wait.client,
-        "list_archived_lodes",
-        MagicMock(side_effect=AssertionError("wait must not list archived lodes")),
-    )
-
     wait._read_due_locals(state, Path("server.sock"), 0.0)
 
     read_snapshot.assert_called_once_with(
