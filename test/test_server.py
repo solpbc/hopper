@@ -5532,7 +5532,7 @@ def test_concurrent_lode_create_responses_are_causally_bound(
         scope="",
         *,
         originating_extro_sid=None,
-        coder_provider="codex",
+        coder_provider,
     ):
         if scope == "scope-a":
             a_create_started.set()
@@ -8897,6 +8897,31 @@ def test_server_handles_legacy_lode_set_codex_thread(socket_path, server, temp_c
     assert server.lodes[0]["codex_thread_id"] == "codex-uuid-1234"
 
     client.close()
+
+
+def test_server_refuses_codex_thread_mutation_for_grok_lode(server, make_lode, caplog):
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="running",
+        coder={"provider": "grok", "session_id": None},
+    )
+    server.lodes = [lode]
+    before = copy.deepcopy(lode)
+
+    with caplog.at_level(logging.WARNING):
+        server._handle_mutation(
+            _runner_message(
+                server,
+                "lode_set_codex_thread",
+                "test-id",
+                codex_thread_id="grok-session",
+            ),
+            None,
+        )
+
+    assert lode == {**before, "run_generation": TEST_RUN_GENERATION}
+    assert "Refusing invalid Codex thread mutation" in caplog.text
 
 
 def test_server_handles_lode_set_coder_session(socket_path, server, temp_config, make_lode):

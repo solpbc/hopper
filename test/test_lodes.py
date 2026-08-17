@@ -1004,7 +1004,9 @@ def test_update_lode_branch(temp_config):
     assert loaded[0]["branch"] == "hopper-testid11-auth-flow"
 
 
-def test_grok_coder_session_roundtrips_and_codex_path_is_refused(temp_config):
+def test_grok_coder_session_roundtrips_and_codex_path_is_refused(temp_config, monkeypatch):
+    timestamps = iter((1000, 2000))
+    monkeypatch.setattr("hopper.lodes.current_time_ms", lambda: next(timestamps))
     lodes_list = []
     lode = create_lode(lodes_list, "test-project")
     persisted_before = (temp_config / "active.jsonl").read_bytes()
@@ -1019,10 +1021,12 @@ def test_grok_coder_session_roundtrips_and_codex_path_is_refused(temp_config):
     assert updated is lode
     assert updated["coder"]["session_id"] == "thread-123"
     assert updated["codex_thread_id"] is None
+    assert updated["updated_at"] == 2000
 
     loaded = load_lodes()
     assert loaded[0]["coder"]["session_id"] == "thread-123"
     assert loaded[0]["codex_thread_id"] is None
+    assert loaded[0]["updated_at"] == 2000
 
 
 def test_update_lode_coder_session_not_found(temp_config):
@@ -1038,6 +1042,35 @@ def test_update_lode_codex_thread_preserves_legacy_field(temp_config):
 
     assert updated["codex_thread_id"] == "thread-123"
     assert "coder" not in updated
+
+
+def test_update_lode_codex_thread_refuses_grok_without_mutation(temp_config):
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project")
+    persisted_before = (temp_config / "active.jsonl").read_bytes()
+    memory_before = json.loads(json.dumps(lodes_list))
+
+    with pytest.raises(ValueError, match="only be stored on Codex lodes"):
+        update_lode_codex_thread(lodes_list, lode["id"], "grok-session")
+
+    assert lodes_list == memory_before
+    assert (temp_config / "active.jsonl").read_bytes() == persisted_before
+
+
+@pytest.mark.parametrize("session_id", [123, ""], ids=["non-string", "empty"])
+def test_update_lode_coder_session_rejects_invalid_session_without_persisting(
+    temp_config, session_id
+):
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project")
+    persisted_before = (temp_config / "active.jsonl").read_bytes()
+    memory_before = json.loads(json.dumps(lodes_list))
+
+    with pytest.raises(ValueError, match="session_id must be a non-empty string"):
+        update_lode_coder_session(lodes_list, lode["id"], "grok", session_id)
+
+    assert lodes_list == memory_before
+    assert (temp_config / "active.jsonl").read_bytes() == persisted_before
 
 
 def test_generic_coder_session_path_does_not_reencode_codex(temp_config):

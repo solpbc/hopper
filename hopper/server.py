@@ -5722,7 +5722,11 @@ class Server:
             lode_id = message.get("lode_id")
             thread_id = message.get("codex_thread_id")
             if lode_id and thread_id:
-                lode = update_lode_codex_thread(self.lodes, lode_id, thread_id)
+                try:
+                    lode = update_lode_codex_thread(self.lodes, lode_id, thread_id)
+                except ValueError as error:
+                    logger.warning("Refusing invalid Codex thread mutation: %s", error)
+                    return
                 if lode:
                     logger.info(f"Lode {lode_id} codex_thread={thread_id}")
                     self.broadcast({"type": "lode_updated", "lode": lode})

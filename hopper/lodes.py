@@ -673,7 +673,14 @@ def lode_coder(lode: dict) -> tuple[str, str | None]:
 
 def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: str) -> dict | None:
     """Update the Codex thread ID on a lode."""
-    return _update_lode_field(lodes, lode_id, "codex_thread_id", codex_thread_id)
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        provider, _session_id = lode_coder(lode)
+        if provider != "codex":
+            raise ValueError("Codex thread IDs can only be stored on Codex lodes")
+        return _update_lode_field(lodes, lode_id, "codex_thread_id", codex_thread_id)
+    return None
 
 
 def update_lode_coder_session(
@@ -681,6 +688,8 @@ def update_lode_coder_session(
 ) -> dict | None:
     """Store a session only when it belongs to the lode's selected coder."""
     provider = validate_coder_provider(provider)
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("coder session_id must be a non-empty string")
     if provider == "codex":
         return None
     for lode in lodes:
