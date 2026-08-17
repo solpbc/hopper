@@ -212,7 +212,8 @@ def test_create_lode(temp_config):
     assert lode["spawn_disposition"] is None
     assert lode["archive_action_id"] is None
     assert lode["codex_thread_id"] is None
-    assert "coder" not in lode
+    assert lode["coder"] == {"provider": "grok", "session_id": None}
+    assert lode_coder(lode) == ("grok", None)
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
@@ -237,10 +238,12 @@ def test_create_lode(temp_config):
     assert loaded[0]["project"] == "test-project"
 
 
-def test_create_lode_can_select_grok(temp_config):
-    lode = create_lode([], "test-project", coder_provider="grok")
+def test_create_lode_can_select_codex(temp_config):
+    lode = create_lode([], "test-project", coder_provider="codex")
 
-    assert lode["coder"] == {"provider": "grok", "session_id": None}
+    assert "coder" not in lode
+    assert lode["codex_thread_id"] is None
+    assert lode_coder(lode) == ("codex", None)
 
 
 def test_create_lode_rejects_unknown_coder_before_writing(temp_config):
@@ -262,7 +265,7 @@ def test_validate_lode_coder_data_rejects_malformed_optional_provider():
         validate_lode_coder_data([{"id": "badlode1", "coder": "grok"}], "active")
 
 
-def test_validate_lode_coder_data_rejects_reencoding_default_codex():
+def test_validate_lode_coder_data_rejects_reencoding_codex():
     with pytest.raises(ValueError, match="must use codex_thread_id"):
         validate_lode_coder_data(
             [{"id": "badlode1", "coder": {"provider": "codex", "session_id": None}}],
@@ -1001,28 +1004,25 @@ def test_update_lode_branch(temp_config):
     assert loaded[0]["branch"] == "hopper-testid11-auth-flow"
 
 
-def test_update_lode_coder_session(temp_config):
-    """update_lode_coder_session changes session ID and touches timestamp."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "refine",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "running",
-            "coder": {"provider": "grok", "session_id": None},
-        }
-    ]
-    save_lodes(lodes_list)
+def test_grok_coder_session_roundtrips_and_codex_path_is_refused(temp_config):
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project")
+    persisted_before = (temp_config / "active.jsonl").read_bytes()
+    memory_before = json.loads(json.dumps(lodes_list))
 
-    updated = update_lode_coder_session(lodes_list, "testid11", "grok", "thread-123")
+    assert update_lode_coder_session(lodes_list, lode["id"], "codex", "wrong-thread") is None
+    assert lodes_list == memory_before
+    assert (temp_config / "active.jsonl").read_bytes() == persisted_before
 
-    assert updated is not None
+    updated = update_lode_coder_session(lodes_list, lode["id"], "grok", "thread-123")
+
+    assert updated is lode
     assert updated["coder"]["session_id"] == "thread-123"
-    assert updated["updated_at"] > 1000
+    assert updated["codex_thread_id"] is None
 
     loaded = load_lodes()
     assert loaded[0]["coder"]["session_id"] == "thread-123"
+    assert loaded[0]["codex_thread_id"] is None
 
 
 def test_update_lode_coder_session_not_found(temp_config):

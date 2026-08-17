@@ -4546,7 +4546,7 @@ def test_completion_spawn_adopts_only_the_fsynced_receipt_pane(socket_path, make
             {"provider": "grok", "session_id": None},
         ),
     ],
-    ids=["default-codex", "grok"],
+    ids=["codex", "grok"],
 )
 def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
     socket_path, make_lode, monkeypatch, source_coder, expected_promoted_coder
@@ -5430,24 +5430,20 @@ def test_lode_create_preserves_originating_extro_sid_over_socket(socket_path, se
 
 
 def test_lode_create_persists_selected_grok_provider(socket_path, server, temp_config):
-    with patch(
-        "hopper.server.coder_check",
-        return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
-    ):
-        created = request_lode_creation(
-            socket_path,
-            "project-a",
-            "scope-a",
-            spawn=False,
-            coder_provider="grok",
-        )
+    created = request_lode_creation(
+        socket_path,
+        "project-a",
+        "scope-a",
+        spawn=False,
+        coder_provider="grok",
+    )
 
     assert created["coder"] == {"provider": "grok", "session_id": None}
     persisted = json.loads((temp_config / "active.jsonl").read_text().strip())
     assert persisted["coder"] == {"provider": "grok", "session_id": None}
 
 
-def test_grok_create_refuses_before_mutation_when_server_lacks_provider_protocol(
+def test_codex_create_refuses_before_mutation_when_server_lacks_provider_protocol(
     tmp_path, monkeypatch
 ):
     calls = []
@@ -5463,15 +5459,15 @@ def test_grok_create_refuses_before_mutation_when_server_lacks_provider_protocol
         "project-a",
         "scope-a",
         spawn=False,
-        coder_provider="grok",
+        coder_provider="codex",
     )
 
     assert created is None
     assert [message["type"] for message in calls] == ["coder_capabilities"]
 
 
-@pytest.mark.parametrize("providers", [None, "grok", [1]])
-def test_grok_create_refuses_malformed_provider_capabilities(tmp_path, monkeypatch, providers):
+@pytest.mark.parametrize("providers", [None, "codex", [1]])
+def test_codex_create_refuses_malformed_provider_capabilities(tmp_path, monkeypatch, providers):
     calls = []
 
     def malformed_response(_socket_path, message, **_kwargs):
@@ -5486,23 +5482,23 @@ def test_grok_create_refuses_malformed_provider_capabilities(tmp_path, monkeypat
             "project-a",
             "scope-a",
             spawn=False,
-            coder_provider="grok",
+            coder_provider="codex",
         )
         is None
     )
     assert [message["type"] for message in calls] == ["coder_capabilities"]
 
 
-def test_lode_create_refuses_grok_before_durable_creation_when_cli_missing(
+def test_lode_create_refuses_codex_before_durable_creation_when_cli_missing(
     socket_path, server, temp_config
 ):
     with patch(
         "hopper.server.coder_check",
         return_value={
-            "provider": "grok",
+            "provider": "codex",
             "ready": False,
             "version": "",
-            "error": "grok command not found",
+            "error": "codex command not found",
         },
     ):
         created = request_lode_creation(
@@ -5510,7 +5506,7 @@ def test_lode_create_refuses_grok_before_durable_creation_when_cli_missing(
             "project-a",
             "scope-a",
             spawn=False,
-            coder_provider="grok",
+            coder_provider="codex",
         )
 
     assert created is None

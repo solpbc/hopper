@@ -24,8 +24,10 @@ Lodes are plain dicts with these fields:
 - failure_kind: str | None - durable terminal runner failure discriminator (default None)
 - archive_action_id: str | None - action that published this archive (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
-- coder: optional dict - non-default refine-stage provider and resumable session:
-    {"provider": "grok", "session_id": str | None}; absence means Codex
+- coder: optional dict - non-Codex refine-stage provider and resumable session:
+    {"provider": "grok", "session_id": str | None}; presence means its session
+    lives in coder.session_id; absence means Codex, whose session lives in
+    codex_thread_id
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
 - last_pane_activity_at: int | None - timestamp of most recent real pane change (default None)
@@ -476,7 +478,7 @@ def create_lode(
         "runs": {},
         "claude": _make_claude_sessions(),
     }
-    if coder_provider != DEFAULT_CODER_PROVIDER:
+    if coder_provider != "codex":
         lode["coder"] = {"provider": coder_provider, "session_id": None}
     lodes.append(lode)
     get_lode_dir(lode["id"]).mkdir(parents=True, exist_ok=True)
@@ -654,15 +656,15 @@ def update_lode_worktree_path(lodes: list[dict], lode_id: str, worktree_path: st
 
 
 def lode_coder(lode: dict) -> tuple[str, str | None]:
-    """Return the selected coder and session; absence selects Codex."""
+    """Return the selected coder and session; absence means Codex."""
     if "coder" not in lode:
-        return DEFAULT_CODER_PROVIDER, lode.get("codex_thread_id")
+        return "codex", lode.get("codex_thread_id")
     coder = lode["coder"]
     if not isinstance(coder, dict):
         raise ValueError("lode contains invalid coder data")
     provider = validate_coder_provider(coder.get("provider"))
-    if provider == DEFAULT_CODER_PROVIDER:
-        raise ValueError("default Codex lodes must use codex_thread_id")
+    if provider == "codex":
+        raise ValueError("Codex lodes must use codex_thread_id")
     session_id = coder.get("session_id")
     if session_id is not None and not isinstance(session_id, str):
         raise ValueError("lode contains invalid coder session_id")
@@ -679,7 +681,7 @@ def update_lode_coder_session(
 ) -> dict | None:
     """Store a session only when it belongs to the lode's selected coder."""
     provider = validate_coder_provider(provider)
-    if provider == DEFAULT_CODER_PROVIDER:
+    if provider == "codex":
         return None
     for lode in lodes:
         if lode["id"] != lode_id:
@@ -695,7 +697,7 @@ def update_lode_coder_session(
 
 
 def validate_lode_coder_data(lodes: list[dict], source: str) -> None:
-    """Validate optional non-default coder data without touching default Codex rows."""
+    """Validate non-Codex coder data without touching absent-coder Codex rows."""
     for lode in lodes:
         if "coder" not in lode:
             continue

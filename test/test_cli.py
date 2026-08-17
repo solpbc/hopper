@@ -847,7 +847,7 @@ def test_backlog_promote_success(capsys):
                     ) as mock_promote:
                         assert cmd_backlog(["promote", "abc"]) == 0
 
-    mock_promote.assert_called_once_with(socket_path, "abc123", scope="", coder_provider="codex")
+    mock_promote.assert_called_once_with(socket_path, "abc123", scope="", coder_provider="grok")
     out = capsys.readouterr().out
     assert "Promoted: newlode1" in out
 
@@ -867,7 +867,7 @@ def test_backlog_promote_with_scope(capsys):
                         assert cmd_backlog(["promote", "abc", "custom", "scope"]) == 0
 
     mock_promote.assert_called_once_with(
-        socket_path, "abc123", scope="custom scope", coder_provider="codex"
+        socket_path, "abc123", scope="custom scope", coder_provider="grok"
     )
     out = capsys.readouterr().out
     assert "custom scope" in out
@@ -1495,7 +1495,7 @@ def test_lode_create_happy(capsys):
     assert "myproj" in out
 
 
-def test_lode_create_can_select_grok(capsys):
+def test_lode_create_can_select_codex(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
@@ -1506,14 +1506,15 @@ def test_lode_create_can_select_grok(capsys):
         patch("hopper.git.dirty_status", return_value=""),
         patch(
             "hopper.cli.coder_check",
-            return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
-        ),
+            return_value={"provider": "codex", "ready": True, "version": "1.0.3", "error": ""},
+        ) as check,
         patch("hopper.client.create_lode", return_value=created_lode) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
-        assert cmd_lode(["create", "myproj", "--coder", "grok", "--json"]) == 0
+        assert cmd_lode(["create", "myproj", "--coder", "codex", "--json"]) == 0
 
-    assert create.call_args.kwargs["coder_provider"] == "grok"
+    check.assert_called_once_with("codex")
+    assert create.call_args.kwargs["coder_provider"] == "codex"
     assert json.loads(capsys.readouterr().out) == {
         "id": "abc12345",
         "project": "myproj",
@@ -1521,15 +1522,15 @@ def test_lode_create_can_select_grok(capsys):
     }
 
 
-def test_lode_create_refuses_unavailable_grok_before_server_mutation(capsys):
+def test_lode_create_refuses_unavailable_codex_before_server_mutation(capsys):
     from io import StringIO
 
     project = Project(path="/fake/repo", name="myproj")
     readiness = {
-        "provider": "grok",
+        "provider": "codex",
         "ready": False,
         "version": "",
-        "error": "grok command not found",
+        "error": "codex command not found",
     }
     with (
         patch("hopper.projects.find_project", return_value=project),
@@ -1537,13 +1538,13 @@ def test_lode_create_refuses_unavailable_grok_before_server_mutation(capsys):
         patch("hopper.client.create_lode") as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
-        assert cmd_lode(["create", "myproj", "--coder", "grok"]) == 1
+        assert cmd_lode(["create", "myproj", "--coder", "codex"]) == 1
 
     create.assert_not_called()
-    assert capsys.readouterr().out == "error: grok unavailable: grok command not found\n"
+    assert capsys.readouterr().out == "error: codex unavailable: codex command not found\n"
 
 
-def test_grok_lode_create_does_not_report_success_when_server_refuses(capsys):
+def test_codex_lode_create_does_not_report_success_when_server_refuses(capsys):
     from io import StringIO
 
     project = Project(path="/fake/repo", name="myproj")
@@ -1553,13 +1554,14 @@ def test_grok_lode_create_does_not_report_success_when_server_refuses(capsys):
         patch("hopper.git.dirty_status", return_value=""),
         patch(
             "hopper.cli.coder_check",
-            return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
-        ),
+            return_value={"provider": "codex", "ready": True, "version": "1.0.3", "error": ""},
+        ) as check,
         patch("hopper.client.create_lode", return_value=None),
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
-        assert cmd_lode(["create", "myproj", "--coder", "grok"]) == 1
+        assert cmd_lode(["create", "myproj", "--coder", "codex"]) == 1
 
+    check.assert_called_once_with("codex")
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: lode was not created\n"
@@ -6806,11 +6808,11 @@ def test_format_lode_detail_still_reports_a_live_gated_lode_as_live(make_lode):
     assert "Gate blocked. Review with: hop gate show ubstskfw" in detail
 
 
-def test_format_lode_detail_does_not_add_coder_to_default_lodes(make_lode):
-    assert "  coder:" not in format_lode_detail(make_lode())
+def test_format_lode_detail_shows_codex_coder_for_legacy_lodes(make_lode):
+    assert "  coder:    codex" in format_lode_detail(make_lode())
 
 
-def test_format_lode_detail_shows_nondefault_coder(make_lode):
+def test_format_lode_detail_shows_grok_coder(make_lode):
     lode = make_lode(coder={"provider": "grok", "session_id": None})
     assert "  coder:    grok" in format_lode_detail(lode)
 

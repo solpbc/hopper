@@ -586,7 +586,7 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
     ]
 
 
-def test_grok_pool_probe_requires_provider_readiness_after_normal_checks(
+def test_codex_pool_probe_requires_provider_readiness_after_normal_checks(
     emitted_project_json,
     emitted_lode_inventory_json,
 ):
@@ -600,7 +600,7 @@ def test_grok_pool_probe_requires_provider_readiness_after_normal_checks(
             stdout = emitted_lode_inventory_json
         else:
             stdout = json.dumps(
-                {"provider": "grok", "ready": True, "version": "1.0.3", "error": ""}
+                {"provider": "codex", "ready": True, "version": "1.0.3", "error": ""}
             )
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
@@ -609,14 +609,14 @@ def test_grok_pool_probe_requires_provider_readiness_after_normal_checks(
         "journal",
         runner,
         monotonic=lambda: 0.0,
-        coder_provider="grok",
+        coder_provider="codex",
     )
 
     assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
-    assert calls[-1][1] == ["coder", "check", "grok", "--json"]
+    assert calls[-1][1] == ["coder", "check", "codex", "--json"]
 
 
-def test_grok_pool_probe_excludes_host_without_grok(
+def test_codex_pool_probe_excludes_host_without_codex(
     emitted_project_json,
     emitted_lode_inventory_json,
 ):
@@ -628,10 +628,10 @@ def test_grok_pool_probe_excludes_host_without_grok(
         else:
             stdout = json.dumps(
                 {
-                    "provider": "grok",
+                    "provider": "codex",
                     "ready": False,
                     "version": "",
-                    "error": "grok command not found",
+                    "error": "codex command not found",
                 }
             )
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
@@ -641,12 +641,12 @@ def test_grok_pool_probe_excludes_host_without_grok(
         "journal",
         runner,
         monotonic=lambda: 0.0,
-        coder_provider="grok",
+        coder_provider="codex",
     )
 
     assert probe.eligible is False
-    assert "grok command not found" in probe.reason
-    assert "hop -H missing.example coder check grok --json" in probe.reason
+    assert "codex command not found" in probe.reason
+    assert "hop -H missing.example coder check codex --json" in probe.reason
 
 
 def test_probe_candidate_accepts_project_contract_superset(

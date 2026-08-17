@@ -2004,12 +2004,11 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(f"  host:     {lode.get('host', '')}")
     lines.append(f"  project:  {lode.get('project', '')}")
     lines.append(f"  stage:    {lode.get('stage', '')}")
-    if "coder" in lode:
-        try:
-            coder_provider, _session_id = lode_coder(lode)
-            lines.append(f"  coder:    {coder_provider}")
-        except ValueError:
-            lines.append("  coder:    INVALID")
+    try:
+        coder_provider, _session_id = lode_coder(lode)
+        lines.append(f"  coder:    {coder_provider}")
+    except ValueError:
+        lines.append("  coder:    INVALID")
     lines.append(f"  state:    {lode.get('state', '')}")
     if lode.get("state") == "reconnecting":
         prior_state = lode.get("reconnect_prior_state")

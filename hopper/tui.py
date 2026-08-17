@@ -479,7 +479,9 @@ class ScopeInputScreen(TextInputScreen):
         yield Button("Cancel", id="btn-cancel", variant="default")
         yield Button("Backlog", id="btn-backlog", variant="default")
         yield Button("Start", id="btn-start", variant="primary")
-        yield Button("Coder: Codex", id="btn-coder", variant="default")
+        yield Button(
+            f"Coder: {self.coder_provider.capitalize()}", id="btn-coder", variant="default"
+        )
 
     def on_submit(self, button: Button, text: str) -> None:
         action = "start" if button.id == "btn-start" else "backlog"
@@ -512,7 +514,9 @@ class BacklogEditScreen(TextInputScreen):
         yield Button("Cancel", id="btn-cancel", variant="default")
         yield Button("Promote", id="btn-promote", variant="default")
         yield Button("Save", id="btn-save", variant="primary")
-        yield Button("Coder: Codex", id="btn-coder", variant="default")
+        yield Button(
+            f"Coder: {self.coder_provider.capitalize()}", id="btn-coder", variant="default"
+        )
 
     def on_submit(self, button: Button, text: str) -> None:
         action = "promote" if button.id == "btn-promote" else "save"

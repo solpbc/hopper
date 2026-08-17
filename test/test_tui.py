@@ -594,7 +594,7 @@ def test_project_picker_call_sites_use_full_load_projects(monkeypatch):
     assert all(screen._projects == full_projects for screen in screens)
 
 
-def test_new_lode_refuses_unavailable_grok_before_enqueue(monkeypatch):
+def test_new_lode_refuses_unavailable_codex_before_enqueue(monkeypatch):
     project = Project(path="/path/to/active", name="active")
     server = MockServer(projects=[project])
     app = HopperApp(server=server)
@@ -606,10 +606,10 @@ def test_new_lode_refuses_unavailable_grok_before_enqueue(monkeypatch):
     monkeypatch.setattr(
         "hopper.tui.coder_check",
         lambda _provider: {
-            "provider": "grok",
+            "provider": "codex",
             "ready": False,
             "version": "",
-            "error": "grok command not found",
+            "error": "codex command not found",
         },
     )
     monkeypatch.setattr(
@@ -621,13 +621,15 @@ def test_new_lode_refuses_unavailable_grok_before_enqueue(monkeypatch):
     app.action_new_lode()
     callbacks[0](project)
     server.events.clear()
-    callbacks[1](("A sufficiently detailed task scope", "start", "grok"))
+    callbacks[1](("A sufficiently detailed task scope", "start", "codex"))
 
     assert server.events == []
-    app.notify.assert_called_once_with("Grok unavailable: grok command not found", severity="error")
+    app.notify.assert_called_once_with(
+        "Codex unavailable: codex command not found", severity="error"
+    )
 
 
-def test_backlog_promote_refuses_unavailable_grok_before_enqueue(monkeypatch):
+def test_backlog_promote_refuses_unavailable_codex_before_enqueue(monkeypatch):
     item = BacklogItem(id="bl111111", project="active", description="Promote me", created_at=1000)
     server = MockServer(backlog=[item])
     app = HopperApp(server=server)
@@ -637,10 +639,10 @@ def test_backlog_promote_refuses_unavailable_grok_before_enqueue(monkeypatch):
     monkeypatch.setattr(
         "hopper.tui.coder_check",
         lambda _provider: {
-            "provider": "grok",
+            "provider": "codex",
             "ready": False,
             "version": "",
-            "error": "grok command not found",
+            "error": "codex command not found",
         },
     )
     monkeypatch.setattr(
@@ -650,10 +652,12 @@ def test_backlog_promote_refuses_unavailable_grok_before_enqueue(monkeypatch):
     )
 
     app._edit_backlog_item(item.id)
-    callbacks[0](("promote", "Promote me", "grok"))
+    callbacks[0](("promote", "Promote me", "codex"))
 
     assert server.events == []
-    app.notify.assert_called_once_with("Grok unavailable: grok command not found", severity="error")
+    app.notify.assert_called_once_with(
+        "Codex unavailable: codex command not found", severity="error"
+    )
 
 
 @pytest.mark.asyncio
@@ -1514,7 +1518,7 @@ async def test_scope_input_start():
         await pilot.press("tab")  # Backlog
         await pilot.press("tab")  # Start
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "start", "codex")
+        assert app.scope_result == ("Test task scope", "start", "grok")
 
 
 @pytest.mark.asyncio
@@ -1532,7 +1536,7 @@ async def test_scope_input_backlog():
         await pilot.press("tab")  # Cancel
         await pilot.press("tab")  # Backlog
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "backlog", "codex")
+        assert app.scope_result == ("Test task scope", "backlog", "grok")
 
 
 @pytest.mark.asyncio
@@ -1559,7 +1563,7 @@ async def test_scope_input_ctrl_enter_submit():
         text_area = app.screen.query_one(TextArea)
         text_area.insert("test scope")
         await pilot.press("ctrl+enter")
-        assert app.scope_result == ("test scope", "start", "codex")
+        assert app.scope_result == ("test scope", "start", "grok")
 
 
 @pytest.mark.asyncio
@@ -1649,22 +1653,25 @@ async def test_scope_input_arrow_key_select():
         await pilot.press("right")
         assert app.screen.focused.id == "btn-start"
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "start", "codex")
+        assert app.scope_result == ("Test task scope", "start", "grok")
 
 
 @pytest.mark.asyncio
-async def test_scope_input_can_select_grok():
+async def test_scope_input_defaults_to_grok_and_can_select_codex():
     from textual.widgets import Button, TextArea
 
     app = ScopeTestApp()
     async with app.run_test() as pilot:
         app.screen.query_one(TextArea).insert("Test task scope")
+        coder_button = app.screen.query_one("#btn-coder", Button)
+        assert str(coder_button.label) == "Coder: Grok"
         await pilot.press("tab", "tab", "tab", "tab")
         assert app.screen.focused.id == "btn-coder"
         await pilot.press("enter")
+        assert str(coder_button.label) == "Coder: Codex"
         app.screen.query_one("#btn-start", Button).focus()
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "start", "grok")
+        assert app.scope_result == ("Test task scope", "start", "codex")
 
 
 # Tests for hint rows
@@ -2633,7 +2640,7 @@ async def test_backlog_edit_save():
         await pilot.press("tab")  # Promote
         await pilot.press("tab")  # Save
         await pilot.press("enter")
-        assert app.edit_result == ("save", "Updated text", "codex")
+        assert app.edit_result == ("save", "Updated text", "grok")
 
 
 @pytest.mark.asyncio
@@ -2649,7 +2656,7 @@ async def test_backlog_edit_promote():
         await pilot.press("tab")  # Cancel
         await pilot.press("tab")  # Promote
         await pilot.press("enter")
-        assert app.edit_result == ("promote", "Task to promote", "codex")
+        assert app.edit_result == ("promote", "Task to promote", "grok")
 
 
 @pytest.mark.asyncio
@@ -2693,7 +2700,20 @@ async def test_backlog_edit_ctrl_enter_submit():
         ta.clear()
         ta.insert("Updated text")
         await pilot.press("ctrl+enter")
-        assert app.edit_result == ("save", "Updated text", "codex")
+        assert app.edit_result == ("save", "Updated text", "grok")
+
+
+@pytest.mark.asyncio
+async def test_backlog_edit_defaults_to_grok_and_can_select_codex():
+    from textual.widgets import Button
+
+    app = BacklogEditTestApp(initial_text="Original")
+    async with app.run_test() as pilot:
+        coder_button = app.screen.query_one("#btn-coder", Button)
+        assert str(coder_button.label) == "Coder: Grok"
+        coder_button.focus()
+        await pilot.press("enter")
+        assert str(coder_button.label) == "Coder: Codex"
 
 
 @pytest.mark.asyncio

@@ -1106,7 +1106,7 @@ def set_coder_session(
         True if message was sent successfully, False otherwise
     """
     provider = validate_coder_provider(provider)
-    if provider == DEFAULT_CODER_PROVIDER:
+    if provider == "codex":
         return set_codex_thread_id(socket_path, lode_id, session_id, timeout)
     msg = {
         "type": "lode_set_coder_session",

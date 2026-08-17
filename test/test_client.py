@@ -40,6 +40,7 @@ from hopper.client import (
     send_gate_feedback,
     send_message,
     send_pane_input,
+    set_coder_session,
     set_lode_progress,
     set_lode_state,
     set_lode_title,
@@ -148,6 +149,34 @@ def test_default_coder_preserves_existing_backlog_promote_wire_contract(monkeypa
             {"timeout": 5.0, "wait_for_response": True},
         )
     ]
+
+
+def test_set_coder_session_routes_by_literal_provider_identity(socket_path):
+    with (
+        patch("hopper.client.current_time_ms", return_value=123),
+        patch("hopper.client._fire_and_forget", return_value=True) as fire_and_forget,
+        patch("hopper.client.set_codex_thread_id", return_value=True) as set_codex_thread,
+    ):
+        assert set_coder_session(socket_path, "test-id", "grok", "grok-session") is True
+
+        set_codex_thread.assert_not_called()
+        fire_and_forget.assert_called_once_with(
+            socket_path,
+            {
+                "type": "lode_set_coder_session",
+                "lode_id": "test-id",
+                "provider": "grok",
+                "session_id": "grok-session",
+                "ts": 123,
+            },
+            2.0,
+        )
+
+        fire_and_forget.reset_mock()
+        assert set_coder_session(socket_path, "test-id", "codex", "codex-session") is True
+
+        set_codex_thread.assert_called_once_with(socket_path, "test-id", "codex-session", 2.0)
+        fire_and_forget.assert_not_called()
 
 
 @pytest.fixture

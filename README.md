@@ -5,7 +5,7 @@ Hopper pairs Claude Code with a selectable coding CLI in a staged feature-delive
 ## What it does
 Hopper runs a dual-agent workflow through a terminal dashboard inside tmux.
 Claude Code handles scoping in `mill` and landing in `ship`.
-Codex handles implementation in `refine` by default; a lode can select Grok instead.
+Grok handles implementation in `refine` by default; a lode can select Codex instead.
 `hop code` resumes the coding provider selected when the lode was created.
 Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a background server persisting state over a Unix socket and broadcasting updates to the TUI.
 
@@ -14,7 +14,7 @@ Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a backgroun
 - tmux
 - uv (Python package manager)
 - git
-- Codex CLI, or Grok CLI for lodes created with `--coder grok`
+- Grok CLI, or Codex CLI for lodes created with `--coder codex`
 
 ## Install
 ```bash
@@ -66,11 +66,11 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
 
-Codex remains the creation default. Select Grok per lode with any create alias:
+Grok is the creation default. Select Codex per lode with any create alias:
 
 ```bash
-cat scope.md | hop implement myproject --coder grok
-hop coder check grok --json
+cat scope.md | hop implement myproject --coder codex
+hop coder check codex --json
 ```
 
 Hopper does not pass a Grok model name, so the CLI uses the current default model
@@ -124,8 +124,8 @@ and never tries another host after a create attempt. These probes require `hop
 project list --json` on every remote host. Upgrade the fleet when deploying this
 version. An older host is unavailable to pooled creation; there is no
 compatibility fallback.
-For `--coder grok`, readiness also requires `hop coder check grok --json`; a host
-without a runnable Grok CLI is excluded before Hopper selects a destination.
+For `--coder codex`, readiness also requires `hop coder check codex --json`; a host
+without a runnable Codex CLI is excluded before Hopper selects a destination.
 
 After creation, Hopper stores a resident route from the lode ID to its resident
 host. That route survives pool replacement or removal, so status, waiting, pane

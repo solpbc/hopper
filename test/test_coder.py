@@ -17,8 +17,8 @@ from hopper.coder import (
 )
 
 
-def test_codex_remains_the_default():
-    assert DEFAULT_CODER_PROVIDER == "codex"
+def test_grok_is_the_default():
+    assert DEFAULT_CODER_PROVIDER == "grok"
 
 
 @pytest.mark.parametrize("provider", [None, "", "claude", 3])

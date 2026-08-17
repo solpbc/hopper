@@ -7,7 +7,7 @@ import shutil
 import subprocess
 
 CODER_PROVIDERS = ("codex", "grok")
-DEFAULT_CODER_PROVIDER = "codex"
+DEFAULT_CODER_PROVIDER = "grok"
 CODER_CHECK_TIMEOUT_SEC = 5.0
 
 
