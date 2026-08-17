@@ -244,9 +244,9 @@ def restart_harness(tmp_path, monkeypatch, make_lode, release_server_lock):
                 }
 
             def run_wait() -> None:
-                run["result"] = wait.wait_for_lodes(
+                run["result"] = wait.wait_for_lode(
                     socket_path,
-                    [lode_id],
+                    lode_id,
                     deadline=make_deadline(5),
                     poll_s=30,
                     observer_timeout_s=5,

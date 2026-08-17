@@ -3260,27 +3260,22 @@ def test_lode_wait_error_state_at_start(capsys):
     assert "Recover with: hop lode restart abc123" in out
 
 
-def _run_scripted_cli_wait(monkeypatch, initial_by_id, observations_by_id, args):
+def _run_scripted_cli_wait(monkeypatch, initial, observations, args):
     now = [0.0]
-    initial_by_id = {
-        lid: {**lode, "archived": lode.get("archived", False)}
-        for lid, lode in initial_by_id.items()
-    }
-    queues = {
-        lid: [{**lode, "archived": lode.get("archived", False)} for lode in items]
-        for lid, items in observations_by_id.items()
-    }
-    latest = dict(initial_by_id)
-    initial_reads = set(initial_by_id)
+    initial = {**initial, "archived": initial.get("archived", False)} if initial else None
+    queue = [{**lode, "archived": lode.get("archived", False)} for lode in observations]
+    latest = initial
+    initial_read = False
     connection = MagicMock()
 
     def read_snapshot(socket_path, lid, timeout=2.0, *, deadline=None):
-        if lid in initial_reads:
-            initial_reads.remove(lid)
-            return "found", initial_by_id[lid]
-        if queues.get(lid):
-            latest[lid] = queues[lid].pop(0)
-        return ("found", latest[lid]) if lid in latest else ("absent", None)
+        nonlocal initial_read, latest
+        if not initial_read and initial is not None:
+            initial_read = True
+            return "found", initial
+        if queue:
+            latest = queue.pop(0)
+        return ("found", latest) if latest is not None else ("absent", None)
 
     def start(callback, on_connect=None, *, deadline=None):
         if on_connect:
@@ -3310,8 +3305,8 @@ def test_wait_stuck_at_start(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.capture_pane", lambda pane, **_kwargs: "line1\nline2\nline3")
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [lode, lode]},
+        lode,
+        [lode, lode],
         ["abc123"],
     )
     assert result == 3
@@ -3337,8 +3332,8 @@ def test_wait_stuck_at_start_no_pane(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.capture_pane", mock_capture)
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [lode, lode]},
+        lode,
+        [lode, lode],
         ["abc123"],
     )
     assert result == 3
@@ -3361,8 +3356,8 @@ def test_wait_stuck_at_start_capture_fails(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.capture_pane", lambda pane, **_kwargs: None)
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [lode, lode]},
+        lode,
+        [lode, lode],
         ["abc123"],
     )
     assert result == 3
@@ -3384,8 +3379,8 @@ def test_wait_stuck_at_start_empty_status(monkeypatch, capsys):
     }
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [lode, lode]},
+        lode,
+        [lode, lode],
         ["abc123"],
     )
     assert result == 3
@@ -3407,8 +3402,8 @@ def test_wait_stuck_at_start_pane_truncated_to_50(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.capture_pane", lambda pane, **_kwargs: pane_capture)
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [lode, lode]},
+        lode,
+        [lode, lode],
         ["abc123"],
     )
     assert result == 3
@@ -3437,8 +3432,8 @@ def test_wait_stuck_transition_grace_expires(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.capture_pane", lambda pane, **_kwargs: "line1")
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": initial_lode},
-        {"abc123": [stuck_lode, stuck_lode]},
+        initial_lode,
+        [stuck_lode, stuck_lode],
         ["abc123", "--timeout", "1"],
     )
     assert result == 3
@@ -3462,8 +3457,8 @@ def test_wait_stuck_transition_recovers_within_grace(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 200)
     result, _ = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [stuck_lode, running_lode, shipped_lode]},
+        lode,
+        [stuck_lode, running_lode, shipped_lode],
         ["abc123"],
     )
     assert result == 0
@@ -3492,44 +3487,14 @@ def test_wait_stuck_flap_rearms(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.capture_pane", lambda pane, **_kwargs: "line1")
     result, _ = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": initial_lode},
-        {"abc123": [stuck_lode, running_lode, stuck_lode, stuck_lode]},
+        initial_lode,
+        [stuck_lode, running_lode, stuck_lode, stuck_lode],
         ["abc123", "--timeout", "60"],
     )
     assert result == 3
     out = capsys.readouterr().out
     assert out.count("✗ abc123 stuck: No output for 60s") == 1
     assert out.count("  --- last 50 lines of pane ---") == 1
-
-
-def test_wait_stuck_multi_lode_aborts_fresh_sibling_at_sweep(monkeypatch, capsys):
-    stuck_lode = {
-        "id": "aaa111",
-        "active": True,
-        "stage": "mill",
-        "state": "stuck",
-        "status": "No output for 60s",
-        "tmux_pane": "hopper:7",
-    }
-    running_lode = {
-        "id": "bbb222",
-        "active": True,
-        "stage": "refine",
-        "state": "running",
-        "status": "Working",
-    }
-    monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 50)
-    monkeypatch.setattr("hopper.wait.capture_pane", lambda pane, **_kwargs: "line1")
-    result, _ = _run_scripted_cli_wait(
-        monkeypatch,
-        {"aaa111": stuck_lode, "bbb222": running_lode},
-        {"aaa111": [stuck_lode, stuck_lode], "bbb222": [running_lode]},
-        ["aaa111", "bbb222"],
-    )
-    assert result == 3
-    out = capsys.readouterr().out
-    assert "✗ aaa111 stuck: No output for 60s" in out
-    assert "bbb222 wait_aborted" in out
 
 
 def test_wait_timeout_shorter_than_grace(monkeypatch, capsys):
@@ -3544,8 +3509,8 @@ def test_wait_timeout_shorter_than_grace(monkeypatch, capsys):
     monkeypatch.setattr("hopper.wait.STUCK_GRACE_MS", 200)
     result, elapsed = _run_scripted_cli_wait(
         monkeypatch,
-        {"abc123": lode},
-        {"abc123": [stuck_lode]},
+        lode,
+        [stuck_lode],
         ["abc123", "--timeout", "0.05"],
     )
     assert result == 4
@@ -3612,260 +3577,6 @@ def test_lode_wait_timeout(capsys):
     assert "Timed out waiting for lode(s): abc123" in capsys.readouterr().out
 
 
-def test_lode_wait_multi_all_ship(capsys):
-    """wait exits 0 when multiple lodes all ship."""
-    lode1 = {
-        "id": "aaa111",
-        "stage": "refine",
-        "state": "running",
-        "status": "Working",
-        "active": True,
-        "archived": False,
-        "title": "First",
-    }
-    lode2 = {
-        "id": "bbb222",
-        "stage": "mill",
-        "state": "running",
-        "status": "Starting",
-        "active": True,
-        "archived": False,
-        "title": "Second",
-    }
-
-    shipped = {
-        "aaa111": {**lode1, "stage": "shipped", "title": "First"},
-        "bbb222": {**lode2, "stage": "shipped", "title": "Second"},
-    }
-    initial = {"aaa111": lode1, "bbb222": lode2}
-    initial_reads = set(initial)
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0, *, deadline=None):
-        if lode_id in initial_reads:
-            initial_reads.remove(lode_id)
-            return "found", initial[lode_id]
-        return ("found", shipped[lode_id]) if lode_id in shipped else ("absent", None)
-
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
-            mock_conn = MagicMock()
-
-            def fake_start(callback, on_connect=None, *, deadline=None):
-                callback(
-                    {
-                        "type": "lode_updated",
-                        "lode": {**lode1, "stage": "shipped", "title": "First"},
-                    }
-                )
-                callback(
-                    {
-                        "type": "lode_updated",
-                        "lode": {**lode2, "stage": "shipped", "title": "Second"},
-                    }
-                )
-
-            mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222"])
-    assert result == 0
-    out = capsys.readouterr().out
-    assert "✓ aaa111 shipped" in out
-    assert "✓ bbb222 shipped" in out
-
-
-def test_lode_wait_multi_one_errors(capsys):
-    """wait renders the error and aborts its fresh nonterminal sibling."""
-    lode1 = {
-        "id": "aaa111",
-        "stage": "refine",
-        "state": "running",
-        "status": "Working",
-        "active": True,
-        "archived": False,
-    }
-    lode2 = {
-        "id": "bbb222",
-        "stage": "mill",
-        "state": "running",
-        "status": "Starting",
-        "active": True,
-        "archived": False,
-    }
-
-    current = {
-        "aaa111": {**lode1, "state": "error", "status": "Crashed"},
-        "bbb222": lode2,
-    }
-    initial = {"aaa111": lode1, "bbb222": lode2}
-    initial_reads = set(initial)
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0, *, deadline=None):
-        if lode_id in initial_reads:
-            initial_reads.remove(lode_id)
-            return "found", initial[lode_id]
-        return ("found", current[lode_id]) if lode_id in current else ("absent", None)
-
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
-            mock_conn = MagicMock()
-
-            def fake_start(callback, on_connect=None, *, deadline=None):
-                callback(
-                    {
-                        "type": "lode_updated",
-                        "lode": {**lode1, "state": "error", "status": "Crashed"},
-                    }
-                )
-
-            mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222"])
-    assert result == 1
-    out = capsys.readouterr().out
-    assert "✗ aaa111 error: Crashed" in out
-    assert "bbb222 wait_aborted" in out
-
-
-def test_lode_wait_multi_mixed_shipped_and_pending(capsys):
-    """wait handles mix of already-shipped and pending lodes."""
-    shipped_lode = {
-        "id": "aaa111",
-        "stage": "shipped",
-        "state": "shipped",
-        "status": "Done",
-        "active": False,
-        "archived": False,
-        "title": "Already done",
-    }
-    pending_lode = {
-        "id": "bbb222",
-        "stage": "refine",
-        "state": "running",
-        "status": "Working",
-        "active": True,
-        "archived": False,
-        "title": "Still going",
-    }
-
-    finished_pending = {
-        **pending_lode,
-        "stage": "shipped",
-        "title": "Still going",
-    }
-    initial = {"aaa111": shipped_lode, "bbb222": pending_lode}
-    initial_reads = set(initial)
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0, *, deadline=None):
-        if lode_id in initial_reads:
-            initial_reads.remove(lode_id)
-            return "found", initial[lode_id]
-        if lode_id == "bbb222":
-            return "found", finished_pending
-        return "absent", None
-
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
-            mock_conn = MagicMock()
-
-            def fake_start(callback, on_connect=None, *, deadline=None):
-                callback(
-                    {
-                        "type": "lode_updated",
-                        "lode": {**pending_lode, "stage": "shipped", "title": "Still going"},
-                    }
-                )
-
-            mock_conn.start = fake_start
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222"])
-    assert result == 0
-    out = capsys.readouterr().out
-    assert "✓ aaa111 shipped" in out
-    assert "✓ bbb222 shipped" in out
-
-
-def test_lode_wait_multi_timeout(capsys):
-    """wait exits 4 with remaining IDs on timeout."""
-    lode1 = {
-        "id": "aaa111",
-        "stage": "refine",
-        "state": "running",
-        "status": "Working",
-        "active": True,
-        "archived": False,
-    }
-    lode2 = {
-        "id": "bbb222",
-        "stage": "mill",
-        "state": "running",
-        "status": "Starting",
-        "active": True,
-        "archived": False,
-    }
-
-    def fake_snapshot(socket_path, lode_id, timeout=2.0, *, deadline=None):
-        if lode_id == "aaa111":
-            return "found", lode1
-        if lode_id == "bbb222":
-            return "found", lode2
-        return "absent", None
-
-    with patch("hopper.cli.require_server", return_value=0):
-        with patch("hopper.client.read_lode_snapshot", side_effect=fake_snapshot):
-            mock_conn = MagicMock()
-            mock_conn.start = MagicMock()
-            with patch("hopper.client.HopperConnection", return_value=mock_conn):
-                result = cmd_lode(["wait", "aaa111", "bbb222", "--timeout", "0.01"])
-    assert result == 4
-    out = capsys.readouterr().out
-    assert "Timed out waiting for lode(s): aaa111" in out
-    assert "Timed out waiting for lode(s): bbb222" in out
-
-
-def test_lode_wait_multi_one_not_found(capsys):
-    """wait renders the failed resolution and its aborted resolved sibling."""
-    lode1 = {
-        "id": "aaa111",
-        "stage": "refine",
-        "state": "running",
-        "status": "Working",
-        "active": True,
-        "archived": False,
-    }
-
-    def resolve(socket_path, lode_id, **_kwargs):
-        if lode_id == "aaa111":
-            return _watch_resolution(lode1)
-        return {
-            "outcome": "absent",
-            "error": "Lode 'bogus' not found.",
-            "probes": [
-                {
-                    "kind": "local",
-                    "server": "test-host",
-                    "route": "local",
-                    "candidate_id": None,
-                    "outcome": "absent",
-                    "detail": None,
-                    "attempts": 1,
-                    "observed_age_s": 0.0,
-                }
-            ],
-            "exit_code": 1,
-        }
-
-    with (
-        patch("hopper.cli._resolve_lode", side_effect=resolve),
-        patch("hopper.client.HopperConnection") as mock_conn_cls,
-    ):
-        result = cmd_lode(["wait", "aaa111", "bogus"])
-    assert result == 1
-    out = capsys.readouterr().out
-    assert "bogus target_absent" in out
-    assert "aaa111 wait_aborted" in out
-    mock_conn_cls.assert_not_called()
-
-
 def test_lode_wait_remote_poll_json_shipped(capsys):
     initial = {
         "id": "abc23456",
@@ -3915,7 +3626,7 @@ def test_wait_surfaces_reject_inside_lode_without_stdout_or_lookup(
     if json_output:
         args.append("--json")
     with (
-        patch("hopper.wait.wait_for_lodes") as supervise,
+        patch("hopper.wait.wait_for_lode") as supervise,
         patch("hopper.cli._resolve_lode") as resolve,
         patch("hopper.client.read_lode_snapshot") as local_snapshot,
         patch("hopper.cli._remote_hosts") as remote_hosts,
@@ -3954,7 +3665,7 @@ def test_wait_surfaces_reject_inside_lode_without_stdout_or_lookup(
 
 
 def test_wait_summary_for_lode_wait_argument_error(monkeypatch, capsys):
-    result, _ = _run_scripted_cli_wait(monkeypatch, {}, {}, [])
+    result, _ = _run_scripted_cli_wait(monkeypatch, None, [], [])
 
     captured = capsys.readouterr()
     assert result == 1
@@ -5993,7 +5704,7 @@ def test_wait_surfaces_share_timeout_parser_and_values(surface, extra_args, expe
     with (
         patch("hopper.cli.require_not_inside_lode", return_value=None),
         patch("hopper.wait._monotonic", return_value=10.0),
-        patch("hopper.wait.wait_for_lodes", return_value=0) as supervise,
+        patch("hopper.wait.wait_for_lode", return_value=0) as supervise,
     ):
         if surface == "wait":
             result = cmd_wait(args)
@@ -6015,7 +5726,7 @@ def test_wait_surfaces_share_timeout_parser_and_values(surface, extra_args, expe
 def test_wait_surfaces_reject_invalid_timeout_before_lookup(surface, value, json_output, capsys):
     with (
         patch("hopper.cli.require_not_inside_lode") as inside,
-        patch("hopper.wait.wait_for_lodes") as supervise,
+        patch("hopper.wait.wait_for_lode") as supervise,
         patch("hopper.cli._resolve_lode") as resolve,
         patch("hopper.remote.run_remote") as run_remote,
     ):
@@ -6097,6 +5808,89 @@ def test_wait_missing_target_keeps_no_target_summary(surface, capsys):
     assert "the following arguments are required: lode_id" in captured.err
     assert hopper_wait.WAIT_SUMMARY_NO_TARGET in captured.err
     assert "Observed: invalid options" not in captured.err
+
+
+@pytest.mark.parametrize("surface", ["wait", "watch", "lode-wait"])
+@pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
+def test_wait_surfaces_reject_extra_lode_ids_before_lookup(surface, json_output, capsys):
+    args = ["a", "b"]
+    if json_output:
+        args.append("--json")
+    with (
+        patch("hopper.wait.wait_for_lode") as supervise,
+        patch("hopper.cli._resolve_lode") as resolve,
+        patch("hopper.client.read_lode_snapshot") as local_snapshot,
+        patch("hopper.remote.run_remote") as run_remote,
+        patch("hopper.cli._socket") as socket_path,
+        patch("hopper.cli.require_not_inside_lode") as inside,
+    ):
+        if surface == "wait":
+            result = cmd_wait(args)
+        elif surface == "watch":
+            result = cmd_watch(args)
+        else:
+            result = cmd_lode(["wait", *args])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "could not resolve target" not in captured.err
+    assert "supervises exactly one lode" in captured.err
+    supervise.assert_not_called()
+    resolve.assert_not_called()
+    local_snapshot.assert_not_called()
+    run_remote.assert_not_called()
+    socket_path.assert_not_called()
+    inside.assert_not_called()
+
+
+@pytest.mark.parametrize("surface", ["wait", "watch", "lode-wait"])
+def test_explicit_wait_surfaces_reject_extra_lode_ids_before_ssh_or_lookup(
+    monkeypatch, surface, capsys
+):
+    command = surface.replace("-", " ")
+    command_args = command.split()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hop", "-H", "resident.example", *command_args, "a", "b"],
+    )
+    with (
+        patch("hopper.wait.wait_for_lode") as supervise,
+        patch("hopper.cli._resolve_lode") as resolve,
+        patch("hopper.client.read_lode_snapshot") as local_snapshot,
+        patch("hopper.remote.run_remote") as run_remote,
+        patch("hopper.remote.run_remote_streaming") as stream,
+        patch("hopper.cli._remote_hosts") as remote_hosts,
+    ):
+        assert main() == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "supervises exactly one lode" in captured.err
+    assert "could not resolve target" not in captured.err
+    assert f"Recover with: hop -H resident.example {command} a." in captured.err
+    supervise.assert_not_called()
+    resolve.assert_not_called()
+    local_snapshot.assert_not_called()
+    run_remote.assert_not_called()
+    stream.assert_not_called()
+    remote_hosts.assert_not_called()
+
+
+@pytest.mark.parametrize("surface", ["wait", "watch", "lode-wait"])
+def test_wait_help_hides_extra_lode_ids(surface, capsys):
+    if surface == "wait":
+        result = cmd_wait(["--help"])
+    elif surface == "watch":
+        result = cmd_watch(["--help"])
+    else:
+        result = cmd_lode(["wait", "--help"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "extra_lode_ids" not in captured.out
+    assert "extra_lode_ids" not in captured.err
 
 
 def test_restart_help_shows_restart(capsys):
@@ -9280,7 +9074,7 @@ def test_main_explicit_remote_watch_uses_wait_supervisor(monkeypatch):
     )
     with (
         patch("hopper.remote.run_remote_streaming") as stream,
-        patch("hopper.wait.wait_for_lodes", return_value=0) as supervise,
+        patch("hopper.wait.wait_for_lode", return_value=0) as supervise,
     ):
         assert main() == 0
 

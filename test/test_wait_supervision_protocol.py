@@ -43,10 +43,10 @@ def supervision_protocol(tmp_path, monkeypatch, make_lode, release_server_lock):
             }
             return make_lode(**fields)
 
-        def run(self, queries):
-            return wait.wait_for_lodes(
+        def run(self, query):
+            return wait.wait_for_lode(
                 Path(socket_path),
-                queries,
+                query,
                 deadline=make_deadline(2),
                 poll_s=10,
                 observer_timeout_s=1,
@@ -70,7 +70,6 @@ def supervision_protocol(tmp_path, monkeypatch, make_lode, release_server_lock):
         ("absent", ["target_absent"], 1),
         ("ambiguous", ["target_ambiguous"], 1),
         ("unavailable", ["status_unavailable"], 4),
-        ("aborted", ["error", "wait_aborted"], 1),
         ("interrupted", ["interrupted"], 130),
     ],
 )
@@ -83,12 +82,12 @@ def test_new_lifecycle_outcomes_cross_real_protocol(
     expected_exit,
 ):
     harness = supervision_protocol
-    queries = ["missing"]
+    query = "missing"
     monkeypatch.delenv("HOPPER_LID", raising=False)
     monkeypatch.setenv("HOP_NO_ROUTE", "1")
     if scenario == "ambiguous":
         harness.seed(harness.lode("prefix11"), harness.lode("prefix22"))
-        queries = ["prefix"]
+        query = "prefix"
     elif scenario == "unavailable":
         harness.seed()
         monkeypatch.delenv("HOP_NO_ROUTE", raising=False)
@@ -98,15 +97,9 @@ def test_new_lifecycle_outcomes_cross_real_protocol(
             "hopper.remote.run_remote",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("transport unavailable")),
         )
-    elif scenario == "aborted":
-        harness.seed(
-            harness.lode("error111", state="error", status="Failed"),
-            harness.lode("fresh222"),
-        )
-        queries = ["error111", "fresh222"]
     elif scenario == "interrupted":
         harness.seed(harness.lode("running1"))
-        queries = ["running1"]
+        query = "running1"
         monkeypatch.setattr(
             wait,
             "_condition_wait",
@@ -115,7 +108,7 @@ def test_new_lifecycle_outcomes_cross_real_protocol(
     else:
         harness.seed()
 
-    result = harness.run(queries)
+    result = harness.run(query)
 
     captured = capsys.readouterr()
     payloads = [json.loads(line) for line in captured.out.splitlines()]

@@ -61,6 +61,11 @@ WATCH_RECONCILE_SECONDS = 30.0
 WATCH_OBSERVER_TIMEOUT_SECONDS = 300.0
 WAIT_TIMEOUT_SECONDS = 3600.0
 WAIT_TIMEOUT_MAX_SECONDS = 3600.0
+WAIT_EXTRA_LODE_IDS_REFUSAL = (
+    "Observed: 'hop {command_name}' supervises exactly one lode, but additional lode IDs "
+    "were provided. Hopper did not proceed; no lode lookup or SSH probe was attempted. "
+    "Run parallel waits as separate hop wait invocations. Recover with: {command}."
+)
 RESOLUTION_TIMEOUT_SECONDS = 5.5
 LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC = 2.0
 LOAD_WARNING_PER_CPU = 1.0
@@ -3471,7 +3476,13 @@ def _wait_timeout(value: str) -> float:
 
 def _add_wait_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the one canonical wait supervisor argument surface."""
-    parser.add_argument("lode_id", nargs="+", help="Lode ID(s) to wait for")
+    parser.add_argument("lode_id", help="Lode ID to wait for")
+    parser.add_argument(
+        "extra_lode_ids",
+        nargs="*",
+        default=[],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--timeout",
         type=_wait_timeout,
@@ -3496,11 +3507,11 @@ def _add_wait_arguments(parser: argparse.ArgumentParser) -> None:
 def _wait_description(command_name: str) -> str:
     if command_name == "watch":
         return (
-            "Exact alias for hop wait. Supervise lodes with a 3600-second default "
+            "Exact alias for hop wait. Supervise one lode with a 3600-second default "
             "and maximum timeout; hop lode watch is the streaming event view."
         )
     return (
-        "Supervise lodes until completion with a 3600-second default and maximum timeout. "
+        "Supervise one lode until completion with a 3600-second default and maximum timeout. "
         "Use hop lode watch for the streaming event view."
     )
 
@@ -3525,7 +3536,7 @@ def _wait_validation_summary(
 
 def _wait_inside_lode_summary(
     command_name: str,
-    lode_ids: list[str],
+    lode_id: str,
     explicit_host: str | None,
 ) -> str:
     """Describe an inside-lode refusal without implying target resolution."""
@@ -3533,11 +3544,28 @@ def _wait_inside_lode_summary(
     if explicit_host is not None:
         command.extend(["-H", explicit_host])
     command.extend(command_name.split())
-    command.extend(lode_ids)
+    command.append(lode_id)
     return (
         f"Observed: 'hop {command_name}' was invoked inside lode {get_hopper_lid()}. "
         "Hopper did not proceed; no lode lookup or SSH probe was attempted. "
         f"Recover by leaving the current lode and retrying with: {shlex.join(command)}."
+    )
+
+
+def _wait_extra_lode_ids_summary(
+    command_name: str,
+    lode_id: str,
+    explicit_host: str | None,
+) -> str:
+    """Describe an extra-target refusal without attempting resolution."""
+    command = ["hop"]
+    if explicit_host is not None:
+        command.extend(["-H", explicit_host])
+    command.extend(command_name.split())
+    command.append(lode_id)
+    return WAIT_EXTRA_LODE_IDS_REFUSAL.format(
+        command_name=command_name,
+        command=shlex.join(command),
     )
 
 
@@ -3568,6 +3596,17 @@ def _run_wait_command(
     except SystemExit:
         return 0
 
+    if parsed.extra_lode_ids:
+        print(
+            _wait_extra_lode_ids_summary(
+                command_name,
+                parsed.lode_id,
+                explicit_host,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
     deadline = deadline_utils.make_deadline(parsed.timeout, clock=wait_module._monotonic)
     with redirect_stdout(sys.stderr):
         rc = require_not_inside_lode()
@@ -3597,7 +3636,7 @@ def _run_wait_command(
 
         selected_resolver = explicit_resolver
 
-    return wait_module.wait_for_lodes(
+    return wait_module.wait_for_lode(
         _socket(),
         parsed.lode_id,
         deadline=deadline,
@@ -4707,7 +4746,7 @@ def cmd_projects(args: list[str]) -> int:
     return cmd_project(args)
 
 
-@command("wait", "Supervise lodes until completion", group="aliases")
+@command("wait", "Supervise one lode until completion", group="aliases")
 def cmd_wait(args: list[str]) -> int:
     """Run the canonical bounded wait supervisor."""
     return _run_wait_command(args, command_name="wait")

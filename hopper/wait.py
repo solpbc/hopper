@@ -11,8 +11,6 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import wait as wait_futures
 from pathlib import Path
 
 import hopper.client as client
@@ -30,10 +28,7 @@ from hopper.tmux import capture_pane
 
 STUCK_GRACE_MS = 120_000
 MIN_POLL_S = 10.0
-WAIT_SUMMARY_ONE = "hop wait: {lode_id} {outcome} — exited {code}"
-WAIT_SUMMARY_ITEM = "  {lode_id}: {outcome}"
-WAIT_SUMMARY_MANY = "hop wait: {resolved} of {requested} lodes resolved — exited {code}"
-WAIT_SUMMARY_INTERRUPT = "hop wait: interrupted — exited 130"
+WAIT_SUMMARY = "hop wait: {lode_id} {outcome} — exited {code}"
 WAIT_SUMMARY_NO_TARGET = "hop wait: could not resolve target — exited 1"
 
 _monotonic = time.monotonic
@@ -90,12 +85,6 @@ REASON_TEXT = {
     "target_ambiguous": "More than one lode matched the requested target.",
     "initial_status_unavailable": (
         "Authoritative status was unavailable during initial resolution."
-    ),
-    "sibling_nonzero": (
-        "A sibling target ended nonzero before this target reached a terminal outcome."
-    ),
-    "resolution_failed": (
-        "Another target failed during resolution, so this nonterminal target was not supervised."
     ),
     "user_interrupted": "The operator interrupted the wait.",
 }
@@ -204,7 +193,6 @@ def _new_record(
     snapshot: dict,
     route: str,
     observed_ts: float,
-    order: int,
     *,
     probes: list[dict],
 ) -> dict:
@@ -218,9 +206,7 @@ def _new_record(
             probe["_observed_ts"] = observed_ts
     return {
         "id": lid,
-        "key": lid,
         "query": lid,
-        "order": order,
         "route": route,
         "server": route if remote_source else None,
         "remote": remote_source,
@@ -242,7 +228,7 @@ def _new_record(
     }
 
 
-def _resolution_failure_record(query: str, result: dict, order: int, now: float) -> dict:
+def _resolution_failure_record(query: str, result: dict, now: float) -> dict:
     """Build a supervisor record for one completed resolution failure."""
     result_outcome = result.get("outcome")
     outcome, code, reason = {
@@ -267,9 +253,7 @@ def _resolution_failure_record(query: str, result: dict, order: int, now: float)
             matches.append({"server": server, "id": lode_id})
     return {
         "id": query,
-        "key": f"failure:{query}",
         "query": query,
-        "order": order,
         "route": route,
         "server": (
             route
@@ -295,96 +279,60 @@ def _resolution_failure_record(query: str, result: dict, order: int, now: float)
     }
 
 
-def _resolve_targets(
+def _resolve_target(
     socket_path: Path,
-    raw_ids: list[str],
+    raw_id: str,
     resolver: Callable,
     *,
     deadline: dict,
     child_control: dict,
-    records: dict[str, dict] | None = None,
-) -> dict[str, dict]:
-    """Resolve every query under deterministic scheduling without early abort."""
-    if records is None:
-        records = {}
-    scheduled = sorted(enumerate(raw_ids), key=lambda item: (item[1].encode("utf-8"), item[0]))
-    for order, raw_id in scheduled:
-        result = resolver(
-            socket_path,
+) -> dict:
+    """Resolve one query into a supervisor record."""
+    result = resolver(
+        socket_path,
+        raw_id,
+        deadline=deadline,
+        child_control=child_control,
+    )
+    if result.get("outcome") != "found":
+        return _resolution_failure_record(raw_id, result, _monotonic())
+    lode = result.get("lode")
+    lid = lode.get("id") if isinstance(lode, dict) else None
+    if not isinstance(lid, str):
+        return _resolution_failure_record(
             raw_id,
-            deadline=deadline,
-            child_control=child_control,
+            {"outcome": "unavailable", "probes": result.get("probes", [])},
+            _monotonic(),
         )
-        if result.get("outcome") != "found":
-            key = f"failure:{raw_id}"
-            if key not in records:
-                records[key] = _resolution_failure_record(raw_id, result, order, _monotonic())
-                records[key]["queries"] = [raw_id]
-            else:
-                records[key]["order"] = min(records[key]["order"], order)
-                records[key]["queries"].append(raw_id)
-            continue
-        lode = result.get("lode")
-
-        lid = lode.get("id") if isinstance(lode, dict) else None
-        if not isinstance(lid, str):
-            key = f"failure:{raw_id}"
-            records[key] = _resolution_failure_record(
-                raw_id,
-                {"outcome": "unavailable", "probes": result.get("probes", [])},
-                order,
-                _monotonic(),
-            )
-            records[key]["queries"] = [raw_id]
-            continue
-        snapshot = validate_snapshot(lode, lid)
-        if snapshot is None:
-            key = f"failure:{raw_id}"
-            records[key] = _resolution_failure_record(
-                raw_id,
-                {"outcome": "unavailable", "probes": result.get("probes", [])},
-                order,
-                _monotonic(),
-            )
-            records[key]["queries"] = [raw_id]
-            continue
-        if lid in records:
-            records[lid]["order"] = min(records[lid]["order"], order)
-            records[lid]["queries"].append(raw_id)
-            continue
-        route = result.get("host")
-        if not isinstance(route, str):
-            records[f"failure:{raw_id}"] = _resolution_failure_record(
-                raw_id,
-                {"outcome": "unavailable", "probes": result.get("probes", [])},
-                order,
-                _monotonic(),
-            )
-            records[f"failure:{raw_id}"]["queries"] = [raw_id]
-            continue
-        observed_ts = _monotonic()
-        records[lid] = _new_record(
-            lid,
-            snapshot,
-            route,
-            observed_ts,
-            order,
-            probes=result["probes"],
+    snapshot = validate_snapshot(lode, lid)
+    if snapshot is None:
+        return _resolution_failure_record(
+            raw_id,
+            {"outcome": "unavailable", "probes": result.get("probes", [])},
+            _monotonic(),
         )
-        records[lid]["query"] = raw_id
-        records[lid]["queries"] = [raw_id]
-        records[lid]["query"] = raw_id
-    return records
+    route = result.get("host")
+    if not isinstance(route, str):
+        return _resolution_failure_record(
+            raw_id,
+            {"outcome": "unavailable", "probes": result.get("probes", [])},
+            _monotonic(),
+        )
+    observed_ts = _monotonic()
+    record = _new_record(
+        lid,
+        snapshot,
+        route,
+        observed_ts,
+        probes=result["probes"],
+    )
+    record["query"] = raw_id
+    return record
 
 
-def _publish_resident_routes(records: dict[str, dict], *, deadline: dict) -> None:
-    """Publish only new or changed initial resident routes, warning once on failure."""
-    remote_records = [
-        record
-        for record in records.values()
-        if record["remote"] and isinstance(record.get("latest_snapshot"), dict)
-    ]
-    if not remote_records:
+def _publish_resident_routes(record: dict, *, deadline: dict) -> None:
+    """Publish a new or changed initial resident route, warning on failure."""
+    if not record["remote"] or not isinstance(record.get("latest_snapshot"), dict):
         return
     if deadline_utils.claim_call_budget(deadline, "wait.route_cache_load") is None:
         return
@@ -394,26 +342,21 @@ def _publish_resident_routes(records: dict[str, dict], *, deadline: dict) -> Non
         print(f"warning: could not read remote lode cache: {error}", file=sys.stderr)
         return
 
-    warned = False
-    for record in remote_records:
-        lid = record["id"]
-        host = record["route"]
-        if cache.get(lid, {}).get("host") == host:
-            continue
-        if deadline_utils.claim_call_budget(deadline, "wait.route_cache_remember") is None:
-            return
-        try:
-            remote.remember_lode(
-                lid,
-                host,
-                record["latest_snapshot"].get("project", ""),
-                deadline=deadline,
-            )
-            cache[lid] = {"host": host}
-        except Exception as error:
-            if not warned:
-                print(f"warning: could not update remote lode cache: {error}", file=sys.stderr)
-                warned = True
+    lid = record["id"]
+    host = record["route"]
+    if cache.get(lid, {}).get("host") == host:
+        return
+    if deadline_utils.claim_call_budget(deadline, "wait.route_cache_remember") is None:
+        return
+    try:
+        remote.remember_lode(
+            lid,
+            host,
+            record["latest_snapshot"].get("project", ""),
+            deadline=deadline,
+        )
+    except Exception as error:
+        print(f"warning: could not update remote lode cache: {error}", file=sys.stderr)
 
 
 def _post_observation(state: dict, observation: dict) -> None:
@@ -426,14 +369,13 @@ def _post_observation(state: dict, observation: dict) -> None:
 
 
 def _request_local_reconcile(state: dict, lid: str | None = None) -> None:
-    """Request main-thread authoritative reads for pending local records."""
+    """Request a main-thread authoritative read for the local record."""
     with state["condition"]:
         if state["shutdown"]:
             return
-        for record_id in state["pending"]:
-            record = state["records"][record_id]
-            if not record["remote"] and (lid is None or lid == record_id):
-                record["reconcile_requested"] = True
+        record = state["record"]
+        if not state["resolved"] and not record["remote"] and (lid is None or lid == record["id"]):
+            record["reconcile_requested"] = True
         state["condition"].notify()
 
 
@@ -492,87 +434,60 @@ def _probe_remote_observation(
 
 def _remote_worker_group(
     state: dict,
-    assignments: list[tuple[str, str]],
     interval_s: float,
     probe_remote: Callable,
 ) -> None:
-    """Observe a bounded shard of remote lodes from one reusable worker."""
+    """Observe the remote lode from one reusable worker."""
     while not state["stop_event"].is_set():
-        any_pending = False
-        for lid, host in assignments:
-            if state["stop_event"].is_set():
+        with state["condition"]:
+            if state["shutdown"] or state["stop_event"].is_set() or state["resolved"]:
                 return
-            with state["condition"]:
-                if state["shutdown"] or state["stop_event"].is_set():
-                    return
-                pending = lid in state["pending"]
-            if not pending:
-                continue
-            any_pending = True
-            budget = deadline_utils.claim_call_budget(
-                state["deadline"],
-                "wait.remote_probe_generation",
-                cap_s=state["probe_timeout_s"],
-            )
-            if budget is None:
-                return
-            probe_deadline = deadline_utils.shorten_deadline(
-                state["deadline"],
-                state["deadline"]["clock"]() + budget,
-            )
-            _post_observation(
-                state,
-                _probe_remote_observation(
-                    lid,
-                    host,
-                    probe_deadline,
-                    probe_remote,
-                    state["child_control"],
-                ),
-            )
+            record = state["record"]
+            lid = record["id"]
+            host = record["route"]
+        budget = deadline_utils.claim_call_budget(
+            state["deadline"],
+            "wait.remote_probe_generation",
+            cap_s=state["probe_timeout_s"],
+        )
+        if budget is None:
+            return
+        probe_deadline = deadline_utils.shorten_deadline(
+            state["deadline"],
+            state["deadline"]["clock"]() + budget,
+        )
+        _post_observation(
+            state,
+            _probe_remote_observation(
+                lid,
+                host,
+                probe_deadline,
+                probe_remote,
+                state["child_control"],
+            ),
+        )
         wait_budget = deadline_utils.claim_call_budget(
             state["deadline"],
             "wait.remote_worker_poll",
             cap_s=interval_s,
         )
-        if not any_pending or wait_budget is None or state["stop_event"].wait(wait_budget):
+        if wait_budget is None or state["stop_event"].wait(wait_budget):
             return
 
 
 def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
-    """Start a fixed-size set of daemon observers for pending remote lodes."""
-    assignments = [
-        (lid, state["records"][lid]["route"])
-        for lid in state["pending"]
-        if state["records"][lid]["remote"]
-    ]
-    if not assignments:
+    """Start one daemon observer for the remote lode."""
+    if state["resolved"] or not state["record"]["remote"]:
         return
-    worker_count = min(remote.REMOTE_MAX_WORKERS, len(assignments))
-    shards: list[list[tuple[str, str]]] = [[] for _ in range(worker_count)]
-    for index, assignment in enumerate(assignments):
-        shards[index % worker_count].append(assignment)
-    for index, shard in enumerate(shards):
-        if (
-            deadline_utils.claim_call_budget(
-                state["deadline"],
-                "wait.remote_worker_start",
-            )
-            is None
-        ):
-            return
-        thread = threading.Thread(
-            target=_remote_worker_group,
-            args=(
-                state,
-                shard,
-                state["poll_s"],
-                probe_remote,
-            ),
-            daemon=True,
-            name=f"wait-remote-{index}",
-        )
-        thread.start()
+    if deadline_utils.claim_call_budget(state["deadline"], "wait.remote_worker_start") is None:
+        return
+    thread = threading.Thread(
+        target=_remote_worker_group,
+        args=(state, state["poll_s"], probe_remote),
+        daemon=True,
+        name="wait-remote",
+    )
+    thread.start()
 
 
 def _stop_remote_workers(state: dict) -> None:
@@ -671,8 +586,8 @@ def _drain_observations(state: dict) -> list[str]:
     warnings = []
     while state["observations"]:
         observation = state["observations"].popleft()
-        record = state["records"].get(observation.get("id"))
-        if not record or record["key"] not in state["pending"]:
+        record = state["record"]
+        if state["resolved"] or observation.get("id") != record["id"]:
             continue
         warning = _apply_observation(record, observation, state["poll_s"])
         if warning:
@@ -682,33 +597,35 @@ def _drain_observations(state: dict) -> list[str]:
 
 def _mark_due_reconciliations(state: dict, now: float) -> None:
     """Turn expired grace and periodic deadlines into reconciliation work."""
-    for lid in state["pending"]:
-        record = state["records"][lid]
-        grace = record["grace"]
-        if grace is not None and not grace["recheck_pending"]:
-            grace_deadline = grace["origin_ts"] + STUCK_GRACE_MS / 1000.0
-            if now >= grace_deadline:
-                grace["recheck_pending"] = True
-                if not record["remote"]:
-                    record["reconcile_requested"] = True
-        if record["remote"] and now >= record["next_reconcile_ts"]:
-            record["next_reconcile_ts"] = now + state["poll_s"]
+    if state["resolved"]:
+        return
+    record = state["record"]
+    grace = record["grace"]
+    if grace is not None and not grace["recheck_pending"]:
+        grace_deadline = grace["origin_ts"] + STUCK_GRACE_MS / 1000.0
+        if now >= grace_deadline:
+            grace["recheck_pending"] = True
+            if not record["remote"]:
+                record["reconcile_requested"] = True
+    if record["remote"] and now >= record["next_reconcile_ts"]:
+        record["next_reconcile_ts"] = now + state["poll_s"]
 
 
 def _read_due_locals(state: dict, socket_path: Path, now: float) -> None:
-    """Perform all due local reads on the supervisor thread."""
-    due = []
+    """Perform a due local read on the supervisor thread."""
+    lid = None
     with state["condition"]:
-        for lid in state["pending"]:
-            record = state["records"][lid]
-            if record["remote"]:
-                continue
-            if record["reconcile_requested"] or now >= record["next_reconcile_ts"]:
-                record["reconcile_requested"] = False
-                record["next_reconcile_ts"] = now + state["poll_s"]
-                due.append(lid)
+        record = state["record"]
+        if (
+            not state["resolved"]
+            and not record["remote"]
+            and (record["reconcile_requested"] or now >= record["next_reconcile_ts"])
+        ):
+            record["reconcile_requested"] = False
+            record["next_reconcile_ts"] = now + state["poll_s"]
+            lid = record["id"]
 
-    for lid in due:
+    if lid is not None:
         observation = _local_probe_observation(socket_path, lid, state["deadline"])
         _post_observation(state, observation)
 
@@ -716,22 +633,20 @@ def _read_due_locals(state: dict, socket_path: Path, now: float) -> None:
 def _next_deadline(state: dict) -> float:
     """Return the earliest active supervisor deadline."""
     deadlines = [state["overall_deadline"]]
-    for lid in state["pending"]:
-        record = state["records"][lid]
-        deadlines.append(record["next_reconcile_ts"])
-        if state["observer_timeout_s"] > 0:
-            deadlines.append(record["last_valid_ts"] + state["observer_timeout_s"])
-        grace = record["grace"]
-        if grace is not None and not grace["recheck_pending"]:
-            deadlines.append(grace["origin_ts"] + STUCK_GRACE_MS / 1000.0)
+    record = state["record"]
+    deadlines.append(record["next_reconcile_ts"])
+    if state["observer_timeout_s"] > 0:
+        deadlines.append(record["last_valid_ts"] + state["observer_timeout_s"])
+    grace = record["grace"]
+    if grace is not None and not grace["recheck_pending"]:
+        deadlines.append(grace["origin_ts"] + STUCK_GRACE_MS / 1000.0)
     return min(deadlines)
 
 
 def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
-    """Collect every terminal sibling known at this reconciliation boundary."""
+    """Collect the terminal outcome known at this reconciliation boundary."""
     outcomes = []
-    for lid in sorted(state["pending"], key=lambda item: state["records"][item]["order"]):
-        record = state["records"][lid]
+    for record in () if state["resolved"] else (state["record"],):
         if record["preset_outcome"] is not None:
             outcomes.append(
                 {
@@ -862,146 +777,6 @@ def _local_probe_observation(
         }
 
 
-def _probe_final_sweep_member(
-    state: dict,
-    socket_path: Path,
-    lid: str,
-    generation_deadline: dict,
-    probe_remote: Callable,
-) -> dict:
-    """Probe one sweep member without classifying or mutating shared records."""
-    record = state["records"][lid]
-    if record["remote"]:
-        return _probe_remote_observation(
-            lid,
-            record["route"],
-            generation_deadline,
-            probe_remote,
-            state["child_control"],
-        )
-    return _local_probe_observation(socket_path, lid, generation_deadline)
-
-
-def _authoritative_final_sweep(
-    state: dict,
-    established: list[dict],
-    socket_path: Path,
-    probe_remote: Callable,
-) -> list[dict]:
-    """Probe every unresolved sibling once, then classify at one barrier."""
-    established_ids = {item["record"]["key"] for item in established}
-    member_ids = [
-        lid
-        for lid in sorted(state["pending"], key=lambda item: state["records"][item]["order"])
-        if lid not in established_ids
-    ]
-    if not member_ids:
-        return established
-
-    budget = deadline_utils.claim_call_budget(
-        state["deadline"],
-        "wait.final_sweep",
-        cap_s=state["probe_timeout_s"],
-    )
-    if budget is None:
-        for lid in member_ids:
-            state["records"][lid]["generation_timed_out"] = True
-    else:
-        generation_deadline = deadline_utils.shorten_deadline(
-            state["deadline"],
-            state["deadline"]["clock"]() + budget,
-        )
-        executor = ThreadPoolExecutor(max_workers=min(remote.REMOTE_MAX_WORKERS, len(member_ids)))
-        futures = {}
-        try:
-            for lid in member_ids:
-                future = executor.submit(
-                    _probe_final_sweep_member,
-                    state,
-                    socket_path,
-                    lid,
-                    generation_deadline,
-                    probe_remote,
-                )
-                futures[future] = lid
-            barrier_budget = deadline_utils.claim_call_budget(
-                generation_deadline,
-                "wait.final_sweep_barrier",
-            )
-            if barrier_budget is None:
-                done = {future for future in futures if future.done()}
-                pending = set(futures) - done
-            else:
-                done, pending = wait_futures(futures, timeout=barrier_budget)
-            observations = {}
-            for future in done:
-                lid = futures[future]
-                try:
-                    observations[lid] = future.result()
-                except Exception as error:
-                    observations[lid] = {
-                        "id": lid,
-                        "kind": "observer_error",
-                        "payload": None,
-                        "detail": f"unexpected {type(error).__name__}",
-                        "failure_key": f"observer_error:{type(error).__name__}",
-                        "observed_ts": _monotonic(),
-                    }
-            for future in pending:
-                lid = futures[future]
-                state["records"][lid]["generation_timed_out"] = True
-                future.cancel()
-            for lid in member_ids:
-                observation = observations.get(lid)
-                if observation is not None:
-                    if observation["observed_ts"] >= generation_deadline["expires_at"]:
-                        state["records"][lid]["generation_timed_out"] = True
-                    warning = _apply_observation(
-                        state["records"][lid], observation, state["poll_s"]
-                    )
-                    if warning:
-                        print(warning, file=sys.stderr)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    now = _monotonic()
-    classified = {
-        item["record"]["key"]: item
-        for item in _collect_boundary_outcomes(state, now)
-        if item["record"]["key"] in member_ids
-    }
-    completed = list(established)
-    for lid in member_ids:
-        item = classified.get(lid)
-        if item is None:
-            item = {
-                "record": state["records"][lid],
-                "outcome": "wait_aborted",
-                "code": 1,
-                "reason": "sibling_nonzero",
-            }
-        completed.append(item)
-    return sorted(completed, key=lambda item: item["record"]["order"])
-
-
-def _resolution_failure_barrier(state: dict, established: list[dict]) -> list[dict]:
-    """Abort unresolved siblings after all query resolutions have completed."""
-    established_keys = {item["record"]["key"] for item in established}
-    completed = list(established)
-    for key in sorted(state["pending"], key=lambda item: state["records"][item]["order"]):
-        if key in established_keys:
-            continue
-        completed.append(
-            {
-                "record": state["records"][key],
-                "outcome": "wait_aborted",
-                "code": 1,
-                "reason": "resolution_failed",
-            }
-        )
-    return sorted(completed, key=lambda item: item["record"]["order"])
-
-
 def _action_is_blocked(snapshot: dict) -> bool:
     """Return whether a structured pending-action projection requires attention."""
     pending_action = snapshot.get("pending_action")
@@ -1047,7 +822,6 @@ def _recovery_for(record: dict, outcome: str) -> str | None:
         "target_absent": "hop lode list --all-hosts --json",
         "target_ambiguous": "hop lode list --all-hosts --json",
         "status_unavailable": f"{hop} lode list --json",
-        "wait_aborted": f"{hop} wait {lid}",
         "interrupted": f"{hop} wait {lid}",
     }
     command = (
@@ -1386,7 +1160,6 @@ def _emit_outcome(
         "target_absent",
         "target_ambiguous",
         "status_unavailable",
-        "wait_aborted",
         "interrupted",
     }:
         print(f"{STATUS_ERROR} {lid} {outcome}")
@@ -1429,70 +1202,45 @@ def _emit_outcome(
 
 
 def _finish_boundary(state: dict, outcomes: list[dict], now: float) -> int | None:
-    """Finalize and render every outcome at one boundary."""
+    """Finalize and render the outcome at one boundary."""
     if not outcomes:
         return None
-    result = 0
-    for item in outcomes:
-        record = item["record"]
-        outcome = item["outcome"]
-        final_record = _final_record(
-            record,
-            outcome,
-            item["code"],
-            now,
-            item.get("reason"),
-            deadline=state["deadline"],
-            child_control=state["child_control"],
-        )
-        item["final_record"] = final_record
-        _emit_outcome(
-            final_record,
-            state["json_output"],
-            deadline=state["deadline"],
-        )
-        with state["condition"]:
-            state["pending"].discard(record["key"])
-        state["resolved"].append(item)
-        result = max(result, item["code"])
-    return result
+    item = outcomes[0]
+    record = item["record"]
+    outcome = item["outcome"]
+    final_record = _final_record(
+        record,
+        outcome,
+        item["code"],
+        now,
+        item.get("reason"),
+        deadline=state["deadline"],
+        child_control=state["child_control"],
+    )
+    item["final_record"] = final_record
+    _emit_outcome(
+        final_record,
+        state["json_output"],
+        deadline=state["deadline"],
+    )
+    with state["condition"]:
+        state["resolved"] = True
+        state["resolved_outcome"] = item
+    return item["code"]
 
 
-def _emit_wait_summary(records: dict[str, dict], resolved: list[dict], code: int) -> None:
+def _emit_wait_summary(item: dict, code: int) -> None:
     """Emit the final wait result without risking the established exit code."""
     try:
-        requested = len(records)
-        if requested == 1:
-            item = resolved[0]
-            final_record = item["final_record"]
-            lines = [
-                WAIT_SUMMARY_ONE.format(
-                    lode_id=final_record["id"],
-                    outcome=final_record["outcome"],
-                    code=code,
-                )
-            ]
-        else:
-            resolved_by_id = {item["record"]["key"]: item for item in resolved}
-            lines = []
-            for record in sorted(records.values(), key=lambda record: record["order"]):
-                item = resolved_by_id.get(record["key"])
-                if item is not None:
-                    final_record = item["final_record"]
-                    lines.append(
-                        WAIT_SUMMARY_ITEM.format(
-                            lode_id=final_record["id"],
-                            outcome=final_record["outcome"],
-                        )
-                    )
-            lines.append(
-                WAIT_SUMMARY_MANY.format(
-                    resolved=len(resolved),
-                    requested=requested,
-                    code=code,
-                )
-            )
-        print("\n".join(lines), file=sys.stderr)
+        final_record = item["final_record"]
+        print(
+            WAIT_SUMMARY.format(
+                lode_id=final_record["id"],
+                outcome=final_record["outcome"],
+                code=code,
+            ),
+            file=sys.stderr,
+        )
     except Exception:
         # The established wait exit code must win over an optional summary rendering failure.
         logger.debug("Could not render wait summary", exc_info=True)
@@ -1511,25 +1259,21 @@ def _condition_wait(condition: threading.Condition, deadline: dict, wake_at: flo
 
 
 def _synthesize_interrupted_records(state: dict) -> None:
-    """Finalize established truth and interrupt every remaining record."""
-    now = _monotonic()
-    established = _collect_boundary_outcomes(state, now)
-    established_ids = {item["record"]["key"] for item in established}
-    outcomes = list(established)
-    for lid in sorted(state["pending"], key=lambda item: state["records"][item]["order"]):
-        if lid in established_ids:
-            continue
-        outcomes.append(
-            {
-                "record": state["records"][lid],
-                "outcome": "interrupted",
-                "code": 130,
-                "reason": "user_interrupted",
-            }
-        )
-    outcomes.sort(key=lambda item: item["record"]["order"])
-    _finish_boundary(state, outcomes, now)
-    _emit_wait_summary(state["records"], state["resolved"], 130)
+    """Finalize established truth or interrupt the unresolved record."""
+    if state["resolved_outcome"] is None:
+        now = _monotonic()
+        outcomes = _collect_boundary_outcomes(state, now)
+        if not outcomes:
+            outcomes = [
+                {
+                    "record": state["record"],
+                    "outcome": "interrupted",
+                    "code": 130,
+                    "reason": "user_interrupted",
+                }
+            ]
+        _finish_boundary(state, outcomes, now)
+    _emit_wait_summary(state["resolved_outcome"], 130)
 
 
 def _interrupt_cleanup_deadline(deadline: dict) -> dict:
@@ -1538,26 +1282,22 @@ def _interrupt_cleanup_deadline(deadline: dict) -> dict:
     return deadline_utils.shorten_deadline(deadline, interrupt_at + 5.0)
 
 
-def _interrupt_wait(cleanup_deadline: dict, child_control: dict, state: dict | None) -> int:
+def _interrupt_wait(cleanup_deadline: dict, child_control: dict, state: dict) -> int:
     """Cancel owned work within the interrupt bound and return the shell exit."""
     child_control["cancel_event"].set()
-    if state is not None:
-        state["stop_event"].set()
-        state["shutdown"] = True
-        state["deadline"] = cleanup_deadline
+    state["stop_event"].set()
+    state["shutdown"] = True
+    state["deadline"] = cleanup_deadline
     remote.cancel_owned_children(child_control, cleanup_deadline)
-    if state is not None and state.get("connection") is not None:
+    if state.get("connection") is not None:
         state["connection"].stop(deadline=cleanup_deadline)
-    if state is not None:
-        _synthesize_interrupted_records(state)
-    else:
-        print(WAIT_SUMMARY_INTERRUPT, file=sys.stderr)
+    _synthesize_interrupted_records(state)
     return 130
 
 
-def wait_for_lodes(
+def wait_for_lode(
     socket_path: Path,
-    lode_ids: list[str],
+    lode_id: str,
     *,
     deadline: dict,
     poll_s: float = 30,
@@ -1566,32 +1306,29 @@ def wait_for_lodes(
     resolver: Callable,
     probe_remote: Callable,
 ) -> int:
-    """Wait for lodes using one main-thread authoritative supervisor."""
+    """Wait for one lode using a main-thread authoritative supervisor."""
     child_control = remote.make_child_registry()
     state: dict | None = None
     condition: threading.Condition | None = None
     cleanup_deadline = deadline
-    records: dict[str, dict] = {}
+    record: dict | None = None
     try:
         poll_s = max(MIN_POLL_S, float(poll_s or 30))
-        resolved_records = _resolve_targets(
+        record = _resolve_target(
             socket_path,
-            lode_ids,
+            lode_id,
             resolver,
             deadline=deadline,
             child_control=child_control,
-            records=records,
         )
-        if resolved_records is not records:
-            records = resolved_records
-        _publish_resident_routes(records, deadline=deadline)
+        _publish_resident_routes(record, deadline=deadline)
 
         condition = threading.Condition()
         state = {
             "condition": condition,
-            "records": records,
-            "pending": set(records),
-            "resolved": [],
+            "record": record,
+            "resolved": False,
+            "resolved_outcome": None,
             "observations": deque(),
             "deadline": deadline,
             "overall_deadline": deadline["expires_at"],
@@ -1606,35 +1343,13 @@ def wait_for_lodes(
         }
 
         initial_now = _monotonic()
-        for record in records.values():
-            record["next_reconcile_ts"] = initial_now + poll_s
+        record["next_reconcile_ts"] = initial_now + poll_s
         initial_outcomes = _collect_boundary_outcomes(state, initial_now)
-        has_resolution_failure = any(
-            record["preset_outcome"] is not None for record in records.values()
-        )
-        if has_resolution_failure:
-            completed = _resolution_failure_barrier(state, initial_outcomes)
-            code = _finish_boundary(state, completed, initial_now) or 0
-            _emit_wait_summary(records, state["resolved"], code)
-            return code
-        if any(item["code"] > 0 for item in initial_outcomes):
-            state["stop_event"].set()
-            completed = _authoritative_final_sweep(
-                state,
-                initial_outcomes,
-                socket_path,
-                probe_remote,
-            )
-            code = _finish_boundary(state, completed, _monotonic()) or 0
-            _emit_wait_summary(records, state["resolved"], code)
-            return code
         if initial_outcomes:
-            _finish_boundary(state, initial_outcomes, initial_now)
-        if not state["pending"]:
-            _emit_wait_summary(records, state["resolved"], 0)
-            return 0
-        local_pending = any(not records[lid]["remote"] for lid in state["pending"])
-        if local_pending:
+            code = _finish_boundary(state, initial_outcomes, initial_now) or 0
+            _emit_wait_summary(state["resolved_outcome"], code)
+            return code
+        if not record["remote"]:
             connection = client.HopperConnection(socket_path)
             state["connection"] = connection
 
@@ -1653,7 +1368,7 @@ def wait_for_lodes(
             )
         _start_remote_workers(state, probe_remote)
 
-        while state["pending"]:
+        while not state["resolved"]:
             now = _monotonic()
             with condition:
                 warnings = _drain_observations(state)
@@ -1665,43 +1380,19 @@ def wait_for_lodes(
                 outcomes = _collect_boundary_outcomes(state, now)
             for warning in warnings:
                 print(warning, file=sys.stderr)
-            if any(item["code"] > 0 for item in outcomes):
-                state["stop_event"].set()
-                completed = _authoritative_final_sweep(
-                    state,
-                    outcomes,
-                    socket_path,
-                    probe_remote,
-                )
-                result = _finish_boundary(state, completed, _monotonic()) or 0
-                _emit_wait_summary(records, state["resolved"], result)
-                return result
             if outcomes:
-                _finish_boundary(state, outcomes, now)
-            if not state["pending"]:
-                _emit_wait_summary(records, state["resolved"], 0)
-                return 0
+                result = _finish_boundary(state, outcomes, now) or 0
+                _emit_wait_summary(state["resolved_outcome"], result)
+                return result
             with condition:
                 wake_at = _next_deadline(state)
                 _condition_wait(condition, deadline, wake_at)
     except KeyboardInterrupt:
         cleanup_deadline = _interrupt_cleanup_deadline(deadline)
         if state is None:
-            interrupted_records = records
-            processed_queries = {
-                query
-                for record in interrupted_records.values()
-                for query in record.get("queries", [record.get("query")])
-                if isinstance(query, str)
-            }
-            for order, query in enumerate(lode_ids):
-                if query in processed_queries:
-                    continue
-                key = f"failure:{query}"
-                if key in interrupted_records:
-                    continue
+            if record is None:
                 record = _resolution_failure_record(
-                    query,
+                    lode_id,
                     {
                         "outcome": "unavailable",
                         "probes": [
@@ -1717,20 +1408,17 @@ def wait_for_lodes(
                             }
                         ],
                     },
-                    order,
                     _monotonic(),
                 )
                 record["preset_outcome"] = None
                 record["preset_code"] = None
                 record["preset_reason"] = None
-                record["queries"] = [query]
-                interrupted_records[key] = record
             condition = threading.Condition()
             state = {
                 "condition": condition,
-                "records": interrupted_records,
-                "pending": set(interrupted_records),
-                "resolved": [],
+                "record": record,
+                "resolved": False,
+                "resolved_outcome": None,
                 "observations": deque(),
                 "deadline": deadline,
                 "overall_deadline": deadline["expires_at"],

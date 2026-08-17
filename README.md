@@ -60,7 +60,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop submit` | Create a lode (alias for implement) |
 | `hop list` | List lodes (alias for lode list) |
 | `hop projects` | List projects (alias for project list) |
-| `hop wait` | Supervise lodes to a final outcome (one-hour default and maximum) |
+| `hop wait` | Supervise one lode to a final outcome (one-hour default and maximum) |
 | `hop show` | Show lode details (alias for lode show) |
 | `hop watch` | Exact alias for `hop wait` |
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
@@ -77,9 +77,10 @@ Hopper does not pass a Grok model name, so the CLI uses the current default mode
 available to the authenticated account. Hopper disables Grok auto-update during a
 lode run; update the installed CLI through the normal host provisioning process.
 
-Run `hop wait ID` or `hop watch ID` as a bare command and read the complete final
-record, not only its exit code. Every record explains why supervision ended and
-includes recovery, owning server, lode status, pane context, and worktree context.
+Run `hop wait ID` or `hop watch ID` as a bare command to supervise exactly one
+lode, and read the complete final record, not only its exit code. The record
+explains why supervision ended and includes recovery, owning server, lode status,
+pane context, and worktree context.
 `hop lode watch ID` is the separate streaming event view.
 
 Useful lode subcommands include `hop lode peek`, `hop lode nudge`, `hop lode

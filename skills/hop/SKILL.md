@@ -84,18 +84,18 @@ fallback. The remote install contract is `$HOME/.local/bin/hop`, installed by
 
 ## Waiting and monitoring
 
-Supervise one or more lodes to a final outcome **(outside lode only)**:
+Supervise exactly one lode to a final outcome **(outside lode only)**:
 
 ```bash
 hop wait <lode-id>
 hop watch <lode-id>
-hop wait <id1> <id2> <id3>
+hop lode wait <lode-id>
 hop wait <lode-id> --timeout 300
 hop wait <lode-id> --observer-timeout 300
 ```
 
 Top-level `hop watch` is an exact alias for `hop wait`: same options, supervisor,
-records, and exit status. `hop lode watch <id>` is different—it streams status
+record, and exit status. `hop lode watch <id>` is different—it streams status
 events and does not provide the bounded final-record contract.
 
 `--timeout` limits the whole operation, including resolution and remote probes.
@@ -123,7 +123,7 @@ the submitted command string to exactly `hop wait ...` or `hop watch ...`.
 
 ### Read the record, not only the exit code
 
-Every target emits one final human block, or one JSON object with `--json`. Read
+The target emits one final human block, or one JSON object with `--json`. Read
 the complete output even when the exit code is zero. The record carries:
 
 - `outcome`, stable `reason_code`, plain-language `reason`, and `recovery`;
@@ -132,19 +132,17 @@ the complete output even when the exit code is zero. The record carries:
 - current or last-known tmux pane; and
 - exact known worktree path, provenance, and fresh existence result.
 
-The command's numeric exit is the maximum severity across target records: `0`
-shipped, `1` error/inactive/archive/resolution failure, `2` gated or durable
-action attention, `3` confirmed stuck, `4` overall timeout or status/observer
-unavailability, and `130` operator interrupt. The code alone is insufficient:
-exit `4`, for example, covers materially different recoveries. Use `outcome`,
-`reason_code`, and `recovery` to decide what happened and what to do next.
+The command's numeric exit is the final record's exit code: `0` shipped, `1`
+error/inactive/archive/resolution failure, `2` gated or durable action attention,
+`3` confirmed stuck, `4` overall timeout or status/observer unavailability, and
+`130` operator interrupt. The code alone is insufficient: exit `4`, for example,
+covers materially different recoveries. Use `outcome`, `reason_code`, and
+`recovery` to decide what happened and what to do next.
 
-With `--json`, stdout is JSONL containing final records only; the always-human
+With `--json`, stdout is JSONL containing only the final record; the always-human
 command summary remains on stderr. In a JavaScript executor, inspect and forward
 both the returned `exit_code` and the complete `output`; never reduce the result
-to one of them. In multi-lode waits, Hopper performs a final authoritative sweep
-at a nonzero boundary so terminal siblings retain their real outcomes and
-unresolved siblings explain why supervision stopped.
+to one of them.
 
 ### Reading the status: three traps
 
