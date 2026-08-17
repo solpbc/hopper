@@ -206,7 +206,6 @@ def _new_record(
             probe["_observed_ts"] = observed_ts
     return {
         "id": lid,
-        "query": lid,
         "route": route,
         "server": route if remote_source else None,
         "remote": remote_source,
@@ -224,7 +223,6 @@ def _new_record(
         "consecutive_failures": 0,
         "warned_failure_key": None,
         "not_found_count": 0,
-        "generation_timed_out": False,
     }
 
 
@@ -253,7 +251,6 @@ def _resolution_failure_record(query: str, result: dict, now: float) -> dict:
             matches.append({"server": server, "id": lode_id})
     return {
         "id": query,
-        "query": query,
         "route": route,
         "server": (
             route
@@ -275,7 +272,6 @@ def _resolution_failure_record(query: str, result: dict, now: float) -> dict:
         "consecutive_failures": 0,
         "warned_failure_key": None,
         "not_found_count": 0,
-        "generation_timed_out": False,
     }
 
 
@@ -326,7 +322,6 @@ def _resolve_target(
         observed_ts,
         probes=result["probes"],
     )
-    record["query"] = raw_id
     return record
 
 
@@ -432,7 +427,7 @@ def _probe_remote_observation(
         }
 
 
-def _remote_worker_group(
+def _remote_observer_loop(
     state: dict,
     interval_s: float,
     probe_remote: Callable,
@@ -475,14 +470,14 @@ def _remote_worker_group(
             return
 
 
-def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
+def _start_remote_observer(state: dict, probe_remote: Callable) -> None:
     """Start one daemon observer for the remote lode."""
     if state["resolved"] or not state["record"]["remote"]:
         return
     if deadline_utils.claim_call_budget(state["deadline"], "wait.remote_worker_start") is None:
         return
     thread = threading.Thread(
-        target=_remote_worker_group,
+        target=_remote_observer_loop,
         args=(state, state["poll_s"], probe_remote),
         daemon=True,
         name="wait-remote",
@@ -490,8 +485,8 @@ def _start_remote_workers(state: dict, probe_remote: Callable) -> None:
     thread.start()
 
 
-def _stop_remote_workers(state: dict) -> None:
-    """Cancel remote observers without serially joining daemon workers."""
+def _stop_remote_observer(state: dict) -> None:
+    """Cancel the remote observer without joining its daemon thread."""
     state["stop_event"].set()
 
 
@@ -687,8 +682,6 @@ def _collect_boundary_outcomes(state: dict, now: float) -> list[dict]:
                     )
                 )
             timed.append((state["overall_deadline"], 1, "timeout", 4, None))
-            if record["generation_timed_out"]:
-                timed.append((now, 1, "timeout", 4, "overall_timeout"))
             grace = record["grace"]
             if grace is not None and grace["confirmed"]:
                 grace_outcomes = {
@@ -1258,7 +1251,7 @@ def _condition_wait(condition: threading.Condition, deadline: dict, wake_at: flo
         condition.wait(timeout=budget)
 
 
-def _synthesize_interrupted_records(state: dict) -> None:
+def _synthesize_interrupted_record(state: dict) -> None:
     """Finalize established truth or interrupt the unresolved record."""
     if state["resolved_outcome"] is None:
         now = _monotonic()
@@ -1291,8 +1284,37 @@ def _interrupt_wait(cleanup_deadline: dict, child_control: dict, state: dict) ->
     remote.cancel_owned_children(child_control, cleanup_deadline)
     if state.get("connection") is not None:
         state["connection"].stop(deadline=cleanup_deadline)
-    _synthesize_interrupted_records(state)
+    _synthesize_interrupted_record(state)
     return 130
+
+
+def _new_supervisor_state(
+    record: dict,
+    *,
+    deadline: dict,
+    poll_s: float,
+    observer_timeout_s: float,
+    child_control: dict,
+    json_output: bool,
+) -> dict:
+    """Build the shared state for one wait supervisor."""
+    return {
+        "condition": threading.Condition(),
+        "record": record,
+        "resolved": False,
+        "resolved_outcome": None,
+        "observations": deque(),
+        "deadline": deadline,
+        "overall_deadline": deadline["expires_at"],
+        "poll_s": poll_s,
+        "observer_timeout_s": max(0.0, observer_timeout_s),
+        "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
+        "stop_event": threading.Event(),
+        "connection": None,
+        "child_control": child_control,
+        "shutdown": False,
+        "json_output": json_output,
+    }
 
 
 def wait_for_lode(
@@ -1323,24 +1345,15 @@ def wait_for_lode(
         )
         _publish_resident_routes(record, deadline=deadline)
 
-        condition = threading.Condition()
-        state = {
-            "condition": condition,
-            "record": record,
-            "resolved": False,
-            "resolved_outcome": None,
-            "observations": deque(),
-            "deadline": deadline,
-            "overall_deadline": deadline["expires_at"],
-            "poll_s": poll_s,
-            "observer_timeout_s": max(0.0, observer_timeout_s),
-            "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
-            "stop_event": threading.Event(),
-            "connection": None,
-            "child_control": child_control,
-            "shutdown": False,
-            "json_output": json_output,
-        }
+        state = _new_supervisor_state(
+            record,
+            deadline=deadline,
+            poll_s=poll_s,
+            observer_timeout_s=observer_timeout_s,
+            child_control=child_control,
+            json_output=json_output,
+        )
+        condition = state["condition"]
 
         initial_now = _monotonic()
         record["next_reconcile_ts"] = initial_now + poll_s
@@ -1366,7 +1379,7 @@ def wait_for_lode(
                 on_connect=lambda: _request_local_reconcile(state),
                 deadline=deadline,
             )
-        _start_remote_workers(state, probe_remote)
+        _start_remote_observer(state, probe_remote)
 
         while not state["resolved"]:
             now = _monotonic()
@@ -1413,31 +1426,22 @@ def wait_for_lode(
                 record["preset_outcome"] = None
                 record["preset_code"] = None
                 record["preset_reason"] = None
-            condition = threading.Condition()
-            state = {
-                "condition": condition,
-                "record": record,
-                "resolved": False,
-                "resolved_outcome": None,
-                "observations": deque(),
-                "deadline": deadline,
-                "overall_deadline": deadline["expires_at"],
-                "poll_s": poll_s,
-                "observer_timeout_s": max(0.0, observer_timeout_s),
-                "probe_timeout_s": max(5.0, min(poll_s, 30.0)),
-                "stop_event": threading.Event(),
-                "connection": None,
-                "child_control": child_control,
-                "shutdown": False,
-                "json_output": json_output,
-            }
+            state = _new_supervisor_state(
+                record,
+                deadline=deadline,
+                poll_s=poll_s,
+                observer_timeout_s=observer_timeout_s,
+                child_control=child_control,
+                json_output=json_output,
+            )
+            condition = state["condition"]
         return _interrupt_wait(cleanup_deadline, child_control, state)
     finally:
         if state is not None and condition is not None:
             with condition:
                 state["shutdown"] = True
                 condition.notify_all()
-            _stop_remote_workers(state)
+            _stop_remote_observer(state)
             if state["connection"] is not None:
                 state["connection"].stop(deadline=cleanup_deadline)
         remote.cancel_owned_children(child_control, cleanup_deadline)

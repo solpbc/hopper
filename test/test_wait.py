@@ -190,7 +190,7 @@ def install_synchronous_remote_driver(monkeypatch, clock):
             finally:
                 one_shot.set()
 
-        wait._remote_worker_group(
+        wait._remote_observer_loop(
             worker_state,
             state["poll_s"],
             probe_once,
@@ -210,8 +210,8 @@ def install_synchronous_remote_driver(monkeypatch, clock):
         if not state["resolved"] and record["remote"] and clock.now >= record["next_reconcile_ts"]:
             post_one(state, holder["probe"])
 
-    monkeypatch.setattr(wait, "_start_remote_workers", start_workers)
-    monkeypatch.setattr(wait, "_stop_remote_workers", lambda state: state["stop_event"].set())
+    monkeypatch.setattr(wait, "_start_remote_observer", start_workers)
+    monkeypatch.setattr(wait, "_stop_remote_observer", lambda state: state["stop_event"].set())
     monkeypatch.setattr(wait, "_condition_wait", condition_wait)
 
 
@@ -442,8 +442,8 @@ def test_deadline_call_budget_ledger_covers_wait_blockers(monkeypatch, tmp_path)
         "child_control": remote.make_child_registry(),
         "stop_event": threading.Event(),
     }
-    wait._start_remote_workers(worker_state, blocked_probe)
-    wait._stop_remote_workers(worker_state)
+    wait._start_remote_observer(worker_state, blocked_probe)
+    wait._stop_remote_observer(worker_state)
     assert worker_state["stop_event"].is_set()
 
     connection = hopper_client.HopperConnection(Path("server.sock"))
@@ -1068,6 +1068,60 @@ def test_remote_failures_follow_observer_health_policy(monkeypatch, capsys, fail
     assert payload["outcome"] == "observer_unavailable"
     assert payload["stage"] == "mill"
     assert payload["state"] == "running"
+
+
+def test_remote_observer_failure_stops_remote_observer(monkeypatch, capsys):
+    clock = FakeClock()
+    initial = snapshot(host="fedora.local")
+    original_stop = wait._stop_remote_observer
+    stop_observer = MagicMock(side_effect=original_stop)
+
+    monkeypatch.setattr(wait, "_monotonic", clock)
+    monkeypatch.setattr(wait, "_publish_resident_routes", lambda record, **_kwargs: None)
+    monkeypatch.setattr(wait, "_stop_remote_observer", stop_observer)
+    monkeypatch.setattr(
+        wait,
+        "_condition_wait",
+        lambda condition, deadline, wake_at: setattr(clock, "now", wake_at),
+    )
+
+    def start_observer(state, _probe_remote):
+        for _ in range(2):
+            wait._post_observation(
+                state,
+                {
+                    "id": "abc123",
+                    "kind": "unreadable",
+                    "payload": None,
+                    "detail": "remote status unreadable",
+                    "failure_key": "unreadable",
+                    "observed_ts": clock(),
+                },
+            )
+
+    monkeypatch.setattr(wait, "_start_remote_observer", start_observer)
+
+    rc = wait.wait_for_lode(
+        Path("server.sock"),
+        "abc123",
+        deadline=make_deadline(60, clock=clock),
+        observer_timeout_s=45,
+        json_output=True,
+        resolver=lambda socket_path, lid, **_kwargs: {
+            "outcome": "found",
+            "lode": initial,
+            "host": "fedora.local",
+            "canonical_id": "abc123",
+            "probes": [configured_probe("fedora.local")],
+            "exit_code": 0,
+        },
+        probe_remote=lambda *_args, **_kwargs: (None, "unreadable"),
+    )
+
+    assert rc == 4
+    assert json.loads(capsys.readouterr().out)["outcome"] == "observer_unavailable"
+    stop_observer.assert_called_once()
+    assert stop_observer.call_args.args[0]["stop_event"].is_set()
 
 
 def test_temporary_unreadability_recovers_without_losing_lode(monkeypatch, capsys):
@@ -2011,7 +2065,7 @@ def test_remote_completed_stage_does_not_resolve_before_shipped(monkeypatch, cap
         (RuntimeError("boom"), "observer_error"),
     ],
 )
-def test_remote_worker_converts_every_outcome_to_observation(probe_result, expected_kind):
+def test_remote_observer_converts_every_outcome_to_observation(probe_result, expected_kind):
     condition = threading.Condition()
     stop_event = threading.Event()
     record = wait._new_record(
@@ -2039,24 +2093,24 @@ def test_remote_worker_converts_every_outcome_to_observation(probe_result, expec
             raise probe_result
         return probe_result
 
-    wait._remote_worker_group(state, 30, probe)
+    wait._remote_observer_loop(state, 30, probe)
 
     assert len(state["observations"]) == 1
     assert state["observations"][0]["kind"] == expected_kind
 
 
-def test_remote_worker_stop_only_sets_cancellation():
+def test_remote_observer_stop_only_sets_cancellation():
     state = {"stop_event": threading.Event()}
 
-    wait._stop_remote_workers(state)
+    wait._stop_remote_observer(state)
 
     assert state["stop_event"].is_set()
 
 
-def test_keyboard_interrupt_returns_130_and_cancels_remote_workers(monkeypatch):
+def test_keyboard_interrupt_returns_130_and_cancels_remote_observer(monkeypatch):
     initial = snapshot(host="fedora.local")
     stopped_states = []
-    original_stop = wait._stop_remote_workers
+    original_stop = wait._stop_remote_observer
 
     monkeypatch.setattr(wait.client, "get_lode", lambda *args, **kwargs: None)
     monkeypatch.setattr(wait, "_publish_resident_routes", lambda record, **_kwargs: None)
@@ -2070,7 +2124,7 @@ def test_keyboard_interrupt_returns_130_and_cancels_remote_workers(monkeypatch):
         original_stop(state)
         stopped_states.append(state)
 
-    monkeypatch.setattr(wait, "_stop_remote_workers", stop_workers)
+    monkeypatch.setattr(wait, "_stop_remote_observer", stop_workers)
 
     rc = wait.wait_for_lode(
         Path("server.sock"),
