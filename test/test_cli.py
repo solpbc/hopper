@@ -9702,7 +9702,7 @@ def test_lode_nudge_wait_for_idle_sends_once_after_idle(monkeypatch, capsys):
 
 
 def test_lode_nudge_wait_for_idle_retries_busy_then_succeeds(monkeypatch, capsys):
-    _nudge_idle_clock(monkeypatch)
+    clock = _nudge_idle_clock(monkeypatch)
     busy = {
         "type": "error",
         "outcome": "busy",
@@ -9718,6 +9718,7 @@ def test_lode_nudge_wait_for_idle_retries_busy_then_succeeds(monkeypatch, capsys
 
     assert send.call_count == 2
     send.assert_called_with(ANY, "abc123", "continue", paste=True)
+    assert clock[0] == NUDGE_IDLE_POLL_SECONDS
     captured = capsys.readouterr()
     assert captured.out == "submitted\n"
     assert captured.err == _nudge_begin_line() + "\n"
@@ -9814,6 +9815,35 @@ def test_lode_nudge_wait_for_idle_expires_after_busy(monkeypatch, capsys):
         f"{_nudge_begin_line(budget=budget)}\n"
         f"{error}\n"
         "Observed: pane %1 was still processing after 5s of a 5s --wait-for-idle budget. "
+        "Hopper did not send another nudge. Recover with: hop lode peek abc123\n"
+    )
+
+
+def test_lode_nudge_wait_for_idle_expires_when_busy_send_overshoots(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    budget = 5.0
+    error = "Input was not sent because pane %1 did not become idle within 3.0s."
+    busy = {"type": "error", "outcome": "busy", "error": error}
+
+    def fake_send(*args, **kwargs):
+        clock[0] += 6.0
+        return busy
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", side_effect=fake_send) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "5"]) == 1
+
+    send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"{_nudge_begin_line(budget=budget)}\n"
+        f"{error}\n"
+        "Observed: pane %1 was still processing after 6s of a 5s --wait-for-idle budget. "
         "Hopper did not send another nudge. Recover with: hop lode peek abc123\n"
     )
 

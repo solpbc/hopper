@@ -3724,11 +3724,7 @@ def _nudge_wait_for_idle(
         response = client.send_pane_input(socket_path, lode_id, text, paste=True)
         if response and response.get("type") == "pane_input_sent":
             return response
-        if (
-            response
-            and response.get("outcome") == NUDGE_RETRYABLE_OUTCOME
-            and deadline_utils.remaining_seconds(deadline) > 0
-        ):
+        if response and response.get("outcome") == NUDGE_RETRYABLE_OUTCOME:
             last_busy_error = response.get("error")
             sent_busy = True
             remaining = deadline_utils.remaining_seconds(deadline)
