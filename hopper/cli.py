@@ -44,7 +44,7 @@ from hopper.lodes import (
     lode_with_status_annotations,
 )
 from hopper.runner import _sum_process_tree_cpu_ms
-from hopper.tmux import capture_pane
+from hopper.tmux import PanePhase, capture_pane, classify_pane_phase, pane_title
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,12 @@ WATCH_RECONCILE_SECONDS = 30.0
 WATCH_OBSERVER_TIMEOUT_SECONDS = 300.0
 WAIT_TIMEOUT_SECONDS = 3600.0
 WAIT_TIMEOUT_MAX_SECONDS = 3600.0
+NUDGE_WAIT_FOR_IDLE_SECONDS = 300.0
+NUDGE_IDLE_POLL_SECONDS = 2.0
+NUDGE_IDLE_HEARTBEAT_SECONDS = 30.0
+NUDGE_RETRYABLE_OUTCOME = "busy"
+# Budget expired, output already emitted; can never collide with a server response dict.
+_NUDGE_IDLE_EXPIRED = object()
 WAIT_EXTRA_LODE_IDS_REFUSAL = (
     "Observed: 'hop {command_name}' supervises exactly one lode, but additional lode IDs "
     "were provided. Hopper did not proceed; no lode lookup or SSH probe was attempted. "
@@ -75,6 +81,11 @@ _watch_monotonic = time.monotonic
 def _watch_condition_wait(condition: threading.Condition, timeout_s: float) -> None:
     """Wait for a watch event; monkeypatched by deterministic tests."""
     condition.wait(timeout=timeout_s)
+
+
+def _nudge_idle_sleep(timeout_s: float) -> None:
+    """Sleep while waiting for a pane to go idle; monkeypatched by deterministic tests."""
+    time.sleep(timeout_s)
 
 
 def _socket() -> Path:
@@ -3648,6 +3659,87 @@ def _run_wait_command(
     )
 
 
+def _nudge_wait_for_idle(
+    socket_path: Path,
+    lode: dict,
+    text: str,
+    budget_s: float,
+) -> dict | None | object:
+    """Poll the pane title until idle, then send; retry only busy while budget remains."""
+    import hopper.client as client
+
+    pane = lode.get("tmux_pane") or "<unknown>"
+    lode_id = lode["id"]
+    deadline = deadline_utils.make_deadline(budget_s, clock=_watch_monotonic)
+    last_busy_error = None
+    sent_busy = False
+    heartbeats_emitted = 0
+
+    def expire() -> object:
+        elapsed = budget_s - deadline_utils.remaining_seconds(deadline)
+        if sent_busy:
+            if last_busy_error:
+                print(last_busy_error, file=sys.stderr)
+            verb = "Hopper did not send another nudge."
+        else:
+            verb = "Hopper did not send the nudge."
+        print(
+            f"Observed: pane {pane} was still processing after {elapsed:g}s "
+            f"of a {budget_s:g}s --wait-for-idle budget. {verb} "
+            f"Recover with: hop lode peek {lode_id}",
+            file=sys.stderr,
+        )
+        return _NUDGE_IDLE_EXPIRED
+
+    print(f"waiting for pane {pane} to become idle (budget {budget_s:g}s)", file=sys.stderr)
+
+    while True:
+        remaining = deadline_utils.remaining_seconds(deadline)
+        if remaining <= 0:
+            return expire()
+
+        elapsed = budget_s - remaining
+        beats_due = int(elapsed // NUDGE_IDLE_HEARTBEAT_SECONDS)
+        if beats_due > heartbeats_emitted:
+            print(
+                f"still waiting for pane {pane} to become idle ({elapsed:g}s / {budget_s:g}s)",
+                file=sys.stderr,
+            )
+            heartbeats_emitted = beats_due
+
+        title = pane_title(pane)
+        phase = classify_pane_phase(title)
+        if phase is PanePhase.PROCESSING:
+            remaining = deadline_utils.remaining_seconds(deadline)
+            sleep_s = min(NUDGE_IDLE_POLL_SECONDS, remaining)
+            if sleep_s <= 0:
+                return expire()
+            _nudge_idle_sleep(sleep_s)
+            continue
+
+        remaining = deadline_utils.remaining_seconds(deadline)
+        if remaining <= 0:
+            return expire()
+
+        response = client.send_pane_input(socket_path, lode_id, text, paste=True)
+        if response and response.get("type") == "pane_input_sent":
+            return response
+        if (
+            response
+            and response.get("outcome") == NUDGE_RETRYABLE_OUTCOME
+            and deadline_utils.remaining_seconds(deadline) > 0
+        ):
+            last_busy_error = response.get("error")
+            sent_busy = True
+            remaining = deadline_utils.remaining_seconds(deadline)
+            sleep_s = min(NUDGE_IDLE_POLL_SECONDS, remaining)
+            if sleep_s <= 0:
+                return expire()
+            _nudge_idle_sleep(sleep_s)
+            continue
+        return response
+
+
 @command("lode", "Manage lodes")
 def cmd_lode(args: list[str]) -> int:
     """Manage lodes — list, create, restart, watch, wait."""
@@ -3750,6 +3842,20 @@ def cmd_lode(args: list[str]) -> int:
     nudge_p.add_argument("lode_id", help="Lode ID to nudge")
     nudge_p.add_argument("text", nargs="?", default=None, help="Text to submit (default: continue)")
     nudge_p.add_argument("--text", dest="text_option", default=None, help="Text to submit")
+    nudge_p.add_argument(
+        "--wait-for-idle",
+        dest="wait_for_idle",
+        nargs="?",
+        const=NUDGE_WAIT_FOR_IDLE_SECONDS,
+        default=None,
+        type=_wait_timeout,
+        help=(
+            f"Block until the pane is idle, then nudge "
+            f"(default: {NUDGE_WAIT_FOR_IDLE_SECONDS:g}; "
+            f"maximum: {WAIT_TIMEOUT_MAX_SECONDS:g}). "
+            "Place after free text, or pass text with --text."
+        ),
+    )
     answer_p = subs.add_parser("answer", help="Answer a numbered lode prompt", exit_on_error=False)
     answer_p.add_argument("lode_id", help="Lode ID to answer")
     answer_p.add_argument("choice", help="Numbered choice, 1-9")
@@ -4617,8 +4723,12 @@ def cmd_lode(args: list[str]) -> int:
             print(resolved["error"])
             return resolved["exit_code"]
         lode = resolved["lode"]
+        wait_for_idle = getattr(parsed, "wait_for_idle", None)
         if resolved["host"] != "local":
-            remote_args = ["lode", subcommand, resolved["canonical_id"]]
+            remote_args = ["lode", subcommand]
+            if subcommand == "nudge" and wait_for_idle is not None:
+                remote_args.extend(["--wait-for-idle", f"{wait_for_idle:g}"])
+            remote_args.append(resolved["canonical_id"])
             if subcommand == "peek":
                 remote_args.extend(["-n", str(parsed.lines)])
             elif subcommand == "nudge":
@@ -4646,12 +4756,17 @@ def cmd_lode(args: list[str]) -> int:
             print("choice must be a digit 1..9")
             return 1
         text = parsed.nudge_text if subcommand == "nudge" else parsed.choice
-        response = client.send_pane_input(
-            socket_path,
-            lode["id"],
-            text,
-            paste=subcommand == "nudge",
-        )
+        if subcommand == "nudge" and wait_for_idle is not None and lode.get("tmux_pane"):
+            response = _nudge_wait_for_idle(socket_path, lode, text, wait_for_idle)
+            if response is _NUDGE_IDLE_EXPIRED:
+                return 1
+        else:
+            response = client.send_pane_input(
+                socket_path,
+                lode["id"],
+                text,
+                paste=subcommand == "nudge",
+            )
         if response and response.get("type") == "pane_input_sent":
             print("submitted")
             return 0

@@ -28,6 +28,9 @@ from hopper.cli import (
     ARCHIVED_PAGE_DEFAULT,
     ARCHIVED_PAGE_MAX,
     HELP_SKILL_REMINDER,
+    NUDGE_IDLE_HEARTBEAT_SECONDS,
+    NUDGE_IDLE_POLL_SECONDS,
+    NUDGE_WAIT_FOR_IDLE_SECONDS,
     _CheckProgress,
     _socket,
     cmd_backlog,
@@ -9639,6 +9642,293 @@ def test_lode_nudge_rejects_positional_and_flag_before_lookup(capsys):
     out = capsys.readouterr().out
     assert "positional text and --text cannot be used together" in out
     assert out.count(HELP_SKILL_REMINDER) == 1
+
+
+_PROCESSING_TITLE = "\u25d0 working"
+_IDLE_TITLE = "\u2733 idle"
+_NUDGE_LODE = {"id": "abc123", "tmux_pane": "%1", "active": True, "state": "running"}
+_NUDGE_SENT = {"type": "pane_input_sent", "lode_id": "abc123", "tmux_pane": "%1"}
+
+
+def _nudge_idle_clock(monkeypatch, start=0.0):
+    clock = [start]
+    monkeypatch.setattr("hopper.cli._watch_monotonic", lambda: clock[0])
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("hopper.cli._nudge_idle_sleep", fake_sleep)
+    return clock
+
+
+def _nudge_begin_line(pane="%1", budget=NUDGE_WAIT_FOR_IDLE_SECONDS) -> str:
+    return f"waiting for pane {pane} to become idle (budget {budget:g}s)"
+
+
+def test_lode_nudge_wait_for_idle_help_lists_bounds(capsys):
+    assert cmd_lode(["nudge", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "--wait-for-idle" in out
+    assert "300" in out
+    assert "3600" in out
+
+
+def test_lode_nudge_wait_for_idle_sends_once_after_idle(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    send_at = []
+
+    def fake_title(target):
+        return _PROCESSING_TITLE if clock[0] < NUDGE_IDLE_POLL_SECONDS else _IDLE_TITLE
+
+    def fake_send(*args, **kwargs):
+        send_at.append(clock[0])
+        return _NUDGE_SENT
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", side_effect=fake_title),
+        patch("hopper.client.send_pane_input", side_effect=fake_send) as send,
+        patch("hopper.cli.capture_pane") as capture,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle"]) == 0
+
+    send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    capture.assert_not_called()
+    assert send_at == [NUDGE_IDLE_POLL_SECONDS]
+    captured = capsys.readouterr()
+    assert captured.out == "submitted\n"
+    assert captured.err == _nudge_begin_line() + "\n"
+
+
+def test_lode_nudge_wait_for_idle_retries_busy_then_succeeds(monkeypatch, capsys):
+    _nudge_idle_clock(monkeypatch)
+    busy = {
+        "type": "error",
+        "outcome": "busy",
+        "error": "Input was not sent because pane %1 did not become idle within 3.0s.",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", side_effect=[busy, _NUDGE_SENT]) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle"]) == 0
+
+    assert send.call_count == 2
+    send.assert_called_with(ANY, "abc123", "continue", paste=True)
+    captured = capsys.readouterr()
+    assert captured.out == "submitted\n"
+    assert captured.err == _nudge_begin_line() + "\n"
+
+
+def test_lode_nudge_wait_for_idle_does_not_retry_awaiting_choice(monkeypatch, capsys):
+    _nudge_idle_clock(monkeypatch)
+    error = "Choice was not sent because pane %1 is not a recognized numbered selector."
+    response = {"type": "error", "outcome": "awaiting_choice", "error": error}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", return_value=response) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle"]) == 1
+
+    send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{_nudge_begin_line()}\n{error}\n"
+
+
+def test_lode_nudge_wait_for_idle_does_not_retry_unverified(monkeypatch, capsys):
+    _nudge_idle_clock(monkeypatch)
+    error = "Delivery outcome unknown; inspect pane."
+    response = {
+        "type": "error",
+        "outcome": "unverified",
+        "error": error,
+        "tail": "first pane line\nlast pane line",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", return_value=response) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle"]) == 1
+
+    send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"{_nudge_begin_line()}\n"
+        f"{error}\n"
+        "--- pane tail ---\n"
+        "first pane line\n"
+        "last pane line\n"
+        "--- end pane tail ---\n"
+    )
+
+
+def test_lode_nudge_wait_for_idle_expires_while_processing(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    budget = 5.0
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_PROCESSING_TITLE),
+        patch("hopper.client.send_pane_input") as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "5"]) == 1
+
+    send.assert_not_called()
+    assert clock[0] == budget
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"{_nudge_begin_line(budget=budget)}\n"
+        "Observed: pane %1 was still processing after 5s of a 5s --wait-for-idle budget. "
+        "Hopper did not send the nudge. Recover with: hop lode peek abc123\n"
+    )
+
+
+def test_lode_nudge_wait_for_idle_expires_after_busy(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    budget = 5.0
+    error = "Input was not sent because pane %1 did not become idle within 3.0s."
+    busy = {"type": "error", "outcome": "busy", "error": error}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", return_value=busy) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "5"]) == 1
+
+    assert send.call_count == 3
+    assert clock[0] == budget
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"{_nudge_begin_line(budget=budget)}\n"
+        f"{error}\n"
+        "Observed: pane %1 was still processing after 5s of a 5s --wait-for-idle budget. "
+        "Hopper did not send another nudge. Recover with: hop lode peek abc123\n"
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3601"])
+def test_lode_nudge_wait_for_idle_rejects_bad_timeout_before_lookup(value, capsys):
+    with (
+        patch("hopper.cli.require_server") as require,
+        patch("hopper.client.read_lode_snapshot") as snapshot,
+        patch("hopper.cli._resolve_lode") as resolver,
+        patch("hopper.client.send_pane_input") as send,
+        patch("hopper.cli.pane_title") as title,
+    ):
+        assert cmd_lode(["nudge", "abc", "--wait-for-idle", value]) == 1
+
+    require.assert_not_called()
+    snapshot.assert_not_called()
+    resolver.assert_not_called()
+    send.assert_not_called()
+    title.assert_not_called()
+    out = capsys.readouterr().out
+    assert "timeout must be finite, greater than 0, and at most 3600" in out
+    assert out.count(HELP_SKILL_REMINDER) == 1
+
+
+@pytest.mark.parametrize(
+    ("args", "forwarded"),
+    [
+        (["nudge", "abc", "--wait-for-idle"], "300"),
+        (["nudge", "abc", "--wait-for-idle", "60"], "60"),
+    ],
+)
+def test_lode_nudge_wait_for_idle_remote_forwards_flag(args, forwarded):
+    payload = "continue"
+    lode = {"id": "abc12345", "host": "resident.example", "active": True, "state": "running"}
+    resolution = {
+        "outcome": "found",
+        "lode": lode,
+        "host": "resident.example",
+        "canonical_id": "abc12345",
+        "error": None,
+        "probe_summary": "",
+        "exit_code": 0,
+    }
+    with (
+        patch("hopper.cli._resolve_lode", return_value=resolution),
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+    ):
+        assert cmd_lode(args) == 0
+
+    assert run_remote.call_args.args[:2] == (
+        "resident.example",
+        ["lode", "nudge", "--wait-for-idle", forwarded, "abc12345", "--", payload],
+    )
+
+
+def test_lode_nudge_wait_for_idle_progress_stays_on_stderr(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    budget = 60.0
+
+    def fake_title(target):
+        return _PROCESSING_TITLE if clock[0] < 32 else _IDLE_TITLE
+
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", side_effect=fake_title),
+        patch("hopper.client.send_pane_input", return_value=_NUDGE_SENT),
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "60"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "submitted\n"
+    assert captured.err == (
+        f"{_nudge_begin_line(budget=budget)}\n"
+        f"still waiting for pane %1 to become idle "
+        f"({NUDGE_IDLE_HEARTBEAT_SECONDS:g}s / {budget:g}s)\n"
+    )
+
+
+def test_lode_nudge_wait_for_idle_absent_pane_skips_wait(monkeypatch, capsys):
+    _nudge_idle_clock(monkeypatch)
+    lode = {"id": "abc123", "active": True, "state": "running"}
+    error = "Input was not sent because pane <unknown> is unavailable."
+    response = {"type": "error", "outcome": "pane_unavailable", "error": error}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.cli.pane_title") as title,
+        patch("hopper.client.send_pane_input", return_value=response) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle"]) == 1
+
+    title.assert_not_called()
+    send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{error}\n"
+
+
+def test_lode_nudge_wait_for_idle_unknown_title_sends(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=None),
+        patch("hopper.client.send_pane_input", return_value=_NUDGE_SENT) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle"]) == 0
+
+    send.assert_called_once_with(ANY, "abc123", "continue", paste=True)
+    assert clock[0] == 0.0
+    captured = capsys.readouterr()
+    assert captured.out == "submitted\n"
+    assert captured.err == _nudge_begin_line() + "\n"
 
 
 def test_top_status_matches_lode_status_human(capsys):

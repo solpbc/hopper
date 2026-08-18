@@ -458,6 +458,8 @@ hop lode nudge <lode-id>            # submit "continue" via buffer paste
 hop lode nudge <lode-id> "focus the failing test"
 hop lode nudge <lode-id> --text "..."
 hop lode nudge <lode-id> -- -leading-dash-text
+hop lode nudge <lode-id> --text "..." --wait-for-idle
+hop lode nudge <lode-id> --text "..." --wait-for-idle 60
 hop lode answer <lode-id> 1         # answer numbered prompts
 ```
 
