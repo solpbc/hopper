@@ -153,6 +153,12 @@ to one of them.
 3. **Use the complete exit-code table above; do not reconstruct it from this
    example.** In particular, `hop wait` timeout is exit `4`, not gate; gate is
    exit `2`.
+4. **An empty `hop lode list` is a claim about the host you queried, not about
+   the lode.** Aimed at the local hopper while the lode lives on another host,
+   it returns `{"lodes": []}` — a clean success — so every cross-reference
+   reads "archived" or "gone." Use `--all-hosts` or `-H <host>`. stderr names
+   the sources that were searched, including on empty results. Same trap:
+   `shared/shell-gotchas.md` § B8.
 
 Watch live status events for a lode **(outside lode only)**:
 
