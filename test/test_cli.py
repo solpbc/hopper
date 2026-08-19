@@ -5083,6 +5083,30 @@ def test_gate_show_reports_when_no_gate_is_set(capsys):
     ]
 
 
+def test_gate_feedback_character_success_names_the_unverified_turn(capsys):
+    """A character send reports delivery, not a verified new user turn."""
+    response = {
+        "type": "feedback_sent",
+        "lode_id": "gate1234",
+        "tmux_pane": "%9",
+        "character": True,
+    }
+    with patch("hopper.cli.require_server", return_value=None):
+        with patch(
+            "hopper.client.read_lode_snapshot",
+            return_value=("found", {"id": "gate1234"}),
+        ):
+            with patch("hopper.client.send_gate_feedback", return_value=response) as mock_send:
+                result = cmd_gate(["feedback", "gate1234", "y"])
+    assert result == 0
+    mock_send.assert_called_once()
+    assert mock_send.call_args.args[1:] == ("gate1234", "y")
+    out = capsys.readouterr().out
+    assert "Character sent to gate1234 (pane %9)" in out
+    assert "did not verify a new user turn" in out
+    assert "hop lode peek gate1234" in out
+
+
 def test_gate_feedback_with_text_arg_calls_client(capsys):
     """gate feedback sends inline feedback text to the client helper."""
     response = {"type": "feedback_sent", "lode_id": "gate1234", "tmux_pane": "%9"}

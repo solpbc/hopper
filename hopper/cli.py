@@ -49,9 +49,15 @@ from hopper.tmux import PanePhase, capture_pane, classify_pane_phase, pane_title
 logger = logging.getLogger(__name__)
 
 _GATE_FEEDBACK_DESCRIPTION = (
-    "Send feedback to a gated lode. Exit 0 means Claude accepted a new user turn. "
-    "Any reported failure leaves the lode gated and Hopper prints a safe next action.\n\n"
+    "Send feedback to a lode. A one-character payload is sent as a keystroke and "
+    "does not wait for the pane to go idle. While the lode is gated, that is the "
+    "only send permitted — a multi-character body is refused. Exit 0 for a pasted "
+    "body means Claude accepted a new user turn. Exit 0 for a single character "
+    "means the keystroke was delivered; inspect the pane to confirm it was "
+    "consumed. Any reported failure leaves the lode gated and Hopper prints a "
+    "safe next action.\n\n"
     "Forms:\n"
+    "  hop gate feedback <lode_id> y\n"
     '  hop gate feedback <lode_id> "<response>"\n'
     "  hop gate feedback <lode_id> < file.md\n"
     "  hop gate feedback <lode_id> - < file.md"
@@ -1547,7 +1553,15 @@ def _cmd_gate_feedback(args: list[str]) -> int:
 
     response = client.send_gate_feedback(_socket(), resolved["canonical_id"], text)
     if response and response.get("type") == "feedback_sent":
-        print(f"Feedback sent to {parsed.lode_id} (pane {response.get('tmux_pane', '')})")
+        pane = response.get("tmux_pane", "")
+        if response.get("character"):
+            print(
+                f"Character sent to {parsed.lode_id} (pane {pane}). "
+                "Hopper did not wait for the pane to go idle and did not verify "
+                f"a new user turn. Inspect with `hop lode peek {parsed.lode_id}`."
+            )
+        else:
+            print(f"Feedback sent to {parsed.lode_id} (pane {pane})")
         return 0
 
     if response is None:

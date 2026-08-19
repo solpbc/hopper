@@ -9166,7 +9166,7 @@ def _observe_acceptance_with_tmux(captures, titles, evidence):
 def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     """Idle staged feedback resumes only after the title becomes processing."""
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9205,7 +9205,7 @@ def test_feedback_state_change_is_logged(socket_path, make_lode, caplog):
     writer logs, and `via` names which one.
     """
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", stage="refine", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     with caplog.at_level(logging.INFO, logger="hopper.server"):
@@ -9241,6 +9241,7 @@ def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
             conn,
             captures=[None],
             titles=[],
+            text="y",
         )
 
     mock_spawn.assert_not_called()
@@ -9260,7 +9261,7 @@ def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
 def test_lode_send_feedback_paste_failure_remains_gated(socket_path, make_lode):
     """A failed paste is proven not sent and remains gated."""
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9285,7 +9286,7 @@ def test_lode_send_feedback_paste_failure_remains_gated(socket_path, make_lode):
 
 def test_lode_send_feedback_changed_input_after_paste_failure_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9313,7 +9314,7 @@ def test_lode_send_feedback_changed_input_after_paste_failure_is_unverified(sock
 def test_lode_send_feedback_pane_disappears_after_paste(socket_path, make_lode):
     """Pane death after paste has an unknown outcome and forbids blind replay."""
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9356,7 +9357,7 @@ def test_lode_send_feedback_missing_lode(socket_path):
 
 def test_gate_feedback_waits_for_idle_before_touching_pane(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
     actions = []
 
@@ -9395,7 +9396,7 @@ def test_gate_feedback_waits_for_idle_before_touching_pane(socket_path, make_lod
 
 def test_gate_feedback_pane_lost_while_waiting_for_idle_is_unavailable(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, mock_title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9421,7 +9422,7 @@ def test_gate_feedback_pane_lost_while_waiting_for_idle_is_unavailable(socket_pa
 def test_gate_feedback_busy_for_entire_idle_wait_never_touches_pane(socket_path, make_lode, caplog):
     """A continuously processing pane exhausts the idle wait as busy."""
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     with caplog.at_level(logging.WARNING, logger="hopper.server"):
@@ -9444,7 +9445,7 @@ def test_gate_feedback_busy_for_entire_idle_wait_never_touches_pane(socket_path,
 
 def test_gate_feedback_circle_processing_title_reports_busy(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, mock_title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9470,7 +9471,7 @@ def test_gate_feedback_identical_old_processing_title_is_frozen_after_idle_wait(
     srv.lodes = [
         make_lode(
             id="test-id",
-            state="gated",
+            state="running",
             tmux_pane="%1",
             pane_title_observation={"title": "⠐ Working", "observed_at": observed_at},
         )
@@ -9503,7 +9504,7 @@ def test_gate_feedback_circle_processing_title_past_threshold_is_frozen(socket_p
     srv.lodes = [
         make_lode(
             id="test-id",
-            state="gated",
+            state="running",
             tmux_pane="%1",
             pane_title_observation={"title": "◐ Working", "observed_at": observed_at},
         )
@@ -9532,7 +9533,7 @@ def test_gate_feedback_old_idle_title_still_delivers(socket_path, make_lode):
     srv.lodes = [
         make_lode(
             id="test-id",
-            state="gated",
+            state="running",
             tmux_pane="%1",
             pane_title_observation={"title": "✳ Ready", "observed_at": observed_at},
         )
@@ -9568,7 +9569,7 @@ def test_gate_feedback_old_unknown_title_remains_unknown(socket_path, make_lode)
     srv.lodes = [
         make_lode(
             id="test-id",
-            state="gated",
+            state="running",
             tmux_pane="%1",
             pane_title_observation={"title": unknown_title, "observed_at": observed_at},
         )
@@ -9597,7 +9598,7 @@ def test_gate_feedback_changed_title_resets_observation_and_keeps_polling(socket
     srv.lodes = [
         make_lode(
             id="test-id",
-            state="gated",
+            state="running",
             tmux_pane="%1",
             pane_title_observation={"title": "⠂ Working", "observed_at": 1_000},
         )
@@ -9628,7 +9629,7 @@ def test_gate_feedback_processing_then_unknown_remains_busy_and_never_touches_pa
 ):
     """PROCESSING followed by UNKNOWN remains idle_timeout because processing was seen."""
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, mock_title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
@@ -9649,7 +9650,7 @@ def test_gate_feedback_processing_then_unknown_remains_busy_and_never_touches_pa
 
 def test_gate_feedback_auto_submit_accepts_without_enter(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9669,7 +9670,7 @@ def test_gate_feedback_placeholder_is_staged_not_accepted(socket_path, make_lode
     # Constructed from prep-verified U+2500 rules, U+276F prompt, and U+00A0 spacing.
     placeholder = "───\n❯ [Pasted text #1 +40 lines]\n───\n"
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, _paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9928,7 +9929,7 @@ def test_pane_acceptance_unchanged_selector_times_out():
 
 def test_gate_feedback_empty_settle_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, _paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9947,7 +9948,7 @@ def test_gate_feedback_empty_settle_is_unverified(socket_path, make_lode):
 
 def test_gate_feedback_enter_failure_keeps_staged_text(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, _paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9966,7 +9967,7 @@ def test_gate_feedback_enter_failure_keeps_staged_text(socket_path, make_lode):
 
 def test_gate_feedback_capture_change_with_same_staged_input_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
     # Constructed from the staged fixture by appending a visible pane-change marker.
     changed_capture = _IDLE_STAGED_CAPTURE + "pane changed\n"
@@ -9986,7 +9987,7 @@ def test_gate_feedback_capture_change_with_same_staged_input_is_unverified(socke
 
 def test_gate_feedback_pane_lost_after_enter_is_unverified(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, _title, _paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -10027,11 +10028,17 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
         "choice_submit_failed",
     }
 
-    assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == shared | choice_only
-    assert set(hopper_server._GATE_FEEDBACK_MESSAGES) == shared
+    character_only = {
+        "gated_body_refused",
+        "character_failed",
+        "character_failed_unknown",
+    }
+    assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == shared | choice_only | character_only
+    assert set(hopper_server._GATE_FEEDBACK_MESSAGES) == shared | character_only
     assert set(hopper_server._PANE_INPUT_MESSAGES) == shared | choice_only
     assert hopper_server._ACCEPTED_DELIVERY_REASONS == {
         "auto_submitted",
+        "character_sent",
         "composer_cleared",
         "enter_accepted",
         "selector_changed",
@@ -10042,6 +10049,7 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
         "pane_state_unknown",
         "pane_frozen",
         "pane_awaiting_choice",
+        "gated_body_refused",
     }
 
 
@@ -10123,9 +10131,179 @@ def test_preexisting_gate_feedback_failure_contracts_stay_unchanged():
     assert rendered == expected
 
 
-def test_gate_feedback_unknown_pane_state_never_touches_pane(socket_path, make_lode):
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("y", "y"),
+        ("y\n", "y"),
+        ("y\r\n", "y"),
+        ("1", "1"),
+        ("-", "-"),
+        (" yes", None),
+        ("y ", None),
+        ("yes", None),
+        ("\n", None),
+        ("", None),
+        (None, None),
+        (1, None),
+    ],
+)
+def test_single_character_payload_classifies_stdin_and_bodies(text, expected):
+    assert hopper_server._single_character_payload(text) == expected
+
+
+def test_gated_feedback_refuses_a_body_without_touching_the_pane(socket_path, make_lode):
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, mock_title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[_PROCESSING_CAPTURE] * 13,
+        titles=["⠐ Working"] * 12,
+        text="approved, ship it",
+    )
+
+    mock_title.assert_not_called()
+    mock_paste.assert_not_called()
+    mock_send.assert_not_called()
+    mock_sleep.assert_not_called()
+    assert srv.lodes[0]["state"] == "gated"
+    assert srv.lodes[0]["status"] == (
+        "Feedback blocked: gated lode accepts only a single character"
+    )
+    assert "gate_epoch" not in srv.lodes[0]
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert response["outcome"] == "gated_character_only"
+    assert "only sends a single character" in response["error"]
+    assert "hop gate feedback test-id y" in response["error"]
+    assert "Nothing was pasted or submitted" in response["error"]
+    assert "tail" not in response
+
+
+def test_gated_feedback_sends_a_character_to_a_busy_pane_without_idle_wait(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, mock_title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[_PROCESSING_CAPTURE],
+        titles=["⠐ Working"],
+        text="y\n",
+    )
+
+    mock_paste.assert_not_called()
+    mock_send.assert_called_once_with("%1", "y", literal=True)
+    mock_sleep.assert_not_called()
+    assert mock_title.call_count == 1
+    assert srv.lodes[0]["state"] == "running"
+    assert srv.lodes[0]["status"] == "Character sent"
+    assert srv.lodes[0]["gate_epoch"] == 1
+    response = _decode_mock_response(conn)
+    assert response["type"] == "feedback_sent"
+    assert response["character"] is True
+    assert response["tmux_pane"] == "%1"
+
+
+def test_gated_feedback_character_send_failure_stays_gated(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, _title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[_PROCESSING_CAPTURE, _PROCESSING_CAPTURE],
+        titles=["⠐ Working"],
+        text="y",
+        submit=False,
+    )
+
+    mock_paste.assert_not_called()
+    mock_send.assert_called_once_with("%1", "y", literal=True)
+    mock_sleep.assert_not_called()
+    assert srv.lodes[0]["state"] == "gated"
+    assert srv.lodes[0]["status"] == "Feedback not sent; gate remains blocked"
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "not_sent"
+    assert "could not deliver it" in response["error"]
+    assert "Retry the same single-character send" in response["error"]
+
+
+def test_gated_feedback_unknown_pane_refuses_a_character_without_sending(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, _title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[_PROCESSING_CAPTURE],
+        titles=["_ Land native skills port to main"],
+        text="y",
+    )
+
+    mock_paste.assert_not_called()
+    mock_send.assert_not_called()
+    mock_sleep.assert_not_called()
+    assert srv.lodes[0]["state"] == "gated"
+    assert "gate_epoch" not in srv.lodes[0]
+    assert _decode_mock_response(conn)["outcome"] == "pane_state_unknown"
+
+
+def test_gated_feedback_idle_character_submits_without_paste(socket_path, make_lode):
+    staged = "─────\n❯ y\n─────\n"
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[_IDLE_EMPTY_CAPTURE, staged, _PROCESSING_CAPTURE],
+        titles=["✳ Ready", "✳ Ready", "⠐ Working"],
+        text="y",
+    )
+
+    mock_paste.assert_not_called()
+    mock_send.assert_any_call("%1", "y", literal=True)
+    mock_send.assert_any_call("%1", "Enter")
+    assert srv.lodes[0]["state"] == "running"
+    response = _decode_mock_response(conn)
+    assert response["type"] == "feedback_sent"
+    assert "character" not in response
+
+
+def test_ungated_feedback_still_pastes_a_body(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
+    conn = _mock_client(srv)
+
+    _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
+        srv,
+        conn,
+        captures=[
+            _IDLE_EMPTY_CAPTURE,
+            _IDLE_EMPTY_CAPTURE,
+            _IDLE_STAGED_CAPTURE,
+            _PROCESSING_CAPTURE,
+        ],
+        titles=["✳ Ready", "✳ Ready", "⠐ Working"],
+        text="Looks good",
+    )
+
+    mock_paste.assert_called_once_with("%1", "Looks good")
+    mock_send.assert_called_once_with("%1", "Enter")
+    assert _decode_mock_response(conn)["type"] == "feedback_sent"
+
+
+def test_gate_feedback_unknown_pane_state_never_touches_pane(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     _capture, mock_title, mock_paste, mock_send, mock_sleep = _handle_delivery_with_tmux(
@@ -10155,7 +10333,7 @@ def test_gate_feedback_missing_title_reports_no_title_without_touching_pane(
 ):
     """A None title remains UNKNOWN and is rendered distinctly in messages and logs."""
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
 
     with caplog.at_level(logging.WARNING, logger="hopper.server"):
@@ -10448,7 +10626,7 @@ def test_send_pane_input_round_trips_over_real_server_socket(
 @pytest.mark.parametrize("reason", ["composer_cleared", "selector_changed"])
 def test_gate_feedback_handler_accepts_consumed_input_reasons(socket_path, make_lode, reason):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
     attempt_result = {
         "reason": reason,
@@ -10468,7 +10646,7 @@ def test_gate_feedback_handler_accepts_consumed_input_reasons(socket_path, make_
 
 def test_feedback_epoch_rejects_stale_resume(socket_path, make_lode, caplog):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%1")]
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1")]
     conn = _mock_client(srv)
     _handle_delivery_with_tmux(
         srv,

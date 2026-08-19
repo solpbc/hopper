@@ -630,6 +630,17 @@ class TestSendKeys:
                 text=True,
             )
 
+    def test_sends_literal_keys_with_flag_and_end_of_options(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            result = send_keys("%1", "-", literal=True)
+            assert result is True
+            mock_run.assert_called_once_with(
+                ["tmux", "send-keys", "-l", "-t", "%1", "--", "-"],
+                capture_output=True,
+                text=True,
+            )
+
     def test_returns_false_when_command_fails(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value.returncode = 1

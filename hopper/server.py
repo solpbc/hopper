@@ -403,7 +403,13 @@ def _capture_worker_registration(source: dict, message: dict) -> dict:
 
 
 _ACCEPTED_DELIVERY_REASONS = frozenset(
-    {"auto_submitted", "composer_cleared", "enter_accepted", "selector_changed"}
+    {
+        "auto_submitted",
+        "character_sent",
+        "composer_cleared",
+        "enter_accepted",
+        "selector_changed",
+    }
 )
 _DELIVERY_FAILURE_OUTCOMES = {
     "pane_unavailable": "pane_unavailable",
@@ -425,6 +431,9 @@ _DELIVERY_FAILURE_OUTCOMES = {
     "submit_failed": "not_sent",
     "acceptance_timeout": "unverified",
     "pane_lost_after_submit": "unverified",
+    "gated_body_refused": "gated_character_only",
+    "character_failed": "not_sent",
+    "character_failed_unknown": "unverified",
 }
 _GATE_FEEDBACK_STATUSES = {
     "pane_unavailable": "Feedback blocked: pane unavailable",
@@ -434,6 +443,7 @@ _GATE_FEEDBACK_STATUSES = {
     "pane_state_unknown": "Feedback blocked: pane state unrecognized",
     "pane_frozen": "Feedback blocked: pane appears frozen",
     "awaiting_choice": "Feedback blocked: pane awaiting a numbered choice",
+    "gated_character_only": ("Feedback blocked: gated lode accepts only a single character"),
 }
 _GATE_FEEDBACK_MESSAGES = {
     "pane_unavailable": (
@@ -503,6 +513,21 @@ _GATE_FEEDBACK_MESSAGES = {
         "resume {lode_id}`, then inspect with `hop lode peek {lode_id}` before deciding "
         "whether to retry; do not paste the feedback again unless the pane proves it was "
         "not accepted or staged."
+    ),
+    "gated_body_refused": (
+        "Feedback was not sent because lode {lode_id} is gated, and while gated "
+        "hop gate feedback only sends a single character. Nothing was pasted or "
+        "submitted. Retry with exactly one character, for example: "
+        "hop gate feedback {lode_id} y"
+    ),
+    "character_failed": (
+        "The character was not sent because Hopper could not deliver it to pane {pane}. "
+        "Nothing was typed or submitted. Retry the same single-character send."
+    ),
+    "character_failed_unknown": (
+        "Hopper could not confirm the character reached pane {pane}. Some input may "
+        "have reached the pane. Inspect with `hop lode peek {lode_id}` before retrying; "
+        "do not send the character again unless the pane proves it was not accepted."
     ),
 }
 _PANE_INPUT_MESSAGES = {
@@ -611,8 +636,23 @@ _PRE_PASTE_REASONS = frozenset(
         "pane_state_unknown",
         "pane_frozen",
         "pane_awaiting_choice",
+        "gated_body_refused",
     }
 )
+
+
+def _single_character_payload(text: object) -> str | None:
+    """Return the character when `text` is a one-character send, else None.
+
+    A trailing CR/LF from stdin or `echo` does not count. Any other surrounding
+    whitespace makes this a body, not a character.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.rstrip("\r\n")
+    if len(stripped) == 1:
+        return stripped
+    return None
 
 
 class ServerLockHeld(RuntimeError):
@@ -933,22 +973,136 @@ def _attempt_pane_delivery(
     )
 
 
+def _attempt_character_delivery(
+    pane_id: str | None,
+    char: str,
+    *,
+    pane_title_observation: dict | None = None,
+) -> dict:
+    """Send one character without waiting for the pane to go idle."""
+    observed_title = None
+    if not pane_id:
+        return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
+
+    latest_capture = capture_pane(pane_id, plain=True)
+    if latest_capture is None:
+        return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
+
+    observed_title = pane_title(pane_id)
+    phase = classify_pane_phase(observed_title)
+    if phase is PanePhase.UNKNOWN:
+        return {
+            "reason": "pane_state_unknown",
+            "capture": latest_capture,
+            "title": observed_title,
+        }
+    if phase is PanePhase.IDLE and pane_needs_answer(latest_capture):
+        return {
+            "reason": "pane_awaiting_choice",
+            "capture": latest_capture,
+            "title": observed_title,
+        }
+    if phase is PanePhase.PROCESSING:
+        if _observe_processing_pane_title(observed_title, pane_title_observation):
+            return {
+                "reason": "pane_frozen",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+    elif pane_title_observation is not None:
+        pane_title_observation.clear()
+
+    if not send_keys(pane_id, char, literal=True):
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return {
+                "reason": "character_failed_unknown",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        return {
+            "reason": "character_failed",
+            "capture": capture,
+            "title": observed_title,
+        }
+
+    if phase is PanePhase.PROCESSING:
+        return {
+            "reason": "character_sent",
+            "capture": latest_capture,
+            "title": observed_title,
+        }
+
+    staged_input = None
+    for _ in range(_FEEDBACK_SETTLE_POLL_COUNT):
+        time.sleep(_FEEDBACK_POLL_INTERVAL)
+        capture = capture_pane(pane_id, plain=True)
+        if capture is None:
+            return {
+                "reason": "pane_lost_after_paste",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        latest_capture = capture
+        observed_title = pane_title(pane_id)
+        settle_phase = classify_pane_phase(observed_title)
+        if settle_phase is PanePhase.PROCESSING:
+            return {
+                "reason": "auto_submitted",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        post_delivery_input = read_pane_input(latest_capture)
+        if settle_phase is PanePhase.IDLE and post_delivery_input:
+            staged_input = post_delivery_input
+            break
+    else:
+        return {
+            "reason": "paste_not_staged",
+            "capture": latest_capture,
+            "title": observed_title,
+        }
+
+    if not send_keys(pane_id, "Enter"):
+        return {
+            "reason": "submit_failed",
+            "capture": latest_capture,
+            "title": observed_title,
+        }
+
+    assert staged_input is not None
+    return _observe_pane_acceptance(
+        pane_id,
+        latest_capture,
+        observed_title,
+        ("composer", staged_input),
+    )
+
+
 def _deliver_pane_input(
     lode_id: str,
     pane_id: str | None,
     text: str,
     *,
     paste: bool,
+    character: bool = False,
     pane_title_observation: dict | None = None,
 ) -> dict:
     """Deliver pane input and emit exactly one outcome record."""
     try:
-        result = _attempt_pane_delivery(
-            pane_id,
-            text,
-            paste=paste,
-            pane_title_observation=pane_title_observation,
-        )
+        if character:
+            result = _attempt_character_delivery(
+                pane_id,
+                text,
+                pane_title_observation=pane_title_observation,
+            )
+        else:
+            result = _attempt_pane_delivery(
+                pane_id,
+                text,
+                paste=paste,
+                pane_title_observation=pane_title_observation,
+            )
     except Exception:
         logger.warning(
             "Pane delivery failed lode=%s pane=%s reason=%s outcome=%s title=%s",
@@ -985,7 +1139,14 @@ def _deliver_pane_input(
     return result
 
 
-def _deliver_lode_pane_input(lodes: list[dict], lode: dict, text: str, *, paste: bool) -> dict:
+def _deliver_lode_pane_input(
+    lodes: list[dict],
+    lode: dict,
+    text: str,
+    *,
+    paste: bool,
+    character: bool = False,
+) -> dict:
     """Deliver input and persist only cross-attempt pane-title evidence."""
     prior_observation = lode.get("pane_title_observation")
     observation = dict(prior_observation) if isinstance(prior_observation, dict) else {}
@@ -994,6 +1155,7 @@ def _deliver_lode_pane_input(lodes: list[dict], lode: dict, text: str, *, paste:
         lode.get("tmux_pane"),
         text,
         paste=paste,
+        character=character,
         pane_title_observation=observation,
     )
     updated_observation = observation or None
@@ -5816,7 +5978,19 @@ class Server:
                 return
 
             pane_id = lode.get("tmux_pane")
-            result = _deliver_lode_pane_input(self.lodes, lode, text, paste=True)
+            character = _single_character_payload(text)
+            if lode.get("state") == "gated" and character is None:
+                result = {
+                    "reason": "gated_body_refused",
+                    "capture": None,
+                    "title": None,
+                }
+            elif character is not None:
+                result = _deliver_lode_pane_input(
+                    self.lodes, lode, character, paste=False, character=True
+                )
+            else:
+                result = _deliver_lode_pane_input(self.lodes, lode, text, paste=True)
             reason = result["reason"]
             accepted = reason in _ACCEPTED_DELIVERY_REASONS
             paste_attempted = reason not in _PRE_PASTE_REASONS
@@ -5825,7 +5999,7 @@ class Server:
 
             if accepted:
                 state = "running"
-                status = "Feedback accepted"
+                status = "Character sent" if reason == "character_sent" else "Feedback accepted"
             else:
                 outcome = _DELIVERY_FAILURE_OUTCOMES[reason]
                 status = _GATE_FEEDBACK_STATUSES[outcome]
@@ -5842,6 +6016,8 @@ class Server:
                         "lode_id": lode_id,
                         "tmux_pane": pane_id,
                     }
+                    if reason == "character_sent":
+                        response["character"] = True
                 else:
                     response = {
                         "type": "error",

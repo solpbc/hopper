@@ -580,19 +580,29 @@ def get_current_pane_id() -> str | None:
     return os.environ.get("TMUX_PANE") or None
 
 
-def send_keys(target: str, keys: str) -> bool:
+def send_keys(target: str, keys: str, *, literal: bool = False) -> bool:
     """Send keys to a tmux pane.
 
     Args:
         target: The tmux target (pane ID like "%1" or window ID like "@1").
         keys: The keys to send (e.g., "C-d" for Ctrl-D).
+        literal: If True, send `keys` as literal characters (`tmux send-keys -l`)
+            rather than as a named key. Required for a single-character payload
+            so `-` is not parsed as a flag and `C` is the letter C.
 
     Returns:
         True if the command succeeded, False otherwise.
     """
+    cmd = ["tmux", "send-keys"]
+    if literal:
+        cmd.append("-l")
+    cmd.extend(["-t", target])
+    if literal:
+        cmd.append("--")
+    cmd.append(keys)
     try:
         result = subprocess.run(
-            ["tmux", "send-keys", "-t", target, keys],
+            cmd,
             capture_output=True,
             text=True,
         )
