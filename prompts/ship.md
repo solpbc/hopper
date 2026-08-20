@@ -67,7 +67,9 @@ hop check --allow-capture -- make ci
 
 Do **not** pipe validation straight through a pager yourself. `make ci 2>&1 | tail -30` reports `tail`'s exit code, not make's, so a red build silently looks green. If you ever must hand-build such a pipeline instead of using `hop check`, prefix it with `set -o pipefail`, or capture to a file and check `$?` explicitly.
 
-If tests fail due to rebase conflicts you resolved, fix the issues and amend the relevant commit. If tests were already failing on the feature branch before rebase, note it but proceed.
+If tests fail due to rebase conflicts you resolved, fix the issues and amend the relevant commit.
+
+A non-zero gate after rebase **blocks landing**. Confirming the same red on bare `origin/main`, or that this branch did not touch the failing file, is the diagnosis — not a license to merge. Do not land. Gate with the failing suite named, and stop. Ship does not restore an inherited red; that is out of scope for this stage. The next ship of any branch stays blocked until main's gate is actually green.
 
 ### 4. Land on main
 
@@ -133,12 +135,12 @@ Apply this same rule to every later failure. There is no attempt limit: a retry 
 Stop and gate on any of these:
 
 - A rebase conflict that cannot be resolved unambiguously (see step 2).
-- Validation fails for a reason attributable to the branch. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs; if the failure was already present on the feature branch before rebase, step 3's exception applies — note it and proceed. Gate only when neither applies.
+- Validation fails. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs. If the red already exists on `origin/main` or was already on the feature branch before rebase, that is still a failed check — gate, do not proceed. There is no pre-existing-failure exception.
 - The original repo is not on main or master and cannot be switched safely.
 - A merge or push failed while the remote base was unchanged.
 - The remote base cannot be fetched or read.
 - The four restore checks above do not all pass.
-- Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you cannot attribute to either exception above.
+- Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you have not already gated on.
 
 Losing a merge race is not a terminal condition. That list is deliberately open-ended at the end: gating is the only correct way to stop this stage short of a completed merge. Never end this stage by reporting a failure as prose — nothing reads the pane, so a prose report leaves the lode silently idle until it is parked as stuck.
 
