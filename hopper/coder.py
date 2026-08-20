@@ -7,7 +7,7 @@ import shutil
 import subprocess
 
 CODER_PROVIDERS = ("codex", "grok")
-DEFAULT_CODER_PROVIDER = "grok"
+DEFAULT_CODER_PROVIDER = "codex"
 CODER_CHECK_TIMEOUT_SEC = 5.0
 
 
@@ -78,6 +78,15 @@ def coder_failure_message(provider: str, event: dict) -> str | None:
     from hopper.grok import grok_failure_message
 
     return grok_failure_message(event)
+
+
+def coder_unavailable_message(provider: str, error: object) -> str:
+    """Return a provider-specific readiness failure message."""
+    provider = validate_coder_provider(provider)
+    diagnostic = (
+        error if isinstance(error, str) and error else "readiness check returned no diagnostic"
+    )
+    return f"{provider} unavailable: {diagnostic}"
 
 
 def coder_check(provider: str) -> dict:

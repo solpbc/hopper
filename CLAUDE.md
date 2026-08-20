@@ -10,7 +10,7 @@ Hopper manages multiple Claude Code sessions (called "lodes") through a terminal
 
 - **Lode** - A Claude Code instance with a unique ID, workflow stage, freeform state, active flag, and associated tmux window
 - **Stage** - Workflow position: "mill" (scoping), "refine" (implementing), or "ship" (merging back to main)
-- **Coder** - Per-lode refine-stage CLI (`grok` by default, or `codex`), selected only at creation
+- **Coder** - Per-lode refine-stage CLI (`codex` by default, or `grok`), selected only at creation
 - **Backlog** - Future work items with project and description
 
 ## Architecture
@@ -18,8 +18,9 @@ Hopper manages multiple Claude Code sessions (called "lodes") through a terminal
 Refine-stage coding dispatch stays deliberately small: `hopper/coder.py` selects
 the existing Codex wrapper or the Grok wrapper. Provider streams remain raw in
 stage event artifacts; `hopper/code.py` translates only provider events that map
-to the existing progress and command-heartbeat behavior. Do not add a generic
-event framework or pin a Grok model.
+to the existing progress and command-heartbeat behavior. Codex bootstrap and
+resume subprocesses are pinned to `gpt-5.6-terra` at `xhigh`; do not add a
+generic event framework or pin a Grok model.
 
 ```
 CLI (hop up)

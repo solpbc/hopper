@@ -212,8 +212,8 @@ def test_create_lode(temp_config):
     assert lode["spawn_disposition"] is None
     assert lode["archive_action_id"] is None
     assert lode["codex_thread_id"] is None
-    assert lode["coder"] == {"provider": "grok", "session_id": None}
-    assert lode_coder(lode) == ("grok", None)
+    assert "coder" not in lode
+    assert lode_coder(lode) == ("codex", None)
     assert lode["created_at"] > 0
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
@@ -238,12 +238,12 @@ def test_create_lode(temp_config):
     assert loaded[0]["project"] == "test-project"
 
 
-def test_create_lode_can_select_codex(temp_config):
-    lode = create_lode([], "test-project", coder_provider="codex")
+def test_create_lode_can_select_grok(temp_config):
+    lode = create_lode([], "test-project", coder_provider="grok")
 
-    assert "coder" not in lode
+    assert lode["coder"] == {"provider": "grok", "session_id": None}
     assert lode["codex_thread_id"] is None
-    assert lode_coder(lode) == ("codex", None)
+    assert lode_coder(lode) == ("grok", None)
 
 
 def test_create_lode_rejects_unknown_coder_before_writing(temp_config):
@@ -1008,7 +1008,7 @@ def test_grok_coder_session_roundtrips_and_codex_path_is_refused(temp_config, mo
     timestamps = iter((1000, 2000))
     monkeypatch.setattr("hopper.lodes.current_time_ms", lambda: next(timestamps))
     lodes_list = []
-    lode = create_lode(lodes_list, "test-project")
+    lode = create_lode(lodes_list, "test-project", coder_provider="grok")
     persisted_before = (temp_config / "active.jsonl").read_bytes()
     memory_before = json.loads(json.dumps(lodes_list))
 
@@ -1046,7 +1046,7 @@ def test_update_lode_codex_thread_preserves_legacy_field(temp_config):
 
 def test_update_lode_codex_thread_refuses_grok_without_mutation(temp_config):
     lodes_list = []
-    lode = create_lode(lodes_list, "test-project")
+    lode = create_lode(lodes_list, "test-project", coder_provider="grok")
     persisted_before = (temp_config / "active.jsonl").read_bytes()
     memory_before = json.loads(json.dumps(lodes_list))
 
@@ -1062,7 +1062,7 @@ def test_update_lode_coder_session_rejects_invalid_session_without_persisting(
     temp_config, session_id
 ):
     lodes_list = []
-    lode = create_lode(lodes_list, "test-project")
+    lode = create_lode(lodes_list, "test-project", coder_provider="grok")
     persisted_before = (temp_config / "active.jsonl").read_bytes()
     memory_before = json.loads(json.dumps(lodes_list))
 

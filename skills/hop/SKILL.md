@@ -36,7 +36,7 @@ Fix login timeout and add regression coverage
 EOF
 ```
 
-`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data. Grok is the default refine-stage coder; add `--coder codex` at creation time to select Codex for that lode. Hopper does not set a Grok model name, so Grok uses the authenticated account's current CLI default.
+`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data. Codex is the default refine-stage coder; add `--coder grok` at creation time to select Grok. Hopper pins Codex to `gpt-5.6-terra` with `xhigh` reasoning. Hopper does not set a Grok model name, so Grok uses the authenticated account's current CLI default.
 
 If `remote.<project>` has a pool and the project is disabled or absent locally,
 `hop implement <project>` probes every pool member concurrently, compares
@@ -75,12 +75,12 @@ equal to the reserved local-source name `local` are refused. `hop remote list
 complete pool. `hop remote set` refuses active local projects, so disable a
 moved project first.
 
-Pooled readiness depends on `hop project list --json` being installed on every
-remote host. A Codex lode also requires `hop coder check codex --json`; hosts without
-a runnable Codex CLI are excluded before selection. Upgrade the fleet after this
-version lands. An older host probes as unavailable; do not add a compatibility
-fallback. The remote install contract is `$HOME/.local/bin/hop`, installed by
-`make install-user`.
+Pooled readiness depends on `hop project list --json` and `hop coder check
+<provider> --json` for the explicitly selected coder on every remote host. Hosts
+without that runnable CLI are excluded before selection. Upgrade the fleet after
+this version lands. An older host probes as unavailable; do not add a
+compatibility fallback. The remote install contract is `$HOME/.local/bin/hop`,
+installed by `make install-user`.
 
 ## Waiting and monitoring
 

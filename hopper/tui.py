@@ -34,7 +34,7 @@ from textual.widgets.option_list import Option
 
 from hopper.backlog import BacklogItem
 from hopper.claude import switch_to_pane
-from hopper.coder import DEFAULT_CODER_PROVIDER, coder_check
+from hopper.coder import DEFAULT_CODER_PROVIDER, coder_check, coder_unavailable_message
 from hopper.git import get_diff_stat
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
@@ -1957,23 +1957,21 @@ class HopperApp(App):
                             }
                         )
                 else:
-                    if coder_provider != DEFAULT_CODER_PROVIDER:
-                        readiness = coder_check(coder_provider)
-                        if not readiness["ready"]:
-                            self.notify(
-                                f"{coder_provider.capitalize()} unavailable: {readiness['error']}",
-                                severity="error",
-                            )
-                            return
+                    readiness = coder_check(coder_provider)
+                    if not readiness["ready"]:
+                        self.notify(
+                            coder_unavailable_message(coder_provider, readiness.get("error")),
+                            severity="error",
+                        )
+                        return
                     if self.server:
                         message = {
                             "type": "lode_create",
                             "project": project.name,
                             "scope": scope,
                             "spawn": True,
+                            "coder_provider": coder_provider,
                         }
-                        if coder_provider != DEFAULT_CODER_PROVIDER:
-                            message["coder_provider"] = coder_provider
                         self.server.enqueue(message)
 
             self.push_screen(ScopeInputScreen(project.name), on_scope_entered)
@@ -2248,22 +2246,20 @@ class HopperApp(App):
                         }
                     )
             elif action == "promote":
-                if coder_provider != DEFAULT_CODER_PROVIDER:
-                    readiness = coder_check(coder_provider)
-                    if not readiness["ready"]:
-                        self.notify(
-                            f"{coder_provider.capitalize()} unavailable: {readiness['error']}",
-                            severity="error",
-                        )
-                        return
+                readiness = coder_check(coder_provider)
+                if not readiness["ready"]:
+                    self.notify(
+                        coder_unavailable_message(coder_provider, readiness.get("error")),
+                        severity="error",
+                    )
+                    return
                 if self.server:
                     message = {
                         "type": "lode_promote_backlog",
                         "item_id": item_id,
                         "scope": text,
+                        "coder_provider": coder_provider,
                     }
-                    if coder_provider != DEFAULT_CODER_PROVIDER:
-                        message["coder_provider"] = coder_provider
                     self.server.enqueue(message)
 
         self.push_screen(BacklogEditScreen(initial_text=item.description), on_edit_result)

@@ -844,13 +844,23 @@ def test_backlog_promote_success(capsys):
         with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.backlog.load_backlog", return_value=[item]):
                 with patch("hopper.backlog.find_by_prefix", return_value=item):
-                    with patch(
-                        "hopper.client.promote_backlog",
-                        return_value={"id": "newlode1"},
-                    ) as mock_promote:
+                    with (
+                        patch("hopper.cli.coder_check") as check,
+                        patch(
+                            "hopper.client.promote_backlog",
+                            return_value={"id": "newlode1"},
+                        ) as mock_promote,
+                    ):
+                        check.return_value = {
+                            "provider": "codex",
+                            "ready": True,
+                            "version": "test-ready",
+                            "error": "",
+                        }
                         assert cmd_backlog(["promote", "abc"]) == 0
 
-    mock_promote.assert_called_once_with(socket_path, "abc123", scope="", coder_provider="grok")
+    check.assert_called_once_with("codex")
+    mock_promote.assert_called_once_with(socket_path, "abc123", scope="", coder_provider="codex")
     out = capsys.readouterr().out
     assert "Promoted: newlode1" in out
 
@@ -867,7 +877,10 @@ def test_backlog_promote_with_scope(capsys):
                         "hopper.client.promote_backlog",
                         return_value={"id": "newlode1"},
                     ) as mock_promote:
-                        assert cmd_backlog(["promote", "abc", "custom", "scope"]) == 0
+                        assert (
+                            cmd_backlog(["promote", "abc", "custom", "scope", "--coder", "grok"])
+                            == 0
+                        )
 
     mock_promote.assert_called_once_with(
         socket_path, "abc123", scope="custom scope", coder_provider="grok"
@@ -884,6 +897,27 @@ def test_backlog_promote_not_found(capsys):
 
     out = capsys.readouterr().out
     assert "No unique backlog item matching" in out
+
+
+def test_backlog_promote_refuses_unavailable_default_before_socket_call(capsys):
+    item = _mock_backlog_item()
+    readiness = {
+        "provider": "codex",
+        "ready": False,
+        "version": "",
+        "error": "codex command not found",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.backlog.load_backlog", return_value=[item]),
+        patch("hopper.backlog.find_by_prefix", return_value=item),
+        patch("hopper.cli.coder_check", return_value=readiness),
+        patch("hopper.client.promote_backlog") as promote,
+    ):
+        assert cmd_backlog(["promote", "abc"]) == 1
+
+    promote.assert_not_called()
+    assert capsys.readouterr().out == "error: codex unavailable: codex command not found\n"
 
 
 def test_backlog_promote_requires_server(capsys):
@@ -1493,12 +1527,13 @@ def test_lode_create_happy(capsys):
                         assert cmd_lode(["create", "myproj"]) == 0
                     mock_create.assert_called_once()
                     assert mock_create.call_args.kwargs["spawn"] is True
+                    assert mock_create.call_args.kwargs["coder_provider"] == "codex"
     out = capsys.readouterr().out
     assert "abc12345" in out
     assert "myproj" in out
 
 
-def test_lode_create_can_select_codex(capsys):
+def test_lode_create_can_select_grok(capsys):
     from io import StringIO
 
     created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
@@ -1509,15 +1544,15 @@ def test_lode_create_can_select_codex(capsys):
         patch("hopper.git.dirty_status", return_value=""),
         patch(
             "hopper.cli.coder_check",
-            return_value={"provider": "codex", "ready": True, "version": "1.0.3", "error": ""},
+            return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
         ) as check,
         patch("hopper.client.create_lode", return_value=created_lode) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
-        assert cmd_lode(["create", "myproj", "--coder", "codex", "--json"]) == 0
+        assert cmd_lode(["create", "myproj", "--coder", "grok", "--json"]) == 0
 
-    check.assert_called_once_with("codex")
-    assert create.call_args.kwargs["coder_provider"] == "codex"
+    check.assert_called_once_with("grok")
+    assert create.call_args.kwargs["coder_provider"] == "grok"
     assert json.loads(capsys.readouterr().out) == {
         "id": "abc12345",
         "project": "myproj",
@@ -1525,7 +1560,16 @@ def test_lode_create_can_select_codex(capsys):
     }
 
 
-def test_lode_create_refuses_unavailable_codex_before_server_mutation(capsys):
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "codex command not found",
+        "version check failed: permission denied",
+        "version check failed: timed out after 5.0 seconds",
+        "version check failed: exit 7",
+    ],
+)
+def test_lode_create_refuses_unavailable_codex_before_server_mutation(capsys, diagnostic):
     from io import StringIO
 
     project = Project(path="/fake/repo", name="myproj")
@@ -1533,7 +1577,7 @@ def test_lode_create_refuses_unavailable_codex_before_server_mutation(capsys):
         "provider": "codex",
         "ready": False,
         "version": "",
-        "error": "codex command not found",
+        "error": diagnostic,
     }
     with (
         patch("hopper.projects.find_project", return_value=project),
@@ -1544,7 +1588,7 @@ def test_lode_create_refuses_unavailable_codex_before_server_mutation(capsys):
         assert cmd_lode(["create", "myproj", "--coder", "codex"]) == 1
 
     create.assert_not_called()
-    assert capsys.readouterr().out == "error: codex unavailable: codex command not found\n"
+    assert capsys.readouterr().out == f"error: codex unavailable: {diagnostic}\n"
 
 
 def test_codex_lode_create_does_not_report_success_when_server_refuses(capsys):
@@ -7627,6 +7671,8 @@ def test_explicit_host_create_bypasses_pool_selection(
             "implement",
             "journal",
             "--json",
+            "--coder",
+            "codex",
             "--originating-extro-sid",
             "",
         ],
@@ -7673,6 +7719,8 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
         "implement",
         "journal",
         "--json",
+        "--coder",
+        "codex",
         "--originating-extro-sid",
         "",
     ]
@@ -7809,6 +7857,7 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
             hopper_cli._run_authoritative_remote_create(
                 "selected.example",
                 ["implement", "journal"],
+                coder_provider="codex",
                 reason="remote.journal pool",
                 project="journal",
                 stdin_text=LONG_SCOPE,
@@ -7823,6 +7872,8 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
         "implement",
         "journal",
         "--json",
+        "--coder",
+        "codex",
         "--originating-extro-sid",
         "",
     ]
@@ -7856,6 +7907,7 @@ def test_authoritative_remote_create_buffers_success_until_route_is_cached(
             hopper_cli._run_authoritative_remote_create(
                 "selected.example",
                 ["implement", "journal"],
+                coder_provider="codex",
                 reason="remote.journal pool",
                 project="journal",
                 stdin_text=LONG_SCOPE,
@@ -7870,11 +7922,51 @@ def test_authoritative_remote_create_buffers_success_until_route_is_cached(
         "implement",
         "journal",
         "--json",
+        "--coder",
+        "codex",
         "--originating-extro-sid",
         "extro-session-1",
     ]
     assert observed == [("abcdefgh", "selected.example", "journal", "")]
     assert capsys.readouterr().out == "Created lode abcdefgh (journal) on selected.example\n"
+
+
+@pytest.mark.parametrize(
+    "provider_args",
+    [["--coder", "grok"], ["--coder=grok"]],
+    ids=["split", "equals"],
+)
+def test_authoritative_remote_create_does_not_duplicate_existing_coder_token(
+    emitted_create_json,
+    provider_args,
+):
+    result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
+    with (
+        patch("hopper.remote.run_remote", return_value=result) as create,
+        patch("hopper.remote.remember_lode"),
+    ):
+        assert (
+            hopper_cli._run_authoritative_remote_create(
+                "selected.example",
+                ["implement", "journal", *provider_args],
+                coder_provider="grok",
+                reason="remote.journal pool",
+                project="journal",
+                stdin_text=LONG_SCOPE,
+                json_output=False,
+                unavailable_hosts=[],
+            )
+            == 0
+        )
+
+    assert create.call_args.args[1] == [
+        "implement",
+        "journal",
+        *provider_args,
+        "--json",
+        "--originating-extro-sid",
+        "",
+    ]
 
 
 def test_authoritative_remote_create_cache_failure_reports_explicit_recovery(
@@ -7890,6 +7982,7 @@ def test_authoritative_remote_create_cache_failure_reports_explicit_recovery(
             hopper_cli._run_authoritative_remote_create(
                 "selected.example",
                 ["implement", "journal"],
+                coder_provider="codex",
                 reason="remote.journal pool",
                 project="journal",
                 stdin_text=LONG_SCOPE,
@@ -7933,6 +8026,8 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
             "implement",
             "journal",
             "--json",
+            "--coder",
+            "codex",
             "--originating-extro-sid",
             "",
         ],

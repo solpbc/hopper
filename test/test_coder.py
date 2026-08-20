@@ -12,13 +12,26 @@ from hopper.coder import (
     DEFAULT_CODER_PROVIDER,
     bootstrap_coder,
     coder_check,
+    coder_unavailable_message,
     run_coder,
     validate_coder_provider,
 )
 
 
-def test_grok_is_the_default():
-    assert DEFAULT_CODER_PROVIDER == "grok"
+def test_codex_is_the_default():
+    assert DEFAULT_CODER_PROVIDER == "codex"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("codex command not found", "codex unavailable: codex command not found"),
+        ("", "codex unavailable: readiness check returned no diagnostic"),
+        (None, "codex unavailable: readiness check returned no diagnostic"),
+    ],
+)
+def test_coder_unavailable_message_always_names_provider_and_diagnostic(error, expected):
+    assert coder_unavailable_message("codex", error) == expected
 
 
 @pytest.mark.parametrize("provider", [None, "", "claude", 3])
@@ -67,6 +80,53 @@ def test_coder_check_reports_missing_executable():
         "ready": False,
         "version": "",
         "error": "grok command not found",
+    }
+
+
+def test_coder_check_reports_oserror_without_changing_contract():
+    with (
+        patch("hopper.coder.shutil.which", return_value="/usr/bin/codex"),
+        patch("hopper.coder.subprocess.run", side_effect=OSError("permission denied")),
+    ):
+        result = coder_check("codex")
+
+    assert result == {
+        "provider": "codex",
+        "ready": False,
+        "version": "",
+        "error": "version check failed: permission denied",
+    }
+
+
+def test_coder_check_reports_timeout_without_changing_contract():
+    timeout = subprocess.TimeoutExpired(["codex", "--version"], 5.0)
+    with (
+        patch("hopper.coder.shutil.which", return_value="/usr/bin/codex"),
+        patch("hopper.coder.subprocess.run", side_effect=timeout),
+    ):
+        result = coder_check("codex")
+
+    assert result == {
+        "provider": "codex",
+        "ready": False,
+        "version": "",
+        "error": f"version check failed: {timeout}",
+    }
+
+
+def test_coder_check_reports_nonzero_without_changing_contract():
+    completed = subprocess.CompletedProcess([], 7, stdout="", stderr="")
+    with (
+        patch("hopper.coder.shutil.which", return_value="/usr/bin/codex"),
+        patch("hopper.coder.subprocess.run", return_value=completed),
+    ):
+        result = coder_check("codex")
+
+    assert result == {
+        "provider": "codex",
+        "ready": False,
+        "version": "",
+        "error": "version check failed: exit 7",
     }
 
 

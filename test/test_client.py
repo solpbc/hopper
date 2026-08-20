@@ -108,17 +108,29 @@ def _exchange_with_responder(socket_path, responder, *, wait=True, timeout=0.2, 
     return result, requests[0]
 
 
-def test_default_coder_preserves_existing_create_wire_contract(monkeypatch, socket_path):
+def test_default_coder_is_explicit_on_create_wire_contract(monkeypatch, socket_path):
     sent = []
 
     def respond(_socket_path, message, **kwargs):
         sent.append((message, kwargs))
+        if message["type"] == "coder_capabilities":
+            return {"type": "coder_capabilities", "providers": ["codex", "grok"]}
         return {"type": "lode_created", "lode": {"id": "abc12345"}}
 
     monkeypatch.setattr("hopper.client.send_message", respond)
 
-    assert create_lode(socket_path, "project-a", "scope-a", spawn=False) == {"id": "abc12345"}
+    assert create_lode(
+        socket_path,
+        "project-a",
+        "scope-a",
+        spawn=False,
+        coder_provider="codex",
+    ) == {"id": "abc12345"}
     assert sent == [
+        (
+            {"type": "coder_capabilities"},
+            {"timeout": 5.0, "wait_for_response": True},
+        ),
         (
             {
                 "type": "lode_create",
@@ -126,28 +138,40 @@ def test_default_coder_preserves_existing_create_wire_contract(monkeypatch, sock
                 "scope": "scope-a",
                 "spawn": False,
                 "originating_extro_sid": None,
+                "coder_provider": "codex",
             },
             {"timeout": 5.0, "wait_for_response": True},
-        )
+        ),
     ]
 
 
-def test_default_coder_preserves_existing_backlog_promote_wire_contract(monkeypatch, socket_path):
+def test_default_coder_is_explicit_on_backlog_promote_wire_contract(monkeypatch, socket_path):
     sent = []
 
     def respond(_socket_path, message, **kwargs):
         sent.append((message, kwargs))
+        if message["type"] == "coder_capabilities":
+            return {"type": "coder_capabilities", "providers": ["codex", "grok"]}
         return {"type": "lode_promoted", "lode": {"id": "abc12345"}}
 
     monkeypatch.setattr("hopper.client.send_message", respond)
     monkeypatch.setattr("hopper.client.current_time_ms", lambda: 123)
 
-    assert promote_backlog(socket_path, "backlog1") == {"id": "abc12345"}
+    assert promote_backlog(socket_path, "backlog1", coder_provider="codex") == {"id": "abc12345"}
     assert sent == [
         (
-            {"type": "lode_promote_backlog", "item_id": "backlog1", "ts": 123},
+            {"type": "coder_capabilities"},
             {"timeout": 5.0, "wait_for_response": True},
-        )
+        ),
+        (
+            {
+                "type": "lode_promote_backlog",
+                "item_id": "backlog1",
+                "ts": 123,
+                "coder_provider": "codex",
+            },
+            {"timeout": 5.0, "wait_for_response": True},
+        ),
     ]
 
 

@@ -30,7 +30,12 @@ from hopper import __version__, config
 from hopper import deadline as deadline_utils
 from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
-from hopper.coder import CODER_PROVIDERS, DEFAULT_CODER_PROVIDER, coder_check
+from hopper.coder import (
+    CODER_PROVIDERS,
+    DEFAULT_CODER_PROVIDER,
+    coder_check,
+    coder_unavailable_message,
+)
 from hopper.lodes import (
     current_time_ms,
     format_age,
@@ -482,6 +487,7 @@ def _run_authoritative_remote_create(
     host: str,
     hop_args: list[str],
     *,
+    coder_provider: str,
     reason: str,
     project: str,
     stdin_text: str | None,
@@ -494,6 +500,8 @@ def _run_authoritative_remote_create(
     remote_args = list(hop_args)
     if "--json" not in remote_args:
         remote_args.append("--json")
+    if not any(arg == "--coder" or arg.startswith("--coder=") for arg in remote_args):
+        remote_args.extend(["--coder", coder_provider])
     remote_args.extend(["--originating-extro-sid", os.environ.get("EXTRO_SESSION") or ""])
     print(f"→ {host} ({reason})", file=sys.stderr)
     try:
@@ -1870,6 +1878,10 @@ def cmd_backlog(args: list[str]) -> int:
             return 1
 
         scope = " ".join(parsed.text[1:]) if len(parsed.text) > 1 else ""
+        readiness = coder_check(parsed.coder)
+        if not readiness["ready"]:
+            print(f"error: {coder_unavailable_message(parsed.coder, readiness.get('error'))}")
+            return 1
         lode = promote_backlog(_socket(), item.id, scope=scope, coder_provider=parsed.coder)
         if lode:
             print(f"Promoted: {lode['id']} [{item.project}] {scope or item.description}")
@@ -4167,11 +4179,10 @@ def cmd_lode(args: list[str]) -> int:
         if project.disabled:
             print(disabled_project_message(project))
             return 1
-        if parsed.coder != DEFAULT_CODER_PROVIDER:
-            readiness = coder_check(parsed.coder)
-            if not readiness["ready"]:
-                print(f"error: {parsed.coder} unavailable: {readiness['error']}")
-                return 1
+        readiness = coder_check(parsed.coder)
+        if not readiness["ready"]:
+            print(f"error: {coder_unavailable_message(parsed.coder, readiness.get('error'))}")
+            return 1
         if not parsed.force:
             from hopper.git import dirty_status
 
@@ -5269,9 +5280,11 @@ def _main() -> int:
         stdin_text = _stdin_for_remote(cmd, cmd_args)
         create_project = _extract_create_project(cmd, cmd_args)
         if create_project is not None:
+            coder_provider = _extract_create_coder(cmd, cmd_args)
             return _run_authoritative_remote_create(
                 explicit_host,
                 [cmd, *cmd_args],
+                coder_provider=coder_provider,
                 reason=f"-H {explicit_host}",
                 project=create_project,
                 stdin_text=stdin_text,
@@ -5329,6 +5342,7 @@ def _main() -> int:
                 return _run_authoritative_remote_create(
                     selected.host,
                     [cmd, *cmd_args],
+                    coder_provider=coder_provider,
                     reason=f"remote.{project} pool",
                     project=project,
                     stdin_text=stdin_text,

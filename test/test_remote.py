@@ -558,6 +558,26 @@ def emitted_lode_inventory_json(monkeypatch, capsys, make_lode):
     return output
 
 
+def _successful_candidate_result(args, project_json, inventory_json):
+    """Return a successful response for each candidate-probe leg."""
+    if args == ["project", "list", "--json"]:
+        stdout = project_json
+    elif args == ["lode", "list", "--json"]:
+        stdout = inventory_json
+    elif args[:2] == ["coder", "check"] and args[3:] == ["--json"]:
+        stdout = json.dumps(
+            {
+                "provider": args[2],
+                "ready": True,
+                "version": "test-ready",
+                "error": "",
+            }
+        )
+    else:
+        raise AssertionError(f"unexpected candidate probe argv: {args}")
+    return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+
 def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
     emitted_project_json,
     emitted_lode_inventory_json,
@@ -566,10 +586,15 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
 
     def runner(host, args, *, timeout):
         calls.append((host, args, timeout))
-        stdout = emitted_project_json if args[0] == "project" else emitted_lode_inventory_json
-        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+        return _successful_candidate_result(args, emitted_project_json, emitted_lode_inventory_json)
 
-    probe = probe_candidate("ready.example", "journal", runner, monotonic=lambda: 0.0)
+    probe = probe_candidate(
+        "ready.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
 
     assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
     assert calls == [
@@ -581,6 +606,11 @@ def test_probe_candidate_accepts_real_local_json_and_counts_all_active_lodes(
         (
             "ready.example",
             ["lode", "list", "--json"],
+            REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
+        ),
+        (
+            "ready.example",
+            ["coder", "check", "codex", "--json"],
             REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC,
         ),
     ]
@@ -616,9 +646,19 @@ def test_codex_pool_probe_requires_provider_readiness_after_normal_checks(
     assert calls[-1][1] == ["coder", "check", "codex", "--json"]
 
 
-def test_codex_pool_probe_excludes_host_without_codex(
+@pytest.mark.parametrize(
+    "readiness_error",
+    [
+        "codex command not found",
+        "version check failed: permission denied",
+        "version check failed: timed out after 5.0 seconds",
+        "version check failed: exit 7",
+    ],
+)
+def test_codex_pool_probe_excludes_host_for_every_local_readiness_failure(
     emitted_project_json,
     emitted_lode_inventory_json,
+    readiness_error,
 ):
     def runner(_host, args, *, timeout):
         if args[0] == "project":
@@ -631,7 +671,7 @@ def test_codex_pool_probe_excludes_host_without_codex(
                     "provider": "codex",
                     "ready": False,
                     "version": "",
-                    "error": "codex command not found",
+                    "error": readiness_error,
                 }
             )
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
@@ -645,8 +685,86 @@ def test_codex_pool_probe_excludes_host_without_codex(
     )
 
     assert probe.eligible is False
-    assert "codex command not found" in probe.reason
+    assert "codex unavailable:" in probe.reason
+    assert readiness_error in probe.reason
     assert "hop -H missing.example coder check codex --json" in probe.reason
+    assert select_candidate([probe]) is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "diagnostic"),
+    [
+        ("malformed", "returned malformed JSON"),
+        ("nonzero", "exited 7: remote failed"),
+        ("transport", "transport failed: network down"),
+        ("timeout", "timed out"),
+    ],
+)
+def test_coder_probe_names_provider_and_diagnostic_for_every_command_failure(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+    failure,
+    diagnostic,
+):
+    def runner(host, args, *, timeout):
+        if args[0] != "coder":
+            return _successful_candidate_result(
+                args, emitted_project_json, emitted_lode_inventory_json
+            )
+        if failure == "malformed":
+            return subprocess.CompletedProcess([], 0, stdout="{", stderr="")
+        if failure == "nonzero":
+            return subprocess.CompletedProcess([], 7, stdout="", stderr="remote failed")
+        if failure == "transport":
+            raise OSError("network down")
+        raise subprocess.TimeoutExpired(["ssh", host], timeout)
+
+    probe = probe_candidate(
+        "bad.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
+
+    assert probe.eligible is False
+    assert probe.load is None
+    assert probe.reason.startswith("codex unavailable: readiness check")
+    assert diagnostic in probe.reason
+    assert "hop -H bad.example coder check codex --json" in probe.reason
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"provider": "grok", "ready": True, "version": "1", "error": ""},
+        {"provider": "codex", "ready": "yes", "version": "1", "error": ""},
+        {"provider": "codex", "ready": True, "version": 1, "error": ""},
+        {"provider": "codex", "ready": False, "version": "", "error": 1},
+    ],
+)
+def test_coder_probe_refuses_malformed_readiness_contract(
+    emitted_project_json,
+    emitted_lode_inventory_json,
+    payload,
+):
+    def runner(_host, args, *, timeout):
+        if args[0] == "coder":
+            return subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+        return _successful_candidate_result(args, emitted_project_json, emitted_lode_inventory_json)
+
+    probe = probe_candidate(
+        "bad.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
+
+    assert probe.eligible is False
+    assert probe.reason.startswith("codex unavailable: readiness check returned a malformed result")
+    assert "hop -H bad.example coder check codex --json" in probe.reason
 
 
 def test_probe_candidate_accepts_project_contract_superset(
@@ -660,12 +778,19 @@ def test_probe_candidate_accepts_project_contract_superset(
 
     def runner(_host, args, *, timeout):
         assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
-        stdout = (
-            json.dumps(project_payload) if args[0] == "project" else emitted_lode_inventory_json
+        return _successful_candidate_result(
+            args,
+            json.dumps(project_payload),
+            emitted_lode_inventory_json,
         )
-        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
-    probe = probe_candidate("ready.example", "journal", runner, monotonic=lambda: 0.0)
+    probe = probe_candidate(
+        "ready.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
 
     assert probe == CandidateProbe("ready.example", eligible=True, load=2, reason=None)
 
@@ -681,10 +806,15 @@ def test_probe_and_discovery_accept_lode_inventory_superset(
 
     def probe_runner(_host, args, *, timeout):
         assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
-        stdout = emitted_project_json if args[0] == "project" else inventory_json
-        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+        return _successful_candidate_result(args, emitted_project_json, inventory_json)
 
-    probe = probe_candidate("ready.example", "journal", probe_runner, monotonic=lambda: 0.0)
+    probe = probe_candidate(
+        "ready.example",
+        "journal",
+        probe_runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
     discoveries = discover_lodes(
         ["ready.example"],
         ["lode", "list", "--json"],
@@ -773,7 +903,13 @@ def test_probe_candidate_refuses_invalid_project_contract(project_payload, reaso
         assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
         return subprocess.CompletedProcess([], 0, stdout=json.dumps(project_payload), stderr="")
 
-    probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
+    probe = probe_candidate(
+        "bad.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
 
     assert probe.eligible is False
     assert probe.load is None
@@ -802,7 +938,13 @@ def test_probe_candidate_refuses_invalid_inventory_contract(
         stdout = emitted_project_json if args[0] == "project" else json.dumps(inventory)
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
-    probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
+    probe = probe_candidate(
+        "bad.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
 
     assert probe.eligible is False
     assert probe.load is None
@@ -829,10 +971,15 @@ def test_probe_candidate_classifies_every_command_failure(
             if failure == "transport":
                 raise OSError("network down")
             raise subprocess.TimeoutExpired(["ssh", host], timeout)
-        stdout = emitted_project_json if args[0] == "project" else emitted_lode_inventory_json
-        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+        return _successful_candidate_result(args, emitted_project_json, emitted_lode_inventory_json)
 
-    probe = probe_candidate("bad.example", "journal", runner, monotonic=lambda: 0.0)
+    probe = probe_candidate(
+        "bad.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: 0.0,
+    )
 
     assert probe.eligible is False
     assert probe.load is None
@@ -846,20 +993,30 @@ def test_probe_candidate_classifies_every_command_failure(
     assert calls[-1][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
 
 
-def test_probe_candidate_shares_deadline_between_both_calls(emitted_project_json):
+def test_probe_candidate_shares_eight_second_deadline_across_all_three_legs(
+    emitted_project_json,
+):
     calls = []
-    clock = iter([0.0, 7.5])
+    clock = iter([0.0, 2.0, 7.5])
 
     def runner(_host, args, *, timeout):
         calls.append((args, timeout))
-        stdout = emitted_project_json if args[0] == "project" else '{"lodes": []}'
-        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+        return _successful_candidate_result(args, emitted_project_json, '{"lodes": []}')
 
-    probe = probe_candidate("slow.example", "journal", runner, monotonic=lambda: next(clock))
+    probe = probe_candidate(
+        "slow.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: next(clock),
+    )
 
     assert probe.eligible is True
-    assert calls[0][1] == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
-    assert calls[1][1] == 0.5
+    assert calls == [
+        (["project", "list", "--json"], 8.0),
+        (["lode", "list", "--json"], 6.0),
+        (["coder", "check", "codex", "--json"], 0.5),
+    ]
 
 
 def test_probe_candidate_refuses_when_first_call_exhausts_shared_deadline(emitted_project_json):
@@ -870,7 +1027,13 @@ def test_probe_candidate_refuses_when_first_call_exhausts_shared_deadline(emitte
         calls.append((args, timeout))
         return subprocess.CompletedProcess([], 0, stdout=emitted_project_json, stderr="")
 
-    probe = probe_candidate("slow.example", "journal", runner, monotonic=lambda: next(clock))
+    probe = probe_candidate(
+        "slow.example",
+        "journal",
+        runner,
+        coder_provider="codex",
+        monotonic=lambda: next(clock),
+    )
 
     assert probe.eligible is False
     assert "deadline expired before lode inventory" in probe.reason
@@ -901,16 +1064,16 @@ def test_probe_candidates_runs_large_pool_concurrently(
             assert release.wait(timeout=2)
             if args[0] == "project":
                 assert timeout == REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
-                stdout = emitted_project_json
             else:
                 assert 0 < timeout <= REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC
-                stdout = emitted_lode_inventory_json
-            return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+            return _successful_candidate_result(
+                args, emitted_project_json, emitted_lode_inventory_json
+            )
         finally:
             with lock:
                 active -= 1
 
-    probes = probe_candidates(hosts, "journal", runner)
+    probes = probe_candidates(hosts, "journal", runner, coder_provider="codex")
 
     assert [probe.host for probe in probes] == hosts
     assert all(probe.eligible for probe in probes)
@@ -945,6 +1108,7 @@ def test_probe_candidates_pins_aggregate_deadline(monkeypatch):
         ["one.example", "two.example"],
         "journal",
         lambda *_args, **_kwargs: None,
+        coder_provider="codex",
         monotonic=lambda: 0.0,
     )
 
@@ -1025,6 +1189,14 @@ def test_pooled_create_probing_never_consumes_stdin_meant_for_the_create_call(
             return subprocess.CompletedProcess(
                 command, 0, stdout=json.dumps({"lodes": lodes}), stderr=""
             )
+        if hop_args[:2] == ["coder", "check"]:
+            payload = {
+                "provider": hop_args[2],
+                "ready": True,
+                "version": "test-ready",
+                "error": "",
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
         if hop_args[:2] == ["implement", "journal"]:
             created = {
                 "id": "abcdefgh",

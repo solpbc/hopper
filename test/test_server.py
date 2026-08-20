@@ -5421,6 +5421,7 @@ def test_lode_create_preserves_originating_extro_sid_over_socket(socket_path, se
         "scope-a",
         spawn=False,
         originating_extro_sid="extro-session-1",
+        coder_provider="codex",
     )
 
     assert created["originating_extro_sid"] == "extro-session-1"
@@ -5443,9 +5444,7 @@ def test_lode_create_persists_selected_grok_provider(socket_path, server, temp_c
     assert persisted["coder"] == {"provider": "grok", "session_id": None}
 
 
-def test_codex_create_refuses_before_mutation_when_server_lacks_provider_protocol(
-    tmp_path, monkeypatch
-):
+def test_create_refuses_before_mutation_when_server_lacks_provider_protocol(tmp_path, monkeypatch):
     calls = []
 
     def old_server_response(_socket_path, message, **_kwargs):
@@ -5467,7 +5466,7 @@ def test_codex_create_refuses_before_mutation_when_server_lacks_provider_protoco
 
 
 @pytest.mark.parametrize("providers", [None, "codex", [1]])
-def test_codex_create_refuses_malformed_provider_capabilities(tmp_path, monkeypatch, providers):
+def test_create_refuses_malformed_provider_capabilities(tmp_path, monkeypatch, providers):
     calls = []
 
     def malformed_response(_socket_path, message, **_kwargs):
@@ -5489,8 +5488,17 @@ def test_codex_create_refuses_malformed_provider_capabilities(tmp_path, monkeypa
     assert [message["type"] for message in calls] == ["coder_capabilities"]
 
 
-def test_lode_create_refuses_codex_before_durable_creation_when_cli_missing(
-    socket_path, server, temp_config
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "codex command not found",
+        "version check failed: permission denied",
+        "version check failed: timed out after 5.0 seconds",
+        "version check failed: exit 7",
+    ],
+)
+def test_lode_create_refuses_codex_before_durable_creation_when_readiness_fails(
+    socket_path, server, temp_config, diagnostic
 ):
     with patch(
         "hopper.server.coder_check",
@@ -5498,7 +5506,7 @@ def test_lode_create_refuses_codex_before_durable_creation_when_cli_missing(
             "provider": "codex",
             "ready": False,
             "version": "",
-            "error": "codex command not found",
+            "error": diagnostic,
         },
     ):
         created = request_lode_creation(
@@ -5512,6 +5520,90 @@ def test_lode_create_refuses_codex_before_durable_creation_when_cli_missing(
     assert created is None
     assert server.lodes == []
     assert (temp_config / "active.jsonl").read_text() == ""
+
+
+def test_lode_create_requires_explicit_provider_before_durable_write(socket_path, temp_config):
+    srv = Server(socket_path)
+    conn = _mock_client(srv)
+    active_path = temp_config / "active.jsonl"
+    assert not active_path.exists()
+
+    srv._handle_mutation(
+        {"type": "lode_create", "project": "project-a", "scope": "scope-a"},
+        conn,
+    )
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert response["error"] == "lode_create requires coder_provider"
+    assert srv.lodes == []
+    assert not active_path.exists()
+
+
+def test_lode_create_unready_response_uses_shared_provider_diagnostic(socket_path, temp_config):
+    srv = Server(socket_path)
+    conn = _mock_client(srv)
+    active_path = temp_config / "active.jsonl"
+    assert not active_path.exists()
+    readiness = {
+        "provider": "codex",
+        "ready": False,
+        "version": "",
+        "error": "codex command not found",
+    }
+
+    with patch("hopper.server.coder_check", return_value=readiness):
+        srv._handle_mutation(
+            {
+                "type": "lode_create",
+                "project": "project-a",
+                "scope": "scope-a",
+                "coder_provider": "codex",
+            },
+            conn,
+        )
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert response["error"] == "codex unavailable: codex command not found"
+    assert srv.lodes == []
+    assert not active_path.exists()
+
+
+def test_sender_explicit_codex_crosses_prior_grok_default_receiver(
+    socket_path, server, monkeypatch
+):
+    current_create = hopper_server.create_lode
+
+    def prior_default_create(
+        lodes,
+        project,
+        scope="",
+        *,
+        originating_extro_sid=None,
+        coder_provider="grok",
+    ):
+        return current_create(
+            lodes,
+            project,
+            scope,
+            originating_extro_sid=originating_extro_sid,
+            coder_provider=coder_provider,
+        )
+
+    monkeypatch.setattr(hopper_server, "create_lode", prior_default_create)
+
+    created = request_lode_creation(
+        socket_path,
+        "project-a",
+        "scope-a",
+        spawn=False,
+        coder_provider="codex",
+    )
+
+    assert created["codex_thread_id"] is None
+    assert "coder" not in created
+    assert "coder" not in server.lodes[0]
 
 
 def test_concurrent_lode_create_responses_are_causally_bound(
@@ -5568,6 +5660,7 @@ def test_concurrent_lode_create_responses_are_causally_bound(
             scope,
             spawn=False,
             timeout=5,
+            coder_provider="codex",
         )
 
     a_thread = threading.Thread(
@@ -5636,6 +5729,7 @@ def test_persistent_subscriber_and_one_shot_commands_are_isolated(socket_path, s
             scope,
             spawn=False,
             timeout=5,
+            coder_provider="codex",
         )
 
     threads = [
@@ -5668,7 +5762,15 @@ def test_lode_create_disabled_project_noop_without_conn(socket_path):
         patch("hopper.server.find_project", return_value=disabled),
         patch.object(srv, "broadcast") as mock_broadcast,
     ):
-        srv._handle_mutation({"type": "lode_create", "project": "P", "scope": "scope"}, None)
+        srv._handle_mutation(
+            {
+                "type": "lode_create",
+                "project": "P",
+                "scope": "scope",
+                "coder_provider": "codex",
+            },
+            None,
+        )
 
     assert srv.lodes == []
     assert not any(
@@ -6874,7 +6976,7 @@ def test_fresh_backlog_promotion_spawns_through_gate(socket_path):
         ),
         patch("hopper.server.spawn_claude", return_value=_spawned("%23")) as mock_spawn,
     ):
-        lode = server._promote_backlog_item(item)
+        lode = server._promote_backlog_item(item, coder_provider="codex")
 
     assert lode["tmux_pane"] == "%23"
     mock_spawn.assert_called_once_with(lode["id"], "/repo", foreground=False, env=ANY)
@@ -6891,7 +6993,13 @@ def test_fresh_lode_create_spawns_through_gate(socket_path):
         patch("hopper.server.spawn_claude", return_value=_spawned("%24")) as mock_spawn,
     ):
         server._handle_mutation(
-            {"type": "lode_create", "project": "proj", "scope": "work", "spawn": True},
+            {
+                "type": "lode_create",
+                "project": "proj",
+                "scope": "work",
+                "spawn": True,
+                "coder_provider": "codex",
+            },
             None,
         )
 
@@ -8207,7 +8315,7 @@ def test_promote_backlog_item_disabled_project_returns_none(socket_path):
         patch("hopper.server.spawn_claude") as mock_spawn,
         patch.object(srv, "broadcast") as mock_broadcast,
     ):
-        result = srv._promote_backlog_item(item)
+        result = srv._promote_backlog_item(item, coder_provider="codex")
 
     assert result is None
     assert srv.lodes == []
@@ -8268,7 +8376,12 @@ def test_lode_promote_backlog_disabled_sends_promote_error(socket_path):
         patch("hopper.server.spawn_claude") as mock_spawn,
     ):
         srv._handle_mutation(
-            {"type": "lode_promote_backlog", "item_id": "bl111111", "scope": ""},
+            {
+                "type": "lode_promote_backlog",
+                "item_id": "bl111111",
+                "scope": "",
+                "coder_provider": "codex",
+            },
             conn,
         )
 
@@ -8279,6 +8392,73 @@ def test_lode_promote_backlog_disabled_sends_promote_error(socket_path):
     assert srv.lodes == []
     assert srv.backlog == [item]
     mock_spawn.assert_not_called()
+
+
+def test_lode_promote_backlog_requires_explicit_provider_before_durable_write(
+    socket_path, temp_config
+):
+    srv = Server(socket_path)
+    item = BacklogItem(
+        id="bl111111",
+        project="P",
+        description="Promote me",
+        created_at=1000,
+    )
+    srv.backlog = [item]
+    conn = _mock_client(srv)
+    active_path = temp_config / "active.jsonl"
+    assert not active_path.exists()
+
+    srv._handle_mutation(
+        {"type": "lode_promote_backlog", "item_id": "bl111111"},
+        conn,
+    )
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "promote_error"
+    assert response["error"] == "lode_promote_backlog requires coder_provider"
+    assert srv.lodes == []
+    assert srv.backlog == [item]
+    assert not active_path.exists()
+
+
+def test_lode_promote_backlog_refuses_unready_default_before_durable_write(
+    socket_path, temp_config
+):
+    srv = Server(socket_path)
+    item = BacklogItem(
+        id="bl111111",
+        project="P",
+        description="Promote me",
+        created_at=1000,
+    )
+    srv.backlog = [item]
+    conn = _mock_client(srv)
+    active_path = temp_config / "active.jsonl"
+    assert not active_path.exists()
+    readiness = {
+        "provider": "codex",
+        "ready": False,
+        "version": "",
+        "error": "codex command not found",
+    }
+
+    with patch("hopper.server.coder_check", return_value=readiness):
+        srv._handle_mutation(
+            {
+                "type": "lode_promote_backlog",
+                "item_id": "bl111111",
+                "coder_provider": "codex",
+            },
+            conn,
+        )
+
+    response = _decode_mock_response(conn)
+    assert response["type"] == "promote_error"
+    assert response["error"] == "codex unavailable: codex command not found"
+    assert srv.lodes == []
+    assert srv.backlog == [item]
+    assert not active_path.exists()
 
 
 def test_auto_promote_backlog_on_ship_stage_uses_oldest(

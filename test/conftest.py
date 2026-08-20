@@ -23,6 +23,23 @@ def isolate_config(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def isolate_coder_readiness(monkeypatch):
+    """Keep creation tests independent of installed coder executables."""
+
+    def ready(provider):
+        return {
+            "provider": provider,
+            "ready": True,
+            "version": "test-ready",
+            "error": "",
+        }
+
+    monkeypatch.setattr("hopper.server.coder_check", ready)
+    monkeypatch.setattr("hopper.cli.coder_check", ready)
+    monkeypatch.setattr("hopper.tui.coder_check", ready)
+
+
 @pytest.fixture
 def temp_config(isolate_config):
     """Alias for isolate_config for tests that need the path.

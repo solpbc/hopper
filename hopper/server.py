@@ -46,8 +46,8 @@ from hopper.client import (
 )
 from hopper.coder import (
     CODER_PROVIDERS,
-    DEFAULT_CODER_PROVIDER,
     coder_check,
+    coder_unavailable_message,
     validate_coder_provider,
 )
 from hopper.git import delete_branch, is_dirty, remove_worktree
@@ -5316,7 +5316,8 @@ class Server:
         self,
         item: BacklogItem,
         scope: str = "",
-        coder_provider: str = DEFAULT_CODER_PROVIDER,
+        *,
+        coder_provider: str,
     ) -> dict | None:
         """Promote a backlog item to a lode. Returns the new lode dict."""
         proj = find_project(item.project)
@@ -5622,23 +5623,35 @@ class Server:
             self._repair_completion_output(message, conn)
 
         elif msg_type == "lode_create":
+            if "coder_provider" not in message:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {"type": "error", "error": "lode_create requires coder_provider"},
+                    )
+                return
             project = message.get("project", "")
             scope = message.get("scope", "")
             originating_extro_sid = message.get("originating_extro_sid")
             try:
-                coder_provider = validate_coder_provider(
-                    message.get("coder_provider", DEFAULT_CODER_PROVIDER)
-                )
+                coder_provider = validate_coder_provider(message["coder_provider"])
             except ValueError as error:
                 if conn:
                     self._send_response(conn, {"type": "error", "error": str(error)})
                 return
-            if coder_provider != DEFAULT_CODER_PROVIDER:
-                readiness = coder_check(coder_provider)
-                if not readiness["ready"]:
-                    if conn:
-                        self._send_response(conn, {"type": "error", "error": readiness["error"]})
-                    return
+            readiness = coder_check(coder_provider)
+            if not readiness["ready"]:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": coder_unavailable_message(
+                                coder_provider, readiness.get("error")
+                            ),
+                        },
+                    )
+                return
             proj = find_project(project)
             if proj and proj.disabled:
                 logger.warning("Refusing to create lode for disabled project %s", project)
@@ -6107,24 +6120,37 @@ class Server:
 
         elif msg_type == "lode_promote_backlog":
             # Compound: create lode from backlog item, remove backlog item
+            if "coder_provider" not in message:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "promote_error",
+                            "error": "lode_promote_backlog requires coder_provider",
+                        },
+                    )
+                return
             item_id = message.get("item_id", "")
             scope = message.get("scope", "")
             try:
-                coder_provider = validate_coder_provider(
-                    message.get("coder_provider", DEFAULT_CODER_PROVIDER)
-                )
+                coder_provider = validate_coder_provider(message["coder_provider"])
             except ValueError as error:
                 if conn:
                     self._send_response(conn, {"type": "promote_error", "error": str(error)})
                 return
-            if coder_provider != DEFAULT_CODER_PROVIDER:
-                readiness = coder_check(coder_provider)
-                if not readiness["ready"]:
-                    if conn:
-                        self._send_response(
-                            conn, {"type": "promote_error", "error": readiness["error"]}
-                        )
-                    return
+            readiness = coder_check(coder_provider)
+            if not readiness["ready"]:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "promote_error",
+                            "error": coder_unavailable_message(
+                                coder_provider, readiness.get("error")
+                            ),
+                        },
+                    )
+                return
             item = find_backlog_by_prefix(self.backlog, item_id)
             if not item:
                 if conn:
@@ -6134,7 +6160,7 @@ class Server:
                     )
             else:
                 try:
-                    lode = self._promote_backlog_item(item, scope, coder_provider)
+                    lode = self._promote_backlog_item(item, scope, coder_provider=coder_provider)
                     if lode and conn:
                         self._send_response(conn, {"type": "lode_promoted", "lode": lode})
                     elif conn:

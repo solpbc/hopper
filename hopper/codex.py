@@ -13,6 +13,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 CODEX_FLAGS = "--dangerously-bypass-approvals-and-sandbox"
+CODEX_MODEL = "gpt-5.6-terra"
+CODEX_REASONING_CONFIG = 'model_reasoning_effort="xhigh"'
 CODEX_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
 
 
@@ -52,7 +54,17 @@ def bootstrap_codex(
         (exit_code, thread_id, turn_failed_message) tuple. thread_id is None on failure.
         Exit code is 124 on timeout, 127 if codex not found, 130 on KeyboardInterrupt.
     """
-    cmd = ["codex", "exec", CODEX_FLAGS, "--json", prompt]
+    cmd = [
+        "codex",
+        "exec",
+        CODEX_FLAGS,
+        "-m",
+        CODEX_MODEL,
+        "-c",
+        CODEX_REASONING_CONFIG,
+        "--json",
+        prompt,
+    ]
 
     logger.debug(f"Bootstrapping codex session in {cwd}")
 
@@ -138,6 +150,10 @@ def run_codex(
         "codex",
         "exec",
         CODEX_FLAGS,
+        "-m",
+        CODEX_MODEL,
+        "-c",
+        CODEX_REASONING_CONFIG,
         "--json",
         "-o",
         output_file,

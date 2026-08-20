@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from hopper import deadline as deadline_utils
-from hopper.coder import DEFAULT_CODER_PROVIDER, validate_coder_provider
+from hopper.coder import validate_coder_provider
 from hopper.lodes import current_time_ms
 
 logger = logging.getLogger(__name__)
@@ -595,6 +595,28 @@ def read_archived_lodes(
     return lodes, total
 
 
+def _server_supports_coder_provider(
+    socket_path: Path,
+    coder_provider: str,
+    timeout: float,
+) -> bool:
+    """Return whether the server explicitly advertises one coder provider."""
+    capabilities = send_message(
+        socket_path,
+        {"type": "coder_capabilities"},
+        timeout=timeout,
+        wait_for_response=True,
+    )
+    if not isinstance(capabilities, dict):
+        return False
+    providers = capabilities.get("providers")
+    return bool(
+        capabilities.get("type") == "coder_capabilities"
+        and isinstance(providers, list)
+        and coder_provider in providers
+    )
+
+
 def create_lode(
     socket_path: Path,
     project: str,
@@ -603,34 +625,20 @@ def create_lode(
     timeout: float = 5.0,
     *,
     originating_extro_sid: str | None = None,
-    coder_provider: str = DEFAULT_CODER_PROVIDER,
+    coder_provider: str,
 ) -> dict | None:
     """Create a new lode via the server. Returns the created lode dict or None."""
     coder_provider = validate_coder_provider(coder_provider)
-    if coder_provider != DEFAULT_CODER_PROVIDER:
-        capabilities = send_message(
-            socket_path,
-            {"type": "coder_capabilities"},
-            timeout=timeout,
-            wait_for_response=True,
-        )
-        providers = capabilities.get("providers") if capabilities else None
-        if (
-            not capabilities
-            or capabilities.get("type") != "coder_capabilities"
-            or not isinstance(providers, list)
-            or coder_provider not in providers
-        ):
-            return None
+    if not _server_supports_coder_provider(socket_path, coder_provider, timeout):
+        return None
     message = {
         "type": "lode_create",
         "project": project,
         "scope": scope,
         "spawn": spawn,
         "originating_extro_sid": originating_extro_sid,
+        "coder_provider": coder_provider,
     }
-    if coder_provider != DEFAULT_CODER_PROVIDER:
-        message["coder_provider"] = coder_provider
     response = send_message(
         socket_path,
         message,
@@ -1173,17 +1181,18 @@ def promote_backlog(
     scope: str = "",
     timeout: float = 5.0,
     *,
-    coder_provider: str = DEFAULT_CODER_PROVIDER,
+    coder_provider: str,
 ) -> dict | None:
     """Promote a backlog item to a lode via the server. Returns the created lode dict or None."""
     coder_provider = validate_coder_provider(coder_provider)
+    if not _server_supports_coder_provider(socket_path, coder_provider, timeout):
+        return None
     msg: dict = {
         "type": "lode_promote_backlog",
         "item_id": item_id,
         "ts": current_time_ms(),
+        "coder_provider": coder_provider,
     }
-    if coder_provider != DEFAULT_CODER_PROVIDER:
-        msg["coder_provider"] = coder_provider
     if scope:
         msg["scope"] = scope
     response = send_message(socket_path, msg, timeout=timeout, wait_for_response=True)
