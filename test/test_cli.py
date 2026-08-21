@@ -1641,8 +1641,18 @@ def test_coder_default_query_reports_builtin_or_saved_value(
     assert capsys.readouterr().out == expected
 
 
-def test_coder_default_query_does_not_check_or_contact_server(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["hop", "coder", "default"])
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["hop", "coder", "default"], "codex (built in)\n"),
+        (["hop", "coder", "default", "grok"], "coder.default=grok\n"),
+    ],
+    ids=["query", "set"],
+)
+def test_coder_default_does_not_check_or_contact_server(
+    temp_config, monkeypatch, capsys, argv, expected
+):
+    monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(
         "hopper.cli.coder_check", lambda _provider: (_ for _ in ()).throw(AssertionError())
     )
@@ -1652,7 +1662,7 @@ def test_coder_default_query_does_not_check_or_contact_server(monkeypatch, capsy
 
     assert main() == 0
 
-    assert capsys.readouterr().out == "codex (built in)\n"
+    assert capsys.readouterr().out == expected
 
 
 def test_coder_default_set_writes_saved_provider(temp_config, monkeypatch, capsys):
@@ -1902,6 +1912,10 @@ def test_local_create_uses_saved_coder_default(temp_config, capsys):
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.projects.find_project", return_value=project),
         patch("hopper.git.dirty_status", return_value=""),
+        patch(
+            "hopper.cli.coder_check",
+            return_value={"provider": "grok", "ready": True, "version": "test", "error": ""},
+        ),
         patch("hopper.client.create_lode", return_value=created_lode) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
@@ -7849,6 +7863,40 @@ def test_explicit_coder_spelling_skips_default_config_read(
         "--originating-extro-sid",
         "",
     ]
+
+
+@pytest.mark.parametrize(
+    "provider_args",
+    [["--coder", "grok"], ["--coder=grok"]],
+    ids=["split", "equals"],
+)
+def test_explicit_local_coder_spelling_skips_default_config_read(
+    temp_config, monkeypatch, provider_args
+):
+    from io import StringIO
+
+    (temp_config / "config.json").write_text('{"coder.default": 42}\n')
+    project = Project(path="/fake/repo", name="myproj")
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    monkeypatch.setattr(sys, "argv", ["hop", "implement", "myproj", *provider_args])
+    monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
+    with (
+        patch(
+            "hopper.cli.resolve_coder_default",
+            side_effect=AssertionError("saved preference was consulted"),
+        ),
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch(
+            "hopper.cli.coder_check",
+            return_value={"provider": "grok", "ready": True, "version": "test", "error": ""},
+        ),
+        patch("hopper.client.create_lode", return_value=created_lode) as create,
+    ):
+        assert main() == 0
+
+    assert create.call_args.kwargs["coder_provider"] == "grok"
 
 
 def test_remote_coder_default_command_forwards_without_local_transaction(monkeypatch, capsys):

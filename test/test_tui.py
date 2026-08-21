@@ -758,6 +758,9 @@ def test_new_lode_resolves_default_for_each_opened_scope_dialog(temp_config, mon
     assert screens[1].coder_provider == "grok"
 
     path.write_text('{"coder.default": "codex"}\n')
+    callbacks[1](("A sufficiently detailed task scope", "start", screens[1].coder_provider))
+    assert server.events[-1]["coder_provider"] == "grok"
+
     app.action_new_lode()
     callbacks[2](project)
     assert screens[3].coder_provider == "codex"
