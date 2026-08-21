@@ -6,6 +6,7 @@
 import pytest
 
 from hopper import config
+from hopper.lodes import make_lode_stage_sessions, project_lode_claude_state
 
 
 @pytest.fixture(autouse=True)
@@ -70,8 +71,9 @@ def make_lode():
     """
 
     def _make(**overrides):
+        lode_id = overrides.get("id", "testid11")
         lode = {
-            "id": "testid11",
+            "id": lode_id,
             "stage": "mill",
             "created_at": 1000,
             "updated_at": 1000,
@@ -100,13 +102,18 @@ def make_lode():
             "pending_action": None,
             "action_results": [],
             "runs": overrides.get("runs", {}),
-            "claude": {
-                "mill": {"session_id": "00000000-0000-0000-0000-000000000001", "started": False},
-                "refine": {"session_id": "00000000-0000-0000-0000-000000000002", "started": False},
-                "ship": {"session_id": "00000000-0000-0000-0000-000000000003", "started": False},
-            },
+            "driver": "claude",
+            "stage_sessions": make_lode_stage_sessions(
+                lode_id,
+                {
+                    "mill": "00000000-0000-0000-0000-000000000001",
+                    "refine": "00000000-0000-0000-0000-000000000002",
+                    "ship": "00000000-0000-0000-0000-000000000003",
+                },
+            ),
             **overrides,
         }
+        project_lode_claude_state(lode)
         return lode
 
     return _make

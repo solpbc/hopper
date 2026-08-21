@@ -22,6 +22,7 @@ from hopper.lodes import (
     format_park_status,
     get_lode_dir,
     load_lodes,
+    lode_stage_session,
 )
 from hopper.projects import find_project
 from hopper.tmux import (
@@ -282,7 +283,7 @@ class BaseRunner:
     """
 
     # Subclasses set these to customize behavior
-    _claude_stage: str = ""  # Key into lode["claude"] dict ("mill", "refine", "ship")
+    _claude_stage: str = ""  # Interactive stage key ("mill", "refine", "ship")
 
     def __init__(
         self,
@@ -360,10 +361,10 @@ class BaseRunner:
                     print(f"Lode {self.lode_id} is already active")
                     return 1
 
-                # Read per-stage Claude session info
-                claude_info = lode_data.get("claude", {}).get(self._claude_stage, {})
-                self.claude_session_id = claude_info.get("session_id", "")
-                self.is_first_run = not claude_info.get("started", False)
+                # Read the canonical per-stage provider session info.
+                stage_session = lode_stage_session(lode_data, self._claude_stage)
+                self.claude_session_id = stage_session["provider_session_id"]
+                self.is_first_run = not stage_session["started"]
                 if self.is_first_run:
                     logger.debug(f"first run detected lode={self.lode_id}")
 

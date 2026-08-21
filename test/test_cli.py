@@ -79,6 +79,8 @@ from hopper.lodes import (
     format_terminal_failure_status,
     get_lode_dir,
     get_worktree_dir,
+    make_lode_stage_sessions,
+    project_lode_claude_state,
     save_lodes,
 )
 from hopper.projects import Project, load_projects, save_projects
@@ -94,6 +96,21 @@ from hopper.server import Server
 from hopper.tmux import Liveness
 
 LONG_SCOPE = "this is a stdin scope that is long enough to pass the minimum character validation"
+
+
+def _started_stage_lode(state: str = "new") -> dict:
+    """Return a valid lode snapshot with a started mill stage."""
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": state,
+        "active": False,
+        "driver": "claude",
+        "stage_sessions": make_lode_stage_sessions("test1234"),
+    }
+    lode["stage_sessions"]["mill"]["started"] = True
+    project_lode_claude_state(lode)
+    return lode
 
 
 @pytest.fixture(autouse=True)
@@ -2452,13 +2469,7 @@ def test_lode_restart_missing_id(capsys):
 
 def test_lode_restart_renders_server_started_stage_refusal(capsys):
     """Restart delegates the started-stage safety rule to the raw server boundary."""
-    lode = {
-        "id": "test1234",
-        "stage": "mill",
-        "state": "new",
-        "active": False,
-        "claude": {"mill": {"started": True}},
-    }
+    lode = _started_stage_lode()
     with (
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
@@ -2487,13 +2498,7 @@ def test_lode_restart_renders_server_started_stage_refusal(capsys):
 
 def test_lode_restart_force_proceeds_when_started(capsys):
     """Restart --force bypasses the started guard."""
-    lode = {
-        "id": "test1234",
-        "stage": "mill",
-        "state": "new",
-        "active": False,
-        "claude": {"mill": {"started": True}},
-    }
+    lode = _started_stage_lode()
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(
@@ -2513,13 +2518,7 @@ def test_lode_restart_force_proceeds_when_started(capsys):
 
 def test_lode_restart_error_proceeds_when_started_without_force(capsys):
     """An inactive failed stage can restart without forcing work discard."""
-    lode = {
-        "id": "test1234",
-        "stage": "mill",
-        "state": "error",
-        "active": False,
-        "claude": {"mill": {"started": True}},
-    }
+    lode = _started_stage_lode("error")
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.client.read_lode_snapshot", return_value=("found", lode)):
             with patch(

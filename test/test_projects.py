@@ -442,23 +442,34 @@ def test_rename_project_in_data(mock_config, git_dir):
     from hopper.lodes import (
         load_archived_lodes,
         load_lodes,
+        make_lode_stage_sessions,
+        project_lode_claude_state,
         save_archived_lodes,
         save_lodes,
     )
 
     add_project(str(git_dir))
 
+    def lode_record(lode_id, project, state):
+        record = {
+            "id": lode_id,
+            "project": project,
+            "state": state,
+            "driver": "claude",
+            "stage_sessions": make_lode_stage_sessions(lode_id),
+        }
+        project_lode_claude_state(record)
+        return record
+
     # Create active lodes
     active = [
-        {"id": "aaa", "project": "test-repo", "state": "running"},
-        {"id": "bbb", "project": "other", "state": "running"},
+        lode_record("aaa", "test-repo", "running"),
+        lode_record("bbb", "other", "running"),
     ]
     save_lodes(active)
 
     # Create archived lodes
-    archived = [
-        {"id": "ccc", "project": "test-repo", "state": "done"},
-    ]
+    archived = [lode_record("ccc", "test-repo", "done")]
     save_archived_lodes(archived)
 
     # Create backlog items

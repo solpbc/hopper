@@ -36,6 +36,9 @@ from hopper.client import create_lode as request_lode_creation
 from hopper.config import config_transaction
 from hopper.lodes import (
     format_terminal_failure_status,
+    lode_driver,
+    lode_stage_session,
+    project_lode_claude_state,
     save_archived_lodes,
     save_lodes,
 )
@@ -129,6 +132,12 @@ def _decode_mock_response(conn: MagicMock) -> dict:
     """Decode the last JSON response sent through a mocked socket."""
     payload = conn.sendall.call_args.args[0].decode("utf-8").strip()
     return json.loads(payload)
+
+
+def _mark_stage_started(lode: dict, stage: str, started: bool = True) -> None:
+    """Update a test lode's canonical session and compatibility projection together."""
+    lode_stage_session(lode, stage)["started"] = started
+    project_lode_claude_state(lode)
 
 
 def _mock_client(server: Server) -> MagicMock:
@@ -1571,7 +1580,7 @@ def test_restart_force_consent_is_enforced_at_raw_server_boundary(socket_path, m
         pid=101,
         run_generation=TEST_RUN_GENERATION,
     )
-    lode["claude"]["mill"]["started"] = safety == "started"
+    _mark_stage_started(lode, "mill", safety == "started")
     server.lodes = [lode]
     if safety == "registered":
         owner = _mock_client(server)
@@ -1776,8 +1785,8 @@ def test_restart_resets_stage_then_records_one_successor_spawn(socket_path, make
         run_generation=record["expected_generation"],
         pending_action=actions.pending_action_projection(record),
     )
-    lode["claude"]["mill"]["started"] = True
-    old_session = lode["claude"]["mill"]["session_id"]
+    _mark_stage_started(lode, "mill")
+    old_session = lode_stage_session(lode, "mill")["provider_session_id"]
     server.lodes = [lode]
 
     with (
@@ -1786,8 +1795,8 @@ def test_restart_resets_stage_then_records_one_successor_spawn(socket_path, make
     ):
         server._continue_action(record)
 
-    assert lode["claude"]["mill"]["started"] is False
-    assert lode["claude"]["mill"]["session_id"] != old_session
+    assert lode_stage_session(lode, "mill")["started"] is False
+    assert lode_stage_session(lode, "mill")["provider_session_id"] != old_session
     assert record["markers"]["containment"]["state"] == "done"
     assert record["markers"]["lode_mutation"]["state"] == "done"
     assert record["markers"]["spawn"]["state"] == "intent"
@@ -1916,7 +1925,7 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
         run_generation=record["expected_generation"],
         pending_action=actions.pending_action_projection(record),
     )
-    original_session = lode["claude"]["mill"]["session_id"]
+    original_session = lode_stage_session(lode, "mill")["provider_session_id"]
     worktree = temp_config / "worktrees" / lode["id"]
     worktree.mkdir(parents=True)
     artifact = worktree / "retained.txt"
@@ -1973,7 +1982,7 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     assert lode["pid"] == 101
     assert lode["oom_scope"] == record["ownership"]["unit"]["name"]
     assert lode["branch"] == "hopper-abcd2345"
-    assert lode["claude"]["mill"]["session_id"] == original_session
+    assert lode_stage_session(lode, "mill")["provider_session_id"] == original_session
     assert artifact.read_text() == "accepted work\n"
     assert blocked["result"] is None
     assert blocked["markers"]["lode_mutation"]["state"] == "not_started"
@@ -2023,7 +2032,7 @@ def test_forced_restart_cannot_publish_or_spawn_before_empty_proof(socket_path, 
         run_generation=record["expected_generation"],
         pending_action=actions.pending_action_projection(record),
     )
-    lode["claude"]["mill"]["started"] = True
+    _mark_stage_started(lode, "mill")
     before = copy.deepcopy(lode)
     server.lodes = [lode]
 
@@ -2582,7 +2591,7 @@ def test_restart_recovery_of_failed_completion_keeps_completion_identity(socket_
         run_generation=record["expected_generation"],
         pending_action=actions.pending_action_projection(record),
     )
-    before_session = lode["claude"][record["stage"]]["session_id"]
+    before_session = lode_stage_session(lode, record["stage"])["provider_session_id"]
     server.lodes = [lode]
     conn = _mock_client(server)
 
@@ -2609,7 +2618,7 @@ def test_restart_recovery_of_failed_completion_keeps_completion_identity(socket_
     assert retry_record["action_type"] == "completion"
     assert retry_record["action_id"] == record["action_id"]
     assert schedule.call_args.args[1:] == ("containment", "observing_containment")
-    assert lode["claude"][record["stage"]]["session_id"] == before_session
+    assert lode_stage_session(lode, record["stage"])["provider_session_id"] == before_session
     restart_stage.assert_not_called()
 
 
@@ -2643,7 +2652,7 @@ def test_manual_action_fault_matrix_converges_after_fresh_server_reconciliation(
         run_generation=record["expected_generation"],
         oom_scope=record["ownership"]["unit"]["name"],
     )
-    original_session = lode["claude"][record["stage"]]["session_id"]
+    original_session = lode_stage_session(lode, record["stage"])["provider_session_id"]
     worktree = temp_config / "worktrees" / lode["id"]
     worktree.mkdir(parents=True)
     artifact = worktree / "retained.txt"
@@ -2716,7 +2725,8 @@ def test_manual_action_fault_matrix_converges_after_fresh_server_reconciliation(
                 return
             terminal = current["state"] == "paused" or (
                 action_type == "restart"
-                and current["claude"][record["stage"]]["session_id"] != original_session
+                and lode_stage_session(current, record["stage"])["provider_session_id"]
+                != original_session
                 and current.get("run_generation") == record["expected_generation"]
             )
             if terminal:
@@ -2819,10 +2829,14 @@ def test_manual_action_fault_matrix_converges_after_fresh_server_reconciliation(
     assert counters["spawn"] == (1 if action_type == "restart" else 0)
     assert counters["archive"] == (1 if action_type in {"kill", "archive"} else 0)
     if action_type == "restart":
-        assert settled["claude"][record["stage"]]["session_id"] != original_session
+        assert (
+            lode_stage_session(settled, record["stage"])["provider_session_id"] != original_session
+        )
         assert receipts[0]["successor"] is not None
     else:
-        assert settled["claude"][record["stage"]]["session_id"] == original_session
+        assert (
+            lode_stage_session(settled, record["stage"])["provider_session_id"] == original_session
+        )
         assert receipts[0]["successor"] is None
     if action_type in {"kill", "archive"}:
         assert restarted.lodes == []
@@ -4548,8 +4562,9 @@ def test_completion_spawn_adopts_only_the_fsynced_receipt_pane(socket_path, make
     ],
     ids=["codex", "grok"],
 )
+@pytest.mark.parametrize("source_driver", ["claude", "codex", "grok"])
 def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
-    socket_path, make_lode, monkeypatch, source_coder, expected_promoted_coder
+    socket_path, make_lode, monkeypatch, source_coder, expected_promoted_coder, source_driver
 ):
     record = _pending_completion_record(stage="ship")
     for marker_name in (
@@ -4582,6 +4597,7 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
             stage="ship",
             state="teardown",
             run_generation=record["expected_generation"],
+            driver=source_driver,
             **source_fields,
         )
     ]
@@ -4603,6 +4619,7 @@ def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(
         assert "coder" not in promoted
     else:
         assert promoted["coder"] == expected_promoted_coder
+    assert lode_driver(promoted) == source_driver
     assert [item.id for item in server.backlog] == ["second01"]
     assert server.backlog[0].queued == promoted["id"]
     assert record["ship"]["backlog"]["selected_item_id"] == "first001"
@@ -8188,6 +8205,7 @@ def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config
     mock_spawn.assert_called_once_with("test-id", "/fake/repo", foreground=False, env=ANY)
     assert srv.lodes[0]["state"] == "ready"
     assert srv.lodes[0]["active"] is False
+    assert lode_driver(srv.lodes[0]) == "claude"
     assert "waiting for handoff registration" in srv.lodes[0]["status"]
     response = _decode_mock_response(conn)
     assert response["type"] == "lode_resumed"
@@ -9170,7 +9188,7 @@ def test_server_refuses_invalid_coder_session_provider(server, make_lode, caplog
 def test_server_handles_lode_set_claude_started(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_claude_started message."""
     lode = make_lode(id="test-id", stage="mill", state="running")
-    assert lode["claude"]["mill"]["started"] is False
+    assert lode_stage_session(lode, "mill")["started"] is False
     server.lodes = [lode]
     save_lodes(server.lodes)
 
@@ -9195,19 +9213,19 @@ def test_server_handles_lode_set_claude_started(socket_path, server, temp_config
 
     assert response["type"] == "lode_updated"
     assert response["lode"]["id"] == "test-id"
-    assert response["lode"]["claude"]["mill"]["started"] is True
+    assert lode_stage_session(response["lode"], "mill")["started"] is True
 
     # Server's lode should be updated
-    assert server.lodes[0]["claude"]["mill"]["started"] is True
+    assert lode_stage_session(server.lodes[0], "mill")["started"] is True
     # Other stages unchanged
-    assert server.lodes[0]["claude"]["refine"]["started"] is False
+    assert lode_stage_session(server.lodes[0], "refine")["started"] is False
 
     client.close()
 
 
 def test_server_refuses_legacy_lode_reset_claude_stage(socket_path, server, temp_config, make_lode):
     lode = make_lode(id="test-id", stage="mill", state="running")
-    lode["claude"]["mill"]["started"] = True
+    _mark_stage_started(lode, "mill")
     before = copy.deepcopy(lode)
     server.lodes = [lode]
     save_lodes(server.lodes)

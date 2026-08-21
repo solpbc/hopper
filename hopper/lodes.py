@@ -36,10 +36,15 @@ Lodes are plain dicts with these fields:
 - archived_at: int | None - milliseconds since epoch when archived
   (default None, set by archive_lode)
 - runs: dict - per-stage runtime tracking {"stage": {"started_at": ms, "stopped_at": ms}}
-- claude: dict - per-stage Claude session tracking:
+- driver: str - immutable interactive-stage provider ("claude", "codex", or "grok")
+- stage_sessions: dict - canonical per-stage launch/session tracking:
+    {"mill": {"launch_id": "<uuid>", "provider_session_id": "<uuid>",
+     "transcript_path": None, "started": false, "start_attempt": None}, ...}
+- claude: dict - retained legacy projection of canonical per-stage session tracking:
     {"mill": {"session_id": "<uuid>", "started": false},
      "refine": {"session_id": "<uuid>", "started": false},
-     "ship": {"session_id": "<uuid>", "started": false}}
+     "ship": {"session_id": "<uuid>", "started": false}}. This is a bounded
+  rolling-version compatibility field.
 """
 
 import json
@@ -57,6 +62,10 @@ ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
 REFUSAL_STATUS_PREFIXES = ("spawn refused: ", "spawn failed: ", "action refused: ")
 _REFUSAL_STATUS_INDEX = {"spawn": 0, "spawn_failed": 1, "action": 2}
+_STAGE_NAMES = ("mill", "refine", "ship")
+_INTERACTIVE_STAGE_DRIVERS = frozenset({"claude", "codex", "grok"})
+# Frozen launch-ID namespace; it must never change or stable durable identities would rewrite.
+_LAUNCH_ID_NAMESPACE = uuid.UUID("bd3a8a6f-6d4f-4d1c-bce3-9d27fc61864c")
 
 
 def format_refusal_status(kind: str, message: str) -> str:
@@ -300,33 +309,255 @@ def read_diff_totals(lode_id: str) -> tuple[int, int]:
         return (0, 0)
 
 
-def load_lodes() -> list[dict]:
-    """Load active lodes from JSONL file."""
-    lodes_file = config.hopper_dir() / "active.jsonl"
-    if not lodes_file.exists():
-        return []
+def _lode_record_error(lode: dict, stage: str, field: str, detail: str) -> ValueError:
+    """Build one prescriptive durable-stage validation error."""
+    lode_id = lode.get("id")
+    return ValueError(f"lode {lode_id!r} stage {stage!r} has invalid {field}: {detail}")
 
+
+def _validate_uuid(value: object, lode: dict, stage: str, field: str) -> str:
+    """Validate and return a durable UUID string without changing its spelling."""
+    if not isinstance(value, str) or not value:
+        raise _lode_record_error(lode, stage, field, "must be a non-empty UUID string")
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError) as error:
+        raise _lode_record_error(lode, stage, field, "must be a UUID string") from error
+    return value
+
+
+def validate_lode_driver(driver: object) -> str:
+    """Validate an immutable interactive-stage provider."""
+    if not isinstance(driver, str) or driver not in _INTERACTIVE_STAGE_DRIVERS:
+        choices = ", ".join(sorted(_INTERACTIVE_STAGE_DRIVERS))
+        raise ValueError(f"lode driver must be one of {choices}")
+    return str(driver)
+
+
+def lode_driver(lode: dict) -> str:
+    """Return a lode's immutable interactive-stage provider.
+
+    Older records predate the field and therefore remain Claude records. New
+    records always write it explicitly.
+    """
+    if "driver" not in lode:
+        return "claude"
+    try:
+        return validate_lode_driver(lode["driver"])
+    except ValueError as error:
+        raise ValueError(f"lode {lode.get('id')!r} has invalid driver: {error}") from error
+
+
+def set_lode_driver(lode: dict, driver: str) -> None:
+    """Refuse any attempt to change the immutable lode driver."""
+    current = lode_driver(lode)
+    requested = validate_lode_driver(driver)
+    if requested != current:
+        raise ValueError(
+            f"lode {lode.get('id')!r} driver is immutable: {current!r} cannot become {requested!r}"
+        )
+
+
+def _expected_launch_id(lode_id: str, stage: str, provider_session_id: str) -> str:
+    """Derive the stable launch identity for one provider session."""
+    return str(uuid.uuid5(_LAUNCH_ID_NAMESPACE, f"{lode_id}:{stage}:{provider_session_id}"))
+
+
+def _validate_stage_session(lode: dict, stage: str, session: object) -> dict:
+    """Validate one canonical stage-session record and return it unchanged."""
+    if not isinstance(session, dict):
+        raise _lode_record_error(lode, stage, "stage session", "must be an object")
+    expected_fields = {
+        "launch_id",
+        "provider_session_id",
+        "transcript_path",
+        "started",
+        "start_attempt",
+    }
+    missing = expected_fields - session.keys()
+    if missing:
+        raise _lode_record_error(lode, stage, next(iter(sorted(missing))), "is required")
+    extra = session.keys() - expected_fields
+    if extra:
+        raise _lode_record_error(lode, stage, next(iter(sorted(extra))), "is not supported")
+
+    provider_session_id = _validate_uuid(
+        session["provider_session_id"], lode, stage, "provider_session_id"
+    )
+    launch_id = _validate_uuid(session["launch_id"], lode, stage, "launch_id")
+    expected_launch_id = _expected_launch_id(str(lode.get("id")), stage, provider_session_id)
+    if launch_id != expected_launch_id:
+        raise _lode_record_error(
+            lode, stage, "launch_id", "does not match the pinned launch identity"
+        )
+    if not isinstance(session["started"], bool):
+        raise _lode_record_error(lode, stage, "started", "must be a boolean")
+    if session["transcript_path"] is not None and not isinstance(session["transcript_path"], str):
+        raise _lode_record_error(lode, stage, "transcript_path", "must be a string or null")
+    if session["start_attempt"] is not None and not isinstance(session["start_attempt"], dict):
+        raise _lode_record_error(lode, stage, "start_attempt", "must be an object or null")
+    return session
+
+
+def lode_stage_session(lode: dict, stage: str) -> dict:
+    """Return one validated canonical stage-session record."""
+    if stage not in _STAGE_NAMES:
+        raise _lode_record_error(lode, stage, "stage", "is not a managed interactive stage")
+    sessions = lode.get("stage_sessions")
+    if not isinstance(sessions, dict):
+        raise _lode_record_error(lode, stage, "stage_sessions", "is required")
+    if stage not in sessions:
+        raise _lode_record_error(lode, stage, "stage session", "is required")
+    return _validate_stage_session(lode, stage, sessions[stage])
+
+
+def project_lode_claude_state(lode: dict) -> None:
+    """Project canonical stage sessions into the retained Claude compatibility map."""
+    lode["claude"] = {
+        stage: {
+            "session_id": lode_stage_session(lode, stage)["provider_session_id"],
+            "started": lode_stage_session(lode, stage)["started"],
+        }
+        for stage in _STAGE_NAMES
+    }
+
+
+def _validate_legacy_claude_stage(lode: dict, stage: str, session: object) -> dict:
+    """Validate one legacy compatibility projection stage."""
+    if not isinstance(session, dict):
+        raise _lode_record_error(lode, stage, "claude stage", "must be an object")
+    expected_fields = {"session_id", "started"}
+    missing = expected_fields - session.keys()
+    if missing:
+        raise _lode_record_error(lode, stage, next(iter(sorted(missing))), "is required")
+    extra = session.keys() - expected_fields
+    if extra:
+        raise _lode_record_error(lode, stage, next(iter(sorted(extra))), "is not supported")
+    _validate_uuid(session["session_id"], lode, stage, "session_id")
+    if not isinstance(session["started"], bool):
+        raise _lode_record_error(lode, stage, "started", "must be a boolean")
+    return session
+
+
+def _legacy_stage_sessions(lode: dict) -> dict:
+    """Materialize canonical session records from a validated legacy projection."""
+    claude = lode.get("claude")
+    if not isinstance(claude, dict):
+        raise _lode_record_error(lode, "mill", "claude", "must be an object")
+    expected_stages = set(_STAGE_NAMES)
+    missing = expected_stages - claude.keys()
+    if missing:
+        raise _lode_record_error(lode, next(iter(sorted(missing))), "claude stage", "is required")
+    extra = claude.keys() - expected_stages
+    if extra:
+        raise _lode_record_error(
+            lode, next(iter(sorted(extra))), "claude stage", "is not supported"
+        )
+    sessions = {}
+    for stage in _STAGE_NAMES:
+        legacy = _validate_legacy_claude_stage(lode, stage, claude[stage])
+        provider_session_id = legacy["session_id"]
+        sessions[stage] = {
+            "launch_id": _expected_launch_id(str(lode.get("id")), stage, provider_session_id),
+            "provider_session_id": provider_session_id,
+            "transcript_path": None,
+            "started": legacy["started"],
+            "start_attempt": None,
+        }
+    return sessions
+
+
+def normalize_lode_stage_sessions(lode: dict) -> dict:
+    """Validate one durable lode record and materialize legacy-only canonical state.
+
+    The normalizer never mints a replacement identity. Legacy-only records get
+    their deterministic canonical projection; hybrid records must agree; and
+    canonical-only records remain canonical-only after validation.
+    """
+    if not isinstance(lode, dict):
+        raise ValueError("lode record must be an object")
+    lode_id = lode.get("id")
+    if not isinstance(lode_id, str) or not lode_id:
+        raise _lode_record_error(lode, "mill", "id", "must be a non-empty string")
+
+    has_canonical = "stage_sessions" in lode
+    has_legacy = "claude" in lode
+    if not has_canonical and not has_legacy:
+        raise _lode_record_error(lode, "mill", "stage_sessions", "or claude is required")
+
+    if has_canonical:
+        if "driver" not in lode:
+            raise _lode_record_error(lode, "mill", "driver", "is required with stage_sessions")
+        try:
+            lode_driver(lode)
+        except ValueError as error:
+            raise _lode_record_error(lode, "mill", "driver", str(error)) from error
+        sessions = lode["stage_sessions"]
+        if not isinstance(sessions, dict):
+            raise _lode_record_error(lode, "mill", "stage_sessions", "must be an object")
+        expected_stages = set(_STAGE_NAMES)
+        missing = expected_stages - sessions.keys()
+        if missing:
+            raise _lode_record_error(
+                lode, next(iter(sorted(missing))), "stage session", "is required"
+            )
+        extra = sessions.keys() - expected_stages
+        if extra:
+            raise _lode_record_error(
+                lode, next(iter(sorted(extra))), "stage session", "is not supported"
+            )
+        if has_legacy:
+            _legacy_stage_sessions(lode)
+        for stage in _STAGE_NAMES:
+            canonical = _validate_stage_session(lode, stage, sessions[stage])
+            if has_legacy:
+                legacy = lode["claude"][stage]
+                if legacy["session_id"] != canonical["provider_session_id"]:
+                    raise _lode_record_error(
+                        lode, stage, "provider_session_id", "conflicts with legacy session_id"
+                    )
+                if legacy["started"] != canonical["started"]:
+                    raise _lode_record_error(
+                        lode, stage, "started", "conflicts with legacy projection"
+                    )
+        return lode
+
+    # The only absence-means-Claude case is a legacy-only durable record.
+    if "driver" in lode:
+        try:
+            driver = lode_driver(lode)
+        except ValueError as error:
+            raise _lode_record_error(lode, "mill", "driver", str(error)) from error
+        if driver != "claude":
+            raise _lode_record_error(
+                lode, "mill", "driver", "legacy claude projection requires claude"
+            )
+    lode["driver"] = "claude"
+    lode["stage_sessions"] = _legacy_stage_sessions(lode)
+    return lode
+
+
+def _load_lodes_file(path: Path) -> list[dict]:
+    """Load and normalize one JSONL lode snapshot."""
+    if not path.exists():
+        return []
     lodes = []
-    with open(lodes_file) as f:
-        for line in f:
+    with open(path) as source:
+        for line in source:
             line = line.strip()
             if line:
-                lodes.append(json.loads(line))
+                lodes.append(normalize_lode_stage_sessions(json.loads(line)))
     return lodes
+
+
+def load_lodes() -> list[dict]:
+    """Load active lodes from JSONL file through the shared normalizer."""
+    return _load_lodes_file(config.hopper_dir() / "active.jsonl")
 
 
 def load_archived_lodes() -> list[dict]:
-    """Load archived lodes from archived.jsonl."""
-    archived_file = config.hopper_dir() / "archived.jsonl"
-    if not archived_file.exists():
-        return []
-    lodes = []
-    with open(archived_file) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                lodes.append(json.loads(line))
-    return lodes
+    """Load archived lodes through the shared normalizer."""
+    return _load_lodes_file(config.hopper_dir() / "archived.jsonl")
 
 
 def _write_jsonl_atomic(path: Path, items: list[dict]) -> None:
@@ -405,12 +636,34 @@ def _generate_lode_id(lodes: list[dict]) -> str:
     raise RuntimeError("Failed to generate unique lode ID after 100 attempts")
 
 
-def _make_claude_sessions() -> dict:
-    """Generate per-stage Claude session tracking with fresh UUIDs."""
-    return {
-        stage: {"session_id": str(uuid.uuid4()), "started": False}
-        for stage in ("mill", "refine", "ship")
+def make_lode_stage_sessions(
+    lode_id: str, provider_session_ids: dict[str, str] | None = None
+) -> dict:
+    """Build canonical stage sessions with one provider identity per stage.
+
+    This is deliberately small and deterministic for callers that construct a
+    complete durable lode in tests. Production creation supplies no IDs and
+    receives fresh provider sessions.
+    """
+    provider_session_ids = provider_session_ids or {
+        stage: str(uuid.uuid4()) for stage in _STAGE_NAMES
     }
+    if set(provider_session_ids) != set(_STAGE_NAMES):
+        raise ValueError("provider session IDs must contain mill, refine, and ship")
+    lode = {"id": lode_id}
+    sessions = {}
+    for stage in _STAGE_NAMES:
+        provider_session_id = _validate_uuid(
+            provider_session_ids[stage], lode, stage, "provider_session_id"
+        )
+        sessions[stage] = {
+            "launch_id": _expected_launch_id(lode_id, stage, provider_session_id),
+            "provider_session_id": provider_session_id,
+            "transcript_path": None,
+            "started": False,
+            "start_attempt": None,
+        }
+    return sessions
 
 
 def create_lode(
@@ -421,6 +674,7 @@ def create_lode(
     lode_id: str | None = None,
     originating_extro_sid: str | None = None,
     coder_provider: str = DEFAULT_CODER_PROVIDER,
+    driver: str = "claude",
 ) -> dict:
     """Create a new lode, add to list, and create its directory.
 
@@ -433,6 +687,7 @@ def create_lode(
         The newly created lode dict.
     """
     coder_provider = validate_coder_provider(coder_provider)
+    driver = validate_lode_driver(driver)
     if lode_id is not None:
         if len(lode_id) != ID_LEN or any(character not in ID_ALPHABET for character in lode_id):
             raise ValueError("reserved lode ID has an invalid format")
@@ -445,9 +700,11 @@ def create_lode(
             with open(archived_path) as source:
                 if any(json.loads(line).get("id") == lode_id for line in source if line.strip()):
                     raise ValueError("reserved lode ID is already archived")
+    new_lode_id = lode_id or _generate_lode_id(lodes)
+    stage_sessions = make_lode_stage_sessions(new_lode_id)
     now = current_time_ms()
     lode = {
-        "id": lode_id or _generate_lode_id(lodes),
+        "id": new_lode_id,
         "stage": "mill",
         "created_at": now,
         "project": project,
@@ -476,7 +733,15 @@ def create_lode(
         "pending_action": None,
         "action_results": [],
         "runs": {},
-        "claude": _make_claude_sessions(),
+        "driver": driver,
+        "stage_sessions": stage_sessions,
+        "claude": {
+            stage: {
+                "session_id": stage_sessions[stage]["provider_session_id"],
+                "started": stage_sessions[stage]["started"],
+            }
+            for stage in _STAGE_NAMES
+        },
     }
     if coder_provider != "codex":
         lode["coder"] = {"provider": coder_provider, "session_id": None}
@@ -716,17 +981,70 @@ def validate_lode_coder_data(lodes: list[dict], source: str) -> None:
             raise ValueError(f"{source} contains invalid coder data: {error}") from error
 
 
-def set_lode_claude_started(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:
-    """Mark a claude stage as started on a lode."""
+def validate_lode_driver_data(lodes: list[dict], source: str) -> None:
+    """Validate interactive-stage data without rewriting a loaded snapshot."""
     for lode in lodes:
-        if lode["id"] == lode_id:
-            if claude_stage not in lode.get("claude", {}):
-                return None
-            lode["claude"][claude_stage]["started"] = True
+        try:
+            normalize_lode_stage_sessions(lode)
+        except ValueError as error:
+            raise ValueError(f"{source} contains invalid lode driver data: {error}") from error
+
+
+def set_lode_stage_session_started(lodes: list[dict], lode_id: str, stage: str) -> dict | None:
+    """Mark one canonical stage session as started and save both projections."""
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        normalize_lode_stage_sessions(lode)
+        if stage not in _STAGE_NAMES:
+            return None
+        lode_stage_session(lode, stage)["started"] = True
+        project_lode_claude_state(lode)
+        touch(lode)
+        save_lodes(lodes)
+        return lode
+    return None
+
+
+def reset_lode_stage_session(
+    lodes: list[dict],
+    lode_id: str,
+    stage: str,
+    *,
+    persist: bool = True,
+    session_id: str | None = None,
+) -> dict | None:
+    """Replace one stage's provider identity and reset its canonical state."""
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        normalize_lode_stage_sessions(lode)
+        if stage not in _STAGE_NAMES:
+            return None
+        provider_session_id = session_id or str(uuid.uuid4())
+        _validate_uuid(provider_session_id, lode, stage, "provider_session_id")
+        lode["stage_sessions"][stage] = {
+            "launch_id": _expected_launch_id(lode["id"], stage, provider_session_id),
+            "provider_session_id": provider_session_id,
+            "transcript_path": None,
+            "started": False,
+            "start_attempt": None,
+        }
+        project_lode_claude_state(lode)
+        lode["last_progress_at"] = None
+        lode["last_progress_summary"] = ""
+        lode["last_pane_activity_at"] = None
+        lode["pane_title_observation"] = None
+        if persist:
             touch(lode)
             save_lodes(lodes)
-            return lode
+        return lode
     return None
+
+
+def set_lode_claude_started(lodes: list[dict], lode_id: str, claude_stage: str) -> dict | None:
+    """Mark a Claude compatibility stage as started through canonical state."""
+    return set_lode_stage_session_started(lodes, lode_id, claude_stage)
 
 
 def reset_lode_claude_stage(
@@ -737,22 +1055,14 @@ def reset_lode_claude_stage(
     persist: bool = True,
     session_id: str | None = None,
 ) -> dict | None:
-    """Reset a claude stage (new session_id, started=False)."""
-    for lode in lodes:
-        if lode["id"] == lode_id:
-            if claude_stage not in lode.get("claude", {}):
-                return None
-            lode["claude"][claude_stage]["session_id"] = session_id or str(uuid.uuid4())
-            lode["claude"][claude_stage]["started"] = False
-            lode["last_progress_at"] = None
-            lode["last_progress_summary"] = ""
-            lode["last_pane_activity_at"] = None
-            lode["pane_title_observation"] = None
-            if persist:
-                touch(lode)
-                save_lodes(lodes)
-            return lode
-    return None
+    """Reset a Claude compatibility stage through canonical session state."""
+    return reset_lode_stage_session(
+        lodes,
+        lode_id,
+        claude_stage,
+        persist=persist,
+        session_id=session_id,
+    )
 
 
 def find_lodes_by_prefix(lodes: list[dict], prefix: str) -> list[dict]:

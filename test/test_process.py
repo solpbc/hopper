@@ -29,7 +29,14 @@ from hopper.git import (
 from hopper.git import (
     quarantine_dirty_repo as git_quarantine_dirty_repo,
 )
-from hopper.lodes import get_lode_dir, get_worktree_dir, load_lodes, save_lodes
+from hopper.lodes import (
+    get_lode_dir,
+    get_worktree_dir,
+    load_lodes,
+    make_lode_stage_sessions,
+    project_lode_claude_state,
+    save_lodes,
+)
 from hopper.process import (
     QUARANTINE_STATUS,
     ProcessRunner,
@@ -43,24 +50,26 @@ from hopper.process import (
 )
 from hopper.server import Server
 
-CLAUDE_SESSIONS = {
-    "mill": {"session_id": "11111111-1111-1111-1111-111111111111", "started": False},
-    "refine": {"session_id": "22222222-2222-2222-2222-222222222222", "started": False},
-    "ship": {"session_id": "33333333-3333-3333-3333-333333333333", "started": False},
+PROVIDER_SESSION_IDS = {
+    "mill": "11111111-1111-1111-1111-111111111111",
+    "refine": "22222222-2222-2222-2222-222222222222",
+    "ship": "33333333-3333-3333-3333-333333333333",
 }
 
 REAL_ARM_WORKER = oom.arm_worker
 
 
-def _claude_sessions(**stage_overrides):
-    """Return claude sessions dict with per-stage overrides."""
-    sessions = copy.deepcopy(CLAUDE_SESSIONS)
+def _stage_sessions(**stage_overrides):
+    """Return canonical stage sessions with per-stage overrides."""
+    sessions = make_lode_stage_sessions("test-id", PROVIDER_SESSION_IDS)
     for stage, overrides in stage_overrides.items():
         sessions[stage].update(overrides)
     return sessions
 
 
-def _mock_response(stage="mill", state="new", active=False, project="", claude=None, **extra):
+def _mock_response(
+    stage="mill", state="new", active=False, project="", stage_sessions=None, **extra
+):
     lode = {
         "state": state,
         "active": active,
@@ -68,9 +77,12 @@ def _mock_response(stage="mill", state="new", active=False, project="", claude=N
         "stage": stage,
         "scope": extra.get("scope", ""),
         "codex_thread_id": None,
-        "claude": claude or _claude_sessions(),
+        "id": "test-id",
+        "driver": "claude",
+        "stage_sessions": stage_sessions or _stage_sessions(),
     }
     lode.update(extra)
+    project_lode_claude_state(lode)
     return {"type": "connected", "tmux": None, "lode": lode, "lode_found": True}
 
 
@@ -560,7 +572,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -617,7 +631,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -641,7 +657,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -669,7 +687,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -685,7 +705,7 @@ class TestMillStage:
             "claude",
             "--dangerously-skip-permissions",
             "--resume",
-            CLAUDE_SESSIONS["mill"]["session_id"],
+            PROVIDER_SESSION_IDS["mill"],
         ]
 
     def test_new_session_uses_session_id_and_prompt(self):
@@ -708,7 +728,7 @@ class TestMillStage:
 
         cmd = mock_popen.call_args[0][0]
         assert cmd[0] == "claude"
-        assert cmd[2:4] == ["--session-id", CLAUDE_SESSIONS["mill"]["session_id"]]
+        assert cmd[2:4] == ["--session-id", PROVIDER_SESSION_IDS["mill"]]
         assert len(cmd) == 5  # claude, skip, --session-id, id, prompt
         started_index = next(
             index for index, event in enumerate(emitted) if event[0] == "lode_set_claude_started"
@@ -1063,7 +1083,7 @@ class TestMillStage:
                     state="running",
                     project="my-project",
                     branch=branch,
-                    claude=_claude_sessions(mill={"started": True}),
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -1347,7 +1367,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -1498,7 +1520,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -1518,7 +1542,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -1542,7 +1568,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn(emitted)),
@@ -1563,7 +1591,9 @@ class TestMillStage:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=mock_conn),
@@ -2224,7 +2254,7 @@ class TestRefineStage:
                     state="running",
                     project="my-project",
                     branch="hopper-test-id",
-                    claude=_claude_sessions(refine={"started": True}),
+                    stage_sessions=_stage_sessions(refine={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -2262,7 +2292,7 @@ class TestRefineStage:
                     state="running",
                     project="my-project",
                     branch="hopper-test-id",
-                    claude=_claude_sessions(refine={"started": True}),
+                    stage_sessions=_stage_sessions(refine={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -2296,7 +2326,7 @@ class TestRefineStage:
                     state="running",
                     project="my-project",
                     branch="hopper-test-id",
-                    claude=_claude_sessions(refine={"started": True}),
+                    stage_sessions=_stage_sessions(refine={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -2683,7 +2713,7 @@ class TestShipStage:
                     stage="ship",
                     state="running",
                     project="my-project",
-                    claude=_claude_sessions(ship={"started": True}),
+                    stage_sessions=_stage_sessions(ship={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
@@ -2987,7 +3017,9 @@ class TestRunProcess:
             patch(
                 "hopper.runner.connect",
                 return_value=_mock_response(
-                    stage="mill", state="running", claude=_claude_sessions(mill={"started": True})
+                    stage="mill",
+                    state="running",
+                    stage_sessions=_stage_sessions(mill={"started": True}),
                 ),
             ),
             patch("hopper.runner.HopperConnection", return_value=_mock_conn()),

@@ -19,6 +19,7 @@ import pytest
 from hopper import config
 from hopper.git import create_worktree
 from hopper.lodes import (
+    _LAUNCH_ID_NAMESPACE,
     ID_ALPHABET,
     ID_LEN,
     OOM_KILLED_STATUS,
@@ -46,14 +47,19 @@ from hopper.lodes import (
     load_archived_lodes,
     load_lodes,
     lode_coder,
+    lode_driver,
     lode_icon,
+    lode_stage_session,
     lode_status_for_display,
     lode_with_status_annotations,
+    make_lode_stage_sessions,
+    project_lode_claude_state,
     reset_lode_claude_stage,
     resolve_worktree_path,
     save_archived_lodes,
     save_lodes,
     set_lode_claude_started,
+    set_lode_driver,
     touch,
     unarchive_lode,
     update_lode_branch,
@@ -64,8 +70,31 @@ from hopper.lodes import (
     update_lode_title,
     update_lode_worktree_path,
     validate_lode_coder_data,
+    validate_lode_driver_data,
 )
 from hopper.tmux import Liveness
+
+
+def _durable_lode(lode_id: str = "testid11") -> dict:
+    """Return a complete canonical lode record for durable lifecycle tests."""
+    lode = {
+        "id": lode_id,
+        "stage": "mill",
+        "created_at": 1000,
+        "updated_at": 1000,
+        "state": "running",
+        "driver": "claude",
+        "stage_sessions": make_lode_stage_sessions(
+            lode_id,
+            {
+                "mill": "00000000-0000-0000-0000-000000000011",
+                "refine": "00000000-0000-0000-0000-000000000012",
+                "ship": "00000000-0000-0000-0000-000000000013",
+            },
+        ),
+    }
+    project_lode_claude_state(lode)
+    return lode
 
 
 @pytest.mark.parametrize("active", [True, False])
@@ -168,16 +197,11 @@ def test_load_lodes_empty(temp_config):
 
 def test_save_and_load_lodes(temp_config):
     """Test save/load roundtrip."""
-    lodes_list = [
-        {"id": "id111111", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
-        {
-            "id": "id222222",
-            "stage": "refine",
-            "created_at": 2000,
-            "updated_at": 2000,
-            "state": "new",
-        },
-    ]
+    first = _durable_lode("id111111")
+    first["state"] = "new"
+    second = _durable_lode("id222222")
+    second.update({"stage": "refine", "created_at": 2000, "updated_at": 2000, "state": "new"})
+    lodes_list = [first, second]
     save_lodes(lodes_list)
 
     loaded = load_lodes()
@@ -218,15 +242,16 @@ def test_create_lode(temp_config):
     assert len(lodes_list) == 1
     assert lodes_list[0] is lode
 
-    # Verify per-stage Claude sessions
-    claude = lode["claude"]
-    for stage in ("mill", "refine", "ship"):
-        assert stage in claude
-        # Valid UUID format
-        import uuid
+    assert lode_driver(lode) == "claude"
 
-        uuid.UUID(claude[stage]["session_id"])
-        assert claude[stage]["started"] is False
+    # Verify canonical per-stage sessions and their retained compatibility projection.
+    for stage in ("mill", "refine", "ship"):
+        session = lode_stage_session(lode, stage)
+        uuid.UUID(session["provider_session_id"])
+        uuid.UUID(session["launch_id"])
+        assert session["started"] is False
+        assert session["transcript_path"] is None
+        assert session["start_attempt"] is None
 
     # Verify directory was created
     assert get_lode_dir(lode["id"]).exists()
@@ -244,6 +269,36 @@ def test_create_lode_can_select_grok(temp_config):
     assert lode["coder"] == {"provider": "grok", "session_id": None}
     assert lode["codex_thread_id"] is None
     assert lode_coder(lode) == ("grok", None)
+
+
+@pytest.mark.parametrize("interactive_driver", ["codex", "grok"])
+def test_internal_interactive_drivers_keep_stage_and_coder_sessions_independent(
+    temp_config, interactive_driver
+):
+    lode = create_lode([], "test-project", coder_provider="grok", driver=interactive_driver)
+
+    assert lode_driver(lode) == interactive_driver
+    assert lode_coder(lode) == ("grok", None)
+    for stage in ("mill", "refine", "ship"):
+        assert lode_stage_session(lode, stage)["provider_session_id"]
+
+
+def test_lode_driver_cannot_change_after_creation(temp_config):
+    lode = create_lode([], "test-project")
+    persisted = (temp_config / "active.jsonl").read_bytes()
+
+    with pytest.raises(ValueError, match="immutable"):
+        set_lode_driver(lode, "grok")
+
+    assert lode_driver(lode) == "claude"
+    assert (temp_config / "active.jsonl").read_bytes() == persisted
+
+
+def test_validate_lode_driver_data_rejects_invalid_driver():
+    lode = _durable_lode("badlode1")
+    lode["driver"] = "other"
+    with pytest.raises(ValueError, match="invalid driver"):
+        validate_lode_driver_data([lode], "active")
 
 
 def test_create_lode_rejects_unknown_coder_before_writing(temp_config):
@@ -301,9 +356,9 @@ def test_create_lode_with_scope(temp_config):
 
 def test_update_lode_stage(temp_config):
     """Test updating lode stage."""
-    lodes_list = [
-        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
-    ]
+    lode = _durable_lode()
+    lode["state"] = "new"
+    lodes_list = [lode]
     save_lodes(lodes_list)
 
     updated = update_lode_stage(lodes_list, "testid11", "refine")
@@ -324,24 +379,29 @@ def test_update_lode_stage_not_found(temp_config):
     assert result is None
 
 
-def test_archive_lode(temp_config):
+@pytest.mark.parametrize("interactive_driver", ["claude", "codex", "grok"])
+def test_archive_lode(temp_config, interactive_driver):
     """Test archiving a lode."""
-    lodes_list = [
-        {"id": "keepid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
+    keep = _durable_lode("keepid11")
+    keep["state"] = "new"
+    archived_lode = _durable_lode("archivid")
+    archived_lode.update(
         {
-            "id": "archivid",
             "stage": "refine",
             "created_at": 2000,
             "updated_at": 2000,
             "state": "new",
-        },
-    ]
+            "driver": interactive_driver,
+        }
+    )
+    lodes_list = [keep, archived_lode]
     save_lodes(lodes_list)
 
     archived = archive_lode(lodes_list, "archivid")
 
     assert archived is not None
     assert archived["id"] == "archivid"
+    assert lode_driver(archived) == interactive_driver
     assert len(lodes_list) == 1
     assert lodes_list[0]["id"] == "keepid11"
 
@@ -369,10 +429,11 @@ def test_archive_lode_not_found(temp_config):
 
 def test_archive_appends(temp_config):
     """Test that archive appends to existing file."""
-    lodes_list = [
-        {"id": "id111111", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
-        {"id": "id222222", "stage": "mill", "created_at": 2000, "updated_at": 2000, "state": "new"},
-    ]
+    first = _durable_lode("id111111")
+    first["state"] = "new"
+    second = _durable_lode("id222222")
+    second.update({"created_at": 2000, "updated_at": 2000, "state": "new"})
+    lodes_list = [first, second]
     save_lodes(lodes_list)
 
     archive_lode(lodes_list, "id111111")
@@ -386,9 +447,9 @@ def test_archive_appends(temp_config):
 
 def test_archive_lode_sets_archived_at(temp_config):
     """Test that archiving a lode sets archived_at timestamp."""
-    lodes_list = [
-        {"id": "archivid", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"},
-    ]
+    lode = _durable_lode("archivid")
+    lode["state"] = "new"
+    lodes_list = [lode]
     save_lodes(lodes_list)
 
     archived = archive_lode(lodes_list, "archivid")
@@ -404,27 +465,15 @@ def test_archive_lode_sets_archived_at(temp_config):
     assert "archived_at" in data
 
 
-def test_unarchive_lode(temp_config):
+@pytest.mark.parametrize("interactive_driver", ["claude", "codex", "grok"])
+def test_unarchive_lode(temp_config, interactive_driver):
     """Test unarchiving a lode moves it from archived to active."""
-    archived_lodes = [
-        {
-            "id": "restorId",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "new",
-            "archived_at": 5000,
-        },
-    ]
-    active_lodes = [
-        {
-            "id": "activeid",
-            "stage": "refine",
-            "created_at": 2000,
-            "updated_at": 2000,
-            "state": "new",
-        },
-    ]
+    restored_lode = _durable_lode("restorId")
+    restored_lode.update({"state": "new", "archived_at": 5000, "driver": interactive_driver})
+    archived_lodes = [restored_lode]
+    active_lode = _durable_lode("activeid")
+    active_lode.update({"stage": "refine", "created_at": 2000, "updated_at": 2000, "state": "new"})
+    active_lodes = [active_lode]
     save_archived_lodes(archived_lodes)
     save_lodes(active_lodes)
 
@@ -436,6 +485,7 @@ def test_unarchive_lode(temp_config):
     assert len(archived_lodes) == 0
     assert len(active_lodes) == 2
     assert active_lodes[1]["id"] == "restorId"
+    assert lode_driver(restored) == interactive_driver
 
     # Verify persistence
     loaded_active = load_lodes()
@@ -913,9 +963,9 @@ def test_touch():
 
 def test_update_lode_stage_touches(temp_config):
     """update_lode_stage updates the timestamp."""
-    lodes_list = [
-        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
-    ]
+    lode = _durable_lode()
+    lode["state"] = "new"
+    lodes_list = [lode]
     save_lodes(lodes_list)
 
     updated = update_lode_stage(lodes_list, "testid11", "refine")
@@ -926,16 +976,9 @@ def test_update_lode_stage_touches(temp_config):
 
 def test_update_lode_state(temp_config):
     """update_lode_state changes state and message, touches timestamp."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "gated",
-            "spawn_disposition": "unknown",
-        }
-    ]
+    lode = _durable_lode()
+    lode.update({"state": "gated", "spawn_disposition": "unknown"})
+    lodes_list = [lode]
     save_lodes(lodes_list)
 
     updated = update_lode_state(lodes_list, "testid11", "running", "Claude running")
@@ -964,9 +1007,9 @@ def test_update_lode_state_not_found(temp_config):
 
 def test_update_lode_title(temp_config):
     """update_lode_title changes title and touches timestamp."""
-    lodes_list = [
-        {"id": "testid11", "stage": "mill", "created_at": 1000, "updated_at": 1000, "state": "new"}
-    ]
+    lode = _durable_lode()
+    lode["state"] = "new"
+    lodes_list = [lode]
     save_lodes(lodes_list)
 
     updated = update_lode_title(lodes_list, "testid11", "Auth Flow")
@@ -982,16 +1025,9 @@ def test_update_lode_title(temp_config):
 
 def test_update_lode_branch(temp_config):
     """update_lode_branch changes branch and touches timestamp."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "new",
-            "branch": "",
-        }
-    ]
+    lode = _durable_lode()
+    lode.update({"state": "new", "branch": ""})
+    lodes_list = [lode]
     save_lodes(lodes_list)
 
     updated = update_lode_branch(lodes_list, "testid11", "hopper-testid11-auth-flow")
@@ -1096,26 +1132,47 @@ def test_update_lode_coder_session_rejects_provider_mismatch(temp_config):
 
 def test_set_lode_claude_started(temp_config):
     """set_lode_claude_started marks stage as started and touches timestamp."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "running",
-            "claude": {"mill": {"session_id": "session-1", "started": False}},
-        }
-    ]
+    lodes_list = [_durable_lode()]
     save_lodes(lodes_list)
+    before_other_stages = {
+        stage: (
+            lode_stage_session(lodes_list[0], stage)["provider_session_id"],
+            lode_stage_session(lodes_list[0], stage)["launch_id"],
+            lode_stage_session(lodes_list[0], stage)["started"],
+            dict(lodes_list[0]["claude"][stage]),
+        )
+        for stage in ("refine", "ship")
+    }
 
-    updated = set_lode_claude_started(lodes_list, "testid11", "mill")
+    with patch("hopper.lodes.save_lodes", wraps=save_lodes) as save:
+        updated = set_lode_claude_started(lodes_list, "testid11", "mill")
 
     assert updated is not None
-    assert updated["claude"]["mill"]["started"] is True
+    assert lode_stage_session(updated, "mill")["started"] is True
     assert updated["updated_at"] > 1000
+    save.assert_called_once_with(lodes_list)
+    written = save.call_args.args[0][0]
+    written_session = lode_stage_session(written, "mill")
+    written_legacy = written["claude"]["mill"]
+    assert written_session["started"] is True
+    assert written_legacy["started"] is True
+    assert written_legacy["session_id"] == written_session["provider_session_id"]
 
     loaded = load_lodes()
-    assert loaded[0]["claude"]["mill"]["started"] is True
+    loaded_session = lode_stage_session(loaded[0], "mill")
+    loaded_legacy = loaded[0]["claude"]["mill"]
+    assert loaded_session["started"] is True
+    assert loaded_legacy["started"] is True
+    assert loaded_legacy["session_id"] == loaded_session["provider_session_id"]
+    for stage in ("refine", "ship"):
+        session = lode_stage_session(loaded[0], stage)
+        legacy = loaded[0]["claude"][stage]
+        assert (
+            session["provider_session_id"],
+            session["launch_id"],
+            session["started"],
+            legacy,
+        ) == before_other_stages[stage]
 
 
 def test_set_lode_claude_started_not_found(temp_config):
@@ -1124,63 +1181,121 @@ def test_set_lode_claude_started_not_found(temp_config):
     assert result is None
 
 
+def test_stage_start_persistence_failure_keeps_previous_snapshot_loadable(temp_config):
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project")
+    persisted = (temp_config / "active.jsonl").read_bytes()
+
+    with (
+        patch("hopper.lodes._write_jsonl_atomic", side_effect=OSError("injected write failure")),
+        pytest.raises(OSError, match="injected write failure"),
+    ):
+        set_lode_claude_started(lodes_list, lode["id"], "mill")
+
+    assert (temp_config / "active.jsonl").read_bytes() == persisted
+    restored = load_lodes()[0]
+    restored_session = lode_stage_session(restored, "mill")
+    restored_legacy = restored["claude"]["mill"]
+    assert restored_session["started"] is False
+    assert restored_legacy["started"] is False
+    assert restored_legacy["session_id"] == restored_session["provider_session_id"]
+
+
 def test_set_lode_claude_started_invalid_stage(temp_config):
     """set_lode_claude_started returns None for unknown claude stage."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "running",
-            "claude": {"mill": {"session_id": "session-1", "started": False}},
-        }
-    ]
+    lodes_list = [_durable_lode()]
     save_lodes(lodes_list)
 
-    result = set_lode_claude_started(lodes_list, "testid11", "ship")
+    result = set_lode_claude_started(lodes_list, "testid11", "other")
 
     assert result is None
-    assert lodes_list[0]["claude"]["mill"]["started"] is False
+    assert lode_stage_session(lodes_list[0], "mill")["started"] is False
 
 
-def test_reset_lode_claude_stage(temp_config):
+@pytest.mark.parametrize("interactive_driver", ["claude", "codex", "grok"])
+def test_reset_lode_claude_stage(temp_config, interactive_driver):
     """reset_lode_claude_stage resets session, start, and heartbeat fields."""
-    lodes_list = [
+    lode = _durable_lode()
+    lode["driver"] = interactive_driver
+    lode_stage_session(lode, "mill")["started"] = True
+    project_lode_claude_state(lode)
+    lode.update(
         {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "running",
             "last_progress_at": 900,
             "last_progress_summary": "codex running",
             "last_pane_activity_at": 800,
             "pane_title_observation": {"title": "⠐ Working", "observed_at": 700},
-            "claude": {"mill": {"session_id": "session-1", "started": True}},
         }
-    ]
+    )
+    lodes_list = [lode]
+    old_session = lode_stage_session(lode, "mill")["provider_session_id"]
+    old_launch = lode_stage_session(lode, "mill")["launch_id"]
+    unaffected_stages = {
+        stage: (
+            lode_stage_session(lode, stage)["provider_session_id"],
+            lode_stage_session(lode, stage)["launch_id"],
+            lode_stage_session(lode, stage)["started"],
+            dict(lode["claude"][stage]),
+        )
+        for stage in ("refine", "ship")
+    }
     save_lodes(lodes_list)
+    new_session_id = "00000000-0000-0000-0000-000000000099"
 
-    updated = reset_lode_claude_stage(lodes_list, "testid11", "mill")
+    with patch("hopper.lodes.save_lodes", wraps=save_lodes) as save:
+        updated = reset_lode_claude_stage(
+            lodes_list,
+            "testid11",
+            "mill",
+            session_id=new_session_id,
+        )
 
     assert updated is not None
-    assert updated["claude"]["mill"]["started"] is False
-    assert updated["claude"]["mill"]["session_id"] != "session-1"
+    session = lode_stage_session(updated, "mill")
+    assert session["started"] is False
+    assert session["provider_session_id"] == new_session_id
+    assert session["provider_session_id"] != old_session
+    assert session["launch_id"] != old_launch
+    assert session["launch_id"] == str(
+        uuid.uuid5(_LAUNCH_ID_NAMESPACE, f"testid11:mill:{new_session_id}")
+    )
+    assert lode_driver(updated) == interactive_driver
     assert updated["last_progress_at"] is None
     assert updated["last_progress_summary"] == ""
     assert updated["last_pane_activity_at"] is None
     assert updated["pane_title_observation"] is None
-    uuid.UUID(updated["claude"]["mill"]["session_id"])
+    uuid.UUID(session["provider_session_id"])
     assert updated["updated_at"] > 1000
+    save.assert_called_once_with(lodes_list)
+    written = save.call_args.args[0][0]
+    written_session = lode_stage_session(written, "mill")
+    written_legacy = written["claude"]["mill"]
+    assert written_session["started"] is False
+    assert written_legacy["started"] is False
+    assert written_legacy["session_id"] == new_session_id
+    assert written_legacy["session_id"] == written_session["provider_session_id"]
 
     loaded = load_lodes()
-    assert loaded[0]["claude"]["mill"]["started"] is False
-    assert loaded[0]["claude"]["mill"]["session_id"] != "session-1"
+    loaded_session = lode_stage_session(loaded[0], "mill")
+    loaded_legacy = loaded[0]["claude"]["mill"]
+    assert loaded_session["started"] is False
+    assert loaded_session["provider_session_id"] == new_session_id
+    assert loaded_legacy["started"] is False
+    assert loaded_legacy["session_id"] == new_session_id
+    assert loaded_legacy["session_id"] == loaded_session["provider_session_id"]
     assert loaded[0]["last_progress_at"] is None
     assert loaded[0]["last_progress_summary"] == ""
     assert loaded[0]["last_pane_activity_at"] is None
     assert loaded[0]["pane_title_observation"] is None
+    for stage in ("refine", "ship"):
+        other_session = lode_stage_session(loaded[0], stage)
+        other_legacy = loaded[0]["claude"][stage]
+        assert (
+            other_session["provider_session_id"],
+            other_session["launch_id"],
+            other_session["started"],
+            other_legacy,
+        ) == unaffected_stages[stage]
 
 
 def test_reset_lode_claude_stage_not_found(temp_config):
@@ -1191,23 +1306,18 @@ def test_reset_lode_claude_stage_not_found(temp_config):
 
 def test_reset_lode_claude_stage_invalid_stage(temp_config):
     """reset_lode_claude_stage returns None for unknown claude stage."""
-    lodes_list = [
-        {
-            "id": "testid11",
-            "stage": "mill",
-            "created_at": 1000,
-            "updated_at": 1000,
-            "state": "running",
-            "claude": {"mill": {"session_id": "session-1", "started": True}},
-        }
-    ]
+    lode = _durable_lode()
+    lode_stage_session(lode, "mill")["started"] = True
+    project_lode_claude_state(lode)
+    lodes_list = [lode]
+    old_session = lode_stage_session(lode, "mill")["provider_session_id"]
     save_lodes(lodes_list)
 
-    result = reset_lode_claude_stage(lodes_list, "testid11", "ship")
+    result = reset_lode_claude_stage(lodes_list, "testid11", "other")
 
     assert result is None
-    assert lodes_list[0]["claude"]["mill"]["started"] is True
-    assert lodes_list[0]["claude"]["mill"]["session_id"] == "session-1"
+    assert lode_stage_session(lodes_list[0], "mill")["started"] is True
+    assert lode_stage_session(lodes_list[0], "mill")["provider_session_id"] == old_session
 
 
 def test_lode_backlog_field_roundtrip():

@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from hopper import actions, teardown
+from hopper.lodes import lode_stage_session, project_lode_claude_state
 from hopper.projects import Project
 from hopper.server import Server
 from hopper.tmux import Liveness
@@ -257,7 +258,8 @@ def test_captured_restart_adopts_ownership_and_proves_without_force(tmp_path, ma
         run_generation=record["expected_generation"],
         pending_action=actions.pending_action_projection(record),
     )
-    lode["claude"][record["stage"]]["started"] = True
+    lode_stage_session(lode, record["stage"])["started"] = True
+    project_lode_claude_state(lode)
     server.lodes = [lode]
 
     try:

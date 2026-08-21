@@ -65,6 +65,8 @@ from hopper.lodes import (
     load_archived_lodes,
     load_lodes,
     lode_coder,
+    lode_driver,
+    lode_stage_session,
     reserve_lode_id,
     reset_lode_claude_stage,
     resolve_worktree_path,
@@ -83,6 +85,7 @@ from hopper.lodes import (
     update_lode_title,
     update_lode_worktree_path,
     validate_lode_coder_data,
+    validate_lode_driver_data,
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
@@ -1947,10 +1950,7 @@ class Server:
                     "action_id": action_id,
                     "detail": f"Cannot restart: lode {lode_id} has a registered runner.",
                 }
-            if (
-                lode.get("claude", {}).get(stage, {}).get("started")
-                and lode.get("state") != "error"
-            ):
+            if lode_stage_session(lode, stage)["started"] and lode.get("state") != "error":
                 return {
                     "outcome": "refused",
                     "reason": "started_stage_requires_force",
@@ -3812,6 +3812,7 @@ class Server:
                         selected.description,
                         lode_id=promoted_id,
                         coder_provider=lode_coder(source)[0],
+                        driver=lode_driver(source),
                     )
                 except (OSError, RuntimeError, ValueError) as error:
                     self._block_action(record, "backlog", "cleanup", str(error))
@@ -4864,6 +4865,8 @@ class Server:
         self.archived_lodes = load_archived_lodes()
         validate_lode_coder_data(self.lodes, "active.jsonl")
         validate_lode_coder_data(self.archived_lodes, "archived.jsonl")
+        validate_lode_driver_data(self.lodes, "active.jsonl")
+        validate_lode_driver_data(self.archived_lodes, "archived.jsonl")
         self.backlog = load_backlog()
         self.projects = get_active_projects()
 
@@ -6218,6 +6221,8 @@ class Server:
             self.archived_lodes = load_archived_lodes()
             validate_lode_coder_data(self.lodes, "active.jsonl")
             validate_lode_coder_data(self.archived_lodes, "archived.jsonl")
+            validate_lode_driver_data(self.lodes, "active.jsonl")
+            validate_lode_driver_data(self.archived_lodes, "archived.jsonl")
             self.backlog = load_backlog()
             logger.info("Projects and lodes reloaded from disk")
 

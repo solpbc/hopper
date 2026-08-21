@@ -11,7 +11,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import hopper.runner as runner_module
-from hopper.lodes import current_time_ms, format_park_status
+from hopper.lodes import (
+    current_time_ms,
+    format_park_status,
+    make_lode_stage_sessions,
+    project_lode_claude_state,
+)
 from hopper.runner import (
     BaseRunner,
     _descendant_pids,
@@ -21,6 +26,18 @@ from hopper.runner import (
     extract_error_message,
 )
 from hopper.workspace_trust import WorkspaceTrustError
+
+
+def _runner_lode() -> dict:
+    """Return the minimal valid durable lode sent to a base runner."""
+    lode = {
+        "id": "test-id",
+        "active": False,
+        "driver": "claude",
+        "stage_sessions": make_lode_stage_sessions("test-id"),
+    }
+    project_lode_claude_state(lode)
+    return lode
 
 
 class TestExtractErrorMessage:
@@ -81,6 +98,7 @@ def test_run_teardown_terminates_children_and_sweeps_platform_orphans():
 class TestBaseRunnerRegistration:
     def test_missing_generation_refusal_exits_before_any_child_launch(self, capsys):
         runner = BaseRunner("test-id", Path("server.sock"))
+        runner._claude_stage = "mill"
         connection = MagicMock()
 
         def start(callback=None, on_connect=None):
@@ -92,7 +110,7 @@ class TestBaseRunnerRegistration:
         with (
             patch(
                 "hopper.runner.connect",
-                return_value={"lode": {"active": False, "claude": {}}},
+                return_value={"lode": _runner_lode()},
             ),
             patch("hopper.runner.HopperConnection", return_value=connection),
             patch.object(runner, "_setup") as setup,
@@ -114,6 +132,7 @@ class TestBaseRunnerRegistration:
 
     def test_registration_refusal_prints_server_reason(self, capsys):
         runner = BaseRunner("test-id", Path("server.sock"))
+        runner._claude_stage = "mill"
         connection = MagicMock()
 
         def start(callback=None, on_connect=None):
@@ -131,7 +150,7 @@ class TestBaseRunnerRegistration:
         with (
             patch(
                 "hopper.runner.connect",
-                return_value={"lode": {"active": False, "claude": {}}},
+                return_value={"lode": _runner_lode()},
             ),
             patch("hopper.runner.HopperConnection", return_value=connection),
             patch.object(runner, "_setup") as setup,
