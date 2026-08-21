@@ -20,6 +20,13 @@ OLD_BYTES = b'{"id": "old"}\n'
 FOREIGN_BYTES = b"foreign writer temp\n"
 
 
+def _target_path(candidate) -> Path | None:
+    """Resolve a path-like spy argument, or None when it cannot be a target."""
+    if isinstance(candidate, (str, os.PathLike)):
+        return Path(candidate)
+    return None
+
+
 class DelegatingStream:
     """Proxy one real stream while allowing exact stream-coordinate faults."""
 
@@ -104,34 +111,39 @@ class AtomicWriteHarness:
         return result
 
     def _open(self, file, *args, **kwargs):
-        if Path(file) == self.tmp_path:
-            error = self.faults.get("open_temp")
-            if error is not None:
-                raise error
-            stream = self._real_open(file, *args, **kwargs)
-            self.real_streams.append(stream)
-            return DelegatingStream(stream, self)
-        return self._real_open(file, *args, **kwargs)
+        if _target_path(file) != self.tmp_path:
+            return self._real_open(file, *args, **kwargs)
+        error = self.faults.get("open_temp")
+        if error is not None:
+            raise error
+        stream = self._real_open(file, *args, **kwargs)
+        self.real_streams.append(stream)
+        return DelegatingStream(stream, self)
 
     def _replace(self, source, target):
-        self.events.append(("replace", Path(source), Path(target)))
+        source_path = _target_path(source)
+        target_path = _target_path(target)
+        if source_path != self.tmp_path or target_path != self.path:
+            return self._real_replace(source, target)
+        self.events.append(("replace", source_path, target_path))
         error = self.faults.get("replace_destination")
-        if Path(source) == self.tmp_path and Path(target) == self.path and error is not None:
+        if error is not None:
             raise error
         return self._real_replace(source, target)
 
     def _os_open(self, path, flags, *args, **kwargs):
-        if Path(path) == self.path.parent:
-            self.destination_at_parent_open.append(self.path.read_bytes())
-            error = self.faults.get("open_destination_parent")
-            if error is not None:
-                raise error
-            fd = self._real_os_open(path, flags, *args, **kwargs)
-            self.directory_fd = fd
-            self.directory_open_paths.append(Path(path))
-            self.events.append(("directory_open", fd))
-            return fd
-        return self._real_os_open(path, flags, *args, **kwargs)
+        path_object = _target_path(path)
+        if path_object != self.path.parent:
+            return self._real_os_open(path, flags, *args, **kwargs)
+        self.destination_at_parent_open.append(self.path.read_bytes())
+        error = self.faults.get("open_destination_parent")
+        if error is not None:
+            raise error
+        fd = self._real_os_open(path, flags, *args, **kwargs)
+        self.directory_fd = fd
+        self.directory_open_paths.append(path_object)
+        self.events.append(("directory_open", fd))
+        return fd
 
     def _fsync(self, fd):
         if self.directory_fd is not None and fd == self.directory_fd:
