@@ -3138,6 +3138,57 @@ class TestProcessingLog:
         content = log_path.read_text()
         assert "stage=refine" in content
 
+    def test_processing_log_records_negotiated_attempt_identity_without_bodies(
+        self, isolate_config
+    ):
+        log_path = isolate_config / "processing.log"
+        response = _mock_response()
+        session = response["lode"]["stage_sessions"]["mill"]
+        runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "mill")
+        proc = MagicMock(returncode=0, stderr=None)
+        proc.poll.return_value = 0
+
+        with (
+            patch("hopper.client.connect", return_value={"lode": {"stage": "mill"}}),
+            patch("hopper.runner.connect", return_value=response),
+            patch("hopper.runner.HopperConnection", return_value=_mock_conn()),
+            patch("hopper.process.ProcessRunner", return_value=runner),
+            patch.object(runner, "_setup", return_value=None),
+            patch.object(
+                runner,
+                "_build_command",
+                return_value=(
+                    [
+                        "claude",
+                        "--dangerously-skip-permissions",
+                        "--session-id",
+                        session["provider_session_id"],
+                        "secret prompt body",
+                    ],
+                    "/repo",
+                ),
+            ),
+            patch("hopper.runner.reap_swiftpm_testing_helpers"),
+            patch("hopper.runner.trust_claude_workspace"),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_start_monitor"),
+        ):
+            assert run_process("test-id", Path("/tmp/test.sock")) == 0
+
+        content = log_path.read_text()
+        assert "current" in content
+        assert "lode=test-id" in content
+        for field, value in {
+            "driver": "claude",
+            "stage": "mill",
+            "launch_id": session["launch_id"],
+            "provider_session_id": session["provider_session_id"],
+            "run_generation": "test-generation",
+        }.items():
+            assert f"'{field}': '{value}'" in content
+        assert "secret prompt body" not in content
+        assert "gate body" not in content
+
     def test_processing_log_error_path(self, isolate_config):
         """processing.log captures connection failures."""
         log_path = isolate_config / "processing.log"

@@ -5539,7 +5539,9 @@ class Server:
             self.broadcast({"type": "lode_updated", "lode": lode})
 
         lode_id = message.get("lode_id")
-        runner_gate_publication = msg_type == "lode_publish_gate" and "run_generation" in message
+        runner_gate_publication = msg_type == "lode_publish_gate" and (
+            "run_generation" in message or message.get("kind") in {"native_question", "idle_park"}
+        )
         if (
             msg_type in RUNNER_MUTATION_TYPES
             and msg_type != "lode_action"
@@ -5980,6 +5982,14 @@ class Server:
                     return
                 if lode and state == "running" and gate is not None:
                     gate_kind = message.get("gate_kind")
+                    if "gate_epoch" not in message:
+                        logger.info(
+                            "Dropping gate clear without epoch lode=%s kind=%s",
+                            lode_id,
+                            gate_kind,
+                        )
+                        acknowledge_mutation(False, "stale_gate_epoch")
+                        return
                     if gate["kind"] == "explicit" or gate_kind != gate["kind"]:
                         logger.info(
                             "Dropping gate clear without matching authority lode=%s kind=%s",

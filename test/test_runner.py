@@ -1241,6 +1241,26 @@ class TestBaseRunnerActivityMonitor:
             "running", "Gate resumed", gate_epoch=7, gate_kind="native_question"
         )
 
+    def test_native_gate_does_not_clear_from_an_unknown_pane_frame(self):
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._open_gate()
+        runner._gate_snapshot = "selector"
+        runner._gate_armed = True
+        runner._gate_epoch = 7
+        runner._gate_kind = "native_question"
+        runner._native_gate_identity = ("Question", ((1, "Keep"), (2, "Change")))
+        malformed = "\x1b]unterminated─────\n❯\u00a0\n─────\n"
+
+        with (
+            patch("hopper.runner.capture_pane", return_value=malformed),
+            patch.object(runner, "_emit_state") as emit,
+        ):
+            runner._check_activity()
+
+        emit.assert_not_called()
+        assert runner._gated.is_set()
+
     def test_explicit_gate_ignores_pane_redraws_after_it_is_armed(self):
         runner = self._make_runner()
         runner._pane_id = "%1"

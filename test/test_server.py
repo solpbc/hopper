@@ -10976,6 +10976,69 @@ def test_matching_idle_gate_epoch_allows_genuine_resume(socket_path, make_lode):
     assert srv.lodes[0]["state"] == "running"
 
 
+def test_gate_clear_without_epoch_is_refused_and_leaves_gate_intact(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            state="gated",
+            gate_body="Parked",
+            gate_kind="idle_park",
+            gate_epoch=4,
+        )
+    ]
+    conn = _mock_client(srv)
+
+    srv._handle_mutation(
+        _runner_message(
+            srv,
+            "lode_set_state",
+            "test-id",
+            state="running",
+            status="Gate resumed",
+            gate_kind="idle_park",
+            ack_requested=True,
+        ),
+        conn,
+    )
+
+    assert srv.lodes[0]["state"] == "gated"
+    assert lode_gate(srv.lodes[0]) == {
+        "body": "Parked",
+        "kind": "idle_park",
+        "epoch": 4,
+        "delivery_epoch": 0,
+    }
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == "stale_gate_epoch"
+
+
+@pytest.mark.parametrize("kind", ["native_question", "idle_park"])
+def test_runner_gate_publication_requires_current_generation(socket_path, make_lode, kind):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="running")]
+    conn = _mock_client(srv)
+
+    srv._handle_mutation(
+        {
+            "type": "lode_publish_gate",
+            "lode_id": "test-id",
+            "body": "Awaiting a response",
+            "kind": kind,
+            "ack_requested": True,
+            "ts": 1,
+        },
+        conn,
+    )
+
+    assert srv.lodes[0]["state"] == "running"
+    assert lode_gate(srv.lodes[0]) is None
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is False
+    assert response["reason"] == "missing_run_generation"
+
+
 def test_durable_gate_publication_round_trips_over_the_real_socket(server, socket_path, make_lode):
     server.lodes = [make_lode(id="test-id", stage="refine", state="running", tmux_pane="%1")]
 
@@ -10990,6 +11053,20 @@ def test_durable_gate_publication_round_trips_over_the_real_socket(server, socke
     assert lode["gate_body"] == "Review this change"
     assert lode["gate_kind"] == "explicit"
     assert lode["gate_epoch"] == 1
+
+
+def test_successful_durable_gate_publication_writes_derived_artifact(
+    isolate_config, server, socket_path, make_lode
+):
+    server.lodes = [make_lode(id="test-id", stage="refine", state="running", tmux_pane="%1")]
+
+    response = hopper_client.publish_lode_gate(
+        socket_path, "test-id", "Review this change", kind="explicit"
+    )
+
+    assert response is not None
+    assert response["artifact_written"] is True
+    assert (isolate_config / "lodes" / "test-id" / "gate.md").read_text() == "Review this change"
 
 
 def test_gate_artifact_failure_leaves_durable_gate_as_the_only_authority(socket_path, make_lode):
@@ -11011,6 +11088,57 @@ def test_gate_artifact_failure_leaves_durable_gate_as_the_only_authority(socket_
     assert srv.lodes[0]["gate_body"] == "Durable review"
     assert not (config.hopper_dir() / "lodes" / "test-id" / "gate.md").exists()
     assert _decode_mock_response(conn)["artifact_written"] is False
+
+
+def test_failed_gate_replacement_preserves_one_prior_authority(socket_path, make_lode):
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        gate_body="Prior gate",
+        gate_kind="explicit",
+        gate_epoch=4,
+    )
+    srv.lodes = [lode]
+    save_lodes(srv.lodes)
+    active_path = config.hopper_dir() / "active.jsonl"
+    prior_bytes = active_path.read_bytes()
+    publication_conn = _mock_client(srv)
+
+    with patch("hopper.lodes._write_jsonl_atomic", side_effect=OSError("disk unavailable")):
+        srv._handle_mutation(
+            {
+                "type": "lode_publish_gate",
+                "lode_id": "test-id",
+                "body": "Replacement gate",
+                "kind": "explicit",
+            },
+            publication_conn,
+        )
+
+    assert lode_gate(lode) == {
+        "body": "Prior gate",
+        "kind": "explicit",
+        "epoch": 4,
+        "delivery_epoch": 0,
+    }
+    assert lode["state"] == "gated"
+    assert _decode_mock_response(publication_conn)["type"] == "error"
+    assert active_path.read_bytes() == prior_bytes
+
+    feedback_conn = _mock_client(srv)
+    srv._handle_mutation(
+        {"type": "lode_send_feedback", "lode_id": "test-id", "text": "mixed authority"},
+        feedback_conn,
+    )
+
+    assert _decode_mock_response(feedback_conn)["type"] == "error"
+    assert lode_gate(lode) == {
+        "body": "Prior gate",
+        "kind": "explicit",
+        "epoch": 4,
+        "delivery_epoch": 0,
+    }
 
 
 def test_stale_native_consumption_cannot_clear_a_replaced_gate(socket_path, make_lode):

@@ -34,10 +34,12 @@ from hopper.lodes import (
 )
 from hopper.projects import find_project
 from hopper.tmux import (
+    KeyboardOwnership,
+    PanePhase,
     capture_pane,
     get_current_pane_id,
+    observe_pane,
     pane_answer_identity,
-    pane_needs_answer,
     rename_window,
 )
 from hopper.workspace_trust import WorkspaceTrustError, trust_claude_workspace
@@ -1131,8 +1133,14 @@ class BaseRunner:
             if snapshot != self._gate_snapshot:
                 self._record_pane_snapshot(snapshot, current_time_ms())
                 if self._gate_kind == "native_question":
+                    phase, keyboard = observe_pane(None, snapshot)
                     selector_identity = pane_answer_identity(snapshot)
-                    if self._native_gate_identity is not None and selector_identity is None:
+                    if (
+                        self._native_gate_identity is not None
+                        and phase is not PanePhase.BLOCKED
+                        and keyboard is not KeyboardOwnership.UNKNOWN
+                        and selector_identity is None
+                    ):
                         self._emit_state(
                             "running",
                             "Gate resumed",
@@ -1154,7 +1162,8 @@ class BaseRunner:
         if snapshot is None:
             return
 
-        if pane_needs_answer(snapshot):
+        phase, _keyboard = observe_pane(None, snapshot)
+        if phase is PanePhase.BLOCKED:
             self._record_pane_snapshot(snapshot, current_time_ms())
             self._stuck_since = None
             selector_identity = pane_answer_identity(snapshot)
@@ -1216,7 +1225,12 @@ class BaseRunner:
                     "(sustained only by heartbeat/CPU activity)"
                 )
                 return
-            if cpu_activity >= real_activity and real_quiet:
+            background_phase, _keyboard = observe_pane(
+                None,
+                snapshot,
+                background_work_active=cpu_activity >= real_activity and real_quiet,
+            )
+            if background_phase is PanePhase.BACKGROUND:
                 self._emit_state(
                     "running",
                     f"background work active ({format_duration_ms(now - real_activity)})",

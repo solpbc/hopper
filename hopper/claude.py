@@ -3,7 +3,6 @@
 
 """Claude interactive-stage driver adapter."""
 
-DRIVER = "claude"
 LABEL = "Claude"
 _FLAGS = ("--dangerously-skip-permissions", "--disallowed-tools=AskUserQuestion")
 

@@ -5253,7 +5253,16 @@ def test_gate_show_prints_durable_gate_and_response_hint(capsys):
                 result = cmd_gate(["show", "gate1234"])
     assert result == 0
     output = capsys.readouterr().out
-    assert "# Design Review\nLooks good" in output
+    assert output == (
+        "Lode: gate1234\n"
+        "Stage: refine\n"
+        "State: gated\n\n"
+        "--- gate ---\n"
+        "# Design Review\n"
+        "Looks good\n"
+        "---\n\n"
+        'Respond with: hop gate feedback gate1234 "<your response>"\n'
+    )
 
 
 def test_gate_show_reports_when_no_gate_is_set(capsys):
@@ -6822,9 +6831,15 @@ def test_format_lode_detail_shows_grok_coder(make_lode):
     assert "  coder:    grok" in format_lode_detail(lode)
 
 
-@pytest.mark.parametrize("provider", ["claude", "codex", "grok"])
-def test_format_lode_detail_shows_the_durable_interactive_driver(make_lode, provider):
-    assert f"  driver:   {provider}" in format_lode_detail(make_lode(driver=provider))
+def test_format_lode_detail_shows_the_durable_interactive_driver(make_lode):
+    rendered = {
+        name: format_lode_detail(
+            make_lode(driver=name, coder={"provider": "codex", "session_id": None})
+        )
+        for name in ("claude", "codex", "grok")
+    }
+
+    assert len(set(rendered.values())) == 3
 
 
 def test_format_lode_reconnecting_is_pending_with_prior_diagnostics(make_lode):
