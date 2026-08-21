@@ -3,6 +3,7 @@
 
 """Tests for the refine-stage coder dispatcher."""
 
+import json
 import subprocess
 from unittest.mock import patch
 
@@ -10,16 +11,75 @@ import pytest
 
 from hopper.coder import (
     DEFAULT_CODER_PROVIDER,
+    CoderDefaultRefusal,
     bootstrap_coder,
     coder_check,
+    coder_default_refusal_lines,
     coder_unavailable_message,
+    resolve_coder_default,
     run_coder,
+    set_coder_default,
     validate_coder_provider,
 )
 
 
 def test_codex_is_the_default():
     assert DEFAULT_CODER_PROVIDER == "codex"
+
+
+@pytest.mark.parametrize(
+    ("saved", "expected"),
+    [
+        (None, ("codex", "built in")),
+        ("codex", ("codex", "saved")),
+        ("grok", ("grok", "saved")),
+    ],
+)
+def test_resolve_coder_default_uses_builtin_or_saved_provider(temp_config, saved, expected):
+    if saved is not None:
+        (temp_config / "config.json").write_text(json.dumps({"coder.default": saved}))
+
+    assert resolve_coder_default() == expected
+
+
+@pytest.mark.parametrize("saved", ["unsupported", 42, "42"])
+def test_resolve_coder_default_refuses_invalid_saved_values(temp_config, saved):
+    path = temp_config / "config.json"
+    path.write_text(json.dumps({"coder.default": saved}))
+
+    with pytest.raises(CoderDefaultRefusal) as raised:
+        resolve_coder_default()
+
+    assert coder_default_refusal_lines(raised.value) == [
+        "error: refine coder default refused",
+        (
+            f"observed: config key 'coder.default' in {path} is {saved!r}, "
+            "which is not a supported coder."
+        ),
+        "Hopper did not change config.json and did not select a coder.",
+        "recover with: hop coder default codex",
+    ]
+
+
+def test_set_coder_default_replaces_existing_non_string_value(temp_config):
+    path = temp_config / "config.json"
+    path.write_text('{"coder.default": 42}\n')
+
+    set_coder_default("grok")
+
+    assert json.loads(path.read_text()) == {"coder.default": "grok"}
+
+
+@pytest.mark.parametrize("provider", ["unsupported", 42])
+def test_set_coder_default_refuses_unsupported_provider_before_transaction(provider):
+    with patch("hopper.coder.config.config_transaction") as transaction:
+        with pytest.raises(CoderDefaultRefusal) as raised:
+            set_coder_default(provider)
+
+    assert raised.value.observed == (
+        f"requested coder {provider!r} is not supported; see `hop coder --help`."
+    )
+    transaction.assert_not_called()
 
 
 @pytest.mark.parametrize(

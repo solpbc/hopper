@@ -660,6 +660,120 @@ def test_new_lode_always_enqueues_explicit_coder_provider(monkeypatch, coder_pro
     ]
 
 
+def test_new_lode_uses_saved_grok_default_and_enqueues(temp_config, monkeypatch):
+    project = Project(path="/path/to/active", name="active")
+    server = MockServer(projects=[project])
+    app = HopperApp(server=server)
+    screens = []
+    callbacks = []
+    (temp_config / "config.json").write_text('{"coder.default": "grok"}\n')
+
+    monkeypatch.setattr("hopper.tui.load_projects", lambda: [project])
+    monkeypatch.setattr("hopper.tui.touch_project", lambda _name: None)
+    monkeypatch.setattr(
+        app,
+        "push_screen",
+        lambda screen, callback=None: (screens.append(screen), callbacks.append(callback)),
+    )
+
+    app.action_new_lode()
+    callbacks[0](project)
+
+    assert isinstance(screens[1], ScopeInputScreen)
+    assert screens[1].coder_provider == "grok"
+    server.events.clear()
+    callbacks[1](("A sufficiently detailed task scope", "start", screens[1].coder_provider))
+
+    assert server.events == [
+        {
+            "type": "lode_create",
+            "project": "active",
+            "scope": "A sufficiently detailed task scope",
+            "spawn": True,
+            "coder_provider": "grok",
+        }
+    ]
+
+
+def test_new_lode_refuses_invalid_saved_coder_default_without_scope_dialog(
+    temp_config, monkeypatch
+):
+    project = Project(path="/path/to/active", name="active")
+    server = MockServer(projects=[project])
+    app = HopperApp(server=server)
+    screens = []
+    callbacks = []
+    app.notify = MagicMock()
+    path = temp_config / "config.json"
+    path.write_text('{"coder.default": 42}\n')
+
+    monkeypatch.setattr("hopper.tui.load_projects", lambda: [project])
+    monkeypatch.setattr("hopper.tui.touch_project", lambda _name: None)
+    monkeypatch.setattr(
+        app,
+        "push_screen",
+        lambda screen, callback=None: (screens.append(screen), callbacks.append(callback)),
+    )
+
+    app.action_new_lode()
+    callbacks[0](project)
+
+    assert len(screens) == 1
+    assert server.events == []
+    app.notify.assert_called_once_with(
+        "\n".join(
+            [
+                "error: refine coder default refused",
+                (
+                    f"observed: config key 'coder.default' in {path} is 42, "
+                    "which is not a supported coder."
+                ),
+                "Hopper did not change config.json and did not select a coder.",
+                "recover with: hop coder default codex",
+            ]
+        ),
+        severity="error",
+    )
+
+
+def test_new_lode_resolves_default_for_each_opened_scope_dialog(temp_config, monkeypatch):
+    project = Project(path="/path/to/active", name="active")
+    server = MockServer(projects=[project])
+    app = HopperApp(server=server)
+    screens = []
+    callbacks = []
+    path = temp_config / "config.json"
+    path.write_text('{"coder.default": "grok"}\n')
+
+    monkeypatch.setattr("hopper.tui.load_projects", lambda: [project])
+    monkeypatch.setattr("hopper.tui.touch_project", lambda _name: None)
+    monkeypatch.setattr(
+        app,
+        "push_screen",
+        lambda screen, callback=None: (screens.append(screen), callbacks.append(callback)),
+    )
+
+    app.action_new_lode()
+    callbacks[0](project)
+    assert screens[1].coder_provider == "grok"
+
+    path.write_text('{"coder.default": "codex"}\n')
+    app.action_new_lode()
+    callbacks[2](project)
+    assert screens[3].coder_provider == "codex"
+
+
+def test_scope_input_screen_does_not_resolve_default(monkeypatch):
+    monkeypatch.setattr(
+        "hopper.tui.resolve_coder_default",
+        lambda: (_ for _ in ()).throw(AssertionError("saved preference was consulted")),
+    )
+
+    screen = ScopeInputScreen("testproject", "grok")
+
+    assert screen.coder_provider == "grok"
+
+
 def test_backlog_promote_refuses_unavailable_codex_before_enqueue(monkeypatch):
     item = BacklogItem(id="bl111111", project="active", description="Promote me", created_at=1000)
     server = MockServer(backlog=[item])
@@ -1522,7 +1636,7 @@ class ScopeTestApp(App):
         def capture_result(r):
             self.scope_result = r
 
-        self.push_screen(ScopeInputScreen("testproject"), capture_result)
+        self.push_screen(ScopeInputScreen("testproject", "codex"), capture_result)
 
 
 @pytest.mark.asyncio

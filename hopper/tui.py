@@ -34,7 +34,14 @@ from textual.widgets.option_list import Option
 
 from hopper.backlog import BacklogItem
 from hopper.claude import switch_to_pane
-from hopper.coder import DEFAULT_CODER_PROVIDER, coder_check, coder_unavailable_message
+from hopper.coder import (
+    DEFAULT_CODER_PROVIDER,
+    CoderDefaultRefusal,
+    coder_check,
+    coder_default_refusal_lines,
+    coder_unavailable_message,
+    resolve_coder_default,
+)
 from hopper.git import get_diff_stat
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
@@ -470,10 +477,10 @@ class ScopeInputScreen(TextInputScreen):
 
     MODAL_TITLE = "Describe Task Scope"
 
-    def __init__(self, project_name: str) -> None:
+    def __init__(self, project_name: str, coder_provider: str) -> None:
         super().__init__()
         self.MODAL_TITLE = f"Describe {project_name.capitalize()} Task Scope"
-        self.coder_provider = DEFAULT_CODER_PROVIDER
+        self.coder_provider = coder_provider
 
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
@@ -1939,6 +1946,12 @@ class HopperApp(App):
             if project is None:
                 return  # Cancelled
 
+            try:
+                coder_provider, _source = resolve_coder_default()
+            except CoderDefaultRefusal as error:
+                self.notify("\n".join(coder_default_refusal_lines(error)), severity="error")
+                return
+
             touch_project(project.name)
             if self.server:
                 self.server.enqueue({"type": "projects_reload"})
@@ -1974,7 +1987,7 @@ class HopperApp(App):
                         }
                         self.server.enqueue(message)
 
-            self.push_screen(ScopeInputScreen(project.name), on_scope_entered)
+            self.push_screen(ScopeInputScreen(project.name, coder_provider), on_scope_entered)
 
         self.push_screen(ProjectPickerScreen(load_projects()), on_project_selected)
 

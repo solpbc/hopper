@@ -6,9 +6,53 @@
 import shutil
 import subprocess
 
+from hopper import config
+
 CODER_PROVIDERS = ("codex", "grok")
 DEFAULT_CODER_PROVIDER = "codex"
 CODER_CHECK_TIMEOUT_SEC = 5.0
+
+
+class CoderDefaultRefusal(Exception):
+    """A host coder-default request that Hopper must refuse."""
+
+    def __init__(self, observed: str) -> None:
+        self.observed = observed
+        super().__init__(observed)
+
+
+def coder_default_refusal_lines(error: CoderDefaultRefusal) -> list[str]:
+    """Return the shared user-facing refusal for coder-default operations."""
+    return [
+        "error: refine coder default refused",
+        f"observed: {error.observed}",
+        "Hopper did not change config.json and did not select a coder.",
+        "recover with: hop coder default codex",
+    ]
+
+
+def resolve_coder_default() -> tuple[str, str]:
+    """Return the saved coder default or the built-in fallback and its source."""
+    settings = config.load_config()
+    if "coder.default" not in settings:
+        return DEFAULT_CODER_PROVIDER, "built in"
+    provider = settings["coder.default"]
+    if isinstance(provider, str) and provider in CODER_PROVIDERS:
+        return provider, "saved"
+    raise CoderDefaultRefusal(
+        f"config key 'coder.default' in {config.config_path()} is {provider!r}, "
+        "which is not a supported coder."
+    )
+
+
+def set_coder_default(provider: object) -> None:
+    """Persist one supported host-local refine coder default."""
+    if not isinstance(provider, str) or provider not in CODER_PROVIDERS:
+        raise CoderDefaultRefusal(
+            f"requested coder {provider!r} is not supported; see `hop coder --help`."
+        )
+    with config.config_transaction() as settings:
+        settings["coder.default"] = provider
 
 
 def validate_coder_provider(provider: object) -> str:

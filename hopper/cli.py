@@ -33,8 +33,13 @@ from hopper.client import set_lode_progress
 from hopper.coder import (
     CODER_PROVIDERS,
     DEFAULT_CODER_PROVIDER,
+    CoderDefaultRefusal,
     coder_check,
+    coder_default_refusal_lines,
     coder_unavailable_message,
+    resolve_coder_default,
+    set_coder_default,
+    validate_coder_provider,
 )
 from hopper.lodes import (
     current_time_ms,
@@ -412,7 +417,7 @@ def _extract_create_coder(cmd: str, cmd_args: list[str]) -> str:
             return args[index + 1]
         if arg.startswith("--coder="):
             return arg.split("=", 1)[1]
-    return DEFAULT_CODER_PROVIDER
+    return resolve_coder_default()[0]
 
 
 def _create_wants_json(cmd: str, cmd_args: list[str]) -> bool:
@@ -1694,13 +1699,24 @@ def cmd_code(args: list[str]) -> int:
     return run_code(lode_id, _socket(), parsed.stage, request)
 
 
-@command("coder", "Check coding-provider readiness")
+@command("coder", "Manage host-local refine coder defaults and check coding-provider readiness")
 def cmd_coder(args: list[str]) -> int:
-    """Check a coding provider without invoking a model or requiring authentication."""
-    parser = make_parser("coder", "Check coding-provider readiness")
-    parser.add_argument("action", choices=["check"])
-    parser.add_argument("provider", choices=CODER_PROVIDERS)
+    """Manage the host-local default or check a coding provider's readiness."""
+    parser = make_parser(
+        "coder",
+        "Manage host-local refine coder defaults and check coding-provider readiness",
+    )
+    parser.add_argument("action", choices=["check", "default"])
+    parser.add_argument("provider", nargs="?")
     parser.add_argument("--json", dest="json_output", action="store_true")
+    parser.epilog = (
+        "Actions:\n"
+        "  hop coder check <provider> [--json]\n"
+        "  hop coder default [provider]\n"
+        "\n"
+        "Use `hop coder default` to show this host's refine-stage creation default, "
+        "or provide a provider to set it. Use `hop coder check <provider>` to test readiness."
+    )
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
@@ -1709,13 +1725,37 @@ def cmd_coder(args: list[str]) -> int:
         print(f"error: {error}")
         parser.print_usage()
         return 1
-    result = coder_check(parsed.provider)
+
+    if parsed.action == "default":
+        if parsed.json_output:
+            print("error: --json applies only to: hop coder check")
+            parser.print_usage()
+            return 1
+        if parsed.provider is None:
+            provider, source = resolve_coder_default()
+            print(f"{provider} ({source})")
+            return 0
+        set_coder_default(parsed.provider)
+        print(f"coder.default={parsed.provider}")
+        return 0
+
+    if parsed.provider is None:
+        print("error: provider required for check")
+        parser.print_usage()
+        return 1
+    try:
+        provider = validate_coder_provider(parsed.provider)
+    except ValueError as error:
+        print(f"error: {error}")
+        parser.print_usage()
+        return 1
+    result = coder_check(provider)
     if parsed.json_output:
         print(json.dumps(result))
     elif result["ready"]:
-        print(f"{parsed.provider} ready: {result['version']}")
+        print(f"{provider} ready: {result['version']}")
     else:
-        print(f"{parsed.provider} unavailable: {result['error']}")
+        print(f"{provider} unavailable: {result['error']}")
     return 0 if result["ready"] else 1
 
 
@@ -3239,8 +3279,8 @@ def _add_create_args(parser):
     parser.add_argument(
         "--coder",
         choices=CODER_PROVIDERS,
-        default=DEFAULT_CODER_PROVIDER,
-        help=f"Refine-stage coding provider (default: {DEFAULT_CODER_PROVIDER})",
+        default=None,
+        help="Refine-stage coding provider (default: this host's `hop coder default`)",
     )
     parser.add_argument("-f", "--force", action="store_true", help="Override dirty-repo check")
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
@@ -4179,9 +4219,13 @@ def cmd_lode(args: list[str]) -> int:
         if project.disabled:
             print(disabled_project_message(project))
             return 1
-        readiness = coder_check(parsed.coder)
+        coder_provider = parsed.coder
+        if coder_provider is None:
+            # _main already refuses invalid saved values before local dispatch.
+            coder_provider = resolve_coder_default()[0]
+        readiness = coder_check(coder_provider)
         if not readiness["ready"]:
-            print(f"error: {coder_unavailable_message(parsed.coder, readiness.get('error'))}")
+            print(f"error: {coder_unavailable_message(coder_provider, readiness.get('error'))}")
             return 1
         if not parsed.force:
             from hopper.git import dirty_status
@@ -4210,7 +4254,7 @@ def cmd_lode(args: list[str]) -> int:
             scope,
             spawn=True,
             originating_extro_sid=originating_extro_sid,
-            coder_provider=parsed.coder,
+            coder_provider=coder_provider,
         )
         if getattr(parsed, "json_output", False):
             if not lode:
@@ -5220,11 +5264,12 @@ def _main() -> int:
         return 1
 
     create_project = _extract_create_project(cmd, cmd_args)
+    create_coder_provider: str | None = None
     if create_project is not None:
-        requested_coder = _extract_create_coder(cmd, cmd_args)
-        if requested_coder not in CODER_PROVIDERS:
+        create_coder_provider = _extract_create_coder(cmd, cmd_args)
+        if create_coder_provider not in CODER_PROVIDERS:
             choices = ", ".join(CODER_PROVIDERS)
-            print(f"error: argument --coder: invalid choice: {requested_coder!r} ({choices})")
+            print(f"error: argument --coder: invalid choice: {create_coder_provider!r} ({choices})")
             return 1
 
     # Set process title
@@ -5280,11 +5325,11 @@ def _main() -> int:
         stdin_text = _stdin_for_remote(cmd, cmd_args)
         create_project = _extract_create_project(cmd, cmd_args)
         if create_project is not None:
-            coder_provider = _extract_create_coder(cmd, cmd_args)
+            assert create_coder_provider is not None
             return _run_authoritative_remote_create(
                 explicit_host,
                 [cmd, *cmd_args],
-                coder_provider=coder_provider,
+                coder_provider=create_coder_provider,
                 reason=f"-H {explicit_host}",
                 project=create_project,
                 stdin_text=stdin_text,
@@ -5302,8 +5347,8 @@ def _main() -> int:
     if not explicit_host and not _remote_disabled():
         project = _extract_create_project(cmd, cmd_args)
         if project:
-            coder_provider = _extract_create_coder(cmd, cmd_args)
-            remote_target = _remote_pool_for_create(project, coder_provider)
+            assert create_coder_provider is not None
+            remote_target = _remote_pool_for_create(project, create_coder_provider)
             if remote_target is not None:
                 selected, probes = remote_target
                 unavailable_hosts = _unavailable_host_rows(probes)
@@ -5342,7 +5387,7 @@ def _main() -> int:
                 return _run_authoritative_remote_create(
                     selected.host,
                     [cmd, *cmd_args],
-                    coder_provider=coder_provider,
+                    coder_provider=create_coder_provider,
                     reason=f"remote.{project} pool",
                     project=project,
                     stdin_text=stdin_text,
@@ -5359,6 +5404,9 @@ def main() -> int:
     """Run command dispatch with one config-unavailable refusal boundary."""
     try:
         return _main()
+    except CoderDefaultRefusal as error:
+        print("\n".join(coder_default_refusal_lines(error)), file=sys.stderr)
+        return 2
     except config.ConfigError as error:
         observed = {
             "malformed": "contains malformed JSON",

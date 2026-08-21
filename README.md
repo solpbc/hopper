@@ -5,7 +5,7 @@ Hopper pairs Claude Code with a selectable coding CLI in a staged feature-delive
 ## What it does
 Hopper runs a dual-agent workflow through a terminal dashboard inside tmux.
 Claude Code handles scoping in `mill` and landing in `ship`.
-Codex handles implementation in `refine` by default; a lode can select Grok instead.
+The refine-stage coding provider is selected when a lode is created; its default is host-local and configurable with `hop coder default`.
 `hop code` resumes the coding provider selected when the lode was created.
 Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a background server persisting state over a Unix socket and broadcasting updates to the TUI.
 
@@ -43,7 +43,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop backlog` | Manage backlog items |
 | `hop lode` | Manage lodes |
 | `hop implement` | Create a lode for an implementation request |
-| `hop coder` | Check whether a coding provider is installed and runnable |
+| `hop coder` | Query or set the host-local refine coder default; check provider readiness |
 | `hop ping` | Check if server is running |
 
 **Inside a lode**
@@ -66,11 +66,12 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
 
-Codex is the creation default. Select Grok per lode with any create alias:
+The effective refine-stage creation default is host-local. Query it with `hop coder default`, or set it with `hop coder default <provider>`. When no value is saved on that host, Hopper uses its built-in Codex fallback. An explicit `--coder <provider>` on any create alias wins and does not consult the saved setting. `hop -H HOST coder default <provider>` changes the default on `HOST` only. This setting selects a provider; it does not establish provider readiness or account quota. Use `hop coder check <provider>` for readiness.
 
 ```bash
+hop coder default
+hop coder default grok
 cat scope.md | hop implement myproject --coder grok
-hop coder check grok --json
 ```
 
 Hopper pins every Codex subprocess to `gpt-5.6-terra` with `xhigh` reasoning,

@@ -1623,6 +1623,118 @@ def test_coder_check_json_is_machine_readable(capsys):
 
 
 @pytest.mark.parametrize(
+    ("saved", "expected"),
+    [
+        (None, "codex (built in)\n"),
+        ("grok", "grok (saved)\n"),
+    ],
+)
+def test_coder_default_query_reports_builtin_or_saved_value(
+    temp_config, monkeypatch, capsys, saved, expected
+):
+    if saved is not None:
+        (temp_config / "config.json").write_text(json.dumps({"coder.default": saved}))
+    monkeypatch.setattr(sys, "argv", ["hop", "coder", "default"])
+
+    assert main() == 0
+
+    assert capsys.readouterr().out == expected
+
+
+def test_coder_default_query_does_not_check_or_contact_server(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["hop", "coder", "default"])
+    monkeypatch.setattr(
+        "hopper.cli.coder_check", lambda _provider: (_ for _ in ()).throw(AssertionError())
+    )
+    monkeypatch.setattr(
+        "hopper.cli.require_server", lambda: (_ for _ in ()).throw(AssertionError())
+    )
+
+    assert main() == 0
+
+    assert capsys.readouterr().out == "codex (built in)\n"
+
+
+def test_coder_default_set_writes_saved_provider(temp_config, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["hop", "coder", "default", "grok"])
+
+    assert main() == 0
+
+    assert capsys.readouterr().out == "coder.default=grok\n"
+    assert json.loads((temp_config / "config.json").read_text()) == {"coder.default": "grok"}
+
+
+def test_coder_default_set_replaces_invalid_saved_value(temp_config, monkeypatch, capsys):
+    path = temp_config / "config.json"
+    path.write_text('{"coder.default": 42}\n')
+    monkeypatch.setattr(sys, "argv", ["hop", "coder", "default", "codex"])
+
+    assert main() == 0
+
+    assert capsys.readouterr().out == "coder.default=codex\n"
+    assert json.loads(path.read_text()) == {"coder.default": "codex"}
+
+
+@pytest.mark.parametrize(
+    ("argv", "original", "observed"),
+    [
+        (
+            ["hop", "coder", "default"],
+            b'{\n  "coder.default": 42\n}\n',
+            "observed: config key 'coder.default' in {path} is 42, which is not a supported coder.",
+        ),
+        (
+            ["hop", "coder", "default", "unsupported"],
+            b'{\n  "name": "keep"\n}\n',
+            "observed: requested coder 'unsupported' is not supported; see `hop coder --help`.",
+        ),
+    ],
+    ids=["invalid-saved", "invalid-setter"],
+)
+def test_coder_default_refusal_preserves_config_bytes(
+    temp_config, monkeypatch, capsys, argv, original, observed
+):
+    path = temp_config / "config.json"
+    path.write_bytes(original)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert main() == 2
+
+    assert path.read_bytes() == original
+    assert capsys.readouterr().err.splitlines() == [
+        "error: refine coder default refused",
+        observed.format(path=path),
+        "Hopper did not change config.json and did not select a coder.",
+        "recover with: hop coder default codex",
+    ]
+
+
+def test_coder_check_requires_provider(capsys):
+    assert hopper_cli.cmd_coder(["check"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("error: provider required for check\n")
+    assert "usage: hop coder" in captured.out
+
+
+def test_coder_check_rejects_unsupported_provider_with_existing_validation_text(capsys):
+    assert hopper_cli.cmd_coder(["check", "unsupported"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("error: coder must be one of: codex, grok\n")
+    assert "usage: hop coder" in captured.out
+
+
+@pytest.mark.parametrize("args", [["default", "--json"], ["default", "grok", "--json"]])
+def test_coder_default_rejects_json(args, capsys):
+    assert hopper_cli.cmd_coder(args) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("error: --json applies only to: hop coder check\n")
+    assert "usage: hop coder" in captured.out
+
+
+@pytest.mark.parametrize(
     ("command", "env_value", "extra_args", "expected"),
     [
         ("lode", None, [], None),
@@ -1778,6 +1890,24 @@ def test_lode_create_reads_scope_from_stdin(capsys):
                         assert cmd_lode(["create", "myproj"]) == 0
                     mock_create.assert_called_once()
                     assert mock_create.call_args.args[2] == LONG_SCOPE
+
+
+def test_local_create_uses_saved_coder_default(temp_config, capsys):
+    from io import StringIO
+
+    (temp_config / "config.json").write_text('{"coder.default": "grok"}\n')
+    created_lode = {"id": "abc12345", "project": "myproj", "stage": "mill"}
+    project = Project(path="/fake/repo", name="myproj")
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert cmd_lode(["create", "myproj"]) == 0
+
+    assert create.call_args.kwargs["coder_provider"] == "grok"
 
 
 def test_lode_create_missing_scope(capsys):
@@ -1970,6 +2100,25 @@ def test_lode_create_help_shows_epilog(capsys):
     out = capsys.readouterr().out
     assert "scope is read from stdin" in out
     assert "42 characters" in out
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["hop", "implement", "--help"], 0),
+        (["hop", "lode", "create", "--help"], 0),
+        (["hop", "lode", "list"], 1),
+    ],
+)
+def test_non_create_help_does_not_resolve_coder_default(monkeypatch, argv, expected):
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        "hopper.cli.resolve_coder_default",
+        lambda: (_ for _ in ()).throw(AssertionError("saved preference was consulted")),
+    )
+    monkeypatch.setattr("hopper.cli.require_server", lambda: 1)
+
+    assert main() == expected
 
 
 def test_lode_restart_happy(capsys):
@@ -7646,13 +7795,90 @@ def test_active_local_project_bypasses_pool_selection():
     probes.assert_not_called()
 
 
+def test_create_refusal_before_local_or_remote_create(temp_config, monkeypatch, capsys):
+    (temp_config / "config.json").write_text('{"coder.default": 42}\n')
+    monkeypatch.setattr(sys, "argv", ["hop", "implement", "journal"])
+
+    with (
+        patch("hopper.client.create_lode") as local_create,
+        patch("hopper.remote.run_remote") as remote_create,
+    ):
+        assert main() == 2
+
+    local_create.assert_not_called()
+    remote_create.assert_not_called()
+    assert "config key 'coder.default'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "provider_args",
+    [["--coder", "grok"], ["--coder=grok"]],
+    ids=["split", "equals"],
+)
+def test_explicit_coder_spelling_skips_default_config_read(
+    emitted_create_json,
+    temp_config,
+    monkeypatch,
+    provider_args,
+):
+    from io import StringIO
+
+    (temp_config / "config.json").write_text('{"coder.default": 42}\n')
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hop", "-H", "explicit.example", "implement", "journal", *provider_args],
+    )
+    monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
+    result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
+    with (
+        patch(
+            "hopper.cli.resolve_coder_default",
+            side_effect=AssertionError("saved preference was consulted"),
+        ),
+        patch("hopper.remote.run_remote", return_value=result) as create,
+        patch("hopper.remote.remember_lode"),
+    ):
+        assert main() == 0
+
+    assert create.call_args.args[1] == [
+        "implement",
+        "journal",
+        *provider_args,
+        "--json",
+        "--originating-extro-sid",
+        "",
+    ]
+
+
+def test_remote_coder_default_command_forwards_without_local_transaction(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["hop", "-H", "explicit.example", "coder", "default", "grok"])
+    result = subprocess.CompletedProcess([], 0, stdout="remote result\n", stderr="")
+
+    with (
+        patch("hopper.remote.run_remote", return_value=result) as remote,
+        patch("hopper.coder.config.config_transaction") as transaction,
+    ):
+        assert main() == 0
+
+    remote.assert_called_once_with(
+        "explicit.example",
+        ["coder", "default", "grok"],
+        stdin_text=None,
+    )
+    transaction.assert_not_called()
+    assert capsys.readouterr().out == "remote result\n"
+
+
 def test_explicit_host_create_bypasses_pool_selection(
     emitted_create_json,
+    temp_config,
     monkeypatch,
     capsys,
 ):
     from io import StringIO
 
+    (temp_config / "config.json").write_text('{"coder.default": "grok"}\n')
     monkeypatch.setattr(sys, "argv", ["hop", "-H", "explicit.example", "implement", "journal"])
     monkeypatch.setattr(sys, "stdin", StringIO(LONG_SCOPE))
     result = subprocess.CompletedProcess([], 0, stdout=emitted_create_json, stderr="")
@@ -7672,7 +7898,7 @@ def test_explicit_host_create_bypasses_pool_selection(
             "journal",
             "--json",
             "--coder",
-            "codex",
+            "grok",
             "--originating-extro-sid",
             "",
         ],
@@ -7684,12 +7910,14 @@ def test_explicit_host_create_bypasses_pool_selection(
 @pytest.mark.parametrize("json_output", [False, True], ids=["human", "json"])
 def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
     emitted_create_json,
+    temp_config,
     monkeypatch,
     capsys,
     json_output,
 ):
     from io import StringIO
 
+    (temp_config / "config.json").write_text('{"coder.default": "grok"}\n')
     selected = CandidateProbe("ready.example", eligible=True, load=1, reason=None)
     unavailable = CandidateProbe(
         "down.example",
@@ -7720,7 +7948,7 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
         "journal",
         "--json",
         "--coder",
-        "codex",
+        "grok",
         "--originating-extro-sid",
         "",
     ]

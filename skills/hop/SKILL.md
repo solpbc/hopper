@@ -36,7 +36,7 @@ Fix login timeout and add regression coverage
 EOF
 ```
 
-`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data. Codex is the default refine-stage coder; add `--coder grok` at creation time to select Grok. Hopper pins Codex to `gpt-5.6-terra` with `xhigh` reasoning. Hopper does not set a Grok model name, so Grok uses the authenticated account's current CLI default.
+`hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data. Add `--coder <provider>` at creation time to select a provider explicitly. Hopper pins Codex to `gpt-5.6-terra` with `xhigh` reasoning. Hopper does not set a Grok model name, so Grok uses the authenticated account's current CLI default.
 
 If `remote.<project>` has a pool and the project is disabled or absent locally,
 `hop implement <project>` probes every pool member concurrently, compares
@@ -356,6 +356,8 @@ hop config delete KEY                 # remove a value
 hop config json                       # dump config as JSON
 hop config path                       # show config file path
 ```
+
+The refine-stage creation default is host-local. Query or set it with `hop coder default [provider]`; use `hop coder --help` for command usage. When this host has no saved default, Hopper uses its built-in Codex fallback. An explicit create-time `--coder` wins and does not read the saved setting. `hop -H HOST coder default <provider>` changes only `HOST`. This setting does not test readiness or quota; use `hop coder check <provider>` for readiness.
 
 ## Status reporting (inside a lode)
 
