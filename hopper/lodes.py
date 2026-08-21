@@ -58,6 +58,8 @@ import os
 import secrets
 import time
 import uuid
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from hopper import config
@@ -664,32 +666,185 @@ def load_archived_lodes() -> list[dict]:
     return _load_lodes_file(config.hopper_dir() / "archived.jsonl")
 
 
-def _write_jsonl_atomic(path: Path, items: list[dict]) -> None:
-    """Atomically write a complete JSONL snapshot using a writer-unique temp file."""
+class _AtomicJsonlPublication(Enum):
+    """Publication state observed during one atomic JSONL write."""
+
+    NOT_PUBLISHED = "not_published"
+    PUBLISHED_DURABILITY_UNKNOWN = "published_durability_unknown"
+    COMMITTED = "committed"
+
+
+@dataclass(frozen=True)
+class _AtomicJsonlOperationFault:
+    """One operation error observed during an atomic JSONL write."""
+
+    operation: str
+    error: Exception
+    errno: int | None
+
+
+@dataclass(frozen=True)
+class _AtomicJsonlWriteObservation:
+    """Independent publication, operation-error, and compatibility facts."""
+
+    publication: _AtomicJsonlPublication
+    errors: tuple[_AtomicJsonlOperationFault, ...]
+    compatibility_exception: Exception | None
+
+
+def _observe_jsonl_atomic_write(path: Path, items: list[dict]) -> _AtomicJsonlWriteObservation:
+    """Observe one atomic JSONL write without raising its caught exceptions.
+
+    Operation labels are mkdir_parent, open_temp, serialize_record, write_record,
+    flush_temp, fsync_temp, close_temp, replace_destination,
+    open_destination_parent, fsync_destination_parent, close_destination_parent,
+    and cleanup_temp.
+    """
     # Unique temps prevent concurrent writers from corrupting each other's
     # snapshots, but writes remain last-writer-wins. A live-server
     # `hop project rename` can still lose updates; this is sound only because
     # the flock singleton removes server-vs-server concurrency.
     tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    publication = _AtomicJsonlPublication.NOT_PUBLISHED
+    faults: list[_AtomicJsonlOperationFault] = []
+    compatibility_exception: Exception | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp_path, "w") as f:
-            for item in items:
-                f.write(json.dumps(item) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(directory_fd)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as error:
+            faults.append(
+                _AtomicJsonlOperationFault("mkdir_parent", error, getattr(error, "errno", None))
+            )
+            raise
+
+        try:
+            context = open(tmp_path, "w")
+            stream = context.__enter__()
+        except Exception as error:
+            faults.append(
+                _AtomicJsonlOperationFault("open_temp", error, getattr(error, "errno", None))
+            )
+            raise
+
+        try:
+            for item in items:
+                try:
+                    serialized = json.dumps(item) + "\n"
+                except Exception as error:
+                    faults.append(
+                        _AtomicJsonlOperationFault(
+                            "serialize_record", error, getattr(error, "errno", None)
+                        )
+                    )
+                    raise
+                try:
+                    stream.write(serialized)
+                except Exception as error:
+                    faults.append(
+                        _AtomicJsonlOperationFault(
+                            "write_record", error, getattr(error, "errno", None)
+                        )
+                    )
+                    raise
+            try:
+                stream.flush()
+            except Exception as error:
+                faults.append(
+                    _AtomicJsonlOperationFault("flush_temp", error, getattr(error, "errno", None))
+                )
+                raise
+            try:
+                os.fsync(stream.fileno())
+            except Exception as error:
+                faults.append(
+                    _AtomicJsonlOperationFault("fsync_temp", error, getattr(error, "errno", None))
+                )
+                raise
+        except BaseException as body_error:
+            try:
+                suppressed = context.__exit__(
+                    type(body_error), body_error, body_error.__traceback__
+                )
+            except Exception as error:
+                faults.append(
+                    _AtomicJsonlOperationFault("close_temp", error, getattr(error, "errno", None))
+                )
+                raise
+            if not suppressed:
+                raise
+        else:
+            try:
+                context.__exit__(None, None, None)
+            except Exception as error:
+                faults.append(
+                    _AtomicJsonlOperationFault("close_temp", error, getattr(error, "errno", None))
+                )
+                raise
+
+        try:
+            os.replace(tmp_path, path)
+        except Exception as error:
+            faults.append(
+                _AtomicJsonlOperationFault(
+                    "replace_destination", error, getattr(error, "errno", None)
+                )
+            )
+            raise
+        publication = _AtomicJsonlPublication.PUBLISHED_DURABILITY_UNKNOWN
+
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except Exception as error:
+            faults.append(
+                _AtomicJsonlOperationFault(
+                    "open_destination_parent", error, getattr(error, "errno", None)
+                )
+            )
+            raise
+        try:
+            try:
+                os.fsync(directory_fd)
+            except Exception as error:
+                faults.append(
+                    _AtomicJsonlOperationFault(
+                        "fsync_destination_parent", error, getattr(error, "errno", None)
+                    )
+                )
+                raise
+            publication = _AtomicJsonlPublication.COMMITTED
         finally:
-            os.close(directory_fd)
-    except Exception:
+            try:
+                os.close(directory_fd)
+            except Exception as error:
+                faults.append(
+                    _AtomicJsonlOperationFault(
+                        "close_destination_parent", error, getattr(error, "errno", None)
+                    )
+                )
+                raise
+    except Exception as error:
+        compatibility_exception = error
         try:
             tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+        except OSError as cleanup_error:
+            faults.append(
+                _AtomicJsonlOperationFault(
+                    "cleanup_temp", cleanup_error, getattr(cleanup_error, "errno", None)
+                )
+            )
+    return _AtomicJsonlWriteObservation(
+        publication,
+        tuple(faults),
+        compatibility_exception,
+    )
+
+
+def _write_jsonl_atomic(path: Path, items: list[dict]) -> None:
+    """Preserve the legacy raising interface over the write observation."""
+    observation = _observe_jsonl_atomic_write(path, items)
+    if observation.compatibility_exception is None:
+        return None
+    raise observation.compatibility_exception
 
 
 def save_archived_lodes(lodes: list[dict]) -> None:
