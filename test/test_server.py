@@ -916,6 +916,7 @@ def _runner_message(server: Server, msg_type: str, lode_id: str, **fields) -> di
         "type": msg_type,
         "lode_id": lode_id,
         "run_generation": TEST_RUN_GENERATION,
+        "ts": 1,
         **fields,
     }
     if msg_type == "lode_register":
@@ -3193,7 +3194,7 @@ def test_pending_action_fences_spawn_after_generation_moves(socket_path, make_lo
     server.lodes = [lode]
     before = copy.deepcopy(lode)
 
-    with patch("hopper.server.spawn_claude") as spawn:
+    with patch("hopper.server.spawn_lode_processor") as spawn:
         outcome, pane_id = server._gated_spawn(lode, "/repo")
 
     assert outcome is SpawnOutcome.UNKNOWN
@@ -3219,7 +3220,7 @@ def test_every_ordinary_spawn_path_uses_lode_wide_action_fence(socket_path, make
 
     with (
         patch("hopper.server.find_project", return_value=Project(path="/repo", name="proj")),
-        patch("hopper.server.spawn_claude") as spawn,
+        patch("hopper.server.spawn_lode_processor") as spawn,
     ):
         server._handle_mutation({"type": msg_type, "lode_id": lode["id"]}, None)
 
@@ -4432,7 +4433,7 @@ def test_action_successor_failures_block_only_the_durable_action(socket_path, ma
         ),
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
         patch(
-            "hopper.server.spawn_claude",
+            "hopper.server.spawn_lode_processor",
             return_value=(
                 (WindowSpawnOutcome.PROVEN_NO_PANE, None)
                 if failure == "spawn_proven_absent"
@@ -5868,7 +5869,7 @@ def test_lock_refusal_happens_before_any_startup_mutation(
             patch("hopper.server.save_lodes") as mock_save,
             patch("hopper.server.remove_worktree") as mock_remove,
             patch("hopper.server.delete_branch") as mock_delete,
-            patch("hopper.server.spawn_claude") as mock_spawn,
+            patch("hopper.server.spawn_lode_processor") as mock_spawn,
         ):
             with pytest.raises(ServerLockHeld) as exc_info:
                 server.start()
@@ -6408,7 +6409,7 @@ def test_gated_spawn_without_recorded_pane_spawns(socket_path, make_lode):
     server.lodes = [lode]
 
     with (
-        patch("hopper.server.spawn_claude", return_value=_spawned("%10")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%10")) as mock_spawn,
         patch.object(server, "broadcast") as mock_broadcast,
     ):
         outcome, pane = server._gated_spawn(lode, "/repo", foreground=False)
@@ -6438,7 +6439,7 @@ def test_gated_spawn_alive_refuses_even_when_active_is_false(socket_path, make_l
 
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
     ):
         outcome, pane = server._gated_spawn(
             lode,
@@ -6470,7 +6471,7 @@ def test_gated_spawn_gone_clears_stale_identity_then_spawns(socket_path, make_lo
 
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
-        patch("hopper.server.spawn_claude", return_value=_spawned("%13")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%13")) as mock_spawn,
     ):
         outcome, pane = server._gated_spawn(lode, "/repo")
 
@@ -6496,7 +6497,7 @@ def test_gated_spawn_unknown_preserves_identity_and_refuses(socket_path, make_lo
 
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.UNKNOWN),
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
     ):
         outcome, pane = server._gated_spawn(lode, "/repo")
 
@@ -6553,7 +6554,7 @@ def test_gated_spawn_missing_project_sets_visible_status(socket_path, make_lode)
     lode = make_lode(id="failed-id")
     server = Server(socket_path)
     server.lodes = [lode]
-    with patch("hopper.server.spawn_claude") as spawn:
+    with patch("hopper.server.spawn_lode_processor") as spawn:
         outcome, pane = server._gated_spawn(lode, None)
 
     assert outcome is SpawnOutcome.PROJECT_MISSING
@@ -6571,7 +6572,7 @@ def test_gated_spawn_unknown_preserves_updates_and_forbids_restart(socket_path, 
     server = Server(socket_path)
     server.lodes = [lode]
     with patch(
-        "hopper.server.spawn_claude",
+        "hopper.server.spawn_lode_processor",
         return_value=(WindowSpawnOutcome.UNKNOWN, None),
     ):
         outcome, pane = server._gated_spawn(
@@ -6704,7 +6705,7 @@ def test_gated_spawn_persists_truthful_disposition_table(
 
     with (
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
-        patch("hopper.server.spawn_claude", return_value=spawn_result) as spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=spawn_result) as spawn,
     ):
         outcome, pane_id = server._gated_spawn(
             lode,
@@ -6739,7 +6740,7 @@ def test_two_queued_spawn_requests_create_one_runner(socket_path, make_lode):
             return_value=Project(path="/repo", name="proj"),
         ),
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
-        patch("hopper.server.spawn_claude", return_value=_spawned("%20")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%20")) as mock_spawn,
     ):
         event_thread = threading.Thread(target=server._event_loop, daemon=True)
         event_thread.start()
@@ -6862,7 +6863,7 @@ def test_resume_refine_applies_updates_before_allowed_spawn(socket_path, make_lo
             "hopper.server.find_project",
             return_value=Project(path="/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", side_effect=assert_updated_before_spawn),
+        patch("hopper.server.spawn_lode_processor", side_effect=assert_updated_before_spawn),
     ):
         server._handle_mutation({"type": "lode_resume_refine", "lode_id": "refine-id"}, None)
 
@@ -6895,7 +6896,7 @@ def test_resume_refine_proven_failure_keeps_refine_and_clears_gone_identity(sock
         ),
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
         patch(
-            "hopper.server.spawn_claude",
+            "hopper.server.spawn_lode_processor",
             return_value=(WindowSpawnOutcome.PROVEN_NO_PANE, None),
         ),
         patch("hopper.server.save_lodes") as mock_save,
@@ -6931,7 +6932,7 @@ def test_resume_refine_live_pane_gates_without_changing_stage(socket_path, make_
     with (
         patch("hopper.server.find_project", return_value=None),
         patch("hopper.server.pane_liveness", return_value=Liveness.ALIVE),
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
     ):
         server._handle_mutation({"type": "lode_resume_refine", "lode_id": "refine-id"}, None)
 
@@ -6961,7 +6962,7 @@ def test_resume_uses_gate_without_signaling_recorded_pid(socket_path, make_lode)
             return_value=Project(path="/repo", name="proj"),
         ),
         patch("hopper.server.pane_liveness", return_value=Liveness.GONE),
-        patch("hopper.server.spawn_claude", return_value=_spawned("%26")),
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%26")),
         patch("hopper.server.os.kill") as mock_kill,
     ):
         server._handle_mutation(
@@ -6991,7 +6992,7 @@ def test_fresh_backlog_promotion_spawns_through_gate(socket_path):
             "hopper.server.find_project",
             return_value=Project(path="/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", return_value=_spawned("%23")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%23")) as mock_spawn,
     ):
         lode = server._promote_backlog_item(item, coder_provider="codex")
 
@@ -7007,7 +7008,7 @@ def test_fresh_lode_create_spawns_through_gate(socket_path):
             "hopper.server.find_project",
             return_value=Project(path="/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", return_value=_spawned("%24")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%24")) as mock_spawn,
     ):
         server._handle_mutation(
             {
@@ -7271,14 +7272,17 @@ def test_runner_registration_refuses_unknown_or_missing_proof_mode(
     assert lode["oom_scope"] == "hopper-test.scope"
 
 
-def test_spawn_claude_has_gated_and_action_successor_callers():
+def test_spawn_lode_processor_has_gated_and_action_successor_callers():
     hopper_dir = Path(__file__).resolve().parents[1] / "hopper"
     source = (hopper_dir / "server.py").read_text()
-    assert source.count("spawn_claude(") == 2
+    assert source.count("spawn_lode_processor(") == 2
     assert "def _gated_spawn(" in source
     assert "def _spawn_action_successor(" in source
     assert "def _spawn_completion_pane(" not in source
-    assert sum(path.read_text().count("spawn_claude(") for path in hopper_dir.glob("*.py")) == 3
+    caller_count = sum(
+        path.read_text().count("spawn_lode_processor(") for path in hopper_dir.glob("*.py")
+    )
+    assert caller_count == 3
 
 
 def test_startup_archives_shipped_lodes(socket_path, temp_config, make_lode):
@@ -8197,7 +8201,7 @@ def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config
             "hopper.server.find_project",
             return_value=Project(path="/fake/repo", name="proj"),
         ),
-        patch("hopper.server.spawn_claude", return_value=_spawned("%2")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%2")) as mock_spawn,
         patch.object(srv, "broadcast"),
     ):
         srv._handle_mutation({"type": "lode_resume", "lode_id": "test-id"}, conn)
@@ -8292,7 +8296,7 @@ def test_auto_promote_backlog_on_ship_stage(socket_path, server, temp_config, ma
         )
     ]
 
-    with patch("hopper.server.spawn_claude", return_value=_spawned("%30")) as mock_spawn:
+    with patch("hopper.server.spawn_lode_processor", return_value=_spawned("%30")) as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -8330,7 +8334,7 @@ def test_promote_backlog_item_disabled_project_returns_none(socket_path):
 
     with (
         patch("hopper.server.find_project", return_value=disabled),
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
         patch.object(srv, "broadcast") as mock_broadcast,
     ):
         result = srv._promote_backlog_item(item, coder_provider="codex")
@@ -8359,7 +8363,7 @@ def test_auto_promote_on_ship_disabled_project_does_not_promote(socket_path, mak
 
     with (
         patch("hopper.server.find_project", return_value=disabled),
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
         patch.object(srv, "broadcast") as mock_broadcast,
     ):
         srv._handle_mutation(
@@ -8391,7 +8395,7 @@ def test_lode_promote_backlog_disabled_sends_promote_error(socket_path):
 
     with (
         patch("hopper.server.find_project", return_value=disabled),
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
     ):
         srv._handle_mutation(
             {
@@ -8502,7 +8506,7 @@ def test_auto_promote_backlog_on_ship_stage_uses_oldest(
     )
     server.backlog = [newer, older]
 
-    with patch("hopper.server.spawn_claude", return_value=_spawned("%31")) as mock_spawn:
+    with patch("hopper.server.spawn_lode_processor", return_value=_spawned("%31")) as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -8552,7 +8556,7 @@ def test_auto_promote_chains_multiple_queued_items(socket_path, server, temp_con
     )
     server.backlog = [item_c, item_b, item_a]  # intentionally out of order
 
-    with patch("hopper.server.spawn_claude", return_value=_spawned("%32")) as mock_spawn:
+    with patch("hopper.server.spawn_lode_processor", return_value=_spawned("%32")) as mock_spawn:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(socket_path))
         client.settimeout(2.0)
@@ -8790,7 +8794,7 @@ def test_auto_spawn_on_disconnect(
 
     with (
         patch("hopper.server.find_project") as mock_find,
-        patch("hopper.server.spawn_claude", return_value=_spawned("%33")) as mock_spawn,
+        patch("hopper.server.spawn_lode_processor", return_value=_spawned("%33")) as mock_spawn,
     ):
         mock_find.return_value = MagicMock(path="/some/path")
 
@@ -8985,7 +8989,7 @@ def test_auto_spawn_skipped_when_stage_done(
 
     with (
         patch("hopper.server.find_project") as mock_find,
-        patch("hopper.server.spawn_claude") as mock_spawn,
+        patch("hopper.server.spawn_lode_processor") as mock_spawn,
     ):
         mock_find.return_value = MagicMock(path="/some/path")
 
@@ -9433,7 +9437,7 @@ def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
     srv.lodes = [make_lode(id="test-id", state="gated", tmux_pane="%dead")]
     conn = _mock_client(srv)
 
-    with patch("hopper.server.spawn_claude") as mock_spawn:
+    with patch("hopper.server.spawn_lode_processor") as mock_spawn:
         _capture, mock_title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
             srv,
             conn,
@@ -11044,7 +11048,7 @@ class TestOomLifecycle:
             patch("hopper.server.uuid.uuid4", return_value=MagicMock(hex=generation)),
             patch("hopper.server.oom.is_linux", return_value=True),
             patch("hopper.server.save_lodes", side_effect=observe_save),
-            patch("hopper.server.spawn_claude", side_effect=observe_spawn),
+            patch("hopper.server.spawn_lode_processor", side_effect=observe_spawn),
             patch.object(srv, "broadcast"),
         ):
             outcome, pane = srv._gated_spawn(lode, "/repo")
@@ -11095,9 +11099,16 @@ class TestOomLifecycle:
                 None,
             )
 
-        assert lode == before
-        save.assert_not_called()
-        broadcast.assert_not_called()
+        if msg_type == "lode_set_claude_started":
+            assert lode_stage_session(lode, "mill") == lode_stage_session(before, "mill")
+            assert lode["status"].startswith("protocol error: stale_run_generation")
+            assert lode["protocol_error"] == "stale_run_generation"
+            save.assert_called_once()
+            broadcast.assert_called_once()
+        else:
+            assert lode == before
+            save.assert_not_called()
+            broadcast.assert_not_called()
 
     @pytest.mark.parametrize(
         ("lode", "run_generation", "reason"),
@@ -11236,7 +11247,7 @@ class TestOomLifecycle:
         lode = make_lode(id="test-id", state="error", status=status, failure_kind="oom")
         srv.lodes = [lode]
 
-        with patch("hopper.server.spawn_claude") as spawn:
+        with patch("hopper.server.spawn_lode_processor") as spawn:
             assert srv._gated_spawn(lode, "/repo") == (SpawnOutcome.UNKNOWN, None)
         spawn.assert_not_called()
         assert (lode["state"], lode["status"], lode["failure_kind"]) == (
@@ -11246,7 +11257,7 @@ class TestOomLifecycle:
         )
 
         with (
-            patch("hopper.server.spawn_claude", return_value=_spawned("%2")),
+            patch("hopper.server.spawn_lode_processor", return_value=_spawned("%2")),
             patch.object(srv, "broadcast"),
         ):
             outcome, _ = srv._gated_spawn(
@@ -11295,7 +11306,7 @@ class TestOomLifecycle:
                 return_value=Project(path="/repo", name="proj"),
             ),
             patch("hopper.server.oom.is_linux", return_value=True),
-            patch("hopper.server.spawn_claude", return_value=_spawned("%4")),
+            patch("hopper.server.spawn_lode_processor", return_value=_spawned("%4")),
             patch("hopper.server.save_lodes"),
             patch.object(srv, "broadcast") as broadcast,
         ):
@@ -11713,7 +11724,7 @@ class TestOomLifecycle:
                 return_value=Project(path="/repo", name="proj"),
             ),
             patch("hopper.server.oom.is_linux", return_value=False),
-            patch("hopper.server.spawn_claude", return_value=_spawned("%2")) as spawn,
+            patch("hopper.server.spawn_lode_processor", return_value=_spawned("%2")) as spawn,
             patch("hopper.server.save_lodes"),
             patch.object(srv, "broadcast"),
         ):
@@ -11862,7 +11873,7 @@ class TestOomLifecycle:
             patch("hopper.server.oom.read_scope_result", return_value="oom-kill"),
             patch("hopper.server.oom.release_scope", release),
             patch("hopper.server.pane_liveness", side_effect=AssertionError("reconciled pane")),
-            patch("hopper.server.spawn_claude", spawn),
+            patch("hopper.server.spawn_lode_processor", spawn),
         ):
             thread = threading.Thread(target=srv.start, daemon=True)
             thread.start()
@@ -11900,7 +11911,7 @@ class TestOomLifecycle:
             patch("hopper.server.oom.read_scope_result", return_value=None),
             patch("hopper.server.oom.release_scope") as release,
             patch("hopper.server.pane_liveness") as pane_liveness,
-            patch("hopper.server.spawn_claude") as spawn,
+            patch("hopper.server.spawn_lode_processor") as spawn,
         ):
             srv._consume_failed_oom_units()
             srv._reconcile_startup_lodes()

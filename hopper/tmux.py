@@ -16,6 +16,30 @@ logger = logging.getLogger(__name__)
 COMPLETION_ACTION_OPTION = "@hopper_completion_action"
 
 
+def spawn_lode_processor(
+    lode_id: str,
+    project_path: str | None = None,
+    foreground: bool = False,
+    env: dict[str, str] | None = None,
+    spawn_receipt: dict | None = None,
+) -> tuple["WindowSpawnOutcome", str | None]:
+    """Spawn Hopper's provider-neutral lode processor in a tmux window."""
+    path = os.environ.get("PATH", "/usr/bin:/bin")
+    # Run through /bin/sh so PATH and || work regardless of tmux's default shell.
+    fail = "echo 'Failed. Press Enter to close.'; read"
+    inner = f"export PATH={shlex.quote(path)}; hop process {lode_id} || {{ {fail}; }}"
+    command = f"/bin/sh -c {shlex.quote(inner)}"
+    kwargs = {"cwd": project_path, "env": env, "background": not foreground}
+    if spawn_receipt is not None:
+        kwargs["spawn_receipt"] = spawn_receipt
+    return new_window(command, **kwargs)
+
+
+def switch_to_pane(pane_id: str) -> bool:
+    """Switch to the tmux window containing one pane."""
+    return select_window(pane_id)
+
+
 class Liveness(Enum):
     """Observed liveness of a recorded tmux pane."""
 

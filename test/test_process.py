@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from hopper import oom
-from hopper.claude import spawn_claude
 from hopper.git import (
     create_worktree as git_create_worktree,
 )
@@ -49,6 +48,7 @@ from hopper.process import (
     run_process_supervisor,
 )
 from hopper.server import Server
+from hopper.tmux import spawn_lode_processor
 
 PROVIDER_SESSION_IDS = {
     "mill": "11111111-1111-1111-1111-111111111111",
@@ -78,12 +78,19 @@ def _mock_response(
         "scope": extra.get("scope", ""),
         "codex_thread_id": None,
         "id": "test-id",
+        "run_generation": "test-generation",
         "driver": "claude",
         "stage_sessions": stage_sessions or _stage_sessions(),
     }
     lode.update(extra)
     project_lode_claude_state(lode)
-    return {"type": "connected", "tmux": None, "lode": lode, "lode_found": True}
+    return {
+        "type": "connected",
+        "tmux": None,
+        "lode": lode,
+        "lode_found": True,
+        "stage_driver_capabilities": {"version": 1, "drivers": ["claude"]},
+    }
 
 
 def _mock_conn(emitted=None):
@@ -120,6 +127,16 @@ def _mock_conn(emitted=None):
                         "id": kw["lode_id"],
                         "worktree_path": kw["worktree_path"],
                     },
+                }
+            )
+        if msg_type == "lode_bind_stage_session" and callback_ref:
+            callback_ref(
+                {
+                    "type": "mutation_ack",
+                    "mutation_type": msg_type,
+                    "lode_id": kw["lode_id"],
+                    "accepted": True,
+                    "reason": "committed",
                 }
             )
         return True
@@ -704,6 +721,7 @@ class TestMillStage:
         assert cmd == [
             "claude",
             "--dangerously-skip-permissions",
+            "--disallowed-tools=AskUserQuestion",
             "--resume",
             PROVIDER_SESSION_IDS["mill"],
         ]
@@ -728,10 +746,12 @@ class TestMillStage:
 
         cmd = mock_popen.call_args[0][0]
         assert cmd[0] == "claude"
-        assert cmd[2:4] == ["--session-id", PROVIDER_SESSION_IDS["mill"]]
-        assert len(cmd) == 5  # claude, skip, --session-id, id, prompt
+        assert cmd[2] == "--disallowed-tools=AskUserQuestion"
+        assert cmd[3:5] == ["--session-id", PROVIDER_SESSION_IDS["mill"]]
+        assert len(cmd) == 6  # claude, skip, disallowed, --session-id, id, prompt
+        assert cmd[-1] != "--disallowed-tools=AskUserQuestion"
         started_index = next(
-            index for index, event in enumerate(emitted) if event[0] == "lode_set_claude_started"
+            index for index, event in enumerate(emitted) if event[0] == "lode_bind_stage_session"
         )
         running_index = next(
             index
@@ -741,7 +761,12 @@ class TestMillStage:
         assert started_index < running_index
         assert emitted[started_index][1] == {
             "lode_id": "test-id",
-            "claude_stage": "mill",
+            "ack_requested": True,
+            "driver": "claude",
+            "stage": "mill",
+            "launch_id": _stage_sessions()["mill"]["launch_id"],
+            "provider_session_id": PROVIDER_SESSION_IDS["mill"],
+            "run_generation": "test-generation",
         }
 
     def test_mill_and_refine_share_fetched_snapshot_without_moving_registered_checkout(
@@ -3186,10 +3211,10 @@ class TestOomBoundary:
         assert "reported process identity is invalid" in caplog.text
 
     def test_pane_command_is_identical_when_guard_environment_is_present(self):
-        with patch("hopper.claude.new_window", return_value="%1") as new_window:
-            spawn_claude("test-id", "/repo")
+        with patch("hopper.tmux.new_window", return_value="%1") as new_window:
+            spawn_lode_processor("test-id", "/repo")
             plain_command = new_window.call_args.args[0]
-            spawn_claude(
+            spawn_lode_processor(
                 "test-id",
                 "/repo",
                 env={"HOPPER_RUN_GENERATION": "a" * 32, "HOPPER_OOM_SCOPE": "unit.scope"},

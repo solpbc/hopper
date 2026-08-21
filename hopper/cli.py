@@ -49,6 +49,7 @@ from hopper.lodes import (
     is_canonical_lode_id,
     is_terminal_failure_kind,
     lode_coder,
+    lode_driver,
     lode_icon,
     lode_status_for_display,
     lode_with_status_annotations,
@@ -2098,6 +2099,10 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(f"  coder:    {coder_provider}")
     except ValueError:
         lines.append("  coder:    INVALID")
+    try:
+        lines.append(f"  driver:   {lode_driver(lode)}")
+    except ValueError:
+        lines.append("  driver:   INVALID")
     lines.append(f"  state:    {lode.get('state', '')}")
     if lode.get("state") == "reconnecting":
         prior_state = lode.get("reconnect_prior_state")

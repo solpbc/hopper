@@ -12,16 +12,24 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
 from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import RUN_GENERATION_ENV, HopperConnection, connect
+from hopper.driver import (
+    STAGE_DRIVER_CAPABILITIES_KEY,
+    STAGE_DRIVER_PROTOCOL_VERSION,
+    DriverRefusal,
+    resolve_driver,
+)
 from hopper.lodes import (
     current_time_ms,
     format_duration_ms,
     format_park_status,
     get_lode_dir,
     load_lodes,
+    lode_driver,
     lode_stage_session,
 )
 from hopper.projects import find_project
@@ -51,6 +59,55 @@ WORKTREE_PUBLICATION_TIMEOUT_SEC = 15.0
 DURABLE_CONFIRMATION_TIMEOUT_SEC = 1.0
 DURABLE_CONFIRMATION_POLL_INTERVAL_SEC = 0.05
 PS_SCAN_TIMEOUT_SEC = 5.0
+
+
+class StageDriverProtocol(Enum):
+    """Compatibility outcome for one interactive-stage connection handshake."""
+
+    CURRENT = "current"
+    LEGACY_CLAUDE = "legacy_claude"
+    UNKNOWN = "unknown"
+
+
+def classify_stage_driver_protocol(response: object, driver: object) -> StageDriverProtocol:
+    """Classify the bounded current-or-legacy stage-driver handshake.
+
+    A marker is positive negotiation. Markerless support is intentionally
+    limited to the exact pre-foundation connected response that this runner
+    sent with a lode_id; every malformed or partial response remains unknown.
+    """
+    if not isinstance(response, dict):
+        return StageDriverProtocol.UNKNOWN
+    if STAGE_DRIVER_CAPABILITIES_KEY in response:
+        marker = response[STAGE_DRIVER_CAPABILITIES_KEY]
+        if not isinstance(marker, dict) or set(marker) != {"version", "drivers"}:
+            return StageDriverProtocol.UNKNOWN
+        providers = marker.get("drivers")
+        if (
+            marker.get("version") == STAGE_DRIVER_PROTOCOL_VERSION
+            and isinstance(providers, list)
+            and all(isinstance(provider, str) for provider in providers)
+            and driver in providers
+        ):
+            return StageDriverProtocol.CURRENT
+        return StageDriverProtocol.UNKNOWN
+
+    expected_fields = {"type", "tmux", "ts", "exchange_id", "lode", "lode_found"}
+    if set(response) != expected_fields:
+        return StageDriverProtocol.UNKNOWN
+    if response.get("type") != "connected":
+        return StageDriverProtocol.UNKNOWN
+    if response.get("tmux") is not None and not isinstance(response.get("tmux"), dict):
+        return StageDriverProtocol.UNKNOWN
+    if type(response.get("ts")) is not int or not isinstance(response.get("exchange_id"), str):
+        return StageDriverProtocol.UNKNOWN
+    if not isinstance(response.get("lode_found"), bool):
+        return StageDriverProtocol.UNKNOWN
+    if response["lode_found"] != isinstance(response.get("lode"), dict):
+        return StageDriverProtocol.UNKNOWN
+    if driver == "claude":
+        return StageDriverProtocol.LEGACY_CLAUDE
+    return StageDriverProtocol.UNKNOWN
 
 
 def _write_recovery_record(lode_id: str, record: dict) -> None:
@@ -271,6 +328,59 @@ def _confirm_durable_lode_mutation(
         time.sleep(min(DURABLE_CONFIRMATION_POLL_INTERVAL_SEC, remaining))
 
 
+def _confirm_durable_stage_attempt(
+    lode_id: str,
+    *,
+    driver: str,
+    stage: str,
+    launch_id: str,
+    provider_session_id: str,
+    run_generation: str | None,
+    emitted_at_ms: int,
+    require_attempt: bool,
+) -> bool:
+    """Confirm a fenced start through the durable record after a lost acknowledgement."""
+    if not isinstance(run_generation, str) or not run_generation:
+        return False
+    expires_at = time.monotonic() + DURABLE_CONFIRMATION_TIMEOUT_SEC
+    while True:
+        try:
+            lodes = load_lodes()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        matches = [lode for lode in lodes if lode.get("id") == lode_id]
+        if len(matches) == 1:
+            lode = matches[0]
+            try:
+                session = lode_stage_session(lode, stage)
+            except ValueError:
+                return False
+            attempt = session["start_attempt"]
+            expected_attempt = {
+                "driver": driver,
+                "stage": stage,
+                "launch_id": launch_id,
+                "provider_session_id": provider_session_id,
+                "run_generation": run_generation,
+                "outcome": "committed",
+            }
+            confirmed = (
+                lode.get("run_generation") == run_generation
+                and type(lode.get("updated_at")) is int
+                and lode["updated_at"] >= emitted_at_ms
+                and session["started"] is True
+                and session["launch_id"] == launch_id
+                and session["provider_session_id"] == provider_session_id
+                and (attempt == expected_attempt if require_attempt else attempt is None)
+            )
+            if confirmed:
+                return True
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(DURABLE_CONFIRMATION_POLL_INTERVAL_SEC, remaining))
+
+
 class BaseRunner:
     """Base class for lode runners.
 
@@ -312,6 +422,14 @@ class BaseRunner:
         self._confirmed_worktree_path: str | None = None
         self.is_first_run = False
         self.claude_session_id: str = ""
+        self.launch_id: str = ""
+        self.driver_name: str = "claude"
+        self.driver = resolve_driver("claude")
+        self.driver_label = self.driver.LABEL
+        self._stage_protocol = StageDriverProtocol.UNKNOWN
+        self._stage_binding_condition = threading.Condition()
+        self._expected_stage_attempt: dict | None = None
+        self._stage_binding_ack: dict | None = None
         self.project_name: str = ""
         self.project_dir: str = ""
         # Activity monitor state
@@ -348,7 +466,12 @@ class BaseRunner:
                 # Query server for lode state and project info
                 response = connect(self.socket_path, lode_id=self.lode_id)
                 if not response:
-                    print(f"Failed to connect to server for lode {self.lode_id}")
+                    message = (
+                        "Interactive-stage protocol is unavailable; inspect connectivity and "
+                        "the Hopper server version before retrying."
+                    )
+                    logger.error("stage protocol unavailable lode=%s", self.lode_id)
+                    print(message)
                     return 1
 
                 lode_data = response.get("lode")
@@ -364,7 +487,37 @@ class BaseRunner:
                 # Read the canonical per-stage provider session info.
                 stage_session = lode_stage_session(lode_data, self._claude_stage)
                 self.claude_session_id = stage_session["provider_session_id"]
+                self.launch_id = stage_session["launch_id"]
+                if self.run_generation is None and isinstance(lode_data.get("run_generation"), str):
+                    self.run_generation = lode_data["run_generation"]
                 self.is_first_run = not stage_session["started"]
+                self.driver_name = lode_driver(lode_data)
+                self._stage_protocol = classify_stage_driver_protocol(response, self.driver_name)
+                if self._stage_protocol is StageDriverProtocol.UNKNOWN:
+                    message = (
+                        "Interactive-stage protocol is unavailable; inspect connectivity and "
+                        "the Hopper server version before retrying."
+                    )
+                    logger.error(
+                        "stage protocol unknown lode=%s driver=%s", self.lode_id, self.driver_name
+                    )
+                    print(message)
+                    return 1
+                try:
+                    self.driver = resolve_driver(self.driver_name)
+                except DriverRefusal as error:
+                    logger.error(
+                        "stage driver refused lode=%s driver=%s", self.lode_id, self.driver_name
+                    )
+                    print(str(error))
+                    return 1
+                self.driver_label = self.driver.LABEL
+                logger.info(
+                    "stage protocol negotiated lode=%s driver=%s path=%s",
+                    self.lode_id,
+                    self.driver_name,
+                    self._stage_protocol.value,
+                )
                 if self.is_first_run:
                     logger.debug(f"first run detected lode={self.lode_id}")
 
@@ -507,6 +660,9 @@ class BaseRunner:
             logger.error(f"workspace trust failed lode={self.lode_id}: {exc}")
             return 1, message
 
+        if not self._admit_stage_start_before_launch():
+            return 1, "Stage launch was not durably acknowledged; inspect before retrying"
+
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -516,9 +672,10 @@ class BaseRunner:
             )
             self._claude_proc = proc
 
-            if self.is_first_run:
-                self._emit_claude_started()
-            self._emit_state("running", "Claude running")
+            if not self._admit_stage_start_after_launch():
+                self._terminate_claude_process()
+                return 1, "Stage launch was not durably acknowledged; inspect before retrying"
+            self._emit_state("running", f"{self.driver_label} running")
             self._start_monitor()
 
             proc.wait()
@@ -537,6 +694,95 @@ class BaseRunner:
         finally:
             if self._claude_proc is not None and self._claude_proc.poll() is not None:
                 self._claude_proc = None
+
+    def _stage_attempt(self) -> dict:
+        """Return the exact fenced binding tuple for this runner's stage launch."""
+        return {
+            "driver": self.driver_name,
+            "stage": self._claude_stage,
+            "launch_id": self.launch_id,
+            "provider_session_id": self.claude_session_id,
+            "run_generation": self.run_generation,
+        }
+
+    def _await_stage_binding(self, attempt: dict, emitted_at_ms: int) -> bool:
+        """Wait for a mutation acknowledgement or reconcile its committed attempt."""
+        if (
+            not self.connection
+            or not isinstance(self.run_generation, str)
+            or not self.run_generation
+        ):
+            return False
+        with self._stage_binding_condition:
+            self._expected_stage_attempt = attempt
+            self._stage_binding_ack = None
+        try:
+            if not self.connection.emit(
+                "lode_bind_stage_session",
+                lode_id=self.lode_id,
+                ack_requested=True,
+                **attempt,
+            ):
+                return False
+            expires_at = time.monotonic() + DURABLE_CONFIRMATION_TIMEOUT_SEC
+            with self._stage_binding_condition:
+                while self._stage_binding_ack is None:
+                    remaining = expires_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._stage_binding_condition.wait(remaining)
+                ack = self._stage_binding_ack
+            if ack is not None:
+                return ack.get("accepted") is True and ack.get("reason") == "committed"
+            return _confirm_durable_stage_attempt(
+                self.lode_id,
+                emitted_at_ms=emitted_at_ms,
+                require_attempt=True,
+                **attempt,
+            )
+        finally:
+            with self._stage_binding_condition:
+                self._expected_stage_attempt = None
+
+    def _admit_stage_start_before_launch(self) -> bool:
+        """Commit current-protocol first starts before a provider process exists."""
+        if self.connection is None:
+            return True
+        if self._stage_protocol is not StageDriverProtocol.CURRENT or not self.is_first_run:
+            return True
+        attempt = self._stage_attempt()
+        if not attempt["launch_id"]:
+            return False
+        logger.info("stage start attempt lode=%s %s", self.lode_id, attempt)
+        return self._await_stage_binding(attempt, current_time_ms())
+
+    def _admit_stage_start_after_launch(self) -> bool:
+        """Apply legacy compatibility confirmation after a provider process starts."""
+        if self.connection is None:
+            return True
+        if self._stage_protocol is StageDriverProtocol.CURRENT:
+            return True
+        emitted_at_ms = current_time_ms()
+        attempt = self._stage_attempt()
+        if self.is_first_run:
+            self._emit_claude_started()
+            return _confirm_durable_stage_attempt(
+                self.lode_id,
+                emitted_at_ms=emitted_at_ms,
+                require_attempt=False,
+                **attempt,
+            )
+        # Legacy servers cannot bind a resume. Persist a non-running launch
+        # marker and require a fresh current-generation durable transition.
+        self._emit_state("ready", f"{self.driver_label} launch confirming")
+        return _confirm_durable_lode_mutation(
+            self.lode_id,
+            "status",
+            f"{self.driver_label} launch confirming",
+            self.run_generation,
+            emitted_at_ms,
+            normalize=lambda value: value,
+        ) is not None
 
     def _handle_signal(self, signum: int, frame) -> None:
         """Handle shutdown signals gracefully."""
@@ -726,6 +972,16 @@ class BaseRunner:
     def _on_server_message(self, message: dict) -> None:
         """Handle incoming server broadcast messages."""
         if message.get("type") == "mutation_ack":
+            if (
+                message.get("mutation_type") == "lode_bind_stage_session"
+                and message.get("lode_id") == self.lode_id
+            ):
+                with self._stage_binding_condition:
+                    attempt = self._expected_stage_attempt
+                    if attempt is not None:
+                        self._stage_binding_ack = message
+                        self._stage_binding_condition.notify_all()
+                return
             if (
                 message.get("mutation_type") == "lode_set_worktree_path"
                 and message.get("lode_id") == self.lode_id
@@ -926,7 +1182,7 @@ class BaseRunner:
                 status = (
                     last_progress_summary
                     if heartbeat > pane_activity and last_progress_summary
-                    else "Claude running"
+                    else f"{self.driver_label} running"
                 )
                 self._emit_state("running", status)
             self._stuck_since = None

@@ -38,7 +38,6 @@ from hopper.backlog import (
 from hopper.backlog import (
     find_by_prefix as find_backlog_by_prefix,
 )
-from hopper.claude import spawn_claude
 from hopper.client import (
     OOM_SCOPE_ENV,
     RUN_GENERATION_ENV,
@@ -50,11 +49,17 @@ from hopper.coder import (
     coder_unavailable_message,
     validate_coder_provider,
 )
+from hopper.driver import (
+    INTERACTIVE_STAGE_DRIVERS,
+    STAGE_DRIVER_CAPABILITIES_KEY,
+    STAGE_DRIVER_PROTOCOL_VERSION,
+)
 from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
     archive_lode,
     archive_lode_for_action,
+    bind_lode_stage_session,
     create_lode,
     current_time_ms,
     find_lodes_by_prefix,
@@ -106,6 +111,7 @@ from hopper.tmux import (
     paste_buffer,
     read_pane_input,
     send_keys,
+    spawn_lode_processor,
 )
 
 logger = logging.getLogger(__name__)
@@ -690,6 +696,13 @@ def _clear_spawn_refusal(lode: dict, *, clear_status: bool = True) -> bool:
         return changed
     lode["status"] = ""
     return True
+
+
+def _persist_protocol_error(lode: dict, message: str) -> None:
+    """Persist one visible protocol refusal that stale running updates cannot erase."""
+    lode["protocol_error"] = message
+    lode["status"] = format_refusal_status("protocol", message)
+    touch(lode)
 
 
 def _lifecycle_grace_pending(lode: dict | None) -> bool:
@@ -2837,7 +2850,7 @@ class Server:
             "target_lode_id": target["id"],
             "target_generation": spawn["target_generation"],
         }
-        window_outcome, pane_id = spawn_claude(
+        window_outcome, pane_id = spawn_lode_processor(
             target["id"],
             context.get("project_path"),
             foreground=False,
@@ -4819,6 +4832,7 @@ class Server:
             lode["state"] = pending_state
         run_generation = uuid.uuid4().hex
         lode["run_generation"] = run_generation
+        lode.pop("protocol_error", None)
         lode["oom_scope"] = (
             oom.scope_unit_name(lode["id"], run_generation) if oom.is_linux() else None
         )
@@ -4830,7 +4844,7 @@ class Server:
         pane_env = {RUN_GENERATION_ENV: run_generation}
         if lode.get("oom_scope"):
             pane_env[OOM_SCOPE_ENV] = lode["oom_scope"]
-        window_outcome, pane_id = spawn_claude(
+        window_outcome, pane_id = spawn_lode_processor(
             lode["id"],
             project_path,
             foreground=foreground,
@@ -5260,6 +5274,10 @@ class Server:
             response: dict = {
                 "type": "connected",
                 "tmux": self.tmux_location,
+                STAGE_DRIVER_CAPABILITIES_KEY: {
+                    "version": STAGE_DRIVER_PROTOCOL_VERSION,
+                    "drivers": list(INTERACTIVE_STAGE_DRIVERS),
+                },
             }
             if lode_id:
                 lode = self._find_lode(lode_id)
@@ -5454,6 +5472,15 @@ class Server:
                     },
                 )
 
+        def refuse_stage_protocol(lode: dict | None, reason: str) -> None:
+            """Record a visible fenced/legacy protocol refusal when a lode remains known."""
+            if lode is None:
+                return
+            _persist_protocol_error(lode, reason)
+            save_lodes(self.lodes)
+            logger.warning("Stage protocol refusal lode=%s reason=%s", lode["id"], reason)
+            self.broadcast({"type": "lode_updated", "lode": lode})
+
         lode_id = message.get("lode_id")
         if msg_type in RUNNER_MUTATION_TYPES and msg_type != "lode_action":
             lode = self._find_lode(lode_id) if lode_id else None
@@ -5474,6 +5501,8 @@ class Server:
                     reason = "missing_run_generation"
                 else:
                     reason = "stale_run_generation"
+                if msg_type in {"lode_set_claude_started", "lode_bind_stage_session"}:
+                    refuse_stage_protocol(lode, reason)
                 acknowledge_mutation(False, reason)
                 return
             if self._generation_has_teardown_intent(lode_id, message.get("run_generation")):
@@ -5498,6 +5527,8 @@ class Server:
                         },
                     )
                 acknowledge_mutation(False, "expected_teardown")
+                if msg_type in {"lode_set_claude_started", "lode_bind_stage_session"}:
+                    refuse_stage_protocol(lode, "expected_teardown")
                 return
             if msg_type not in {
                 "lode_register",
@@ -5519,7 +5550,13 @@ class Server:
                     acknowledge_mutation(False, reason)
                     return
                 message["worktree_path"] = canonical_path
-            if msg_type not in {"lode_register", "lode_supervisor_register", "lode_set_state"}:
+            if msg_type not in {
+                "lode_register",
+                "lode_supervisor_register",
+                "lode_set_state",
+                "lode_set_claude_started",
+                "lode_bind_stage_session",
+            }:
                 acknowledge_mutation(True, "accepted")
 
         if msg_type == "_client_disconnect":
@@ -5631,6 +5668,23 @@ class Server:
                     self._send_response(
                         conn,
                         {"type": "error", "error": "lode_create requires coder_provider"},
+                    )
+                return
+            requested_driver = message.get("driver", "claude")
+            if requested_driver != "claude":
+                logger.warning(
+                    "Refusing unavailable interactive driver request driver=%r", requested_driver
+                )
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                "interactive-stage driver is unavailable; inspect connectivity and "
+                                "server version"
+                            ),
+                        },
                     )
                 return
             project = message.get("project", "")
@@ -5820,6 +5874,19 @@ class Server:
                     )
                     acknowledge_mutation(False, "stale_gate_epoch")
                     return
+                if (
+                    lode
+                    and state == "running"
+                    and lode.get("protocol_error")
+                    and message.get("run_generation") == lode.get("run_generation")
+                ):
+                    logger.warning(
+                        "Dropping running state over protocol error lode=%s generation=%s",
+                        lode_id,
+                        message.get("run_generation"),
+                    )
+                    acknowledge_mutation(False, "protocol_error")
+                    return
                 lode = update_lode_state(self.lodes, lode_id, state, status)
                 if lode:
                     _log_state_change(lode_id, state, status, "lode_set_state")
@@ -5923,14 +5990,91 @@ class Server:
                     logger.info(f"Lode {lode_id} coder={provider} session={session_id}")
                     self.broadcast({"type": "lode_updated", "lode": lode})
 
+        elif msg_type == "lode_bind_stage_session":
+            lode_id = message.get("lode_id")
+            lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
+            driver = message.get("driver")
+            stage = message.get("stage")
+            launch_id = message.get("launch_id")
+            provider_session_id = message.get("provider_session_id")
+            run_generation = message.get("run_generation")
+            if not lode:
+                acknowledge_mutation(False, "lode_not_found")
+                return
+            if (
+                driver != "claude"
+                or lode_driver(lode) != driver
+                or stage != lode.get("stage")
+                or not all(
+                    isinstance(value, str) and value
+                    for value in (stage, launch_id, provider_session_id, run_generation)
+                )
+            ):
+                refuse_stage_protocol(
+                    lode, "stage binding identity does not match the current lode"
+                )
+                acknowledge_mutation(False, "stage_identity_mismatch")
+                return
+            try:
+                bound, outcome = bind_lode_stage_session(
+                    self.lodes,
+                    lode_id,
+                    driver=driver,
+                    stage=stage,
+                    launch_id=launch_id,
+                    provider_session_id=provider_session_id,
+                    run_generation=run_generation,
+                )
+            except ValueError as error:
+                refuse_stage_protocol(lode, str(error))
+                acknowledge_mutation(False, "stage_binding_conflict")
+                return
+            if bound is None:
+                acknowledge_mutation(False, "lode_not_found")
+                return
+            logger.info(
+                "stage binding committed lode=%s driver=%s stage=%s launch_id=%s "
+                "provider_session_id=%s run_generation=%s",
+                lode_id,
+                driver,
+                stage,
+                launch_id,
+                provider_session_id,
+                run_generation,
+            )
+            self.broadcast({"type": "lode_updated", "lode": bound})
+            acknowledge_mutation(True, outcome)
+
         elif msg_type == "lode_set_claude_started":
             lode_id = message.get("lode_id")
             claude_stage = message.get("claude_stage")
-            if lode_id and claude_stage:
-                lode = set_lode_claude_started(self.lodes, lode_id, claude_stage)
-                if lode:
-                    logger.info(f"Lode {lode_id} claude_started stage={claude_stage}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+            lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
+            expected_fields = {"type", "lode_id", "claude_stage", "ts", "run_generation"}
+            if (
+                lode is None
+                or set(message) != expected_fields
+                or not isinstance(claude_stage, str)
+                or lode_driver(lode) != "claude"
+                or claude_stage != lode.get("stage")
+            ):
+                if lode is not None:
+                    refuse_stage_protocol(
+                        lode, "legacy Claude start does not match the current stage"
+                    )
+                acknowledge_mutation(False, "stage_identity_mismatch")
+                return
+            lode = set_lode_claude_started(self.lodes, lode_id, claude_stage)
+            if lode:
+                logger.info(
+                    "legacy Claude start committed lode=%s stage=%s generation=%s",
+                    lode_id,
+                    claude_stage,
+                    message["run_generation"],
+                )
+                self.broadcast({"type": "lode_updated", "lode": lode})
+                acknowledge_mutation(True, "committed")
+            else:
+                acknowledge_mutation(False, "lode_not_found")
 
         elif msg_type == "lode_reset_claude_stage":
             self._send_action_ack(

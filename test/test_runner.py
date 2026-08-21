@@ -33,11 +33,23 @@ def _runner_lode() -> dict:
     lode = {
         "id": "test-id",
         "active": False,
+        "run_generation": "test-generation",
         "driver": "claude",
         "stage_sessions": make_lode_stage_sessions("test-id"),
     }
     project_lode_claude_state(lode)
     return lode
+
+
+def _runner_connected(lode: dict) -> dict:
+    """Return a current server handshake for runner lifecycle tests."""
+    return {
+        "type": "connected",
+        "tmux": None,
+        "lode": lode,
+        "lode_found": True,
+        "stage_driver_capabilities": {"version": 1, "drivers": ["claude"]},
+    }
 
 
 class TestExtractErrorMessage:
@@ -110,7 +122,7 @@ class TestBaseRunnerRegistration:
         with (
             patch(
                 "hopper.runner.connect",
-                return_value={"lode": _runner_lode()},
+                return_value=_runner_connected(_runner_lode()),
             ),
             patch("hopper.runner.HopperConnection", return_value=connection),
             patch.object(runner, "_setup") as setup,
@@ -150,7 +162,7 @@ class TestBaseRunnerRegistration:
         with (
             patch(
                 "hopper.runner.connect",
-                return_value={"lode": _runner_lode()},
+                return_value=_runner_connected(_runner_lode()),
             ),
             patch("hopper.runner.HopperConnection", return_value=connection),
             patch.object(runner, "_setup") as setup,
@@ -458,13 +470,62 @@ class TestBaseRunnerActivityMonitor:
         )
         launch.assert_not_called()
 
+    def test_current_binding_refusal_starts_no_provider_process(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+        runner.is_first_run = True
+        runner._stage_protocol = runner_module.StageDriverProtocol.CURRENT
+        runner.run_generation = "generation-1"
+        runner.claude_session_id = "11111111-1111-1111-1111-111111111111"
+        runner.launch_id = "22222222-2222-2222-2222-222222222222"
+        connection = MagicMock()
+        connection.emit.return_value = False
+        runner.connection = connection
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], "/repo")),
+            patch("hopper.runner.trust_claude_workspace"),
+            patch("hopper.runner.subprocess.Popen") as launch,
+        ):
+            assert runner._run_claude() == (
+                1,
+                "Stage launch was not durably acknowledged; inspect before retrying",
+            )
+
+        launch.assert_not_called()
+
+    def test_legacy_resume_emits_no_fabricated_start_and_requires_durable_confirmation(self):
+        runner = self._make_runner()
+        runner._claude_stage = "mill"
+        runner.is_first_run = False
+        runner._stage_protocol = runner_module.StageDriverProtocol.LEGACY_CLAUDE
+        runner.run_generation = "generation-1"
+        runner.claude_session_id = "11111111-1111-1111-1111-111111111111"
+        runner.launch_id = "22222222-2222-2222-2222-222222222222"
+        emitted = []
+        connection = MagicMock()
+        connection.emit.side_effect = lambda kind, **fields: emitted.append((kind, fields)) or True
+        runner.connection = connection
+
+        with patch(
+            "hopper.runner._confirm_durable_lode_mutation",
+            return_value="Claude launch confirming",
+        ) as confirm:
+            assert runner._admit_stage_start_after_launch() is True
+
+        assert [kind for kind, _fields in emitted] == ["lode_set_state"]
+        assert emitted[0][1]["state"] == "ready"
+        assert confirm.call_args.args[3] == "generation-1"
+
     def test_subprocess_env_configures_managed_claude(self):
         """Managed Hopper stages configure Claude Code for machine-read panes."""
         runner = self._make_runner()
+        runner.run_generation = "generation-for-env"
 
         env = runner._get_subprocess_env()
 
         assert env["HOPPER_LID"] == "test-session"
+        assert env["HOPPER_RUN_GENERATION"] == "generation-for-env"
         assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
         assert env["CLAUDE_CODE_DISABLE_MEMORY_PERIODIC_RESYNC"] == "1"
         assert env["CLAUDE_CODE_DISABLE_MEMORY_BULK_INFLATE"] == "1"

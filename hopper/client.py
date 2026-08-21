@@ -39,6 +39,7 @@ RUNNER_MUTATION_TYPES = frozenset(
         "lode_set_codex_thread",
         "lode_set_coder_session",
         "lode_set_claude_started",
+        "lode_bind_stage_session",
     }
 )
 
@@ -376,6 +377,7 @@ def connect(socket_path: Path, lode_id: str | None = None, timeout: float = 2.0)
         - tmux: {"session": str, "pane": str} or None
         - lode: lode dict if lode_id provided and found, else None
         - lode_found: bool if lode_id was provided
+        - stage_driver_capabilities: current interactive-stage protocol marker
         Returns None if server is unreachable.
     """
     message: dict = {"type": "connect", "ts": current_time_ms()}

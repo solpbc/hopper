@@ -1,49 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 sol pbc
 
-"""Claude Code wrapper for hopper."""
+"""Claude interactive-stage driver adapter."""
 
-import os
-import shlex
-
-from hopper.tmux import WindowSpawnOutcome, new_window, select_window
-
-
-def spawn_claude(
-    lode_id: str,
-    project_path: str | None = None,
-    foreground: bool = False,
-    env: dict[str, str] | None = None,
-    spawn_receipt: dict | None = None,
-) -> tuple[WindowSpawnOutcome, str | None]:
-    """Spawn Claude via hopper in a new tmux window.
-
-    Args:
-        lode_id: The hopper lode ID.
-        project_path: Working directory for the Claude session.
-        foreground: If True, switch to the new window. Defaults to staying in current window.
-
-    Returns:
-        The authoritative tmux creation result and pane ID when known.
-    """
-    path = os.environ.get("PATH", "/usr/bin:/bin")
-    # Run through /bin/sh so PATH and || work regardless of tmux's default shell
-    fail = "echo 'Failed. Press Enter to close.'; read"
-    inner = f"export PATH={shlex.quote(path)}; hop process {lode_id} || {{ {fail}; }}"
-    command = f"/bin/sh -c {shlex.quote(inner)}"
-    kwargs = {"cwd": project_path, "env": env, "background": not foreground}
-    if spawn_receipt is not None:
-        kwargs["spawn_receipt"] = spawn_receipt
-    return new_window(command, **kwargs)
+DRIVER = "claude"
+LABEL = "Claude"
+_FLAGS = ("--dangerously-skip-permissions", "--disallowed-tools=AskUserQuestion")
 
 
-def switch_to_pane(pane_id: str) -> bool:
-    """Switch to the tmux window containing the given pane.
-
-    Args:
-        pane_id: The tmux pane ID to switch to (e.g., "%1").
-
-    Returns:
-        True if successfully switched, False otherwise.
-    """
-    return select_window(pane_id)
+def build_command(*, session_id: str, prompt: str | None, resume: bool) -> list[str]:
+    """Build one Claude command while preserving its durable session identity."""
+    if resume:
+        return ["claude", *_FLAGS, "--resume", session_id]
+    if not isinstance(prompt, str):
+        raise ValueError("a Claude first launch requires a prompt")
+    return ["claude", *_FLAGS, "--session-id", session_id, prompt]

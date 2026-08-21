@@ -1124,6 +1124,36 @@ def test_persistent_connection_attaches_runner_generation(socket_path):
     assert conn.send_queue.get_nowait()["run_generation"] == TEST_RUN_GENERATION
 
 
+def test_persistent_connection_emits_complete_fenced_stage_binding(socket_path):
+    conn = HopperConnection(socket_path, run_generation=TEST_RUN_GENERATION)
+    conn.thread = MagicMock()
+    conn.thread.is_alive.return_value = True
+
+    assert conn.emit(
+        "lode_bind_stage_session",
+        lode_id="test-id",
+        driver="claude",
+        stage="mill",
+        launch_id="11111111-1111-1111-1111-111111111111",
+        provider_session_id="22222222-2222-2222-2222-222222222222",
+        ack_requested=True,
+    )
+
+    message = conn.send_queue.get_nowait()
+    assert set(message) == {
+        "type",
+        "lode_id",
+        "driver",
+        "stage",
+        "launch_id",
+        "provider_session_id",
+        "ack_requested",
+        "ts",
+        "run_generation",
+    }
+    assert message["run_generation"] == TEST_RUN_GENERATION
+
+
 def test_set_lode_state_sends_message(server, socket_path):
     """set_lode_state sends the correct message type."""
 

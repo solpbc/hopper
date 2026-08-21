@@ -22,6 +22,7 @@ Lodes are plain dicts with these fields:
 - run_generation: str | None - generation owning runner mutations (default None)
 - oom_scope: str | None - guarded systemd scope unit name (default None)
 - failure_kind: str | None - durable terminal runner failure discriminator (default None)
+- protocol_error: str | None - durable current-generation stage-protocol refusal (default None)
 - archive_action_id: str | None - action that published this archive (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - coder: optional dict - non-Codex refine-stage provider and resumable session:
@@ -60,8 +61,13 @@ from hopper.tmux import Liveness, pane_liveness
 
 ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
-REFUSAL_STATUS_PREFIXES = ("spawn refused: ", "spawn failed: ", "action refused: ")
-_REFUSAL_STATUS_INDEX = {"spawn": 0, "spawn_failed": 1, "action": 2}
+REFUSAL_STATUS_PREFIXES = (
+    "spawn refused: ",
+    "spawn failed: ",
+    "action refused: ",
+    "protocol error: ",
+)
+_REFUSAL_STATUS_INDEX = {"spawn": 0, "spawn_failed": 1, "action": 2, "protocol": 3}
 _STAGE_NAMES = ("mill", "refine", "ship")
 _INTERACTIVE_STAGE_DRIVERS = frozenset({"claude", "codex", "grok"})
 # Frozen launch-ID namespace; it must never change or stable durable identities would rewrite.
@@ -394,9 +400,44 @@ def _validate_stage_session(lode: dict, stage: str, session: object) -> dict:
         raise _lode_record_error(lode, stage, "started", "must be a boolean")
     if session["transcript_path"] is not None and not isinstance(session["transcript_path"], str):
         raise _lode_record_error(lode, stage, "transcript_path", "must be a string or null")
-    if session["start_attempt"] is not None and not isinstance(session["start_attempt"], dict):
-        raise _lode_record_error(lode, stage, "start_attempt", "must be an object or null")
+    if session["start_attempt"] is not None:
+        _validate_stage_start_attempt(lode, stage, session, session["start_attempt"])
     return session
+
+
+def _validate_stage_start_attempt(lode: dict, stage: str, session: dict, attempt: object) -> dict:
+    """Validate the lode-local committed binding attempt for one stage."""
+    if not isinstance(attempt, dict):
+        raise _lode_record_error(lode, stage, "start_attempt", "must be an object or null")
+    expected_fields = {
+        "driver",
+        "stage",
+        "launch_id",
+        "provider_session_id",
+        "run_generation",
+        "outcome",
+    }
+    missing = expected_fields - attempt.keys()
+    if missing:
+        raise _lode_record_error(lode, stage, next(iter(sorted(missing))), "is required")
+    extra = attempt.keys() - expected_fields
+    if extra:
+        raise _lode_record_error(lode, stage, next(iter(sorted(extra))), "is not supported")
+    if attempt["driver"] != lode_driver(lode):
+        raise _lode_record_error(lode, stage, "driver", "does not match the lode driver")
+    if attempt["stage"] != stage:
+        raise _lode_record_error(lode, stage, "stage", "does not match the stage session")
+    if attempt["launch_id"] != session["launch_id"]:
+        raise _lode_record_error(lode, stage, "launch_id", "does not match the stage session")
+    if attempt["provider_session_id"] != session["provider_session_id"]:
+        raise _lode_record_error(
+            lode, stage, "provider_session_id", "does not match the stage session"
+        )
+    if not isinstance(attempt["run_generation"], str) or not attempt["run_generation"]:
+        raise _lode_record_error(lode, stage, "run_generation", "must be a non-empty string")
+    if attempt["outcome"] != "committed":
+        raise _lode_record_error(lode, stage, "outcome", "must be committed")
+    return attempt
 
 
 def lode_stage_session(lode: dict, stage: str) -> dict:
@@ -722,6 +763,7 @@ def create_lode(
         "run_generation": None,
         "oom_scope": None,
         "failure_kind": None,
+        "protocol_error": None,
         "spawn_disposition": None,
         "archive_action_id": None,
         "codex_thread_id": None,
@@ -1004,6 +1046,54 @@ def set_lode_stage_session_started(lodes: list[dict], lode_id: str, stage: str) 
         save_lodes(lodes)
         return lode
     return None
+
+
+def bind_lode_stage_session(
+    lodes: list[dict],
+    lode_id: str,
+    *,
+    driver: str,
+    stage: str,
+    launch_id: str,
+    provider_session_id: str,
+    run_generation: str,
+) -> tuple[dict | None, str]:
+    """Commit one fenced provider start attempt and both durable projections.
+
+    The stage-local attempt is the idempotency record. An exact replay reports
+    its committed outcome; a differing replay is an identity conflict.
+    """
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        normalize_lode_stage_sessions(lode)
+        if lode_driver(lode) != driver:
+            raise ValueError("driver does not match the durable lode")
+        session = lode_stage_session(lode, stage)
+        attempt = {
+            "driver": driver,
+            "stage": stage,
+            "launch_id": launch_id,
+            "provider_session_id": provider_session_id,
+            "run_generation": run_generation,
+            "outcome": "committed",
+        }
+        if session["launch_id"] != launch_id:
+            raise ValueError("launch_id does not match the durable stage session")
+        if session["provider_session_id"] != provider_session_id:
+            raise ValueError("provider_session_id does not match the durable stage session")
+        existing = session["start_attempt"]
+        if existing is not None:
+            if existing == attempt:
+                return lode, "committed"
+            raise ValueError("start attempt conflicts with the committed durable attempt")
+        session["started"] = True
+        session["start_attempt"] = attempt
+        project_lode_claude_state(lode)
+        touch(lode)
+        save_lodes(lodes)
+        return lode, "committed"
+    return None, "lode_not_found"
 
 
 def reset_lode_stage_session(

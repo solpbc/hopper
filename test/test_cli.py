@@ -6844,6 +6844,11 @@ def test_format_lode_detail_shows_grok_coder(make_lode):
     assert "  coder:    grok" in format_lode_detail(lode)
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex", "grok"])
+def test_format_lode_detail_shows_the_durable_interactive_driver(make_lode, provider):
+    assert f"  driver:   {provider}" in format_lode_detail(make_lode(driver=provider))
+
+
 def test_format_lode_reconnecting_is_pending_with_prior_diagnostics(make_lode):
     status = "Runner pane %8 survived server replacement; waiting for registration"
     lode = make_lode(

@@ -33,7 +33,6 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from hopper.backlog import BacklogItem
-from hopper.claude import switch_to_pane
 from hopper.coder import (
     DEFAULT_CODER_PROVIDER,
     CoderDefaultRefusal,
@@ -64,7 +63,7 @@ from hopper.lodes import (
     read_diff_totals,
 )
 from hopper.projects import Project, find_project, load_projects, touch_project
-from hopper.tmux import capture_pane, rename_window
+from hopper.tmux import capture_pane, rename_window, switch_to_pane
 
 # Claude Code-inspired theme
 # Colors derived from Claude Code's terminal UI (ANSI bright colors)

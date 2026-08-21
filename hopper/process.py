@@ -694,15 +694,21 @@ class ProcessRunner(BaseRunner):
         return base_env
 
     def _build_command(self) -> tuple[list[str], str | None]:
-        skip = "--dangerously-skip-permissions"
-
         if self.is_first_run:
             initial_prompt = prompt.load(
                 self._prompt_name, context=self._context if self._context else None
             )
-            cmd = ["claude", skip, "--session-id", self.claude_session_id, initial_prompt]
+            cmd = self.driver.build_command(
+                session_id=self.claude_session_id,
+                prompt=initial_prompt,
+                resume=False,
+            )
         else:
-            cmd = ["claude", skip, "--resume", self.claude_session_id]
+            cmd = self.driver.build_command(
+                session_id=self.claude_session_id,
+                prompt=None,
+                resume=True,
+            )
 
         return cmd, self._cwd
 

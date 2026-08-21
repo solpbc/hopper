@@ -91,6 +91,7 @@ def make_lode():
             "run_generation": None,
             "oom_scope": None,
             "failure_kind": None,
+            "protocol_error": None,
             "spawn_disposition": None,
             "archive_action_id": None,
             "codex_thread_id": None,
