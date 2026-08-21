@@ -2048,6 +2048,9 @@ def test_implement_warns_with_registered_runner_count_and_still_creates(capsys):
         ),
         patch("hopper.client.create_lode", return_value=created_lode) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
+        # Pin free space above the floor: this assertion is exact, and the real
+        # disk of the box running the suite is exactly the thing under test.
+        patch("hopper.cli.shutil.disk_usage", return_value=_disk_usage(free_gb=500.0)),
     ):
         assert cmd_implement(["myproj"]) == 0
 
@@ -2061,6 +2064,44 @@ def test_implement_warns_with_registered_runner_count_and_still_creates(capsys):
 def test_load_report_failure_is_swallowed():
     with patch("hopper.cli.os.getloadavg", side_effect=OSError("unavailable")):
         hopper_cli._warn_target_load(Path("/tmp/test.sock"))
+
+
+def _disk_usage(free_gb: float):
+    """Build a shutil.disk_usage result with the given free space."""
+    free = int(free_gb * 1_000_000_000)
+    return shutil._ntuple_diskusage(total=free * 2, used=free, free=free)
+
+
+def test_disk_warning_fires_below_the_floor(capsys):
+    with patch("hopper.cli.shutil.disk_usage", return_value=_disk_usage(free_gb=2.9)):
+        hopper_cli._warn_target_disk()
+    err = capsys.readouterr().err
+    assert "2.9 GB free" in err
+    assert "floor 30 GB" in err
+    assert "creating anyway" in err
+    # The whole point of the warning: name the shape the failure actually takes.
+    assert "linker/toolchain crash in code the diff never touched" in err
+
+
+def test_disk_warning_silent_above_the_floor(capsys):
+    with patch("hopper.cli.shutil.disk_usage", return_value=_disk_usage(free_gb=120.0)):
+        hopper_cli._warn_target_disk()
+    assert capsys.readouterr().err == ""
+
+
+def test_disk_warning_does_not_gate_at_the_floor_exactly(capsys):
+    with patch(
+        "hopper.cli.shutil.disk_usage",
+        return_value=_disk_usage(free_gb=hopper_cli.DISK_WARNING_FREE_GB),
+    ):
+        hopper_cli._warn_target_disk()
+    assert capsys.readouterr().err == ""
+
+
+def test_disk_report_failure_is_swallowed(capsys):
+    with patch("hopper.cli.shutil.disk_usage", side_effect=OSError("unavailable")):
+        hopper_cli._warn_target_disk()
+    assert capsys.readouterr().err == ""
 
 
 def test_implement_rejects_inside_lode(monkeypatch, capsys):

@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,7 @@ WAIT_EXTRA_LODE_IDS_REFUSAL = (
 RESOLUTION_TIMEOUT_SECONDS = 5.5
 LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC = 2.0
 LOAD_WARNING_PER_CPU = 1.0
+DISK_WARNING_FREE_GB = 30.0
 _watch_monotonic = time.monotonic
 
 
@@ -311,6 +313,36 @@ def _warn_target_load(socket_path: Path) -> None:
             f"warning: target load 1m={one:.2f} 5m={five:.2f} 15m={fifteen:.2f} "
             f"across {logical_cpus} logical CPUs; lodes with a registered runner="
             f"{registered_runners}; creating anyway",
+            file=sys.stderr,
+        )
+    except Exception:
+        return
+
+
+def _warn_target_disk() -> None:
+    """Best-effort warning about worktree-root free space without gating submission.
+
+    Disk is the other shared resource a new lode consumes and the only one with no
+    admission control at all. It matters more than the byte count suggests: a lode
+    that runs out of space mid-build does not report a full disk. It reports a
+    toolchain crash — `collect2: ld terminated with signal 7 [Bus error]`, plus an
+    LLVM crash handler inviting a bug report — while linking binaries the lode's
+    diff never touched, which sends the session into the wrong repository. Naming
+    that failure mode at submission time is worth more than the disk it saves.
+    """
+    try:
+        root = config.worktree_root()
+        probe = root if root.is_dir() else root.parent
+        usage = shutil.disk_usage(probe)
+        free_gb = usage.free / 1_000_000_000
+        if free_gb >= DISK_WARNING_FREE_GB:
+            return
+        print(
+            f"warning: worktree root {root} has {free_gb:.1f} GB free "
+            f"(floor {DISK_WARNING_FREE_GB:.0f} GB); each lode worktree carries its own "
+            "build output and typically consumes tens of GB; creating anyway. "
+            "If this host fills, builds fail as a linker/toolchain crash in code the "
+            "diff never touched, not as a disk error.",
             file=sys.stderr,
         )
     except Exception:
@@ -4376,6 +4408,7 @@ def cmd_lode(args: list[str]) -> int:
         if err:
             return err
         _warn_target_load(socket_path)
+        _warn_target_disk()
         raw_originating_extro_sid = (
             parsed.originating_extro_sid
             if parsed.originating_extro_sid is not None
