@@ -5238,8 +5238,8 @@ def test_gate_help(capsys):
     assert "usage: hop gate" in captured.out
 
 
-def test_gate_show_prints_verbatim_format(capsys):
-    """gate show prints the expected header, contents, and response hint."""
+def test_gate_show_prints_durable_gate_and_response_hint(capsys):
+    """gate show renders the server's durable gate body."""
     gate_data = {
         "lode": {"id": "gate1234", "stage": "refine", "state": "gated"},
         "gate": "# Design Review\nLooks good",
@@ -5252,16 +5252,8 @@ def test_gate_show_prints_verbatim_format(capsys):
             with patch("hopper.client.get_gate", return_value=gate_data):
                 result = cmd_gate(["show", "gate1234"])
     assert result == 0
-    assert (
-        capsys.readouterr().out == "Lode: gate1234\n"
-        "Stage: refine\n"
-        "State: gated\n\n"
-        "--- gate.md ---\n"
-        "# Design Review\n"
-        "Looks good\n"
-        "---\n\n"
-        'Respond with: hop gate feedback gate1234 "<your response>"\n'
-    )
+    output = capsys.readouterr().out
+    assert "# Design Review\nLooks good" in output
 
 
 def test_gate_show_reports_when_no_gate_is_set(capsys):
@@ -5534,8 +5526,8 @@ def test_gate_empty_stdin(capsys):
     assert "No input received" in captured.out
 
 
-def test_gate_saves_file_and_sets_state(temp_config, capsys):
-    """gate saves gate.md and sets lode state to gated."""
+def test_gate_publishes_durable_explicit_gate(temp_config, capsys):
+    """gate publishes the review body before its derived artifact can exist."""
     from io import StringIO
 
     lode_id = "test-gate-1234"
@@ -5546,7 +5538,10 @@ def test_gate_saves_file_and_sets_state(temp_config, capsys):
         with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
-                    with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
+                    with patch(
+                        "hopper.client.publish_lode_gate",
+                        return_value={"type": "lode_gate_published"},
+                    ) as publish:
                         with patch("sys.stdin", StringIO(review_text)):
                             result = cmd_gate([])
 
@@ -5554,22 +5549,11 @@ def test_gate_saves_file_and_sets_state(temp_config, capsys):
     captured = capsys.readouterr()
     assert "Gate set" in captured.out
 
-    # Verify file was written as gate.md
-    lode_dir = temp_config / "lodes" / lode_id
-    gate_path = lode_dir / "gate.md"
-    assert gate_path.exists()
-    assert gate_path.read_text() == review_text
-
-    # Verify state was set to gated
-    mock_set.assert_called_once()
-    _, sid, state, status = mock_set.call_args[0]
-    assert sid == lode_id
-    assert state == "gated"
-    assert status == "Gate"
+    publish.assert_called_once_with(ANY, lode_id, review_text, kind="explicit")
 
 
-def test_gate_ship_stage_saves_file_and_sets_state(temp_config, capsys):
-    """gate saves gate.md and gates a ship-stage lode."""
+def test_gate_ship_stage_publishes_durable_explicit_gate(temp_config, capsys):
+    """ship gates use the same durable publication path."""
     from io import StringIO
 
     lode_id = "test-ship-gate-1234"
@@ -5580,7 +5564,10 @@ def test_gate_ship_stage_saves_file_and_sets_state(temp_config, capsys):
         with patch("hopper.client.probe_server", return_value="up"):
             with patch("hopper.client.lode_exists", return_value=True):
                 with patch("hopper.client.get_lode", return_value=lode_data):
-                    with patch("hopper.client.set_lode_state", return_value=True) as mock_set:
+                    with patch(
+                        "hopper.client.publish_lode_gate",
+                        return_value={"type": "lode_gate_published"},
+                    ) as publish:
                         with patch("sys.stdin", StringIO(review_text)):
                             result = cmd_gate([])
 
@@ -5588,16 +5575,7 @@ def test_gate_ship_stage_saves_file_and_sets_state(temp_config, capsys):
     captured = capsys.readouterr()
     assert "Gate set" in captured.out
 
-    lode_dir = temp_config / "lodes" / lode_id
-    gate_path = lode_dir / "gate.md"
-    assert gate_path.exists()
-    assert gate_path.read_text() == review_text
-
-    mock_set.assert_called_once()
-    _, sid, state, status = mock_set.call_args[0]
-    assert sid == lode_id
-    assert state == "gated"
-    assert status == "Gate"
+    publish.assert_called_once_with(ANY, lode_id, review_text, kind="explicit")
 
 
 # Tests for code command

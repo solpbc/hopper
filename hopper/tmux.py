@@ -57,10 +57,24 @@ class WindowSpawnOutcome(Enum):
 
 
 class PanePhase(Enum):
-    """Claude pane activity phase inferred from its tmux title."""
+    """Provider-neutral pane phases; several values have no detector yet."""
 
+    STARTING = "starting"
+    BUSY = "busy"
     IDLE = "idle"
-    PROCESSING = "processing"
+    BLOCKED = "blocked"
+    BACKGROUND = "background"
+    AUTH = "auth"
+    UNKNOWN = "unknown"
+
+
+class KeyboardOwnership(Enum):
+    """Provider-neutral keyboard ownership; card and none have no detector yet."""
+
+    COMPOSER = "composer"
+    NUMBERED_CHOICE = "numbered_choice"
+    CARD = "card"
+    NONE = "none"
     UNKNOWN = "unknown"
 
 
@@ -173,20 +187,88 @@ def pane_title(target: str) -> str | None:
     return result.stdout.strip() or None
 
 
-def classify_pane_phase(title: str | None) -> PanePhase:
-    """Classify a Claude pane title without guessing on unrecognized titles."""
-    if not title:
+def normalize_terminal_text(text: object) -> str | None:
+    """Strip valid CSI and OSC terminal control sequences without guessing.
+
+    Semantic parsers must call this before interpreting a pane frame. A malformed
+    escape sequence is deliberately not partially recovered: callers receive
+    ``None`` and classify the frame as unknown rather than accepting text that
+    may have been rearranged by terminal controls.
+    """
+    if not isinstance(text, str):
+        return None
+
+    normalized: list[str] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character != "\x1b":
+            normalized.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(text):
+            return None
+
+        introducer = text[index + 1]
+        if introducer == "[":
+            # ECMA-48 CSI: parameter bytes, intermediate bytes, then a final.
+            cursor = index + 2
+            while cursor < len(text) and "0" <= text[cursor] <= "?":
+                cursor += 1
+            while cursor < len(text) and " " <= text[cursor] <= "/":
+                cursor += 1
+            if cursor >= len(text) or not ("@" <= text[cursor] <= "~"):
+                return None
+            index = cursor + 1
+            continue
+        if introducer == "]":
+            # OSC accepts BEL or ST (ESC \\) as its terminator.
+            cursor = index + 2
+            while cursor < len(text):
+                if text[cursor] == "\x07":
+                    index = cursor + 1
+                    break
+                if text[cursor] == "\x1b":
+                    if cursor + 1 < len(text) and text[cursor + 1] == "\\":
+                        index = cursor + 2
+                        break
+                    return None
+                cursor += 1
+            else:
+                return None
+            continue
+        return None
+    return "".join(normalized)
+
+
+def classify_pane_phase(title: str | None, snapshot: str | None = None) -> PanePhase:
+    """Classify a pane title without guessing on malformed or unfamiliar input."""
+    if (
+        snapshot is not None
+        and pane_keyboard_ownership(snapshot) is KeyboardOwnership.NUMBERED_CHOICE
+    ):
+        return PanePhase.BLOCKED
+    normalized = normalize_terminal_text(title)
+    if not normalized:
         return PanePhase.UNKNOWN
-    marker = title[0]
+    marker = normalized[0]
     if marker == "\u2733":
         return PanePhase.IDLE
     if "\u25d0" <= marker <= "\u25d3" or "\u2800" <= marker <= "\u28ff":
-        return PanePhase.PROCESSING
+        return PanePhase.BUSY
     return PanePhase.UNKNOWN
 
 
 def read_pane_input(pane_text: str) -> str | None:
     """Read input after the prompt in the final complete Claude input box."""
+    normalized = normalize_terminal_text(pane_text)
+    if normalized is None:
+        return None
+    return _read_normalized_pane_input(normalized)
+
+
+def _read_normalized_pane_input(pane_text: str) -> str | None:
+    """Read input from terminal text already accepted by the normalizer."""
     lines = pane_text.splitlines()
     rules = [
         index
@@ -206,7 +288,6 @@ def read_pane_input(pane_text: str) -> str | None:
     return None
 
 
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _QUESTION_OPTION_RE = re.compile(
     r"^\s*(?P<cursor>\u276f)?\s*(?P<number>\d+)\.(?:\s|$)",
 )
@@ -216,13 +297,12 @@ _QUESTION_CHROME_RE = re.compile(
 )
 
 
-def _parse_pane_answer(
-    snapshot: str,
+def _parse_normalized_pane_answer(
+    text: str,
 ) -> tuple[list[str], list[tuple[int, int, str, bool]], int, int] | None:
-    """Parse the current contiguous rows from a numbered selector."""
-    if not snapshot:
+    """Parse the current selector from terminal text accepted by the normalizer."""
+    if not text:
         return None
-    text = _ANSI_ESCAPE_RE.sub("", snapshot)
     lines = text.splitlines()
     chrome_lines = [index for index, line in enumerate(lines) if _QUESTION_CHROME_RE.search(line)]
     if not chrome_lines:
@@ -255,7 +335,10 @@ def _parse_pane_answer(
 
 def pane_answer_choices(snapshot: str) -> tuple[int, tuple[int, ...], frozenset[int]] | None:
     """Return the selected row, visible choices, and free-text rows for a selector."""
-    parsed = _parse_pane_answer(snapshot)
+    normalized = normalize_terminal_text(snapshot)
+    if normalized is None:
+        return None
+    parsed = _parse_normalized_pane_answer(normalized)
     if parsed is None:
         return None
     lines, rows, selected_position, _chrome_line = parsed
@@ -281,7 +364,10 @@ def _normalize_pane_text(parts: list[str]) -> str:
 
 def pane_answer_identity(snapshot: str) -> tuple[str, tuple[tuple[int, str], ...]] | None:
     """Return stable rendered content identifying a numbered selector."""
-    parsed = _parse_pane_answer(snapshot)
+    normalized = normalize_terminal_text(snapshot)
+    if normalized is None:
+        return None
+    parsed = _parse_normalized_pane_answer(normalized)
     if parsed is None:
         return None
     lines, rows, _selected_position, chrome_line = parsed
@@ -317,8 +403,12 @@ def pane_answer_identity(snapshot: str) -> tuple[str, tuple[tuple[int, str], ...
 
 def pane_surface_readable(snapshot: str) -> bool:
     """Return whether a non-empty capture contains a readable Claude input surface."""
-    return bool(snapshot.strip()) and (
-        read_pane_input(snapshot) is not None or pane_answer_choices(snapshot) is not None
+    normalized = normalize_terminal_text(snapshot)
+    if normalized is None:
+        return False
+    return bool(normalized.strip()) and (
+        _read_normalized_pane_input(normalized) is not None
+        or _parse_normalized_pane_answer(normalized) is not None
     )
 
 
@@ -331,12 +421,39 @@ def pane_needs_answer(snapshot: str) -> bool:
     staged with nothing to submit it, and every retry appends to whatever is
     already sitting there.
 
-    Escapes are stripped first because `capture_pane` keeps them by default
-    (`-e`) and Claude colorizes the selector: raw, the cursor and its number are
-    separated by a colour sequence, so an anchored match cannot succeed. Both
-    call sites matter -- one passes a plain capture and one does not.
+    Valid escapes are normalized first because `capture_pane` keeps them by
+    default (`-e`) and Claude colorizes the selector. Malformed escapes are
+    unknown, never a reason to accept input.
     """
     return pane_answer_choices(snapshot) is not None
+
+
+def pane_keyboard_ownership(snapshot: str) -> KeyboardOwnership:
+    """Classify the current input affordance without treating unknown text as input."""
+    normalized = normalize_terminal_text(snapshot)
+    if normalized is None:
+        return KeyboardOwnership.UNKNOWN
+    if _parse_normalized_pane_answer(normalized) is not None:
+        return KeyboardOwnership.NUMBERED_CHOICE
+    if _read_normalized_pane_input(normalized) is not None:
+        return KeyboardOwnership.COMPOSER
+    # There is no reliable detector for a readable surface with no affordance.
+    return KeyboardOwnership.UNKNOWN
+
+
+def observe_pane(
+    title: str | None,
+    snapshot: str,
+    *,
+    background_work_active: bool = False,
+) -> tuple[PanePhase, KeyboardOwnership]:
+    """Return the current provider-neutral observation from existing detectors only."""
+    keyboard = pane_keyboard_ownership(snapshot)
+    if keyboard is KeyboardOwnership.NUMBERED_CHOICE:
+        return PanePhase.BLOCKED, keyboard
+    if background_work_active:
+        return PanePhase.BACKGROUND, keyboard
+    return classify_pane_phase(title), keyboard
 
 
 def new_window(

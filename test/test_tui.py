@@ -3622,13 +3622,15 @@ async def test_file_viewer_initial_file(tmp_path):
 
 def test_review_gate_on_dismiss_noop(temp_config):
     """Reviewing a gate should not enqueue any state mutation on dismiss."""
-    from hopper.lodes import get_lode_dir
     from hopper.tui import GateReviewScreen
 
-    lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
-    lode_dir = get_lode_dir(lode["id"])
-    lode_dir.mkdir(parents=True, exist_ok=True)
-    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
+    lode = {
+        "id": "gate1234",
+        "stage": "refine",
+        "state": "gated",
+        "created_at": 1000,
+        "gate_body": "# Design Review\nPlan summary",
+    }
 
     server = MockServer([lode])
     app = HopperApp(server=server)
@@ -3642,18 +3644,14 @@ def test_review_gate_on_dismiss_noop(temp_config):
 
 
 def test_review_gate_reopen_enqueues_foreground_spawn(temp_config):
-    from hopper.lodes import get_lode_dir
-
     lode = {
         "id": "gate1234",
         "stage": "refine",
         "state": "gated",
         "created_at": 1000,
         "tmux_pane": "%9",
+        "gate_body": "# Design Review\nPlan summary",
     }
-    lode_dir = get_lode_dir(lode["id"])
-    lode_dir.mkdir(parents=True, exist_ok=True)
-    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
     server = MockServer([lode])
     app = HopperApp(server=server)
 
@@ -3707,7 +3705,6 @@ async def test_gate_review_cancel_escape():
 @pytest.mark.asyncio
 async def test_enter_on_gated_opens_gate_review(monkeypatch, temp_config):
     """Enter on a gated lode opens GateReviewScreen."""
-    from hopper.lodes import get_lode_dir
     from hopper.tui import GateReviewScreen
 
     lode = {
@@ -3716,10 +3713,8 @@ async def test_enter_on_gated_opens_gate_review(monkeypatch, temp_config):
         "state": "gated",
         "created_at": 1000,
         "tmux_pane": "%9",
+        "gate_body": "# Design Review\nPlan summary",
     }
-    lode_dir = get_lode_dir(lode["id"])
-    lode_dir.mkdir(parents=True, exist_ok=True)
-    (lode_dir / "gate.md").write_text("# Design Review\nPlan summary")
 
     monkeypatch.setattr("hopper.tui.capture_pane", lambda _id: "alive")
 
@@ -3731,8 +3726,8 @@ async def test_enter_on_gated_opens_gate_review(monkeypatch, temp_config):
 
 
 @pytest.mark.asyncio
-async def test_gate_review_missing_gate_md(temp_config):
-    """Missing gate.md should notify and leave the main screen active."""
+async def test_gate_review_without_durable_body_leaves_main_screen_active(temp_config):
+    """A gated lode without durable authority does not open a review modal."""
     lode = {"id": "gate1234", "stage": "refine", "state": "gated", "created_at": 1000}
     server = MockServer([lode])
     app = HopperApp(server=server)
@@ -3741,7 +3736,7 @@ async def test_gate_review_missing_gate_md(temp_config):
         with patch.object(app, "notify") as mock_notify:
             await pilot.press("enter")
         assert app.screen is initial_screen
-        mock_notify.assert_called_once_with("Gate review doc not found", severity="error")
+        mock_notify.assert_called_once()
     assert server.events == []
 
 

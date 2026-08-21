@@ -670,7 +670,7 @@ class ShipReviewScreen(ModalScreen[str | None]):
 
 
 class GateReviewScreen(ModalScreen[str | None]):
-    """Modal: show gate.md and offer Switch (live pane) or Reopen (dead pane)."""
+    """Modal: show the durable gate body and offer Switch or Reopen."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -2303,13 +2303,11 @@ class HopperApp(App):
 
     def _review_gate(self, lode: dict) -> None:
         """Open gate review modal for a gated lode."""
-        lode_dir = get_lode_dir(lode["id"])
-        gate_path = lode_dir / "gate.md"
-        if not gate_path.exists():
-            self.notify("Gate review doc not found", severity="error")
+        gate_text = lode.get("gate_body")
+        if not isinstance(gate_text, str) or not gate_text:
+            self.notify("No current gate review is available", severity="error")
             return
 
-        gate_text = gate_path.read_text()
         pane_id = lode.get("tmux_pane")
         pane_alive = bool(pane_id and capture_pane(pane_id) is not None)
 

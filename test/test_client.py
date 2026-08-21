@@ -1049,15 +1049,17 @@ def test_manual_lode_clients_send_bound_action_and_wait_for_disposition(
     )
 
 
-def test_get_gate_returns_lode_and_doc(socket_path, temp_config):
-    """get_gate returns the lode plus the current gate.md text."""
-    from hopper.lodes import get_lode_dir
-
-    lode = {"id": "test-id", "stage": "refine", "state": "gated"}
-    gate_path = get_lode_dir("test-id") / "gate.md"
-    gate_path.parent.mkdir(parents=True, exist_ok=True)
-    gate_path.write_text("# Gate\n\nLooks good.")
-
+def test_get_gate_returns_lode_and_doc(socket_path):
+    """get_gate returns the lode plus its durable gate body."""
+    lode = {
+        "id": "test-id",
+        "stage": "refine",
+        "state": "gated",
+        "gate_body": "# Gate\n\nLooks good.",
+        "gate_kind": "explicit",
+        "gate_epoch": 1,
+        "gate_delivery_epoch": 0,
+    }
     with patch(
         "hopper.client.connect",
         return_value={"type": "connected", "lode_found": True, "lode": lode},

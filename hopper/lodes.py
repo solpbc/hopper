@@ -23,6 +23,10 @@ Lodes are plain dicts with these fields:
 - oom_scope: str | None - guarded systemd scope unit name (default None)
 - failure_kind: str | None - durable terminal runner failure discriminator (default None)
 - protocol_error: str | None - durable current-generation stage-protocol refusal (default None)
+- gate_body: str | None - durable operator-visible current gate body (default None)
+- gate_kind: str | None - durable current gate kind (default None)
+- gate_epoch: int - monotonic current/most-recent gate identity (default 0)
+- gate_delivery_epoch: int - monotonic delivery attempt identity (default 0)
 - archive_action_id: str | None - action that published this archive (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - coder: optional dict - non-Codex refine-stage provider and resumable session:
@@ -48,6 +52,7 @@ Lodes are plain dicts with these fields:
   rolling-version compatibility field.
 """
 
+import copy
 import json
 import os
 import secrets
@@ -69,7 +74,9 @@ REFUSAL_STATUS_PREFIXES = (
 )
 _REFUSAL_STATUS_INDEX = {"spawn": 0, "spawn_failed": 1, "action": 2, "protocol": 3}
 _STAGE_NAMES = ("mill", "refine", "ship")
-_INTERACTIVE_STAGE_DRIVERS = frozenset({"claude", "codex", "grok"})
+# These are valid durable record values, not necessarily runnable adapters.
+VALID_DURABLE_STAGE_DRIVERS = frozenset({"claude", "codex", "grok"})
+GATE_KINDS = frozenset({"explicit", "native_question", "idle_park"})
 # Frozen launch-ID namespace; it must never change or stable durable identities would rewrite.
 _LAUNCH_ID_NAMESPACE = uuid.UUID("bd3a8a6f-6d4f-4d1c-bce3-9d27fc61864c")
 
@@ -334,8 +341,8 @@ def _validate_uuid(value: object, lode: dict, stage: str, field: str) -> str:
 
 def validate_lode_driver(driver: object) -> str:
     """Validate an immutable interactive-stage provider."""
-    if not isinstance(driver, str) or driver not in _INTERACTIVE_STAGE_DRIVERS:
-        choices = ", ".join(sorted(_INTERACTIVE_STAGE_DRIVERS))
+    if not isinstance(driver, str) or driver not in VALID_DURABLE_STAGE_DRIVERS:
+        choices = ", ".join(sorted(VALID_DURABLE_STAGE_DRIVERS))
         raise ValueError(f"lode driver must be one of {choices}")
     return str(driver)
 
@@ -367,6 +374,54 @@ def set_lode_driver(lode: dict, driver: str) -> None:
 def _expected_launch_id(lode_id: str, stage: str, provider_session_id: str) -> str:
     """Derive the stable launch identity for one provider session."""
     return str(uuid.uuid5(_LAUNCH_ID_NAMESPACE, f"{lode_id}:{stage}:{provider_session_id}"))
+
+
+def _normalize_lode_gate(lode: dict) -> None:
+    """Validate one durable gate or materialize an old status-only gate once."""
+    epoch = lode.get("gate_epoch", 0)
+    delivery_epoch = lode.get("gate_delivery_epoch", 0)
+    if (
+        not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or epoch < 0
+        or not isinstance(delivery_epoch, int)
+        or isinstance(delivery_epoch, bool)
+        or delivery_epoch < 0
+    ):
+        raise ValueError(f"lode {lode.get('id')!r} has invalid gate epoch")
+
+    body = lode.get("gate_body")
+    kind = lode.get("gate_kind")
+    if body is None and kind is None:
+        # Older status-only gates have one bounded, deterministic conversion so
+        # every future reader has the same durable authority.
+        if lode.get("state") == "gated":
+            body = lode.get("status") or "Gate"
+            kind = "idle_park" if str(body).startswith("Parked (idle)") else "explicit"
+            epoch = max(epoch, 1)
+        lode["gate_body"] = body
+        lode["gate_kind"] = kind
+        lode["gate_epoch"] = epoch
+        lode["gate_delivery_epoch"] = delivery_epoch
+        return
+    if not isinstance(body, str) or not body or kind not in GATE_KINDS or epoch < 1:
+        raise ValueError(f"lode {lode.get('id')!r} has malformed durable gate")
+    lode["gate_epoch"] = epoch
+    lode["gate_delivery_epoch"] = delivery_epoch
+
+
+def lode_gate(lode: dict) -> dict | None:
+    """Return the validated durable gate, or None when this lode is ungated."""
+    _normalize_lode_gate(lode)
+    body = lode["gate_body"]
+    if body is None:
+        return None
+    return {
+        "body": body,
+        "kind": lode["gate_kind"],
+        "epoch": lode["gate_epoch"],
+        "delivery_epoch": lode["gate_delivery_epoch"],
+    }
 
 
 def _validate_stage_session(lode: dict, stage: str, session: object) -> dict:
@@ -561,6 +616,7 @@ def normalize_lode_stage_sessions(lode: dict) -> dict:
                     raise _lode_record_error(
                         lode, stage, "started", "conflicts with legacy projection"
                     )
+        _normalize_lode_gate(lode)
         return lode
 
     # The only absence-means-Claude case is a legacy-only durable record.
@@ -575,6 +631,7 @@ def normalize_lode_stage_sessions(lode: dict) -> dict:
             )
     lode["driver"] = "claude"
     lode["stage_sessions"] = _legacy_stage_sessions(lode)
+    _normalize_lode_gate(lode)
     return lode
 
 
@@ -764,6 +821,10 @@ def create_lode(
         "oom_scope": None,
         "failure_kind": None,
         "protocol_error": None,
+        "gate_body": None,
+        "gate_kind": None,
+        "gate_epoch": 0,
+        "gate_delivery_epoch": 0,
         "spawn_disposition": None,
         "archive_action_id": None,
         "codex_thread_id": None,
@@ -905,27 +966,157 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
     """Update a lode's state and status. Returns the updated lode or None if not found."""
     for lode in lodes:
         if lode["id"] == lode_id:
-            lode["state"] = state
-            lode["status"] = status
-            lode["spawn_disposition"] = None
-            # Record run timing
-            stage = lode.get("stage", "")
-            if stage in ("mill", "refine", "ship"):
-                runs = lode.setdefault("runs", {})
-                now = current_time_ms()
-                if state == "running":
-                    stage_run = runs.get(stage, {})
-                    if "started_at" not in stage_run or "stopped_at" in stage_run:
-                        runs[stage] = {"started_at": now}
-                elif state in ("error", "ready"):
-                    stage_run = runs.get(stage, {})
-                    if "started_at" in stage_run:
-                        stage_run["stopped_at"] = now
-                        runs[stage] = stage_run
+            _set_lode_state_fields(lode, state, status)
             touch(lode)
             save_lodes(lodes)
             return lode
     return None
+
+
+def _set_lode_state_fields(lode: dict, state: str, status: str) -> None:
+    """Apply state fields and their existing runtime bookkeeping without saving."""
+    lode["state"] = state
+    lode["status"] = status
+    lode["spawn_disposition"] = None
+    stage = lode.get("stage", "")
+    if stage in _STAGE_NAMES:
+        runs = lode.setdefault("runs", {})
+        now = current_time_ms()
+        if state == "running":
+            stage_run = runs.get(stage, {})
+            if "started_at" not in stage_run or "stopped_at" in stage_run:
+                runs[stage] = {"started_at": now}
+        elif state in ("error", "ready"):
+            stage_run = runs.get(stage, {})
+            if "started_at" in stage_run:
+                stage_run["stopped_at"] = now
+                runs[stage] = stage_run
+
+
+def publish_lode_gate(
+    lodes: list[dict],
+    lode_id: str,
+    *,
+    body: str,
+    kind: str,
+    status: str,
+) -> tuple[dict | None, bool]:
+    """Atomically publish a coherent durable gate and return whether it is new."""
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        prior = copy.deepcopy(lode)
+        if not set_lode_gate_fields(lode, body=body, kind=kind, status=status):
+            return lode, False
+        touch(lode)
+        try:
+            save_lodes(lodes)
+        except Exception:
+            lode.clear()
+            lode.update(prior)
+            raise
+        return lode, True
+    return None, False
+
+
+def set_lode_gate_fields(lode: dict, *, body: str, kind: str, status: str) -> bool:
+    """Apply one coherent gate publication without saving; return whether it changed."""
+    if not isinstance(body, str) or not body:
+        raise ValueError("gate body must be a non-empty string")
+    if kind not in GATE_KINDS:
+        raise ValueError("gate kind is not supported")
+    gate = lode_gate(lode)
+    if gate is not None and gate["kind"] == kind and gate["body"] == body:
+        return False
+    lode["gate_body"] = body
+    lode["gate_kind"] = kind
+    lode["gate_epoch"] += 1
+    _set_lode_state_fields(lode, "gated", status)
+    return True
+
+
+def begin_lode_gate_delivery(
+    lodes: list[dict], lode_id: str
+) -> tuple[dict | None, tuple[int, int] | None]:
+    """Durably fence one operator delivery against the current gate instance."""
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        prior = copy.deepcopy(lode)
+        gate = lode_gate(lode)
+        if gate is None:
+            return lode, None
+        lode["gate_epoch"] += 1
+        lode["gate_delivery_epoch"] += 1
+        touch(lode)
+        try:
+            save_lodes(lodes)
+        except Exception:
+            lode.clear()
+            lode.update(prior)
+            raise
+        return lode, (lode["gate_epoch"], lode["gate_delivery_epoch"])
+    return None, None
+
+
+def clear_lode_gate(
+    lodes: list[dict],
+    lode_id: str,
+    *,
+    gate_epoch: int,
+    kind: str,
+    state: str,
+    status: str,
+    delivery_epoch: int | None = None,
+) -> dict | None:
+    """Atomically clear one exact gate instance, refusing stale/mixed authority."""
+    for lode in lodes:
+        if lode["id"] != lode_id:
+            continue
+        prior = copy.deepcopy(lode)
+        gate = lode_gate(lode)
+        if (
+            gate is None
+            or gate["epoch"] != gate_epoch
+            or gate["kind"] != kind
+            or (delivery_epoch is not None and gate["delivery_epoch"] != delivery_epoch)
+        ):
+            return None
+        lode["gate_body"] = None
+        lode["gate_kind"] = None
+        _set_lode_state_fields(lode, state, status)
+        touch(lode)
+        try:
+            save_lodes(lodes)
+        except Exception:
+            lode.clear()
+            lode.update(prior)
+            raise
+        return lode
+    return None
+
+
+def write_lode_gate_artifact(lode: dict) -> None:
+    """Write derived gate.md after durable publication; it is never read as authority."""
+    gate = lode_gate(lode)
+    path = get_lode_dir(lode["id"]) / "gate.md"
+    if gate is None:
+        path.unlink(missing_ok=True)
+        return
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w") as artifact:
+            artifact.write(gate["body"])
+            artifact.flush()
+            os.fsync(artifact.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def stop_lode_runtime(lode: dict, *, stopped_at: int | None = None) -> bool:

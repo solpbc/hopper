@@ -40,6 +40,7 @@ RUNNER_MUTATION_TYPES = frozenset(
         "lode_set_coder_session",
         "lode_set_claude_started",
         "lode_bind_stage_session",
+        "lode_publish_gate",
     }
 )
 
@@ -687,8 +688,7 @@ def send_pane_input(
 
 
 def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
-    """Look up a lode and read its gate.md. Returns None if the lode doesn't exist."""
-    from hopper.lodes import get_lode_dir
+    """Look up one lode's durable gate. Returns None when no gate is active."""
 
     response = connect(socket_path, lode_id=lode_id, timeout=timeout)
     if response is None or not response.get("lode_found"):
@@ -698,9 +698,27 @@ def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | No
     if not lode:
         return None
 
-    gate_path = get_lode_dir(lode_id) / "gate.md"
-    gate_text = gate_path.read_text() if gate_path.exists() else ""
+    gate_text = lode.get("gate_body")
+    if not isinstance(gate_text, str) or not gate_text:
+        return None
     return {"lode": lode, "gate": gate_text}
+
+
+def publish_lode_gate(
+    socket_path: Path,
+    lode_id: str,
+    body: str,
+    *,
+    kind: str,
+    timeout: float = 2.0,
+) -> dict | None:
+    """Publish one durable gate and wait for its atomic server acknowledgement."""
+    return send_message(
+        socket_path,
+        {"type": "lode_publish_gate", "lode_id": lode_id, "body": body, "kind": kind},
+        timeout=timeout,
+        wait_for_response=True,
+    )
 
 
 def submit_lode_action(

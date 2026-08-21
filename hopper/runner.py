@@ -36,6 +36,7 @@ from hopper.projects import find_project
 from hopper.tmux import (
     capture_pane,
     get_current_pane_id,
+    pane_answer_identity,
     pane_needs_answer,
     rename_window,
 )
@@ -452,6 +453,8 @@ class BaseRunner:
         self._gate_snapshot: str | None = None
         self._gate_armed = False
         self._gate_epoch = 0
+        self._gate_kind: str | None = None
+        self._native_gate_identity: tuple[str, tuple[tuple[int, str], ...]] | None = None
         self._setup_error: str | None = None
 
     def run(self) -> int:
@@ -775,14 +778,17 @@ class BaseRunner:
         # Legacy servers cannot bind a resume. Persist a non-running launch
         # marker and require a fresh current-generation durable transition.
         self._emit_state("ready", f"{self.driver_label} launch confirming")
-        return _confirm_durable_lode_mutation(
-            self.lode_id,
-            "status",
-            f"{self.driver_label} launch confirming",
-            self.run_generation,
-            emitted_at_ms,
-            normalize=lambda value: value,
-        ) is not None
+        return (
+            _confirm_durable_lode_mutation(
+                self.lode_id,
+                "status",
+                f"{self.driver_label} launch confirming",
+                self.run_generation,
+                emitted_at_ms,
+                normalize=lambda value: value,
+            )
+            is not None
+        )
 
     def _handle_signal(self, signum: int, frame) -> None:
         """Handle shutdown signals gracefully."""
@@ -948,16 +954,33 @@ class BaseRunner:
         status: str,
         *,
         gate_epoch: int | None = None,
+        gate_kind: str | None = None,
     ) -> bool:
         """Emit state change to server via persistent connection."""
         if self.connection:
             fields = {"lode_id": self.lode_id, "state": state, "status": status}
             if gate_epoch is not None:
                 fields["gate_epoch"] = gate_epoch
+            if gate_kind is not None:
+                fields["gate_kind"] = gate_kind
             emitted = self.connection.emit("lode_set_state", **fields)
             logger.debug(f"Emitted state: {state}, status: {status}")
             return emitted
         return False
+
+    def _emit_gate(self, kind: str, body: str, status: str) -> bool:
+        """Publish one coherent durable gate through the current runner connection."""
+        if not self.connection:
+            return False
+        emitted = self.connection.emit(
+            "lode_publish_gate",
+            lode_id=self.lode_id,
+            kind=kind,
+            body=body,
+            status=status,
+        )
+        logger.debug("Emitted gate kind=%s lode=%s", kind, self.lode_id)
+        return emitted
 
     def _emit_claude_started(self) -> None:
         """Mark this stage's Claude session as started on the server."""
@@ -1034,6 +1057,9 @@ class BaseRunner:
         # Adopt the epoch only after state handling disarms the gate detector. Until then,
         # an armed monitor must emit the old epoch so the server rejects a stale resume.
         self._gate_epoch = lode.get("gate_epoch", 0)
+        self._gate_kind = lode.get("gate_kind")
+        if self._gate_kind != "native_question":
+            self._native_gate_identity = None
 
     def _start_monitor(self) -> None:
         """Start the activity monitor thread."""
@@ -1103,13 +1129,25 @@ class BaseRunner:
                 self._record_pane_snapshot(snapshot, current_time_ms())
                 return
             if snapshot != self._gate_snapshot:
-                self._emit_state(
-                    "running",
-                    "Gate resumed",
-                    gate_epoch=self._gate_epoch,
-                )
                 self._record_pane_snapshot(snapshot, current_time_ms())
-                self._clear_gate()
+                if self._gate_kind == "native_question":
+                    selector_identity = pane_answer_identity(snapshot)
+                    if self._native_gate_identity is not None and selector_identity is None:
+                        self._emit_state(
+                            "running",
+                            "Gate resumed",
+                            gate_epoch=self._gate_epoch,
+                            gate_kind="native_question",
+                        )
+                        self._clear_gate()
+                elif self._gate_kind == "idle_park":
+                    self._emit_state(
+                        "running",
+                        "Gate resumed",
+                        gate_epoch=self._gate_epoch,
+                        gate_kind="idle_park",
+                    )
+                    self._clear_gate()
             return
 
         snapshot = self._capture_activity_pane()
@@ -1119,7 +1157,12 @@ class BaseRunner:
         if pane_needs_answer(snapshot):
             self._record_pane_snapshot(snapshot, current_time_ms())
             self._stuck_since = None
-            self._emit_state("gated", "Awaiting operator answer")
+            selector_identity = pane_answer_identity(snapshot)
+            if selector_identity is not None:
+                question, choices = selector_identity
+                body = "\n".join([question, *(f"{number}. {label}" for number, label in choices)])
+                self._native_gate_identity = selector_identity
+                self._emit_gate("native_question", body, "Awaiting operator answer")
             self._open_gate()
             return
 
@@ -1266,7 +1309,8 @@ class BaseRunner:
             logger.error(f"failed to write park record lode={self.lode_id}: {exc}")
 
         self._stuck_since = None
-        self._emit_state("gated", self._format_park_status(reason))
+        status = self._format_park_status(reason)
+        self._emit_gate("idle_park", status, status)
         self._open_gate()
 
     def _format_park_status(self, reason: str) -> str:

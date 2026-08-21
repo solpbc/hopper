@@ -5,7 +5,8 @@
 
 from types import ModuleType
 
-INTERACTIVE_STAGE_DRIVERS = ("claude",)
+# This set is runnable adapters, not every durable record value.
+RUNNABLE_STAGE_DRIVERS = ("claude",)
 STAGE_DRIVER_CAPABILITIES_KEY = "stage_driver_capabilities"
 STAGE_DRIVER_PROTOCOL_VERSION = 1
 

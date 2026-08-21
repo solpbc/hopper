@@ -1476,7 +1476,7 @@ def cmd_processed(args: list[str]) -> int:
 
 
 def _cmd_gate_show(args: list[str]) -> int:
-    """Show a lode's gate.md review doc."""
+    """Show a lode's durable gate review body."""
     import hopper.client as client
 
     parser = make_parser("gate show", "Show gate review details")
@@ -1516,7 +1516,7 @@ def _cmd_gate_show(args: list[str]) -> int:
         f"Lode: {lode.get('id', '')}\n"
         f"Stage: {lode.get('stage', '')}\n"
         f"State: {lode.get('state', '')}\n\n"
-        f"--- gate.md ---\n{gate_text}\n---\n\n"
+        f"--- gate ---\n{gate_text}\n---\n\n"
         f'Respond with: hop gate feedback {lode.get("id", "")} "<your response>"'
     )
     return 0
@@ -1603,8 +1603,7 @@ def cmd_gate(args: list[str]) -> int:
     if args and args[0] == "feedback":
         return _cmd_gate_feedback(args[1:])
 
-    from hopper.client import get_lode, set_lode_state
-    from hopper.lodes import get_lode_dir
+    from hopper.client import get_lode, publish_lode_gate
 
     parser = make_parser(
         "gate",
@@ -1648,18 +1647,12 @@ def cmd_gate(args: list[str]) -> int:
         print("No input received. Use: hop gate <<'EOF'\\n<review doc>\\nEOF")
         return 1
 
-    # Save to lode directory as gate.md
-    lode_dir = get_lode_dir(lode_id)
-    lode_dir.mkdir(parents=True, exist_ok=True)
-    gate_path = lode_dir / "gate.md"
-    tmp_path = gate_path.with_suffix(".md.tmp")
-    tmp_path.write_text(output)
-    os.replace(tmp_path, gate_path)
+    response = publish_lode_gate(_socket(), lode_id, output, kind="explicit")
+    if not response or response.get("type") != "lode_gate_published":
+        print("Gate publication failed. The lode was not changed.", file=sys.stderr)
+        return 1
 
-    # Set lode state to gated
-    set_lode_state(_socket(), lode_id, "gated", "Gate")
-
-    print(f"Gate set. Review saved to {gate_path}")
+    print("Gate set. Review is durable on the lode record.")
     print("Session will be resumed after review.")
     return 0
 
@@ -3787,7 +3780,7 @@ def _nudge_wait_for_idle(
 
         title = pane_title(pane)
         phase = classify_pane_phase(title)
-        if phase is PanePhase.PROCESSING:
+        if phase is PanePhase.BUSY:
             remaining = deadline_utils.remaining_seconds(deadline)
             sleep_s = min(NUDGE_IDLE_POLL_SECONDS, remaining)
             if sleep_s <= 0:

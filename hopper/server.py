@@ -50,7 +50,7 @@ from hopper.coder import (
     validate_coder_provider,
 )
 from hopper.driver import (
-    INTERACTIVE_STAGE_DRIVERS,
+    RUNNABLE_STAGE_DRIVERS,
     STAGE_DRIVER_CAPABILITIES_KEY,
     STAGE_DRIVER_PROTOCOL_VERSION,
 )
@@ -59,7 +59,9 @@ from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
     archive_lode,
     archive_lode_for_action,
+    begin_lode_gate_delivery,
     bind_lode_stage_session,
+    clear_lode_gate,
     create_lode,
     current_time_ms,
     find_lodes_by_prefix,
@@ -71,13 +73,16 @@ from hopper.lodes import (
     load_lodes,
     lode_coder,
     lode_driver,
+    lode_gate,
     lode_stage_session,
+    publish_lode_gate,
     reserve_lode_id,
     reset_lode_claude_stage,
     resolve_worktree_path,
     save_archived_lodes,
     save_lodes,
     set_lode_claude_started,
+    set_lode_gate_fields,
     stop_lode_runtime,
     touch,
     unarchive_lode,
@@ -91,10 +96,12 @@ from hopper.lodes import (
     update_lode_worktree_path,
     validate_lode_coder_data,
     validate_lode_driver_data,
+    write_lode_gate_artifact,
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
 from hopper.tmux import (
+    KeyboardOwnership,
     Liveness,
     PanePhase,
     WindowSpawnOutcome,
@@ -104,8 +111,8 @@ from hopper.tmux import (
     pane_answer_choices,
     pane_answer_identity,
     pane_identity,
+    pane_keyboard_ownership,
     pane_liveness,
-    pane_needs_answer,
     pane_surface_readable,
     pane_title,
     paste_buffer,
@@ -705,6 +712,18 @@ def _persist_protocol_error(lode: dict, message: str) -> None:
     touch(lode)
 
 
+def _sync_gate_artifact(lode: dict) -> bool:
+    """Refresh the derived gate artifact after its durable authority is saved."""
+    try:
+        write_lode_gate_artifact(lode)
+    except OSError as error:
+        # gate.md is deliberately non-authoritative. Its failure cannot make a
+        # caller read stale gate text because every consumer reads gate_body.
+        logger.warning("Could not write derived gate artifact lode=%s: %s", lode["id"], error)
+        return False
+    return True
+
+
 def _lifecycle_grace_pending(lode: dict | None) -> bool:
     """Return whether worker mutations are held for registration authority."""
     return bool(
@@ -752,7 +771,7 @@ def _observe_pane_acceptance(
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
-        if classify_pane_phase(observed_title) is PanePhase.PROCESSING:
+        if classify_pane_phase(observed_title) is PanePhase.BUSY:
             return {
                 "reason": "enter_accepted",
                 "capture": latest_capture,
@@ -822,7 +841,7 @@ def _attempt_pane_delivery(
         latest_capture = capture
         observed_title = pane_title(pane_id)
         phase = classify_pane_phase(observed_title)
-        if phase is PanePhase.PROCESSING:
+        if phase is PanePhase.BUSY:
             saw_processing = True
             processing_frozen = _observe_processing_pane_title(
                 observed_title,
@@ -831,7 +850,8 @@ def _attempt_pane_delivery(
         elif phase is PanePhase.IDLE:
             if pane_title_observation is not None:
                 pane_title_observation.clear()
-            if paste and pane_needs_answer(latest_capture):
+            keyboard = pane_keyboard_ownership(latest_capture)
+            if paste and keyboard is KeyboardOwnership.NUMBERED_CHOICE:
                 # A numbered selector is not a text composer. Pasting free text into
                 # one stages it with nothing able to submit it, and each retry appends
                 # to what is already there -- so refuse before touching the pane and
@@ -841,7 +861,19 @@ def _attempt_pane_delivery(
                     "capture": latest_capture,
                     "title": observed_title,
                 }
+            if paste and keyboard is not KeyboardOwnership.COMPOSER:
+                return {
+                    "reason": "pane_state_unknown",
+                    "capture": latest_capture,
+                    "title": observed_title,
+                }
             if not paste:
+                if keyboard is KeyboardOwnership.UNKNOWN:
+                    return {
+                        "reason": "pane_state_unknown",
+                        "capture": latest_capture,
+                        "title": observed_title,
+                    }
                 answer_state = pane_answer_choices(latest_capture)
                 if answer_state is None:
                     return {
@@ -956,7 +988,7 @@ def _attempt_pane_delivery(
         latest_capture = capture
         observed_title = pane_title(pane_id)
         phase = classify_pane_phase(observed_title)
-        if phase is PanePhase.PROCESSING:
+        if phase is PanePhase.BUSY:
             return {
                 "reason": "auto_submitted",
                 "capture": latest_capture,
@@ -1012,13 +1044,21 @@ def _attempt_character_delivery(
             "capture": latest_capture,
             "title": observed_title,
         }
-    if phase is PanePhase.IDLE and pane_needs_answer(latest_capture):
-        return {
-            "reason": "pane_awaiting_choice",
-            "capture": latest_capture,
-            "title": observed_title,
-        }
-    if phase is PanePhase.PROCESSING:
+    if phase is PanePhase.IDLE:
+        keyboard = pane_keyboard_ownership(latest_capture)
+        if keyboard is KeyboardOwnership.NUMBERED_CHOICE:
+            return {
+                "reason": "pane_awaiting_choice",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+        if keyboard is KeyboardOwnership.UNKNOWN:
+            return {
+                "reason": "pane_state_unknown",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
+    if phase is PanePhase.BUSY:
         if _observe_processing_pane_title(observed_title, pane_title_observation):
             return {
                 "reason": "pane_frozen",
@@ -1042,7 +1082,7 @@ def _attempt_character_delivery(
             "title": observed_title,
         }
 
-    if phase is PanePhase.PROCESSING:
+    if phase is PanePhase.BUSY:
         return {
             "reason": "character_sent",
             "capture": latest_capture,
@@ -1062,7 +1102,7 @@ def _attempt_character_delivery(
         latest_capture = capture
         observed_title = pane_title(pane_id)
         settle_phase = classify_pane_phase(observed_title)
-        if settle_phase is PanePhase.PROCESSING:
+        if settle_phase is PanePhase.BUSY:
             return {
                 "reason": "auto_submitted",
                 "capture": latest_capture,
@@ -4576,6 +4616,7 @@ class Server:
     def _reconcile_startup_lodes(self) -> None:
         """Reconcile stale ownership against authoritative tmux evidence."""
         changed = False
+        gate_artifacts: list[dict] = []
         for lode in self.lodes:
             before = copy.deepcopy(lode)
             generation = lode.get("run_generation")
@@ -4610,7 +4651,8 @@ class Server:
                             )
                             lode["spawn_disposition"] = None
                         else:
-                            self._gate_unknown_startup_lode(lode)
+                            if self._gate_unknown_startup_lode(lode):
+                                gate_artifacts.append(lode)
                 elif liveness is Liveness.GONE:
                     lode["tmux_pane"] = None
                     lode["pid"] = None
@@ -4629,13 +4671,15 @@ class Server:
                             "another runner"
                         )
                 else:
-                    self._gate_unknown_startup_lode(lode)
+                    if self._gate_unknown_startup_lode(lode):
+                        gate_artifacts.append(lode)
             else:
                 no_runner_identity = not generation and pane is None and lode.get("pid") is None
                 intentionally_new = lode.get("state") == "new" and no_runner_identity
                 bounded_ready = lode.get("state") == "ready" and no_runner_identity
                 if not intentionally_new and not bounded_ready:
-                    self._gate_unknown_startup_lode(lode)
+                    if self._gate_unknown_startup_lode(lode):
+                        gate_artifacts.append(lode)
                 if pane is None and not generation:
                     lode["pid"] = None
 
@@ -4645,16 +4689,19 @@ class Server:
 
         if changed:
             save_lodes(self.lodes)
+            for lode in gate_artifacts:
+                _sync_gate_artifact(lode)
 
     @staticmethod
-    def _gate_unknown_startup_lode(lode: dict) -> None:
+    def _gate_unknown_startup_lode(lode: dict) -> bool:
         """Persist inspection-only authority when pane liveness is unknowable."""
-        lode["state"] = "gated"
-        lode["spawn_disposition"] = "unknown"
-        lode["status"] = (
+        status = (
             "Runner pane liveness is unverified after server replacement; inspect with: "
             f"tmux list-panes -a and hop lode status {lode['id']}. Do not restart."
         )
+        changed = set_lode_gate_fields(lode, body=status, kind="explicit", status=status)
+        lode["spawn_disposition"] = "unknown"
+        return changed
 
     def _consume_failed_oom_units(self) -> None:
         """Consume retained failed scope evidence before startup reconciliation."""
@@ -4724,6 +4771,7 @@ class Server:
         def persist_outcome(outcome: SpawnOutcome, pane_id: str | None = None) -> None:
             lode["active"] = False
             lode["spawn_disposition"] = outcome.value
+            gate_changed = False
             if outcome is SpawnOutcome.SPAWNED:
                 if not terminal_recovery:
                     lode["state"] = pending_state
@@ -4744,10 +4792,12 @@ class Server:
                     f"then run: hop lode restart {lode['id']}."
                 )
             elif outcome is SpawnOutcome.ALREADY_LIVE:
-                lode["state"] = "gated"
-                lode["status"] = (
+                status = (
                     f"Runner pane {pane_id} is already live; attach with: "
                     f"hop lode peek {lode['id']}. No new pane was started."
+                )
+                gate_changed = set_lode_gate_fields(
+                    lode, body=status, kind="explicit", status=status
                 )
             elif outcome is SpawnOutcome.PROVEN_NO_PANE:
                 lode["state"] = "error"
@@ -4760,14 +4810,21 @@ class Server:
                 lode["tmux_pane"] = None
                 lode["pid"] = None
             else:
-                lode["state"] = "gated"
-                lode["status"] = (
+                status = (
                     "Runner pane creation is unverified and a pane may be live; inspect with: "
                     f"tmux list-panes -a and hop lode status {lode['id']}. "
                     "Do not launch another runner."
                 )
+                gate_changed = set_lode_gate_fields(
+                    lode, body=status, kind="explicit", status=status
+                )
+            # Gate publication uses the ordinary state helper, which clears a
+            # stale disposition; this outcome remains the authoritative one.
+            lode["spawn_disposition"] = outcome.value
             touch(lode)
             save_lodes(self.lodes)
+            if gate_changed:
+                _sync_gate_artifact(lode)
             _log_state_change(lode["id"], lode["state"], lode["status"], "spawn")
             self.broadcast({"type": "lode_updated", "lode": lode})
 
@@ -5276,7 +5333,7 @@ class Server:
                 "tmux": self.tmux_location,
                 STAGE_DRIVER_CAPABILITIES_KEY: {
                     "version": STAGE_DRIVER_PROTOCOL_VERSION,
-                    "drivers": list(INTERACTIVE_STAGE_DRIVERS),
+                    "drivers": list(RUNNABLE_STAGE_DRIVERS),
                 },
             }
             if lode_id:
@@ -5482,7 +5539,12 @@ class Server:
             self.broadcast({"type": "lode_updated", "lode": lode})
 
         lode_id = message.get("lode_id")
-        if msg_type in RUNNER_MUTATION_TYPES and msg_type != "lode_action":
+        runner_gate_publication = msg_type == "lode_publish_gate" and "run_generation" in message
+        if (
+            msg_type in RUNNER_MUTATION_TYPES
+            and msg_type != "lode_action"
+            and (msg_type != "lode_publish_gate" or runner_gate_publication)
+        ):
             lode = self._find_lode(lode_id) if lode_id else None
             if not self._runner_generation_matches(lode, message):
                 if msg_type in {"lode_register", "lode_supervisor_register"} and conn and lode_id:
@@ -5556,6 +5618,7 @@ class Server:
                 "lode_set_state",
                 "lode_set_claude_started",
                 "lode_bind_stage_session",
+                "lode_publish_gate",
             }:
                 acknowledge_mutation(True, "accepted")
 
@@ -5778,6 +5841,29 @@ class Server:
                         {"type": "error", "error": f"lode {lode_id} stage {stage} cannot resume"},
                     )
                 return
+            gate = lode_gate(lode)
+            if gate is not None:
+                if gate["kind"] != "idle_park":
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {"type": "error", "error": "current gate requires feedback"},
+                        )
+                    return
+                cleared = clear_lode_gate(
+                    self.lodes,
+                    lode_id,
+                    gate_epoch=gate["epoch"],
+                    kind="idle_park",
+                    state="ready",
+                    status="Resuming parked lode",
+                )
+                if cleared is None:
+                    if conn:
+                        self._send_response(conn, {"type": "error", "error": "stale gate"})
+                    return
+                _sync_gate_artifact(cleared)
+                self.broadcast({"type": "lode_updated", "lode": cleared})
             project = find_project(lode.get("project", ""))
             outcome, pane_id = self._gated_spawn(
                 lode,
@@ -5887,6 +5973,37 @@ class Server:
                     )
                     acknowledge_mutation(False, "protocol_error")
                     return
+                gate = lode_gate(lode) if lode else None
+                if lode and state == "gated" and gate is None:
+                    logger.warning("Refusing status-only gate lode=%s", lode_id)
+                    acknowledge_mutation(False, "gate_publication_required")
+                    return
+                if lode and state == "running" and gate is not None:
+                    gate_kind = message.get("gate_kind")
+                    if gate["kind"] == "explicit" or gate_kind != gate["kind"]:
+                        logger.info(
+                            "Dropping gate clear without matching authority lode=%s kind=%s",
+                            lode_id,
+                            gate_kind,
+                        )
+                        acknowledge_mutation(False, "gate_clear_refused")
+                        return
+                    cleared = clear_lode_gate(
+                        self.lodes,
+                        lode_id,
+                        gate_epoch=gate["epoch"],
+                        kind=gate["kind"],
+                        state="running",
+                        status=status,
+                    )
+                    if cleared is None:
+                        acknowledge_mutation(False, "stale_gate_epoch")
+                        return
+                    _sync_gate_artifact(cleared)
+                    _log_state_change(lode_id, state, status, "gate_observation")
+                    self.broadcast({"type": "lode_updated", "lode": cleared})
+                    acknowledge_mutation(True, "accepted")
+                    return
                 lode = update_lode_state(self.lodes, lode_id, state, status)
                 if lode:
                     _log_state_change(lode_id, state, status, "lode_set_state")
@@ -5896,6 +6013,51 @@ class Server:
                     acknowledge_mutation(False, "lode_not_found")
             else:
                 acknowledge_mutation(False, "invalid_mutation")
+
+        elif msg_type == "lode_publish_gate":
+            lode_id = message.get("lode_id")
+            lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
+            body = message.get("body")
+            kind = message.get("kind")
+            status = message.get("status")
+            if not isinstance(status, str) or not status:
+                status = "Gate" if kind == "explicit" else "Awaiting operator response"
+            if lode is None:
+                acknowledge_mutation(False, "lode_not_found")
+                if conn:
+                    self._send_response(conn, {"type": "error", "error": "lode not found"})
+                return
+            try:
+                published, changed = publish_lode_gate(
+                    self.lodes,
+                    lode_id,
+                    body=body,
+                    kind=kind,
+                    status=status,
+                )
+            except (OSError, ValueError) as error:
+                logger.warning("Refusing gate publication lode=%s: %s", lode_id, error)
+                acknowledge_mutation(False, "gate_publication_refused")
+                if conn:
+                    self._send_response(conn, {"type": "error", "error": str(error)})
+                return
+            if published is None:
+                acknowledge_mutation(False, "lode_not_found")
+                return
+            artifact_written = _sync_gate_artifact(published)
+            if changed:
+                _log_state_change(lode_id, "gated", published["status"], "gate_publication")
+                self.broadcast({"type": "lode_updated", "lode": published})
+            acknowledge_mutation(True, "committed")
+            if conn:
+                self._send_response(
+                    conn,
+                    {
+                        "type": "lode_gate_published",
+                        "lode": published,
+                        "artifact_written": artifact_written,
+                    },
+                )
 
         elif msg_type == "lode_set_progress":
             lode_id = message.get("lode_id")
@@ -6139,35 +6301,91 @@ class Server:
 
             pane_id = lode.get("tmux_pane")
             character = _single_character_payload(text)
+            gate = lode_gate(lode)
+            delivery_fence: tuple[int, int] | None = None
             if lode.get("state") == "gated" and character is None:
                 result = {
                     "reason": "gated_body_refused",
                     "capture": None,
                     "title": None,
                 }
-            elif character is not None:
-                result = _deliver_lode_pane_input(
-                    self.lodes, lode, character, paste=False, character=True
-                )
             else:
-                result = _deliver_lode_pane_input(self.lodes, lode, text, paste=True)
+                if gate is not None:
+                    try:
+                        _delivery_lode, delivery_fence = begin_lode_gate_delivery(
+                            self.lodes, lode_id
+                        )
+                    except OSError as error:
+                        logger.warning("Could not fence gate delivery lode=%s: %s", lode_id, error)
+                        result = {
+                            "reason": "acceptance_timeout",
+                            "capture": None,
+                            "title": None,
+                        }
+                    else:
+                        result = None
+                else:
+                    result = None
+                if result is None and character is not None:
+                    result = _deliver_lode_pane_input(
+                        self.lodes, lode, character, paste=False, character=True
+                    )
+                elif result is None:
+                    result = _deliver_lode_pane_input(self.lodes, lode, text, paste=True)
             reason = result["reason"]
             accepted = reason in _ACCEPTED_DELIVERY_REASONS
-            paste_attempted = reason not in _PRE_PASTE_REASONS
-            if paste_attempted:
-                lode["gate_epoch"] = lode.get("gate_epoch", 0) + 1
-
+            updated: dict | None = None
             if accepted:
-                state = "running"
                 status = "Character sent" if reason == "character_sent" else "Feedback accepted"
-            else:
+                if gate is not None and gate["kind"] in {"explicit", "idle_park"}:
+                    if delivery_fence is None:
+                        accepted = False
+                        reason = "acceptance_timeout"
+                    else:
+                        try:
+                            updated = clear_lode_gate(
+                                self.lodes,
+                                lode_id,
+                                gate_epoch=delivery_fence[0],
+                                kind=gate["kind"],
+                                delivery_epoch=delivery_fence[1],
+                                state="running",
+                                status=status,
+                            )
+                        except OSError as error:
+                            logger.warning("Could not clear gate lode=%s: %s", lode_id, error)
+                            updated = None
+                        if updated is None:
+                            accepted = False
+                            reason = "acceptance_timeout"
+                        else:
+                            _sync_gate_artifact(updated)
+                elif gate is not None:
+                    # A native selector clears only when its runner observes the
+                    # current selector consumed; a character is not that evidence.
+                    updated = update_lode_state(self.lodes, lode_id, "gated", status)
+                else:
+                    updated = update_lode_state(self.lodes, lode_id, "running", status)
+            if not accepted:
                 outcome = _DELIVERY_FAILURE_OUTCOMES[reason]
                 status = _GATE_FEEDBACK_STATUSES[outcome]
+                if updated is None and gate is not None:
+                    updated = update_lode_state(self.lodes, lode_id, "gated", status)
+                elif updated is None:
+                    updated, _changed = publish_lode_gate(
+                        self.lodes,
+                        lode_id,
+                        body=status,
+                        kind="explicit",
+                        status=status,
+                    )
+                    if updated is not None:
+                        _sync_gate_artifact(updated)
+            if not accepted:
+                outcome = _DELIVERY_FAILURE_OUTCOMES[reason]
                 message_template = _GATE_FEEDBACK_MESSAGES[reason]
-                state = "gated"
-            updated = update_lode_state(self.lodes, lode_id, state, status)
             if updated:
-                _log_state_change(lode_id, state, status, "feedback")
+                _log_state_change(lode_id, updated["state"], updated["status"], "feedback")
                 self.broadcast({"type": "lode_updated", "lode": updated})
             if conn:
                 if accepted:

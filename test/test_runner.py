@@ -25,6 +25,7 @@ from hopper.runner import (
     _sum_process_tree_cpu_ms,
     extract_error_message,
 )
+from hopper.tmux import KeyboardOwnership, pane_keyboard_ownership
 from hopper.workspace_trust import WorkspaceTrustError
 
 
@@ -400,9 +401,10 @@ class TestBaseRunnerActivityMonitor:
             runner._park_idle(reason)
 
         runner.connection.emit.assert_called_once_with(
-            "lode_set_state",
+            "lode_publish_gate",
             lode_id="test-session",
-            state="gated",
+            kind="idle_park",
+            body=format_park_status(reason, "test-session"),
             status=format_park_status(reason, "test-session"),
         )
         mock_write_recovery.assert_called_once()
@@ -587,8 +589,8 @@ class TestBaseRunnerActivityMonitor:
         assert runner._gated.is_set()
         assert runner._stuck_since is None
         assert any(
-            event == "lode_set_state"
-            and body["state"] == "gated"
+            event == "lode_publish_gate"
+            and body["kind"] == "native_question"
             and body["status"] == "Awaiting operator answer"
             for event, body in emitted
         )
@@ -619,6 +621,22 @@ class TestBaseRunnerActivityMonitor:
         assert runner._stuck_since is None
         assert not any(e[0] == "lode_set_state" and e[1]["state"] == "stuck" for e in emitted)
         assert runner._last_snapshot == "Hello World 2"
+
+    def test_raw_escape_changes_count_as_activity_but_not_keyboard_evidence(self):
+        runner = self._make_runner()
+        emitted = []
+        connection = MagicMock()
+        connection.emit = lambda kind, **fields: emitted.append((kind, fields)) or True
+        runner.connection = connection
+        malformed = "\x1b]unterminated─────\n❯\u00a0staged\n─────\n"
+
+        runner._record_pane_snapshot("plain frame", 10)
+        runner._record_pane_snapshot(malformed, 40_000)
+
+        assert pane_keyboard_ownership(malformed) is KeyboardOwnership.UNKNOWN
+        assert emitted == [
+            ("lode_set_pane_activity", {"lode_id": "test-session", "observed_at": 40_000})
+        ]
 
     def test_check_activity_recovers_from_stuck(self):
         """Monitor emits running when recovering from stuck state."""
@@ -793,8 +811,10 @@ class TestBaseRunnerActivityMonitor:
         assert runner._gated.is_set()
         assert not runner._monitor_stop.is_set()
 
-        states = [kw.get("state") for msg_type, kw in emitted if msg_type == "lode_set_state"]
-        assert "gated" in states
+        assert any(
+            msg_type == "lode_publish_gate" and kw["kind"] == "idle_park"
+            for msg_type, kw in emitted
+        )
 
     def test_codex_only_running_never_stuck(self, monkeypatch):
         """Fresh progress heartbeats keep an unchanged pane running across ticks."""
@@ -1184,6 +1204,7 @@ class TestBaseRunnerActivityMonitor:
         runner._gate_snapshot = "Gate set. Review saved."
         runner._gate_armed = True
         runner._gate_epoch = 7
+        runner._gate_kind = "idle_park"
         runner._last_snapshot = "Gate set. Review saved."
 
         with (
@@ -1193,10 +1214,50 @@ class TestBaseRunnerActivityMonitor:
         ):
             runner._check_activity()
 
-        mock_emit.assert_called_once_with("running", "Gate resumed", gate_epoch=7)
+        mock_emit.assert_called_once_with(
+            "running", "Gate resumed", gate_epoch=7, gate_kind="idle_park"
+        )
         assert not runner._gated.is_set()
         assert runner._last_snapshot == "Gate set. Review saved.\n> go"
         assert runner._last_pane_activity_ms == 12345
+
+    def test_native_gate_clears_only_after_its_selector_is_consumed(self):
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._open_gate()
+        runner._gate_snapshot = "selector"
+        runner._gate_armed = True
+        runner._gate_epoch = 7
+        runner._gate_kind = "native_question"
+        runner._native_gate_identity = ("Question", ((1, "Keep"), (2, "Change")))
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="─────\n❯\u00a0\n─────\n"),
+            patch.object(runner, "_emit_state", return_value=True) as emit,
+        ):
+            runner._check_activity()
+
+        emit.assert_called_once_with(
+            "running", "Gate resumed", gate_epoch=7, gate_kind="native_question"
+        )
+
+    def test_explicit_gate_ignores_pane_redraws_after_it_is_armed(self):
+        runner = self._make_runner()
+        runner._pane_id = "%1"
+        runner._open_gate()
+        runner._gate_snapshot = "Gate output settled"
+        runner._gate_armed = True
+        runner._gate_epoch = 7
+        runner._gate_kind = "explicit"
+
+        with (
+            patch("hopper.runner.capture_pane", return_value="Gate output settled\nclock changed"),
+            patch.object(runner, "_emit_state") as emit,
+        ):
+            runner._check_activity()
+
+        emit.assert_not_called()
+        assert runner._gated.is_set()
 
     def test_gate_is_not_resumed_by_its_own_output(self):
         """A gate's own output must never read as an operator resume.

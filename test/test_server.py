@@ -37,8 +37,10 @@ from hopper.config import config_transaction
 from hopper.lodes import (
     format_terminal_failure_status,
     lode_driver,
+    lode_gate,
     lode_stage_session,
     project_lode_claude_state,
+    publish_lode_gate,
     save_archived_lodes,
     save_lodes,
 )
@@ -6278,6 +6280,10 @@ def test_startup_reconciliation_unknown_gates_without_restart(socket_path, make_
     assert lode["pid"] == 3456
     assert "Do not restart" in lode["status"]
     assert lode["spawn_disposition"] == "unknown"
+    gate = lode_gate(lode)
+    assert gate is not None
+    assert gate["body"] == lode["status"]
+    assert gate["kind"] == "explicit"
     assert lode["updated_at"] > 1000
     mock_save.assert_called_once_with(server.lodes)
 
@@ -6721,6 +6727,11 @@ def test_gated_spawn_persists_truthful_disposition_table(
         expected_disposition,
     )
     assert status_fragment in lode["status"]
+    if expected_state == "gated":
+        gate = lode_gate(lode)
+        assert gate is not None
+        assert gate["body"] == lode["status"]
+        assert gate["kind"] == "explicit"
     if expected_outcome is SpawnOutcome.UNKNOWN:
         assert "retry" not in lode["status"].lower()
         assert "restart" not in lode["status"].lower()
@@ -9388,7 +9399,8 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     mock_send.assert_called_once_with("%1", "Enter")
     assert srv.lodes[0]["state"] == "running"
     assert srv.lodes[0]["status"] == "Feedback accepted"
-    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_epoch"] == 0
+    assert srv.lodes[0]["gate_body"] is None
     broadcast = srv.broadcast_queue.get_nowait()
     assert broadcast["type"] == "lode_updated"
     response = _decode_mock_response(conn)
@@ -9452,7 +9464,8 @@ def test_lode_send_feedback_dead_pane_fails_closed(socket_path, make_lode):
     mock_send.assert_not_called()
     assert srv.lodes[0]["state"] == "gated"
     assert srv.lodes[0]["status"] == "Feedback blocked: pane unavailable"
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 2
+    assert srv.lodes[0]["gate_body"] == "Gate"
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["outcome"] == "pane_unavailable"
@@ -9613,7 +9626,8 @@ def test_gate_feedback_pane_lost_while_waiting_for_idle_is_unavailable(socket_pa
     mock_send.assert_not_called()
     assert srv.lodes[0]["state"] == "gated"
     assert srv.lodes[0]["status"] == "Feedback blocked: pane unavailable"
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_body"] == srv.lodes[0]["status"]
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["outcome"] == "pane_unavailable"
@@ -9640,7 +9654,8 @@ def test_gate_feedback_busy_for_entire_idle_wait_never_touches_pane(socket_path,
     mock_paste.assert_not_called()
     mock_send.assert_not_called()
     assert srv.lodes[0]["status"] == "Feedback blocked: pane busy"
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_body"] == srv.lodes[0]["status"]
     assert _decode_mock_response(conn)["outcome"] == "busy"
     assert "reason=idle_timeout outcome=busy" in caplog.text
 
@@ -9846,7 +9861,8 @@ def test_gate_feedback_processing_then_unknown_remains_busy_and_never_touches_pa
     mock_paste.assert_not_called()
     mock_send.assert_not_called()
     assert srv.lodes[0]["status"] == "Feedback blocked: pane busy"
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_body"] == srv.lodes[0]["status"]
     assert _decode_mock_response(conn)["outcome"] == "busy"
 
 
@@ -10375,7 +10391,8 @@ def test_gated_feedback_refuses_a_body_without_touching_the_pane(socket_path, ma
     assert srv.lodes[0]["status"] == (
         "Feedback blocked: gated lode accepts only a single character"
     )
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_body"] == "Gate"
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["outcome"] == "gated_character_only"
@@ -10404,11 +10421,39 @@ def test_gated_feedback_sends_a_character_to_a_busy_pane_without_idle_wait(socke
     assert mock_title.call_count == 1
     assert srv.lodes[0]["state"] == "running"
     assert srv.lodes[0]["status"] == "Character sent"
-    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_epoch"] == 2
+    assert srv.lodes[0]["gate_body"] is None
+    assert srv.lodes[0]["gate_kind"] is None
+    assert srv.lodes[0]["gate_delivery_epoch"] == 1
     response = _decode_mock_response(conn)
     assert response["type"] == "feedback_sent"
     assert response["character"] is True
     assert response["tmux_pane"] == "%1"
+
+
+def test_idle_park_resume_clears_only_the_current_durable_gate(socket_path, make_lode):
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", state="gated")
+    published, changed = publish_lode_gate(
+        [lode],
+        "test-id",
+        body="Parked (idle): awaiting an operator turn",
+        kind="idle_park",
+        status="Parked (idle)",
+    )
+    assert published is lode
+    assert changed
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with patch.object(srv, "_gated_spawn", return_value=(SpawnOutcome.SPAWNED, "%1")) as spawn:
+        srv._handle_mutation({"type": "lode_resume", "lode_id": "test-id"}, conn)
+
+    assert lode["gate_body"] is None
+    assert lode["gate_kind"] is None
+    assert lode["state"] == "ready"
+    spawn.assert_called_once()
+    assert _decode_mock_response(conn)["type"] == "lode_resumed"
 
 
 def test_gated_feedback_character_send_failure_stays_gated(socket_path, make_lode):
@@ -10453,7 +10498,8 @@ def test_gated_feedback_unknown_pane_refuses_a_character_without_sending(socket_
     mock_send.assert_not_called()
     mock_sleep.assert_not_called()
     assert srv.lodes[0]["state"] == "gated"
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 2
+    assert srv.lodes[0]["gate_body"] == "Gate"
     assert _decode_mock_response(conn)["outcome"] == "pane_state_unknown"
 
 
@@ -10521,7 +10567,8 @@ def test_gate_feedback_unknown_pane_state_never_touches_pane(socket_path, make_l
     mock_send.assert_not_called()
     assert srv.lodes[0]["state"] == "gated"
     assert srv.lodes[0]["status"] == "Feedback blocked: pane state unrecognized"
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_body"] == srv.lodes[0]["status"]
     response = _decode_mock_response(conn)
     assert response["outcome"] == "pane_state_unknown"
     assert '"_ Land native skills port to main"' in response["error"]
@@ -10550,7 +10597,8 @@ def test_gate_feedback_missing_title_reports_no_title_without_touching_pane(
     assert mock_sleep.call_count == 12
     mock_paste.assert_not_called()
     mock_send.assert_not_called()
-    assert "gate_epoch" not in srv.lodes[0]
+    assert srv.lodes[0]["gate_epoch"] == 1
+    assert srv.lodes[0]["gate_body"] == srv.lodes[0]["status"]
     response = _decode_mock_response(conn)
     assert response["outcome"] == "pane_state_unknown"
     assert "<no title reported>" in response["error"]
@@ -10586,6 +10634,31 @@ def test_pane_delivery_unknown_then_idle_proceeds():
     }
     mock_paste.assert_called_once_with("%1", "continue")
     mock_send.assert_not_called()
+
+
+def test_malformed_terminal_frame_is_neither_input_eligible_nor_acceptance_evidence():
+    malformed = "\x1b]0;unterminated─────\n❯\u00a0staged\n─────\n"
+    with (
+        patch("hopper.server.capture_pane", return_value=malformed),
+        patch("hopper.server.pane_title", return_value="✳ Ready"),
+        patch("hopper.server.paste_buffer") as paste,
+        patch("hopper.server.time.sleep"),
+    ):
+        delivery = hopper_server._attempt_pane_delivery("%1", "continue", paste=True)
+
+    assert delivery["reason"] == "pane_state_unknown"
+    paste.assert_not_called()
+
+    with (
+        patch("hopper.server.capture_pane", return_value=malformed),
+        patch("hopper.server.pane_title", return_value="not a known title"),
+        patch("hopper.server.time.sleep"),
+    ):
+        observed = hopper_server._observe_pane_acceptance(
+            "%1", malformed, "not a known title", ("composer", "staged")
+        )
+
+    assert observed["reason"] == "acceptance_timeout"
 
 
 def test_lode_send_pane_input_answer_auto_submits_without_state_write(socket_path, make_lode):
@@ -10875,9 +10948,17 @@ def test_feedback_epoch_rejects_stale_resume(socket_path, make_lode, caplog):
     assert "Dropping stale state update lode=test-id" in caplog.text
 
 
-def test_matching_gate_epoch_allows_genuine_resume(socket_path, make_lode):
+def test_matching_idle_gate_epoch_allows_genuine_resume(socket_path, make_lode):
     srv = Server(socket_path)
-    srv.lodes = [make_lode(id="test-id", state="gated", gate_epoch=4)]
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            state="gated",
+            gate_body="Parked",
+            gate_kind="idle_park",
+            gate_epoch=4,
+        )
+    ]
 
     srv._handle_mutation(
         _runner_message(
@@ -10887,11 +10968,86 @@ def test_matching_gate_epoch_allows_genuine_resume(socket_path, make_lode):
             state="running",
             status="Gate resumed",
             gate_epoch=4,
+            gate_kind="idle_park",
         ),
         None,
     )
 
     assert srv.lodes[0]["state"] == "running"
+
+
+def test_durable_gate_publication_round_trips_over_the_real_socket(server, socket_path, make_lode):
+    server.lodes = [make_lode(id="test-id", stage="refine", state="running", tmux_pane="%1")]
+
+    response = hopper_client.publish_lode_gate(
+        socket_path, "test-id", "Review this change", kind="explicit"
+    )
+
+    assert response is not None
+    assert response["type"] == "lode_gate_published"
+    lode = server.lodes[0]
+    assert lode["state"] == "gated"
+    assert lode["gate_body"] == "Review this change"
+    assert lode["gate_kind"] == "explicit"
+    assert lode["gate_epoch"] == 1
+
+
+def test_gate_artifact_failure_leaves_durable_gate_as_the_only_authority(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", stage="refine", state="running")]
+    conn = _mock_client(srv)
+
+    with patch("hopper.server.write_lode_gate_artifact", side_effect=OSError("disk unavailable")):
+        srv._handle_mutation(
+            {
+                "type": "lode_publish_gate",
+                "lode_id": "test-id",
+                "body": "Durable review",
+                "kind": "explicit",
+            },
+            conn,
+        )
+
+    assert srv.lodes[0]["gate_body"] == "Durable review"
+    assert not (config.hopper_dir() / "lodes" / "test-id" / "gate.md").exists()
+    assert _decode_mock_response(conn)["artifact_written"] is False
+
+
+def test_stale_native_consumption_cannot_clear_a_replaced_gate(socket_path, make_lode):
+    srv = Server(socket_path)
+    lode = make_lode(
+        id="test-id",
+        state="gated",
+        run_generation="1" * 32,
+        gate_body="First question",
+        gate_kind="native_question",
+        gate_epoch=1,
+    )
+    srv.lodes = [lode]
+    publish_lode_gate(
+        srv.lodes,
+        "test-id",
+        body="Second question",
+        kind="native_question",
+        status="Gate",
+    )
+
+    srv._handle_mutation(
+        _runner_message(
+            srv,
+            "lode_set_state",
+            "test-id",
+            state="running",
+            status="Gate resumed",
+            gate_epoch=1,
+            gate_kind="native_question",
+        ),
+        None,
+    )
+
+    assert lode["state"] == "gated"
+    assert lode["gate_body"] == "Second question"
+    assert lode["gate_epoch"] == 2
 
 
 class TestActivityLog:

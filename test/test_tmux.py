@@ -10,6 +10,7 @@ import pytest
 
 from hopper import actions
 from hopper.tmux import (
+    KeyboardOwnership,
     Liveness,
     PanePhase,
     WindowSpawnOutcome,
@@ -25,9 +26,12 @@ from hopper.tmux import (
     is_tmux_server_running,
     kill_pane,
     new_window,
+    normalize_terminal_text,
+    observe_pane,
     pane_answer_choices,
     pane_answer_identity,
     pane_identity,
+    pane_keyboard_ownership,
     pane_liveness,
     pane_needs_answer,
     pane_surface_readable,
@@ -340,13 +344,13 @@ class TestPaneTitle:
     ("title", "expected"),
     [
         ("✳ Ready", PanePhase.IDLE),
-        ("◐ Thinking", PanePhase.PROCESSING),
-        ("◑ Thinking", PanePhase.PROCESSING),
-        ("◒ Thinking", PanePhase.PROCESSING),
-        ("◓ Thinking", PanePhase.PROCESSING),
-        ("⠀ Thinking", PanePhase.PROCESSING),
-        ("⠐ Thinking", PanePhase.PROCESSING),
-        ("⣿ Thinking", PanePhase.PROCESSING),
+        ("◐ Thinking", PanePhase.BUSY),
+        ("◑ Thinking", PanePhase.BUSY),
+        ("◒ Thinking", PanePhase.BUSY),
+        ("◓ Thinking", PanePhase.BUSY),
+        ("⠀ Thinking", PanePhase.BUSY),
+        ("⠐ Thinking", PanePhase.BUSY),
+        ("⣿ Thinking", PanePhase.BUSY),
         (None, PanePhase.UNKNOWN),
         ("", PanePhase.UNKNOWN),
         ("Fix auth bug", PanePhase.UNKNOWN),
@@ -356,6 +360,62 @@ class TestPaneTitle:
 )
 def test_classify_pane_phase_literal_titles(title, expected):
     assert classify_pane_phase(title) is expected
+
+
+def test_terminal_normalization_keeps_recognized_composer_and_selector_semantics():
+    composer = "─────\n❯\u00a0staged\n─────\n"
+    selector = (
+        "Which choice?\n❯ 1. Keep it\n  2. Change it\n"
+        "↑/↓ to navigate · Enter to select · Esc to cancel\n"
+    )
+    decorated_composer = "\x1b]0;ignored title\x07\x1b[36m" + composer + "\x1b[0m"
+    decorated_selector = "\x1b]2;ignored\x1b\\\x1b[1m" + selector + "\x1b[0m"
+
+    assert read_pane_input(decorated_composer) == read_pane_input(composer)
+    assert pane_answer_choices(decorated_selector) == pane_answer_choices(selector)
+    assert pane_keyboard_ownership(decorated_composer) is KeyboardOwnership.COMPOSER
+    assert pane_keyboard_ownership(decorated_selector) is KeyboardOwnership.NUMBERED_CHOICE
+
+
+def test_malformed_terminal_escape_is_unknown_and_not_input_eligible():
+    malformed = "\x1b]0;unterminated─────\n❯\u00a0staged\n─────\n"
+
+    assert normalize_terminal_text(malformed) is None
+    assert read_pane_input(malformed) is None
+    assert pane_answer_choices(malformed) is None
+    assert pane_surface_readable(malformed) is False
+    assert pane_keyboard_ownership(malformed) is KeyboardOwnership.UNKNOWN
+
+
+def test_observation_vocabulary_keeps_unproduced_members_valid():
+    assert {phase.value for phase in PanePhase} == {
+        "starting",
+        "busy",
+        "idle",
+        "blocked",
+        "background",
+        "auth",
+        "unknown",
+    }
+    assert {ownership.value for ownership in KeyboardOwnership} == {
+        "composer",
+        "numbered_choice",
+        "card",
+        "none",
+        "unknown",
+    }
+    assert classify_pane_phase("★ unknown") is PanePhase.UNKNOWN
+    assert pane_keyboard_ownership("unfamiliar frame") is KeyboardOwnership.UNKNOWN
+
+
+def test_existing_selector_and_background_detectors_map_to_observation_vocabulary():
+    selector = "❯ 1. Keep\n  2. Change\nEnter to select · Esc to cancel\n"
+
+    assert classify_pane_phase("✳ Ready", selector) is PanePhase.BLOCKED
+    assert observe_pane("✳ Ready", "─────\n❯\u00a0\n─────\n", background_work_active=True) == (
+        PanePhase.BACKGROUND,
+        KeyboardOwnership.COMPOSER,
+    )
 
 
 class TestReadPaneInput:
