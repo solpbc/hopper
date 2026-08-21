@@ -26,8 +26,6 @@ _SUPERVISOR_BOOTSTRAP_FLAGS = (
     "--ignore-rules",
     "-s",
     "read-only",
-    "-a",
-    "never",
     "-m",
     CODEX_MODEL,
     "-c",
@@ -140,7 +138,14 @@ def prepare_session(
     timeout_sec: float = CODEX_BOOTSTRAP_TIMEOUT_SEC,
 ) -> tuple[int, str | None, str | None]:
     """Create one restricted Codex thread for an interactive supervisor."""
-    cmd = ["codex", "exec", *_SUPERVISOR_BOOTSTRAP_FLAGS, _SUPERVISOR_BOOTSTRAP_PROMPT]
+    cmd = [
+        "codex",
+        "-a",
+        "never",
+        "exec",
+        *_SUPERVISOR_BOOTSTRAP_FLAGS,
+        _SUPERVISOR_BOOTSTRAP_PROMPT,
+    ]
     try:
         proc = subprocess.Popen(
             cmd,

@@ -206,11 +206,10 @@ def test_codex_bootstrap_pins_terra_xhigh_and_returns_one_uuid():
             None,
         )
     cmd = launch.call_args.args[0]
-    assert cmd[:2] == ["codex", "exec"]
+    assert cmd[:4] == ["codex", "-a", "never", "exec"]
     assert "--ignore-user-config" in cmd
     assert "--ignore-rules" in cmd
     assert cmd[cmd.index("-s") + 1] == "read-only"
-    assert cmd[cmd.index("-a") + 1] == "never"
     assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
     assert 'model_reasoning_effort="xhigh"' in cmd
     assert "--json" in cmd
