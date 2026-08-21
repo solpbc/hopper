@@ -144,7 +144,10 @@ def test_frozen_connect_request_reaches_real_server_and_current_marker(
     try:
         assert response["type"] == "connected"
         assert response["exchange_id"] == request["exchange_id"]
-        assert response["stage_driver_capabilities"] == {"version": 1, "drivers": ["claude"]}
+        assert response["stage_driver_capabilities"] == {
+            "version": 1,
+            "drivers": ["claude", "codex", "grok"],
+        }
     finally:
         _stop_protocol_server(server, thread, release)
 
@@ -505,27 +508,24 @@ def test_protocol_error_blocks_late_running_update_from_same_generation(
         _stop_protocol_server(server, thread, release)
 
 
-def test_non_claude_wire_creation_refuses_before_a_lode_or_processor_exists(
-    socket_path, release_server_lock
-):
+def test_non_claude_wire_creation_persists_driver(socket_path, release_server_lock):
     server, thread, release = _start_protocol_server(socket_path, release_server_lock)
     try:
-        with patch("hopper.server.spawn_lode_processor") as spawn:
-            response = send_message(
-                socket_path,
-                {
-                    "type": "lode_create",
-                    "project": "project-one",
-                    "scope": "internal coverage only",
-                    "spawn": True,
-                    "coder_provider": "codex",
-                    "driver": "codex",
-                },
-                wait_for_response=True,
-            )
+        response = send_message(
+            socket_path,
+            {
+                "type": "lode_create",
+                "project": "project-one",
+                "scope": "internal coverage only",
+                "spawn": False,
+                "coder_provider": "codex",
+                "driver": "codex",
+            },
+            wait_for_response=True,
+        )
 
-        assert response["type"] == "error"
-        assert server.lodes == []
-        spawn.assert_not_called()
+        assert response["type"] == "lode_created"
+        assert len(server.lodes) == 1
+        assert server.lodes[0]["driver"] == "codex"
     finally:
         _stop_protocol_server(server, thread, release)

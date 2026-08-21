@@ -55,6 +55,17 @@ from hopper.lodes import (
     lode_with_status_annotations,
 )
 from hopper.runner import _sum_process_tree_cpu_ms
+from hopper.supervisor import (
+    DEFAULT_SUPERVISOR_PROVIDER,
+    SUPERVISOR_PROVIDERS,
+    SupervisorDefaultRefusal,
+    resolve_supervisor_default,
+    set_supervisor_default,
+    supervisor_check,
+    supervisor_default_refusal_lines,
+    supervisor_unavailable_message,
+    validate_supervisor_provider,
+)
 from hopper.tmux import PanePhase, capture_pane, classify_pane_phase, pane_title
 
 logger = logging.getLogger(__name__)
@@ -63,7 +74,7 @@ _GATE_FEEDBACK_DESCRIPTION = (
     "Send feedback to a lode. A one-character payload is sent as a keystroke and "
     "does not wait for the pane to go idle. While the lode is gated, that is the "
     "only send permitted — a multi-character body is refused. Exit 0 for a pasted "
-    "body means Claude accepted a new user turn. Exit 0 for a single character "
+    "body means the selected supervisor accepted a new user turn. Exit 0 for a single character "
     "means the keystroke was delivered; inspect the pane to confirm it was "
     "consumed. Any reported failure leaves the lode gated and Hopper prints a "
     "safe next action.\n\n"
@@ -397,10 +408,10 @@ def _extract_create_project(cmd: str, cmd_args: list[str]) -> str | None:
         if arg in ("-f", "--force", "--json"):
             index += 1
             continue
-        if arg == "--coder":
+        if arg in {"--coder", "--supervisor"}:
             index += 2
             continue
-        if arg.startswith("--coder="):
+        if arg.startswith(("--coder=", "--supervisor=")):
             index += 1
             continue
         if arg.startswith("-"):
@@ -421,12 +432,23 @@ def _extract_create_coder(cmd: str, cmd_args: list[str]) -> str:
     return resolve_coder_default()[0]
 
 
+def _extract_create_supervisor(cmd: str, cmd_args: list[str]) -> str:
+    """Return the requested supervisor for create-like commands, before dispatch."""
+    args = cmd_args[1:] if cmd == "lode" and cmd_args[:1] == ["create"] else cmd_args
+    for index, arg in enumerate(args):
+        if arg == "--supervisor" and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--supervisor="):
+            return arg.split("=", 1)[1]
+    return resolve_supervisor_default()[0]
+
+
 def _create_wants_json(cmd: str, cmd_args: list[str]) -> bool:
     args = cmd_args[1:] if cmd == "lode" and cmd_args[:1] == ["create"] else cmd_args
     return "--json" in args
 
 
-def _remote_pool_for_create(project: str, coder_provider: str):
+def _remote_pool_for_create(project: str, coder_provider: str, supervisor_provider: str = "claude"):
     """Probe a configured pool when an active local project does not take precedence."""
     from hopper.projects import find_project
     from hopper.remote import probe_candidates, remote_registry, run_remote, select_candidate
@@ -437,7 +459,13 @@ def _remote_pool_for_create(project: str, coder_provider: str):
     hosts = remote_registry().get(project)
     if not hosts:
         return None
-    probes = probe_candidates(hosts, project, run_remote, coder_provider=coder_provider)
+    probes = probe_candidates(
+        hosts,
+        project,
+        run_remote,
+        coder_provider=coder_provider,
+        supervisor_provider=supervisor_provider,
+    )
     return select_candidate(probes), probes
 
 
@@ -494,6 +522,7 @@ def _run_authoritative_remote_create(
     hop_args: list[str],
     *,
     coder_provider: str,
+    supervisor_provider: str = "claude",
     reason: str,
     project: str,
     stdin_text: str | None,
@@ -508,6 +537,8 @@ def _run_authoritative_remote_create(
         remote_args.append("--json")
     if not any(arg == "--coder" or arg.startswith("--coder=") for arg in remote_args):
         remote_args.extend(["--coder", coder_provider])
+    if not any(arg == "--supervisor" or arg.startswith("--supervisor=") for arg in remote_args):
+        remote_args.extend(["--supervisor", supervisor_provider])
     remote_args.extend(["--originating-extro-sid", os.environ.get("EXTRO_SESSION") or ""])
     print(f"→ {host} ({reason})", file=sys.stderr)
     try:
@@ -1760,6 +1791,68 @@ def cmd_coder(args: list[str]) -> int:
     return 0 if result["ready"] else 1
 
 
+@command("supervisor", "Manage host-local supervisor defaults and check provider readiness")
+def cmd_supervisor(args: list[str]) -> int:
+    """Manage the host-local supervisor default or check one provider."""
+    parser = make_parser(
+        "supervisor",
+        "Manage host-local supervisor defaults and check provider readiness",
+    )
+    parser.add_argument("action", choices=["check", "default"])
+    parser.add_argument("provider", nargs="?")
+    parser.add_argument("--json", dest="json_output", action="store_true")
+    providers = ", ".join(SUPERVISOR_PROVIDERS)
+    parser.epilog = (
+        "Actions:\n"
+        "  hop supervisor check <provider> [--json]\n"
+        "  hop supervisor default [provider]\n"
+        f"Providers: {providers}\n\n"
+        "The saved value is this host's creation default. An explicit "
+        "`--supervisor <provider>` wins. When unset, Hopper uses "
+        f"{DEFAULT_SUPERVISOR_PROVIDER}. Readiness and account access are checked separately."
+    )
+    try:
+        parsed = parse_args(parser, args)
+    except SystemExit:
+        return 0
+    except ArgumentError as error:
+        print(f"error: {error}")
+        parser.print_usage()
+        return 1
+
+    if parsed.action == "default":
+        if parsed.json_output:
+            print("error: --json applies only to: hop supervisor check")
+            parser.print_usage()
+            return 1
+        if parsed.provider is None:
+            provider, source = resolve_supervisor_default()
+            print(f"{provider} ({source})")
+            return 0
+        set_supervisor_default(parsed.provider)
+        print(f"supervisor.default={parsed.provider}")
+        return 0
+
+    if parsed.provider is None:
+        print("error: provider required for check")
+        parser.print_usage()
+        return 1
+    try:
+        provider = validate_supervisor_provider(parsed.provider)
+    except ValueError as error:
+        print(f"error: {error}")
+        parser.print_usage()
+        return 1
+    result = supervisor_check(provider)
+    if parsed.json_output:
+        print(json.dumps(result))
+    elif result["ready"]:
+        print(f"{provider} supervisor ready: {result['version']}")
+    else:
+        print(f"{provider} supervisor unavailable: {result['error']}")
+    return 0 if result["ready"] else 1
+
+
 @command("backlog", "Manage backlog items")
 def cmd_backlog(args: list[str]) -> int:
     """Manage backlog items (list, add, remove, promote, queue)."""
@@ -1808,6 +1901,12 @@ def cmd_backlog(args: list[str]) -> int:
         choices=CODER_PROVIDERS,
         default=DEFAULT_CODER_PROVIDER,
         help=f"Coder for promote (default: {DEFAULT_CODER_PROVIDER})",
+    )
+    parser.add_argument(
+        "--supervisor",
+        choices=SUPERVISOR_PROVIDERS,
+        default=None,
+        help="Supervisor for promote (default: this host's `hop supervisor default`)",
     )
     try:
         parsed = parse_args(parser, args)
@@ -1919,11 +2018,25 @@ def cmd_backlog(args: list[str]) -> int:
             return 1
 
         scope = " ".join(parsed.text[1:]) if len(parsed.text) > 1 else ""
+        supervisor_provider = parsed.supervisor or resolve_supervisor_default()[0]
         readiness = coder_check(parsed.coder)
         if not readiness["ready"]:
             print(f"error: {coder_unavailable_message(parsed.coder, readiness.get('error'))}")
             return 1
-        lode = promote_backlog(_socket(), item.id, scope=scope, coder_provider=parsed.coder)
+        supervisor_readiness = supervisor_check(supervisor_provider)
+        if not supervisor_readiness["ready"]:
+            diagnostic = supervisor_unavailable_message(
+                supervisor_provider, supervisor_readiness.get("error")
+            )
+            print(f"error: {diagnostic}")
+            return 1
+        lode = promote_backlog(
+            _socket(),
+            item.id,
+            scope=scope,
+            coder_provider=parsed.coder,
+            supervisor_provider=supervisor_provider,
+        )
         if lode:
             print(f"Promoted: {lode['id']} [{item.project}] {scope or item.description}")
             return 0
@@ -2093,9 +2206,9 @@ def format_lode_detail(lode: dict) -> str:
     except ValueError:
         lines.append("  coder:    INVALID")
     try:
-        lines.append(f"  driver:   {lode_driver(lode)}")
+        lines.append(f"  supervisor: {lode_driver(lode)}")
     except ValueError:
-        lines.append("  driver:   INVALID")
+        lines.append("  supervisor: INVALID")
     lines.append(f"  state:    {lode.get('state', '')}")
     if lode.get("state") == "reconnecting":
         prior_state = lode.get("reconnect_prior_state")
@@ -3287,6 +3400,12 @@ def _add_create_args(parser):
         default=None,
         help="Refine-stage coding provider (default: this host's `hop coder default`)",
     )
+    parser.add_argument(
+        "--supervisor",
+        choices=SUPERVISOR_PROVIDERS,
+        default=None,
+        help="Interactive supervisor (default: this host's `hop supervisor default`)",
+    )
     parser.add_argument("-f", "--force", action="store_true", help="Override dirty-repo check")
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output JSON")
     parser.add_argument("--originating-extro-sid", default=None, help=argparse.SUPPRESS)
@@ -4228,9 +4347,19 @@ def cmd_lode(args: list[str]) -> int:
         if coder_provider is None:
             # Resolve lazily; main() normally validates the saved value before dispatch.
             coder_provider = resolve_coder_default()[0]
+        supervisor_provider = parsed.supervisor
+        if supervisor_provider is None:
+            supervisor_provider = resolve_supervisor_default()[0]
         readiness = coder_check(coder_provider)
         if not readiness["ready"]:
             print(f"error: {coder_unavailable_message(coder_provider, readiness.get('error'))}")
+            return 1
+        supervisor_readiness = supervisor_check(supervisor_provider)
+        if not supervisor_readiness["ready"]:
+            diagnostic = supervisor_unavailable_message(
+                supervisor_provider, supervisor_readiness.get("error")
+            )
+            print(f"error: {diagnostic}")
             return 1
         if not parsed.force:
             from hopper.git import dirty_status
@@ -4260,6 +4389,7 @@ def cmd_lode(args: list[str]) -> int:
             spawn=True,
             originating_extro_sid=originating_extro_sid,
             coder_provider=coder_provider,
+            supervisor_provider=supervisor_provider,
         )
         if getattr(parsed, "json_output", False):
             if not lode:
@@ -5270,11 +5400,20 @@ def _main() -> int:
 
     create_project = _extract_create_project(cmd, cmd_args)
     create_coder_provider: str | None = None
+    create_supervisor_provider: str | None = None
     if create_project is not None:
         create_coder_provider = _extract_create_coder(cmd, cmd_args)
+        create_supervisor_provider = _extract_create_supervisor(cmd, cmd_args)
         if create_coder_provider not in CODER_PROVIDERS:
             choices = ", ".join(CODER_PROVIDERS)
             print(f"error: argument --coder: invalid choice: {create_coder_provider!r} ({choices})")
+            return 1
+        if create_supervisor_provider not in SUPERVISOR_PROVIDERS:
+            choices = ", ".join(SUPERVISOR_PROVIDERS)
+            print(
+                "error: argument --supervisor: invalid choice: "
+                f"{create_supervisor_provider!r} ({choices})"
+            )
             return 1
 
     # Set process title
@@ -5331,10 +5470,12 @@ def _main() -> int:
         create_project = _extract_create_project(cmd, cmd_args)
         if create_project is not None:
             assert create_coder_provider is not None
+            assert create_supervisor_provider is not None
             return _run_authoritative_remote_create(
                 explicit_host,
                 [cmd, *cmd_args],
                 coder_provider=create_coder_provider,
+                supervisor_provider=create_supervisor_provider,
                 reason=f"-H {explicit_host}",
                 project=create_project,
                 stdin_text=stdin_text,
@@ -5353,7 +5494,10 @@ def _main() -> int:
         project = _extract_create_project(cmd, cmd_args)
         if project:
             assert create_coder_provider is not None
-            remote_target = _remote_pool_for_create(project, create_coder_provider)
+            assert create_supervisor_provider is not None
+            remote_target = _remote_pool_for_create(
+                project, create_coder_provider, create_supervisor_provider
+            )
             if remote_target is not None:
                 selected, probes = remote_target
                 unavailable_hosts = _unavailable_host_rows(probes)
@@ -5393,6 +5537,7 @@ def _main() -> int:
                     selected.host,
                     [cmd, *cmd_args],
                     coder_provider=create_coder_provider,
+                    supervisor_provider=create_supervisor_provider,
                     reason=f"remote.{project} pool",
                     project=project,
                     stdin_text=stdin_text,
@@ -5411,6 +5556,9 @@ def main() -> int:
         return _main()
     except CoderDefaultRefusal as error:
         print("\n".join(coder_default_refusal_lines(error)), file=sys.stderr)
+        return 2
+    except SupervisorDefaultRefusal as error:
+        print("\n".join(supervisor_default_refusal_lines(error)), file=sys.stderr)
         return 2
     except config.ConfigError as error:
         observed = {

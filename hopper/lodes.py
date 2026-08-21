@@ -376,6 +376,11 @@ def _expected_launch_id(lode_id: str, stage: str, provider_session_id: str) -> s
     return str(uuid.uuid5(_LAUNCH_ID_NAMESPACE, f"{lode_id}:{stage}:{provider_session_id}"))
 
 
+def stage_launch_id(lode_id: str, stage: str, provider_session_id: str) -> str:
+    """Return the durable launch UUID paired with one provider session UUID."""
+    return _expected_launch_id(lode_id, stage, provider_session_id)
+
+
 def _normalize_lode_gate(lode: dict) -> None:
     """Validate one durable gate or materialize an old status-only gate once."""
     epoch = lode.get("gate_epoch", 0)
@@ -1275,15 +1280,24 @@ def bind_lode_stage_session(
             "run_generation": run_generation,
             "outcome": "committed",
         }
-        if session["launch_id"] != launch_id:
-            raise ValueError("launch_id does not match the durable stage session")
-        if session["provider_session_id"] != provider_session_id:
-            raise ValueError("provider_session_id does not match the durable stage session")
         existing = session["start_attempt"]
         if existing is not None:
             if existing == attempt:
                 return lode, "committed"
             raise ValueError("start attempt conflicts with the committed durable attempt")
+        expected_launch_id = _expected_launch_id(lode_id, stage, provider_session_id)
+        if launch_id != expected_launch_id:
+            raise ValueError("launch_id does not match the provider session")
+        if (
+            session["launch_id"] != launch_id
+            or session["provider_session_id"] != provider_session_id
+        ):
+            if driver != "codex" or session["started"]:
+                raise ValueError("stage identity does not match the durable stage session")
+            # Codex chooses its thread UUID. Replace the provisional pair only
+            # as part of this first, generation-fenced binding commit.
+            session["launch_id"] = launch_id
+            session["provider_session_id"] = provider_session_id
         session["started"] = True
         session["start_attempt"] = attempt
         project_lode_claude_state(lode)

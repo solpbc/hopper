@@ -25,6 +25,7 @@ from hopper import config
 from hopper import deadline as deadline_utils
 from hopper.coder import coder_unavailable_message, validate_coder_provider
 from hopper.lodes import current_time_ms, is_canonical_lode_id
+from hopper.supervisor import supervisor_unavailable_message, validate_supervisor_provider
 
 REMOTE_CONFIG_PREFIX = "remote."
 REMOTE_LODE_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
@@ -576,10 +577,12 @@ def probe_candidate(
     runner: RemoteRunner,
     *,
     coder_provider: str,
+    supervisor_provider: str = "claude",
     monotonic: Callable[[], float] = time.monotonic,
 ) -> CandidateProbe:
     """Probe one pool member within one shared per-candidate deadline."""
     coder_provider = validate_coder_provider(coder_provider)
+    supervisor_provider = validate_supervisor_provider(supervisor_provider)
     started = monotonic()
     project_args = ["project", "list", "--json"]
     payload, failure = _run_candidate_probe(
@@ -657,6 +660,48 @@ def probe_candidate(
             coder_unavailable_message(coder_provider, payload["error"]),
             coder_args,
         )
+    if supervisor_provider == "claude":
+        return CandidateProbe(host=host, eligible=True, load=load, reason=None)
+    remaining = REMOTE_CANDIDATE_PROBE_TIMEOUT_SEC - (monotonic() - started)
+    supervisor_args = ["supervisor", "check", supervisor_provider, "--json"]
+    if remaining <= 0:
+        return _unavailable(
+            host,
+            supervisor_unavailable_message(
+                supervisor_provider, "candidate deadline expired before supervisor readiness"
+            ),
+            supervisor_args,
+        )
+    payload, failure = _run_candidate_probe(
+        host,
+        supervisor_args,
+        label=supervisor_unavailable_message(supervisor_provider, "readiness check"),
+        timeout=remaining,
+        runner=runner,
+    )
+    if failure is not None:
+        return failure
+    assert payload is not None
+    if (
+        set(payload) != {"provider", "ready", "version", "error"}
+        or payload.get("provider") != supervisor_provider
+        or not isinstance(payload.get("ready"), bool)
+        or not isinstance(payload.get("version"), str)
+        or not isinstance(payload.get("error"), str)
+    ):
+        return _unavailable(
+            host,
+            supervisor_unavailable_message(
+                supervisor_provider, "readiness check returned a malformed result"
+            ),
+            supervisor_args,
+        )
+    if not payload["ready"]:
+        return _unavailable(
+            host,
+            supervisor_unavailable_message(supervisor_provider, payload["error"]),
+            supervisor_args,
+        )
     return CandidateProbe(host=host, eligible=True, load=load, reason=None)
 
 
@@ -666,13 +711,21 @@ def probe_candidates(
     runner: RemoteRunner,
     *,
     coder_provider: str,
+    supervisor_provider: str = "claude",
     monotonic: Callable[[], float] = time.monotonic,
 ) -> list[CandidateProbe]:
     """Probe unique pool members concurrently under one aggregate deadline."""
     coder_provider = validate_coder_provider(coder_provider)
+    supervisor_provider = validate_supervisor_provider(supervisor_provider)
     return _bounded_host_fanout(
         hosts,
-        lambda host: probe_candidate(host, project, runner, coder_provider=coder_provider),
+        lambda host: probe_candidate(
+            host,
+            project,
+            runner,
+            coder_provider=coder_provider,
+            supervisor_provider=supervisor_provider,
+        ),
         lambda host, error: _unavailable(
             host,
             f"candidate probe failed unexpectedly: {error}",

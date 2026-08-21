@@ -41,6 +41,23 @@ def isolate_coder_readiness(monkeypatch):
     monkeypatch.setattr("hopper.tui.coder_check", ready)
 
 
+@pytest.fixture(autouse=True)
+def isolate_supervisor_readiness(monkeypatch):
+    """Keep creation tests independent of installed supervisor executables."""
+
+    def ready(provider):
+        return {
+            "provider": provider,
+            "ready": True,
+            "version": "test-ready",
+            "error": "",
+        }
+
+    monkeypatch.setattr("hopper.server.supervisor_check", ready)
+    monkeypatch.setattr("hopper.cli.supervisor_check", ready)
+    monkeypatch.setattr("hopper.tui.supervisor_check", ready)
+
+
 @pytest.fixture
 def temp_config(isolate_config):
     """Alias for isolate_config for tests that need the path.

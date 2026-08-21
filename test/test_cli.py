@@ -877,7 +877,13 @@ def test_backlog_promote_success(capsys):
                         assert cmd_backlog(["promote", "abc"]) == 0
 
     check.assert_called_once_with("codex")
-    mock_promote.assert_called_once_with(socket_path, "abc123", scope="", coder_provider="codex")
+    mock_promote.assert_called_once_with(
+        socket_path,
+        "abc123",
+        scope="",
+        coder_provider="codex",
+        supervisor_provider="claude",
+    )
     out = capsys.readouterr().out
     assert "Promoted: newlode1" in out
 
@@ -900,7 +906,11 @@ def test_backlog_promote_with_scope(capsys):
                         )
 
     mock_promote.assert_called_once_with(
-        socket_path, "abc123", scope="custom scope", coder_provider="grok"
+        socket_path,
+        "abc123",
+        scope="custom scope",
+        coder_provider="grok",
+        supervisor_provider="claude",
     )
     out = capsys.readouterr().out
     assert "custom scope" in out
@@ -7857,6 +7867,8 @@ def test_explicit_coder_spelling_skips_default_config_read(
         "journal",
         *provider_args,
         "--json",
+        "--supervisor",
+        "claude",
         "--originating-extro-sid",
         "",
     ]
@@ -7944,6 +7956,8 @@ def test_explicit_host_create_bypasses_pool_selection(
             "--json",
             "--coder",
             "grok",
+            "--supervisor",
+            "claude",
             "--originating-extro-sid",
             "",
         ],
@@ -7994,6 +8008,8 @@ def test_pooled_create_uses_eligible_host_and_reports_unavailable_siblings(
         "--json",
         "--coder",
         "grok",
+        "--supervisor",
+        "claude",
         "--originating-extro-sid",
         "",
     ]
@@ -8147,6 +8163,8 @@ def test_authoritative_remote_create_refuses_every_invalid_response(case, capsys
         "--json",
         "--coder",
         "codex",
+        "--supervisor",
+        "claude",
         "--originating-extro-sid",
         "",
     ]
@@ -8197,6 +8215,8 @@ def test_authoritative_remote_create_buffers_success_until_route_is_cached(
         "--json",
         "--coder",
         "codex",
+        "--supervisor",
+        "claude",
         "--originating-extro-sid",
         "extro-session-1",
     ]
@@ -8237,6 +8257,8 @@ def test_authoritative_remote_create_does_not_duplicate_existing_coder_token(
         "journal",
         *provider_args,
         "--json",
+        "--supervisor",
+        "claude",
         "--originating-extro-sid",
         "",
     ]
@@ -8301,6 +8323,8 @@ def test_main_routes_disabled_project_to_remote(monkeypatch, capsys):
             "--json",
             "--coder",
             "codex",
+            "--supervisor",
+            "claude",
             "--originating-extro-sid",
             "",
         ],

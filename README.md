@@ -1,11 +1,11 @@
 # hopper
 
-Hopper pairs Claude Code with a selectable coding CLI in a staged feature-delivery workflow.
+Hopper pairs a selectable interactive supervisor with a selectable coding CLI in a staged feature-delivery workflow.
 
 ## What it does
 Hopper runs a dual-agent workflow through a terminal dashboard inside tmux.
-Claude Code handles scoping in `mill` and landing in `ship`.
-The refine-stage coding provider is selected when a lode is created; its default is host-local and configurable with `hop coder default`.
+Claude Code, Codex, or Grok can supervise the full lode; Codex or Grok performs the refine-stage coding pass.
+Both provider selections are made when a lode is created and retained for that lode. Their host-local defaults are configurable with `hop supervisor default` and `hop coder default`.
 `hop code` resumes the coding provider selected when the lode was created.
 Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a background server persisting state over a Unix socket and broadcasting updates to the TUI.
 
@@ -14,7 +14,8 @@ Each feature is a lode that moves `mill` -> `refine` -> `ship`, with a backgroun
 - tmux
 - uv (Python package manager)
 - git
-- Codex CLI, or Grok CLI for lodes created with `--coder grok`
+- The CLI selected as supervisor: Claude Code, Codex, or Grok
+- The CLI selected as refine coder: Codex or Grok
 
 ## Install
 ```bash
@@ -44,6 +45,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop lode` | Manage lodes |
 | `hop implement` | Create a lode for an implementation request |
 | `hop coder` | Query or set the host-local refine coder default; check provider readiness |
+| `hop supervisor` | Query or set the host-local supervisor default; check provider readiness |
 | `hop ping` | Check if server is running |
 
 **Inside a lode**
@@ -72,6 +74,14 @@ The effective refine-stage creation default is host-local. Query it with `hop co
 hop coder default
 hop coder default grok
 cat scope.md | hop implement myproject --coder grok
+```
+
+The interactive supervisor default is separate and host-local. Hopper falls back to Claude when it is unset. Use `hop supervisor default [provider]` to query or change it, `hop supervisor check <provider>` to verify the selected CLI, or `--supervisor <provider>` on a create command to override it for one lode.
+
+```bash
+hop supervisor default
+hop supervisor default codex
+cat scope.md | hop implement myproject --supervisor codex --coder grok
 ```
 
 Hopper pins every Codex subprocess to `gpt-5.6-terra` with `xhigh` reasoning,
@@ -169,8 +179,9 @@ retrying. Once accepted, the server closes the owned pane, proves the recorded
 runner containment is empty, and publishes the terminal stage disposition.
 
 ## Key concepts
-**Lode** -- a Claude Code session with a unique ID, selected refine-stage coder,
-workflow stage, status, and associated tmux window.
+**Lode** -- a supervised feature-delivery session with a unique ID, selected
+supervisor and refine-stage coder, workflow stage, status, and associated tmux
+window.
 
 **Stage** -- workflow position: mill (scoping), refine (implementing), or ship (merging back to main).
 
@@ -188,7 +199,7 @@ CLI (hop)
     +-- TUI (main thread)
         +-- Renders from server's lode list
         +-- Handles keyboard input
-        +-- Spawns Claude in tmux windows
+        +-- Spawns the selected supervisor in tmux windows
 ```
 
 User input flows through the TUI to mutate lode state, which the server broadcasts back for re-render.

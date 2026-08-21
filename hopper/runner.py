@@ -31,6 +31,7 @@ from hopper.lodes import (
     load_lodes,
     lode_driver,
     lode_stage_session,
+    stage_launch_id,
 )
 from hopper.projects import find_project
 from hopper.tmux import (
@@ -38,8 +39,6 @@ from hopper.tmux import (
     PanePhase,
     capture_pane,
     get_current_pane_id,
-    observe_pane,
-    pane_answer_identity,
     rename_window,
 )
 from hopper.workspace_trust import WorkspaceTrustError, trust_claude_workspace
@@ -573,13 +572,19 @@ class BaseRunner:
                     return 0 if emitted else 1
                 logger.info(f"setup complete lode={self.lode_id}")
 
-                # Run Claude (blocking)
+                # Run the selected interactive supervisor (blocking)
                 exit_code, error_msg = self._run_claude()
-                logger.info(f"claude exited lode={self.lode_id} exit_code={exit_code}")
+                logger.info(
+                    "%s exited lode=%s exit_code=%s",
+                    self.driver_name,
+                    self.lode_id,
+                    exit_code,
+                )
 
                 if exit_code == 127:
                     logger.error(
-                        f"claude error lode={self.lode_id} exit_code={exit_code}: {error_msg}"
+                        f"{self.driver_name} error lode={self.lode_id} "
+                        f"exit_code={exit_code}: {error_msg}"
                     )
                     msg = error_msg or "Command not found"
                     print(f"Error [{self.lode_id}]: {msg}")
@@ -587,7 +592,8 @@ class BaseRunner:
                     return 0 if emitted else 1
                 elif exit_code != 0 and exit_code != 130:
                     logger.error(
-                        f"claude error lode={self.lode_id} exit_code={exit_code}: {error_msg}"
+                        f"{self.driver_name} error lode={self.lode_id} "
+                        f"exit_code={exit_code}: {error_msg}"
                     )
                     msg = error_msg or f"Exited with code {exit_code}"
                     print(f"Error [{self.lode_id}]: {msg}")
@@ -639,31 +645,36 @@ class BaseRunner:
         env["HOPPER_LID"] = self.lode_id
         if self.run_generation:
             env[RUN_GENERATION_ENV] = self.run_generation
-        # Hopper lodes are scoped by their prompt and repo context; do not let
-        # Claude Code read/write project auto-memory during managed stages.
-        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
-        env["CLAUDE_CODE_DISABLE_MEMORY_PERIODIC_RESYNC"] = "1"
-        env["CLAUDE_CODE_DISABLE_MEMORY_BULK_INFLATE"] = "1"
-        # A lode pane is machine-read, so grayed-out prompt suggestions are scrape noise.
-        env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
+        env.update(self.driver.subprocess_environment())
         return env
 
     def _run_claude(self) -> tuple[int, str | None]:
         """Run Claude subprocess. Returns (exit_code, error_message)."""
-        cmd, cwd = self._build_command()
-
         env = self._get_subprocess_env()
+
+        if self.is_first_run and hasattr(self.driver, "prepare_session"):
+            cwd = getattr(self, "_cwd", None)
+            exit_code, session_id, error = self.driver.prepare_session(cwd=cwd, env=env)
+            if exit_code != 0 or session_id is None:
+                return exit_code or 1, error or f"{self.driver_label} bootstrap failed"
+            self.claude_session_id = session_id
+            self.launch_id = stage_launch_id(self.lode_id, self._claude_stage, session_id)
+
+        cmd, cwd = self._build_command()
 
         logger.debug(f"Running: {' '.join(cmd[:3])}...")
 
-        try:
-            trust_root = trust_claude_workspace(cwd, env)
-            if trust_root is not None:
-                logger.debug(f"Claude workspace pre-trusted lode={self.lode_id} path={trust_root}")
-        except WorkspaceTrustError as exc:
-            message = f"Failed to pre-trust Claude workspace: {exc}"
-            logger.error(f"workspace trust failed lode={self.lode_id}: {exc}")
-            return 1, message
+        if self.driver.requires_workspace_trust():
+            try:
+                trust_root = trust_claude_workspace(cwd, env)
+                if trust_root is not None:
+                    logger.debug(
+                        f"Claude workspace pre-trusted lode={self.lode_id} path={trust_root}"
+                    )
+            except WorkspaceTrustError as exc:
+                message = f"Failed to pre-trust Claude workspace: {exc}"
+                logger.error(f"workspace trust failed lode={self.lode_id}: {exc}")
+                return 1, message
 
         if not self._admit_stage_start_before_launch():
             return 1, "Stage launch was not durably acknowledged; inspect before retrying"
@@ -692,8 +703,9 @@ class BaseRunner:
 
             return proc.returncode, None
         except FileNotFoundError:
-            logger.error("claude command not found")
-            return 127, "claude command not found"
+            message = f"{self.driver_name} command not found"
+            logger.error(message)
+            return 127, message
         except KeyboardInterrupt:
             return 130, None
         finally:
@@ -1133,11 +1145,11 @@ class BaseRunner:
             if snapshot != self._gate_snapshot:
                 self._record_pane_snapshot(snapshot, current_time_ms())
                 if self._gate_kind == "native_question":
-                    phase, keyboard = observe_pane(None, snapshot)
-                    selector_identity = pane_answer_identity(snapshot)
+                    phase, keyboard = self.driver.observe_pane(None, snapshot)
+                    selector_identity = self.driver.pane_blocked_identity(snapshot)
                     if (
                         self._native_gate_identity is not None
-                        and phase is not PanePhase.BLOCKED
+                        and phase not in {PanePhase.BLOCKED, PanePhase.AUTH}
                         and keyboard is not KeyboardOwnership.UNKNOWN
                         and selector_identity is None
                     ):
@@ -1162,16 +1174,25 @@ class BaseRunner:
         if snapshot is None:
             return
 
-        phase, _keyboard = observe_pane(None, snapshot)
+        phase, _keyboard = self.driver.observe_pane(None, snapshot)
+        if phase is PanePhase.AUTH:
+            self._record_pane_snapshot(snapshot, current_time_ms())
+            self._stuck_since = None
+            identity = (f"{self.driver_label} authentication required", ())
+            self._native_gate_identity = identity
+            self._emit_gate("native_question", identity[0], identity[0])
+            self._open_gate()
+            return
         if phase is PanePhase.BLOCKED:
             self._record_pane_snapshot(snapshot, current_time_ms())
             self._stuck_since = None
-            selector_identity = pane_answer_identity(snapshot)
-            if selector_identity is not None:
-                question, choices = selector_identity
-                body = "\n".join([question, *(f"{number}. {label}" for number, label in choices)])
-                self._native_gate_identity = selector_identity
-                self._emit_gate("native_question", body, "Awaiting operator answer")
+            selector_identity = self.driver.pane_blocked_identity(snapshot)
+            if selector_identity is None:
+                selector_identity = (f"{self.driver_label} is awaiting operator input", ())
+            question, choices = selector_identity
+            body = "\n".join([question, *(f"{number}. {label}" for number, label in choices)])
+            self._native_gate_identity = selector_identity
+            self._emit_gate("native_question", body, "Awaiting operator answer")
             self._open_gate()
             return
 
@@ -1225,7 +1246,7 @@ class BaseRunner:
                     "(sustained only by heartbeat/CPU activity)"
                 )
                 return
-            background_phase, _keyboard = observe_pane(
+            background_phase, _keyboard = self.driver.observe_pane(
                 None,
                 snapshot,
                 background_work_active=cpu_activity >= real_activity and real_quiet,

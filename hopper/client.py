@@ -620,6 +620,24 @@ def _server_supports_coder_provider(
     )
 
 
+def _server_supports_supervisor_provider(
+    socket_path: Path,
+    supervisor_provider: str,
+    timeout: float,
+) -> bool:
+    """Return whether the server advertises one runnable stage supervisor."""
+    response = connect(socket_path, timeout=timeout)
+    if not isinstance(response, dict):
+        return False
+    marker = response.get("stage_driver_capabilities")
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("version") == 1
+        and isinstance(marker.get("drivers"), list)
+        and supervisor_provider in marker["drivers"]
+    )
+
+
 def create_lode(
     socket_path: Path,
     project: str,
@@ -629,10 +647,18 @@ def create_lode(
     *,
     originating_extro_sid: str | None = None,
     coder_provider: str,
+    supervisor_provider: str = "claude",
 ) -> dict | None:
     """Create a new lode via the server. Returns the created lode dict or None."""
     coder_provider = validate_coder_provider(coder_provider)
+    from hopper.supervisor import validate_supervisor_provider
+
+    supervisor_provider = validate_supervisor_provider(supervisor_provider)
     if not _server_supports_coder_provider(socket_path, coder_provider, timeout):
+        return None
+    if supervisor_provider != "claude" and not _server_supports_supervisor_provider(
+        socket_path, supervisor_provider, timeout
+    ):
         return None
     message = {
         "type": "lode_create",
@@ -641,6 +667,7 @@ def create_lode(
         "spawn": spawn,
         "originating_extro_sid": originating_extro_sid,
         "coder_provider": coder_provider,
+        "driver": supervisor_provider,
     }
     response = send_message(
         socket_path,
@@ -1202,16 +1229,25 @@ def promote_backlog(
     timeout: float = 5.0,
     *,
     coder_provider: str,
+    supervisor_provider: str = "claude",
 ) -> dict | None:
     """Promote a backlog item to a lode via the server. Returns the created lode dict or None."""
     coder_provider = validate_coder_provider(coder_provider)
+    from hopper.supervisor import validate_supervisor_provider
+
+    supervisor_provider = validate_supervisor_provider(supervisor_provider)
     if not _server_supports_coder_provider(socket_path, coder_provider, timeout):
+        return None
+    if supervisor_provider != "claude" and not _server_supports_supervisor_provider(
+        socket_path, supervisor_provider, timeout
+    ):
         return None
     msg: dict = {
         "type": "lode_promote_backlog",
         "item_id": item_id,
         "ts": current_time_ms(),
         "coder_provider": coder_provider,
+        "driver": supervisor_provider,
     }
     if scope:
         msg["scope"] = scope

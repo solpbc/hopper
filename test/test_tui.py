@@ -647,7 +647,7 @@ def test_new_lode_always_enqueues_explicit_coder_provider(monkeypatch, coder_pro
     app.action_new_lode()
     callbacks[0](project)
     server.events.clear()
-    callbacks[1](("A sufficiently detailed task scope", "start", coder_provider))
+    callbacks[1](("A sufficiently detailed task scope", "start", coder_provider, "claude"))
 
     assert server.events == [
         {
@@ -656,6 +656,7 @@ def test_new_lode_always_enqueues_explicit_coder_provider(monkeypatch, coder_pro
             "scope": "A sufficiently detailed task scope",
             "spawn": True,
             "coder_provider": coder_provider,
+            "driver": "claude",
         }
     ]
 
@@ -682,7 +683,14 @@ def test_new_lode_uses_saved_grok_default_and_enqueues(temp_config, monkeypatch)
     assert isinstance(screens[1], ScopeInputScreen)
     assert screens[1].coder_provider == "grok"
     server.events.clear()
-    callbacks[1](("A sufficiently detailed task scope", "start", screens[1].coder_provider))
+    callbacks[1](
+        (
+            "A sufficiently detailed task scope",
+            "start",
+            screens[1].coder_provider,
+            screens[1].supervisor_provider,
+        )
+    )
 
     assert server.events == [
         {
@@ -691,6 +699,7 @@ def test_new_lode_uses_saved_grok_default_and_enqueues(temp_config, monkeypatch)
             "scope": "A sufficiently detailed task scope",
             "spawn": True,
             "coder_provider": "grok",
+            "driver": "claude",
         }
     ]
 
@@ -821,7 +830,7 @@ def test_backlog_promote_always_enqueues_explicit_coder_provider(monkeypatch, co
     )
 
     app._edit_backlog_item(item.id)
-    callbacks[0](("promote", "Promote me", coder_provider))
+    callbacks[0](("promote", "Promote me", coder_provider, "claude"))
 
     assert server.events == [
         {
@@ -829,6 +838,7 @@ def test_backlog_promote_always_enqueues_explicit_coder_provider(monkeypatch, co
             "item_id": "bl111111",
             "scope": "Promote me",
             "coder_provider": coder_provider,
+            "driver": "claude",
         }
     ]
 
@@ -1691,7 +1701,7 @@ async def test_scope_input_start():
         await pilot.press("tab")  # Backlog
         await pilot.press("tab")  # Start
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "start", "codex")
+        assert app.scope_result == ("Test task scope", "start", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -1709,7 +1719,7 @@ async def test_scope_input_backlog():
         await pilot.press("tab")  # Cancel
         await pilot.press("tab")  # Backlog
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "backlog", "codex")
+        assert app.scope_result == ("Test task scope", "backlog", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -1736,7 +1746,7 @@ async def test_scope_input_ctrl_enter_submit():
         text_area = app.screen.query_one(TextArea)
         text_area.insert("test scope")
         await pilot.press("ctrl+enter")
-        assert app.scope_result == ("test scope", "start", "codex")
+        assert app.scope_result == ("test scope", "start", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -1762,12 +1772,16 @@ async def test_scope_input_arrow_keys_navigate_buttons():
         # Right arrow to Start
         await pilot.press("right")
         assert app.screen.focused.id == "btn-start"
-        # Right arrow moves to the coder choice, then wraps to Cancel
+        # Right arrow moves through both provider choices, then wraps to Cancel
         await pilot.press("right")
         assert app.screen.focused.id == "btn-coder"
         await pilot.press("right")
+        assert app.screen.focused.id == "btn-supervisor"
+        await pilot.press("right")
         assert app.screen.focused.id == "btn-cancel"
-        # Left arrow wraps to the coder choice
+        # Left arrow wraps to the supervisor choice
+        await pilot.press("left")
+        assert app.screen.focused.id == "btn-supervisor"
         await pilot.press("left")
         assert app.screen.focused.id == "btn-coder"
         await pilot.press("left")
@@ -1826,7 +1840,7 @@ async def test_scope_input_arrow_key_select():
         await pilot.press("right")
         assert app.screen.focused.id == "btn-start"
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "start", "codex")
+        assert app.scope_result == ("Test task scope", "start", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -1842,9 +1856,17 @@ async def test_scope_input_defaults_to_codex_and_can_select_grok():
         assert app.screen.focused.id == "btn-coder"
         await pilot.press("enter")
         assert str(coder_button.label) == "Coder: Grok"
+        supervisor_button = app.screen.query_one("#btn-supervisor", Button)
+        assert str(supervisor_button.label) == "Supervisor: Claude"
+        supervisor_button.focus()
+        await pilot.press("enter")
+        assert str(supervisor_button.label) == "Supervisor: Codex"
+        await pilot.pause(0.4)
+        await pilot.press("enter")
+        assert str(supervisor_button.label) == "Supervisor: Grok"
         app.screen.query_one("#btn-start", Button).focus()
         await pilot.press("enter")
-        assert app.scope_result == ("Test task scope", "start", "grok")
+        assert app.scope_result == ("Test task scope", "start", "grok", "grok")
 
 
 # Tests for hint rows
@@ -2813,7 +2835,7 @@ async def test_backlog_edit_save():
         await pilot.press("tab")  # Promote
         await pilot.press("tab")  # Save
         await pilot.press("enter")
-        assert app.edit_result == ("save", "Updated text", "codex")
+        assert app.edit_result == ("save", "Updated text", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -2829,7 +2851,7 @@ async def test_backlog_edit_promote():
         await pilot.press("tab")  # Cancel
         await pilot.press("tab")  # Promote
         await pilot.press("enter")
-        assert app.edit_result == ("promote", "Task to promote", "codex")
+        assert app.edit_result == ("promote", "Task to promote", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -2858,6 +2880,8 @@ async def test_backlog_edit_arrow_navigation():
         assert app.screen.focused.id == "btn-save"
         await pilot.press("right")
         assert app.screen.focused.id == "btn-coder"
+        await pilot.press("right")
+        assert app.screen.focused.id == "btn-supervisor"
         await pilot.press("right")  # wraps
         assert app.screen.focused.id == "btn-cancel"
 
@@ -2873,7 +2897,7 @@ async def test_backlog_edit_ctrl_enter_submit():
         ta.clear()
         ta.insert("Updated text")
         await pilot.press("ctrl+enter")
-        assert app.edit_result == ("save", "Updated text", "codex")
+        assert app.edit_result == ("save", "Updated text", "codex", "claude")
 
 
 @pytest.mark.asyncio
@@ -2887,6 +2911,11 @@ async def test_backlog_edit_defaults_to_codex_and_can_select_grok():
         coder_button.focus()
         await pilot.press("enter")
         assert str(coder_button.label) == "Coder: Grok"
+        supervisor_button = app.screen.query_one("#btn-supervisor", Button)
+        assert str(supervisor_button.label) == "Supervisor: Claude"
+        supervisor_button.focus()
+        await pilot.press("enter")
+        assert str(supervisor_button.label) == "Supervisor: Codex"
 
 
 @pytest.mark.asyncio
@@ -2971,6 +3000,7 @@ async def test_backlog_promote_creates_session(monkeypatch, temp_config):
                 "item_id": "bl111111",
                 "scope": "Promote me",
                 "coder_provider": "codex",
+                "driver": "claude",
             }
         ]
 

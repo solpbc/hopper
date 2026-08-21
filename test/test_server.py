@@ -10251,9 +10251,12 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
         "character_failed",
         "character_failed_unknown",
     }
-    assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == shared | choice_only | character_only
-    assert set(hopper_server._GATE_FEEDBACK_MESSAGES) == shared | character_only
-    assert set(hopper_server._PANE_INPUT_MESSAGES) == shared | choice_only
+    provider_only = {"pane_blocked", "pane_character_unsupported"}
+    assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == (
+        shared | choice_only | character_only | provider_only
+    )
+    assert set(hopper_server._GATE_FEEDBACK_MESSAGES) == shared | character_only | provider_only
+    assert set(hopper_server._PANE_INPUT_MESSAGES) == shared | choice_only | provider_only
     assert hopper_server._ACCEPTED_DELIVERY_REASONS == {
         "auto_submitted",
         "character_sent",

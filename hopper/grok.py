@@ -6,13 +6,38 @@
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
 import uuid
 from pathlib import Path
 
+from hopper.tmux import KeyboardOwnership, PanePhase, normalize_terminal_text
+
 logger = logging.getLogger(__name__)
+
+LABEL = "Grok"
+_SUPERVISOR_FLAGS = (
+    "--fullscreen",
+    "--permission-mode",
+    "bypassPermissions",
+    "--sandbox",
+    "off",
+    "--no-memory",
+    "--no-plan",
+    "--no-subagents",
+    "--disable-web-search",
+    "--disallowed-tools",
+    "ask_user_question",
+)
+_TURN_ACTIVE_RE = re.compile(r"⇣\S+\s+\[stop\]\s*$", re.MULTILINE)
+_HINT_LINE_RE = re.compile(r"^\s*\S+:\S[^│]*(?:│[^│]*\S+:\S[^│]*)+$")
+_BACKGROUND_RE = re.compile(
+    r"\b[1-9]\d*\s+commands?\s+still\s+running\b|^\s*[▾▸]\s*Tasks\s+[1-9]\d*\s*$",
+    re.MULTILINE,
+)
+_AUTH_MARKERS = ("Approve in your browser to finish signing in.", "Waiting for approval...")
 
 GROK_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
 GROK_FLAGS = (
@@ -39,6 +64,95 @@ def _new_command(prompt: str, session_id: str) -> list[str]:
 
 def _resume_command(prompt: str, session_id: str) -> list[str]:
     return ["grok", *GROK_FLAGS, "--resume", session_id, "-p", prompt]
+
+
+def build_command(*, session_id: str, prompt: str | None, resume: bool) -> list[str]:
+    """Build one interactive Grok supervisor command."""
+    if resume:
+        return ["grok", *_SUPERVISOR_FLAGS, "--resume", session_id]
+    if not isinstance(prompt, str):
+        raise ValueError("a Grok first launch requires a prompt")
+    return ["grok", *_SUPERVISOR_FLAGS, "--session-id", session_id, prompt]
+
+
+def subprocess_environment() -> dict[str, str]:
+    return {"GROK_DISABLE_AUTOUPDATER": "1"}
+
+
+def requires_workspace_trust() -> bool:
+    return False
+
+
+def _normalized(snapshot: str) -> str | None:
+    return normalize_terminal_text(snapshot)
+
+
+def _hint_line(normalized: str) -> str:
+    return next((line for line in reversed(normalized.splitlines()) if line.strip()), "")
+
+
+def read_pane_input(snapshot: str) -> str | None:
+    """Read the final visible Grok ordinary-composer row."""
+    normalized = _normalized(snapshot)
+    if normalized is None:
+        return None
+    for line in reversed(normalized.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("│ ❯") and stripped.endswith("│"):
+            return stripped[3:-1].strip()
+    return None
+
+
+def observe_pane(
+    title: str | None,
+    snapshot: str,
+    *,
+    background_work_active: bool = False,
+) -> tuple[PanePhase, KeyboardOwnership]:
+    normalized = _normalized(snapshot)
+    if not normalized:
+        return PanePhase.UNKNOWN, KeyboardOwnership.UNKNOWN
+    if any(marker in normalized for marker in _AUTH_MARKERS):
+        return PanePhase.AUTH, KeyboardOwnership.NONE
+    hint = _hint_line(normalized)
+    if "Ctrl+x:shortcuts" in hint:
+        keyboard = KeyboardOwnership.COMPOSER
+        if _TURN_ACTIVE_RE.search(normalized):
+            return PanePhase.BUSY, keyboard
+        if background_work_active or _BACKGROUND_RE.search(normalized):
+            return PanePhase.BACKGROUND, keyboard
+        if read_pane_input(normalized) is not None:
+            return PanePhase.IDLE, keyboard
+        return PanePhase.UNKNOWN, KeyboardOwnership.UNKNOWN
+    if _HINT_LINE_RE.match(hint):
+        return PanePhase.BLOCKED, KeyboardOwnership.CARD
+    if "grok build" in normalized.lower() or "starting grok" in normalized.lower():
+        return PanePhase.STARTING, KeyboardOwnership.NONE
+    return PanePhase.UNKNOWN, KeyboardOwnership.UNKNOWN
+
+
+def pane_surface_readable(snapshot: str) -> bool:
+    phase, keyboard = observe_pane(None, snapshot)
+    return keyboard in {KeyboardOwnership.COMPOSER, KeyboardOwnership.CARD} and phase not in {
+        PanePhase.UNKNOWN,
+        PanePhase.AUTH,
+    }
+
+
+def pane_answer_choices(snapshot: str):
+    return None
+
+
+def pane_blocked_identity(snapshot: str):
+    phase, _keyboard = observe_pane(None, snapshot)
+    if phase is not PanePhase.BLOCKED:
+        return None
+    normalized = _normalized(snapshot) or ""
+    for line in reversed(normalized.splitlines()):
+        stripped = " ".join(line.split())
+        if "Waiting on" in stripped:
+            return stripped, ()
+    return "Grok is waiting on an operator card", ()
 
 
 def grok_failure_message(event: dict) -> str | None:

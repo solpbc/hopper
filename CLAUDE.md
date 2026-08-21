@@ -4,13 +4,14 @@ Development guidelines for Hopper, a TUI for managing coding agents.
 
 ## Project Overview
 
-Hopper manages multiple Claude Code sessions (called "lodes") through a terminal interface. It runs inside tmux, spawning each Claude instance in its own window while providing a central dashboard for navigation and status. The server persists state and broadcasts changes over a Unix socket; the TUI renders from that state.
+Hopper manages multiple supervised feature-delivery sessions (called "lodes") through a terminal interface. It runs inside tmux, spawning each selected supervisor in its own window while providing a central dashboard for navigation and status. The server persists state and broadcasts changes over a Unix socket; the TUI renders from that state.
 
 ## Key Concepts
 
-- **Lode** - A Claude Code instance with a unique ID, workflow stage, freeform state, active flag, and associated tmux window
+- **Lode** - A supervised session with a unique ID, workflow stage, freeform state, active flag, and associated tmux window
 - **Stage** - Workflow position: "mill" (scoping), "refine" (implementing), or "ship" (merging back to main)
 - **Coder** - Per-lode refine-stage CLI, selected only at creation; its host-local default is configurable with `hop coder default`
+- **Supervisor** - Per-lode interactive CLI (Claude, Codex, or Grok), selected only at creation; its host-local default is configurable with `hop supervisor default`
 - **Backlog** - Future work items with project and description
 
 ## Architecture
@@ -21,6 +22,13 @@ stage event artifacts; `hopper/code.py` translates only provider events that map
 to the existing progress and command-heartbeat behavior. Codex bootstrap and
 resume subprocesses are pinned to `gpt-5.6-terra` at `xhigh`; do not add a
 generic event framework or pin a Grok model.
+
+Interactive supervision follows the same small adapter shape through
+`hopper/driver.py`: each provider owns only its command, environment, and pane
+parsing. Codex supervisor sessions are bootstrapped read-only on
+`gpt-5.6-terra` at `xhigh`, then resumed in the full interactive TUI. Keep
+provider-specific TUI rules in the provider modules rather than growing a
+generic framework.
 
 ```
 CLI (hop up)
@@ -33,7 +41,7 @@ CLI (hop up)
     +-- TUI (main thread)
         +-- Renders from server's lode list
         +-- Handles keyboard input
-        +-- Spawns Claude in tmux windows
+        +-- Spawns the selected supervisor in tmux windows
 ```
 
 **Data flow:** User input -> TUI -> Lode mutation -> Server broadcast -> TUI re-render

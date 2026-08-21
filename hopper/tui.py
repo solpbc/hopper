@@ -63,6 +63,15 @@ from hopper.lodes import (
     read_diff_totals,
 )
 from hopper.projects import Project, find_project, load_projects, touch_project
+from hopper.supervisor import (
+    DEFAULT_SUPERVISOR_PROVIDER,
+    SUPERVISOR_PROVIDERS,
+    SupervisorDefaultRefusal,
+    resolve_supervisor_default,
+    supervisor_check,
+    supervisor_default_refusal_lines,
+    supervisor_unavailable_message,
+)
 from hopper.tmux import capture_pane, rename_window, switch_to_pane
 
 # Claude Code-inspired theme
@@ -464,6 +473,12 @@ class TextInputScreen(ModalScreen):
             self.coder_provider = "grok" if provider == "codex" else "codex"
             event.button.label = f"Coder: {self.coder_provider.capitalize()}"
             return
+        if event.button.id == "btn-supervisor":
+            provider = getattr(self, "supervisor_provider", DEFAULT_SUPERVISOR_PROVIDER)
+            index = SUPERVISOR_PROVIDERS.index(provider)
+            self.supervisor_provider = SUPERVISOR_PROVIDERS[(index + 1) % len(SUPERVISOR_PROVIDERS)]
+            event.button.label = f"Supervisor: {self.supervisor_provider.capitalize()}"
+            return
         self._try_submit(event.button)
 
     def on_submit(self, button: Button, text: str) -> None:
@@ -476,10 +491,16 @@ class ScopeInputScreen(TextInputScreen):
 
     MODAL_TITLE = "Describe Task Scope"
 
-    def __init__(self, project_name: str, coder_provider: str) -> None:
+    def __init__(
+        self,
+        project_name: str,
+        coder_provider: str,
+        supervisor_provider: str = DEFAULT_SUPERVISOR_PROVIDER,
+    ) -> None:
         super().__init__()
         self.MODAL_TITLE = f"Describe {project_name.capitalize()} Task Scope"
         self.coder_provider = coder_provider
+        self.supervisor_provider = supervisor_provider
 
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
@@ -488,10 +509,15 @@ class ScopeInputScreen(TextInputScreen):
         yield Button(
             f"Coder: {self.coder_provider.capitalize()}", id="btn-coder", variant="default"
         )
+        yield Button(
+            f"Supervisor: {self.supervisor_provider.capitalize()}",
+            id="btn-supervisor",
+            variant="default",
+        )
 
     def on_submit(self, button: Button, text: str) -> None:
         action = "start" if button.id == "btn-start" else "backlog"
-        self.dismiss((text, action, self.coder_provider))
+        self.dismiss((text, action, self.coder_provider, self.supervisor_provider))
 
 
 class BacklogInputScreen(TextInputScreen):
@@ -512,9 +538,15 @@ class BacklogEditScreen(TextInputScreen):
 
     MODAL_TITLE = "Edit Backlog Item"
 
-    def __init__(self, initial_text: str = "") -> None:
+    def __init__(
+        self,
+        initial_text: str = "",
+        coder_provider: str = DEFAULT_CODER_PROVIDER,
+        supervisor_provider: str = DEFAULT_SUPERVISOR_PROVIDER,
+    ) -> None:
         super().__init__(initial_text=initial_text)
-        self.coder_provider = DEFAULT_CODER_PROVIDER
+        self.coder_provider = coder_provider
+        self.supervisor_provider = supervisor_provider
 
     def compose_buttons(self) -> ComposeResult:
         yield Button("Cancel", id="btn-cancel", variant="default")
@@ -523,10 +555,15 @@ class BacklogEditScreen(TextInputScreen):
         yield Button(
             f"Coder: {self.coder_provider.capitalize()}", id="btn-coder", variant="default"
         )
+        yield Button(
+            f"Supervisor: {self.supervisor_provider.capitalize()}",
+            id="btn-supervisor",
+            variant="default",
+        )
 
     def on_submit(self, button: Button, text: str) -> None:
         action = "promote" if button.id == "btn-promote" else "save"
-        self.dismiss((action, text, self.coder_provider))
+        self.dismiss((action, text, self.coder_provider, self.supervisor_provider))
 
 
 class MillReviewScreen(TextInputScreen):
@@ -1950,15 +1987,24 @@ class HopperApp(App):
             except CoderDefaultRefusal as error:
                 self.notify("\n".join(coder_default_refusal_lines(error)), severity="error")
                 return
+            try:
+                supervisor_provider, _source = resolve_supervisor_default()
+            except SupervisorDefaultRefusal as error:
+                self.notify("\n".join(supervisor_default_refusal_lines(error)), severity="error")
+                return
 
             touch_project(project.name)
             if self.server:
                 self.server.enqueue({"type": "projects_reload"})
 
-            def on_scope_entered(result: tuple[str, str, str] | None) -> None:
+            def on_scope_entered(result: tuple[str, str, str, str] | None) -> None:
                 if result is None:
                     return  # Cancelled
-                scope, action, coder_provider = result
+                if len(result) == 3:
+                    scope, action, coder_provider = result
+                    supervisor_provider = DEFAULT_SUPERVISOR_PROVIDER
+                else:
+                    scope, action, coder_provider, supervisor_provider = result
                 if action == "backlog":
                     if self.server:
                         self.server.enqueue(
@@ -1976,6 +2022,15 @@ class HopperApp(App):
                             severity="error",
                         )
                         return
+                    supervisor_readiness = supervisor_check(supervisor_provider)
+                    if not supervisor_readiness["ready"]:
+                        self.notify(
+                            supervisor_unavailable_message(
+                                supervisor_provider, supervisor_readiness.get("error")
+                            ),
+                            severity="error",
+                        )
+                        return
                     if self.server:
                         message = {
                             "type": "lode_create",
@@ -1983,10 +2038,14 @@ class HopperApp(App):
                             "scope": scope,
                             "spawn": True,
                             "coder_provider": coder_provider,
+                            "driver": supervisor_provider,
                         }
                         self.server.enqueue(message)
 
-            self.push_screen(ScopeInputScreen(project.name, coder_provider), on_scope_entered)
+            self.push_screen(
+                ScopeInputScreen(project.name, coder_provider, supervisor_provider),
+                on_scope_entered,
+            )
 
         self.push_screen(ProjectPickerScreen(load_projects()), on_project_selected)
 
@@ -2244,10 +2303,14 @@ class HopperApp(App):
         if not item:
             return
 
-        def on_edit_result(result: tuple[str, str, str] | None) -> None:
+        def on_edit_result(result: tuple[str, str, str, str] | None) -> None:
             if result is None:
                 return  # Cancelled
-            action, text, coder_provider = result
+            if len(result) == 3:
+                action, text, coder_provider = result
+                supervisor_provider = DEFAULT_SUPERVISOR_PROVIDER
+            else:
+                action, text, coder_provider, supervisor_provider = result
             if action == "save":
                 if self.server:
                     self.server.enqueue(
@@ -2265,16 +2328,37 @@ class HopperApp(App):
                         severity="error",
                     )
                     return
+                supervisor_readiness = supervisor_check(supervisor_provider)
+                if not supervisor_readiness["ready"]:
+                    self.notify(
+                        supervisor_unavailable_message(
+                            supervisor_provider, supervisor_readiness.get("error")
+                        ),
+                        severity="error",
+                    )
+                    return
                 if self.server:
                     message = {
                         "type": "lode_promote_backlog",
                         "item_id": item_id,
                         "scope": text,
                         "coder_provider": coder_provider,
+                        "driver": supervisor_provider,
                     }
                     self.server.enqueue(message)
 
-        self.push_screen(BacklogEditScreen(initial_text=item.description), on_edit_result)
+        try:
+            supervisor_provider, _source = resolve_supervisor_default()
+        except SupervisorDefaultRefusal as error:
+            self.notify("\n".join(supervisor_default_refusal_lines(error)), severity="error")
+            return
+        self.push_screen(
+            BacklogEditScreen(
+                initial_text=item.description,
+                supervisor_provider=supervisor_provider,
+            ),
+            on_edit_result,
+        )
 
     def _review_mill_output(self, lode: dict) -> None:
         """Open the mill output review modal for a refine-ready lode."""

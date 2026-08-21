@@ -6,7 +6,7 @@
 from types import ModuleType
 
 # This set is runnable adapters, not every durable record value.
-RUNNABLE_STAGE_DRIVERS = ("claude",)
+RUNNABLE_STAGE_DRIVERS = ("claude", "codex", "grok")
 STAGE_DRIVER_CAPABILITIES_KEY = "stage_driver_capabilities"
 STAGE_DRIVER_PROTOCOL_VERSION = 1
 
@@ -21,6 +21,14 @@ def resolve_driver(name: object) -> ModuleType:
         from hopper import claude
 
         return claude
+    if name == "codex":
+        from hopper import codex
+
+        return codex
+    if name == "grok":
+        from hopper import grok
+
+        return grok
     raise DriverRefusal(
         f"interactive-stage driver {name!r} is unavailable; inspect the server version and lode."
     )

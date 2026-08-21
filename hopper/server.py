@@ -53,6 +53,7 @@ from hopper.driver import (
     RUNNABLE_STAGE_DRIVERS,
     STAGE_DRIVER_CAPABILITIES_KEY,
     STAGE_DRIVER_PROTOCOL_VERSION,
+    resolve_driver,
 )
 from hopper.git import delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
@@ -100,6 +101,11 @@ from hopper.lodes import (
 )
 from hopper.process import STAGES
 from hopper.projects import Project, disabled_project_message, find_project, get_active_projects
+from hopper.supervisor import (
+    supervisor_check,
+    supervisor_unavailable_message,
+    validate_supervisor_provider,
+)
 from hopper.tmux import (
     KeyboardOwnership,
     Liveness,
@@ -119,6 +125,16 @@ from hopper.tmux import (
     read_pane_input,
     send_keys,
     spawn_lode_processor,
+)
+
+# Retained module aliases for the established Claude parser test/diagnostic surface.
+_CLAUDE_PANE_EXPORTS = (
+    classify_pane_phase,
+    pane_answer_choices,
+    pane_answer_identity,
+    pane_keyboard_ownership,
+    pane_surface_readable,
+    read_pane_input,
 )
 
 logger = logging.getLogger(__name__)
@@ -431,6 +447,8 @@ _DELIVERY_FAILURE_OUTCOMES = {
     "pane_unavailable": "pane_unavailable",
     "idle_timeout": "busy",
     "pane_state_unknown": "pane_state_unknown",
+    "pane_blocked": "awaiting_operator",
+    "pane_character_unsupported": "not_sent",
     "pane_frozen": "pane_frozen",
     "pane_awaiting_choice": "awaiting_choice",
     "pane_not_awaiting_choice": "not_sent",
@@ -459,6 +477,7 @@ _GATE_FEEDBACK_STATUSES = {
     "pane_state_unknown": "Feedback blocked: pane state unrecognized",
     "pane_frozen": "Feedback blocked: pane appears frozen",
     "awaiting_choice": "Feedback blocked: pane awaiting a numbered choice",
+    "awaiting_operator": "Feedback blocked: supervisor awaits operator input",
     "gated_character_only": ("Feedback blocked: gated lode accepts only a single character"),
 }
 _GATE_FEEDBACK_MESSAGES = {
@@ -487,6 +506,15 @@ _GATE_FEEDBACK_MESSAGES = {
         "Feedback was not sent. Pane {pane} is waiting on a numbered choice, which is a "
         "selector rather than a text box. Nothing was pasted. Read the options with "
         "`hop lode peek {lode_id}`, then answer with `hop lode answer {lode_id} <n>`."
+    ),
+    "pane_blocked": (
+        "Feedback was not sent because pane {pane} is showing a supervisor menu, card, or "
+        "authentication screen. Nothing was typed. Inspect with `hop lode peek {lode_id}` "
+        "and resolve it in the pane."
+    ),
+    "pane_character_unsupported": (
+        "The character was not sent because this lode's supervisor does not support Hopper's "
+        "single-character shortcut. Nothing was typed. Inspect pane {pane} and respond there."
     ),
     "paste_failed": (
         "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
@@ -573,6 +601,15 @@ _PANE_INPUT_MESSAGES = {
         "pasted. Read the options with `hop lode peek {lode_id}`, then answer with "
         "`hop lode answer {lode_id} <n>`. Hopper cannot drive the free-text entry "
         '("Type something"); inspect pane {pane} and enter that answer directly.'
+    ),
+    "pane_blocked": (
+        "Input was not sent because pane {pane} is showing a supervisor menu, card, or "
+        "authentication screen. Nothing was typed. Inspect with `hop lode peek {lode_id}` "
+        "and resolve it in the pane."
+    ),
+    "pane_character_unsupported": (
+        "Input was not sent because this lode's supervisor does not support Hopper's "
+        "single-character shortcut. Nothing was typed. Inspect pane {pane} and respond there."
     ),
     "pane_not_awaiting_choice": (
         "Choice was not sent because pane {pane} is not a recognized numbered selector. "
@@ -756,8 +793,11 @@ def _observe_pane_acceptance(
     latest_capture: str,
     observed_title: str | None,
     acceptance_evidence: tuple[str, object],
+    *,
+    driver_name: str = "claude",
 ) -> dict:
     """Verify that one submitted input started a new processing turn."""
+    driver = resolve_driver(driver_name)
     evidence_kind, pre_enter_evidence = acceptance_evidence
     evidence_observed = False
     for _ in range(_FEEDBACK_ACCEPTANCE_POLL_COUNT):
@@ -771,28 +811,32 @@ def _observe_pane_acceptance(
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
-        if classify_pane_phase(observed_title) is PanePhase.BUSY:
+        phase, _keyboard = driver.observe_pane(observed_title, latest_capture)
+        if phase is PanePhase.BUSY:
             return {
                 "reason": "enter_accepted",
                 "capture": latest_capture,
                 "title": observed_title,
             }
         if evidence_kind == "selector":
-            selector_identity = pane_answer_identity(latest_capture)
+            selector_identity = driver.pane_blocked_identity(latest_capture)
             consumed = (
                 bool(latest_capture.strip())
-                and pane_surface_readable(latest_capture)
+                and driver.pane_surface_readable(latest_capture)
                 and (
                     (selector_identity is not None and selector_identity != pre_enter_evidence)
-                    or (selector_identity is None and read_pane_input(latest_capture) is not None)
+                    or (
+                        selector_identity is None
+                        and driver.read_pane_input(latest_capture) is not None
+                    )
                 )
             )
             accepted_reason = "selector_changed"
         else:
             consumed = (
                 bool(latest_capture.strip())
-                and pane_surface_readable(latest_capture)
-                and read_pane_input(latest_capture) != pre_enter_evidence
+                and driver.pane_surface_readable(latest_capture)
+                and driver.read_pane_input(latest_capture) != pre_enter_evidence
             )
             accepted_reason = "composer_cleared"
         if consumed and evidence_observed:
@@ -815,8 +859,10 @@ def _attempt_pane_delivery(
     *,
     paste: bool,
     pane_title_observation: dict | None = None,
+    driver_name: str = "claude",
 ) -> dict:
     """Attempt one pane delivery and return its reason and latest observations."""
+    driver = resolve_driver(driver_name)
     observed_title = None
     if not pane_id:
         return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
@@ -840,7 +886,7 @@ def _attempt_pane_delivery(
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
-        phase = classify_pane_phase(observed_title)
+        phase, keyboard = driver.observe_pane(observed_title, latest_capture)
         if phase is PanePhase.BUSY:
             saw_processing = True
             processing_frozen = _observe_processing_pane_title(
@@ -850,7 +896,6 @@ def _attempt_pane_delivery(
         elif phase is PanePhase.IDLE:
             if pane_title_observation is not None:
                 pane_title_observation.clear()
-            keyboard = pane_keyboard_ownership(latest_capture)
             if paste and keyboard is KeyboardOwnership.NUMBERED_CHOICE:
                 # A numbered selector is not a text composer. Pasting free text into
                 # one stages it with nothing able to submit it, and each retry appends
@@ -874,15 +919,40 @@ def _attempt_pane_delivery(
                         "capture": latest_capture,
                         "title": observed_title,
                     }
-                answer_state = pane_answer_choices(latest_capture)
+                answer_state = driver.pane_answer_choices(latest_capture)
                 if answer_state is None:
                     return {
                         "reason": "pane_not_awaiting_choice",
                         "capture": latest_capture,
                         "title": observed_title,
                     }
-            pre_delivery_input = read_pane_input(latest_capture)
+            pre_delivery_input = driver.read_pane_input(latest_capture)
             break
+        elif (
+            phase is PanePhase.BLOCKED
+            and driver_name == "claude"
+            and keyboard is KeyboardOwnership.NUMBERED_CHOICE
+        ):
+            if paste:
+                return {
+                    "reason": "pane_awaiting_choice",
+                    "capture": latest_capture,
+                    "title": observed_title,
+                }
+            answer_state = driver.pane_answer_choices(latest_capture)
+            if answer_state is None:
+                return {
+                    "reason": "pane_not_awaiting_choice",
+                    "capture": latest_capture,
+                    "title": observed_title,
+                }
+            break
+        elif phase in {PanePhase.BLOCKED, PanePhase.AUTH}:
+            return {
+                "reason": "pane_blocked",
+                "capture": latest_capture,
+                "title": observed_title,
+            }
         else:
             processing_frozen = False
             if pane_title_observation is not None:
@@ -935,14 +1005,14 @@ def _attempt_pane_delivery(
                 "title": observed_title,
             }
         latest_capture = capture
-        moved_state = pane_answer_choices(latest_capture)
+        moved_state = driver.pane_answer_choices(latest_capture)
         if moved_state is None or moved_state[0] != target_choice:
             return {
                 "reason": "choice_navigation_unverified",
                 "capture": latest_capture,
                 "title": observed_title,
             }
-        selector_identity = pane_answer_identity(latest_capture)
+        selector_identity = driver.pane_blocked_identity(latest_capture)
         assert selector_identity is not None
         if not send_keys(pane_id, "Enter"):
             return {
@@ -955,6 +1025,7 @@ def _attempt_pane_delivery(
             latest_capture,
             observed_title,
             ("selector", selector_identity),
+            driver_name=driver_name,
         )
 
     delivered = paste_buffer(pane_id, text) if paste else send_keys(pane_id, text)
@@ -967,7 +1038,7 @@ def _attempt_pane_delivery(
                 "title": observed_title,
             }
         latest_capture = capture
-        post_delivery_input = read_pane_input(latest_capture)
+        post_delivery_input = driver.read_pane_input(latest_capture)
         reason = (
             "paste_failed_unknown"
             if pre_delivery_input is None or post_delivery_input != pre_delivery_input
@@ -987,14 +1058,14 @@ def _attempt_pane_delivery(
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
-        phase = classify_pane_phase(observed_title)
+        phase, _keyboard = driver.observe_pane(observed_title, latest_capture)
         if phase is PanePhase.BUSY:
             return {
                 "reason": "auto_submitted",
                 "capture": latest_capture,
                 "title": observed_title,
             }
-        post_delivery_input = read_pane_input(latest_capture)
+        post_delivery_input = driver.read_pane_input(latest_capture)
         if phase is PanePhase.IDLE and post_delivery_input:
             staged_input = post_delivery_input
             break
@@ -1018,6 +1089,7 @@ def _attempt_pane_delivery(
         latest_capture,
         observed_title,
         ("composer", staged_input),
+        driver_name=driver_name,
     )
 
 
@@ -1026,8 +1098,10 @@ def _attempt_character_delivery(
     char: str,
     *,
     pane_title_observation: dict | None = None,
+    driver_name: str = "claude",
 ) -> dict:
     """Send one character without waiting for the pane to go idle."""
+    driver = resolve_driver(driver_name)
     observed_title = None
     if not pane_id:
         return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
@@ -1036,8 +1110,15 @@ def _attempt_character_delivery(
     if latest_capture is None:
         return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
 
+    if driver_name != "claude":
+        return {
+            "reason": "pane_character_unsupported",
+            "capture": latest_capture,
+            "title": pane_title(pane_id),
+        }
+
     observed_title = pane_title(pane_id)
-    phase = classify_pane_phase(observed_title)
+    phase, keyboard = driver.observe_pane(observed_title, latest_capture)
     if phase is PanePhase.UNKNOWN:
         return {
             "reason": "pane_state_unknown",
@@ -1045,7 +1126,6 @@ def _attempt_character_delivery(
             "title": observed_title,
         }
     if phase is PanePhase.IDLE:
-        keyboard = pane_keyboard_ownership(latest_capture)
         if keyboard is KeyboardOwnership.NUMBERED_CHOICE:
             return {
                 "reason": "pane_awaiting_choice",
@@ -1101,14 +1181,14 @@ def _attempt_character_delivery(
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
-        settle_phase = classify_pane_phase(observed_title)
+        settle_phase, _keyboard = driver.observe_pane(observed_title, latest_capture)
         if settle_phase is PanePhase.BUSY:
             return {
                 "reason": "auto_submitted",
                 "capture": latest_capture,
                 "title": observed_title,
             }
-        post_delivery_input = read_pane_input(latest_capture)
+        post_delivery_input = driver.read_pane_input(latest_capture)
         if settle_phase is PanePhase.IDLE and post_delivery_input:
             staged_input = post_delivery_input
             break
@@ -1132,6 +1212,7 @@ def _attempt_character_delivery(
         latest_capture,
         observed_title,
         ("composer", staged_input),
+        driver_name=driver_name,
     )
 
 
@@ -1143,6 +1224,7 @@ def _deliver_pane_input(
     paste: bool,
     character: bool = False,
     pane_title_observation: dict | None = None,
+    driver_name: str = "claude",
 ) -> dict:
     """Deliver pane input and emit exactly one outcome record."""
     try:
@@ -1151,6 +1233,7 @@ def _deliver_pane_input(
                 pane_id,
                 text,
                 pane_title_observation=pane_title_observation,
+                driver_name=driver_name,
             )
         else:
             result = _attempt_pane_delivery(
@@ -1158,6 +1241,7 @@ def _deliver_pane_input(
                 text,
                 paste=paste,
                 pane_title_observation=pane_title_observation,
+                driver_name=driver_name,
             )
     except Exception:
         logger.warning(
@@ -1213,6 +1297,7 @@ def _deliver_lode_pane_input(
         paste=paste,
         character=character,
         pane_title_observation=observation,
+        driver_name=lode_driver(lode),
     )
     updated_observation = observation or None
     if updated_observation != prior_observation:
@@ -5396,6 +5481,7 @@ class Server:
         scope: str = "",
         *,
         coder_provider: str,
+        supervisor_provider: str = "claude",
     ) -> dict | None:
         """Promote a backlog item to a lode. Returns the new lode dict."""
         proj = find_project(item.project)
@@ -5411,6 +5497,7 @@ class Server:
             item.project,
             scope or item.description,
             coder_provider=coder_provider,
+            driver=supervisor_provider,
         )
         lode["backlog"] = item.to_dict()
         save_lodes(self.lodes)
@@ -5735,22 +5822,11 @@ class Server:
                         {"type": "error", "error": "lode_create requires coder_provider"},
                     )
                 return
-            requested_driver = message.get("driver", "claude")
-            if requested_driver != "claude":
-                logger.warning(
-                    "Refusing unavailable interactive driver request driver=%r", requested_driver
-                )
+            try:
+                requested_driver = validate_supervisor_provider(message.get("driver", "claude"))
+            except ValueError as error:
                 if conn:
-                    self._send_response(
-                        conn,
-                        {
-                            "type": "error",
-                            "error": (
-                                "interactive-stage driver is unavailable; inspect connectivity and "
-                                "server version"
-                            ),
-                        },
-                    )
+                    self._send_response(conn, {"type": "error", "error": str(error)})
                 return
             project = message.get("project", "")
             scope = message.get("scope", "")
@@ -5774,6 +5850,19 @@ class Server:
                         },
                     )
                 return
+            supervisor_readiness = supervisor_check(requested_driver)
+            if not supervisor_readiness["ready"]:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": supervisor_unavailable_message(
+                                requested_driver, supervisor_readiness.get("error")
+                            ),
+                        },
+                    )
+                return
             proj = find_project(project)
             if proj and proj.disabled:
                 logger.warning("Refusing to create lode for disabled project %s", project)
@@ -5783,13 +5872,13 @@ class Server:
                         {"type": "error", "error": disabled_project_message(proj)},
                     )
                 return
-            lode = create_lode(
-                self.lodes,
-                project,
-                scope,
-                originating_extro_sid=originating_extro_sid,
-                coder_provider=coder_provider,
-            )
+            create_kwargs = {
+                "originating_extro_sid": originating_extro_sid,
+                "coder_provider": coder_provider,
+            }
+            if requested_driver != "claude":
+                create_kwargs["driver"] = requested_driver
+            lode = create_lode(self.lodes, project, scope, **create_kwargs)
             backlog_data = message.get("backlog")
             if backlog_data:
                 lode["backlog"] = backlog_data
@@ -6174,7 +6263,7 @@ class Server:
                 acknowledge_mutation(False, "lode_not_found")
                 return
             if (
-                driver != "claude"
+                driver not in RUNNABLE_STAGE_DRIVERS
                 or lode_driver(lode) != driver
                 or stage != lode.get("stage")
                 or not all(
@@ -6509,6 +6598,7 @@ class Server:
             scope = message.get("scope", "")
             try:
                 coder_provider = validate_coder_provider(message["coder_provider"])
+                supervisor_provider = validate_supervisor_provider(message.get("driver", "claude"))
             except ValueError as error:
                 if conn:
                     self._send_response(conn, {"type": "promote_error", "error": str(error)})
@@ -6526,6 +6616,19 @@ class Server:
                         },
                     )
                 return
+            supervisor_readiness = supervisor_check(supervisor_provider)
+            if not supervisor_readiness["ready"]:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "promote_error",
+                            "error": supervisor_unavailable_message(
+                                supervisor_provider, supervisor_readiness.get("error")
+                            ),
+                        },
+                    )
+                return
             item = find_backlog_by_prefix(self.backlog, item_id)
             if not item:
                 if conn:
@@ -6535,7 +6638,12 @@ class Server:
                     )
             else:
                 try:
-                    lode = self._promote_backlog_item(item, scope, coder_provider=coder_provider)
+                    lode = self._promote_backlog_item(
+                        item,
+                        scope,
+                        coder_provider=coder_provider,
+                        supervisor_provider=supervisor_provider,
+                    )
                     if lode and conn:
                         self._send_response(conn, {"type": "lode_promoted", "lode": lode})
                     elif conn:
