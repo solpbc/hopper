@@ -24,6 +24,7 @@ import uuid
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 
 from hopper import actions, config, git, oom, teardown
 from hopper.backlog import (
@@ -153,6 +154,33 @@ _FEEDBACK_ACCEPTANCE_POLL_COUNT = 12
 _FEEDBACK_IDLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_IDLE_POLL_COUNT
 _FEEDBACK_SETTLE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_SETTLE_POLL_COUNT
 _FEEDBACK_ACCEPTANCE_WAIT_SECONDS = _FEEDBACK_POLL_INTERVAL * _FEEDBACK_ACCEPTANCE_POLL_COUNT
+
+_WORKER_LOOP_OUTCOMES = {
+    "writer": frozenset(
+        {
+            "select_none",
+            "select_non_none",
+            "select_raised",
+            "target_returned_before_operation",
+        }
+    ),
+    "event": frozenset(
+        {
+            "get_empty",
+            "get_item",
+            "drain_raised",
+            "get_raised",
+            "target_returned_before_operation",
+        }
+    ),
+}
+
+
+class _WorkerLoopOutcomeSnapshot(NamedTuple):
+    """Frozen causal outcomes from each server worker's first loop operation."""
+
+    writer: str | None
+    event: str | None
 
 
 def _validate_worktree_path_publication(lode: dict, message: dict) -> tuple[str | None, str | None]:
@@ -1325,6 +1353,32 @@ class Server:
         self._socket_bound = False
         self.ready = threading.Event()
         self.startup_error: Exception | None = None
+        self._worker_loop_outcome_lock = threading.Lock()
+        self._worker_loop_outcomes: dict[str, str | None] = {
+            "writer": None,
+            "event": None,
+        }
+
+    def _worker_loop_outcome_snapshot(self) -> _WorkerLoopOutcomeSnapshot:
+        """Return immutable causal facts without exposing the live outcome container."""
+        with self._worker_loop_outcome_lock:
+            return _WorkerLoopOutcomeSnapshot(
+                writer=self._worker_loop_outcomes["writer"],
+                event=self._worker_loop_outcomes["event"],
+            )
+
+    def _record_worker_loop_outcome(self, worker: str, outcome: str) -> bool:
+        """Record one worker's first causal outcome, returning whether it won."""
+        vocabulary = _WORKER_LOOP_OUTCOMES.get(worker)
+        if vocabulary is None:
+            raise ValueError(f"unknown server worker {worker!r}")
+        if outcome not in vocabulary:
+            raise ValueError(f"invalid {worker} loop outcome {outcome!r}")
+        with self._worker_loop_outcome_lock:
+            if self._worker_loop_outcomes[worker] is not None:
+                return False
+            self._worker_loop_outcomes[worker] = outcome
+            return True
 
     def _find_lode(self, lode_id: str) -> dict | None:
         """Find a lode by ID."""
@@ -6658,30 +6712,45 @@ class Server:
         Dequeues (message, conn) pairs and processes them one at a time,
         ensuring no concurrent access to serialized lode/backlog state or save_lodes.
         """
-        while not self.stop_event.is_set():
-            self._drain_due_disconnects()
-            try:
-                message, conn = self.event_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    self._drain_due_disconnects()
+                except BaseException:
+                    self._record_worker_loop_outcome("event", "drain_raised")
+                    raise
+                try:
+                    queued_event = self.event_queue.get(timeout=0.1)
+                except queue.Empty:
+                    self._record_worker_loop_outcome("event", "get_empty")
+                    continue
+                except BaseException:
+                    self._record_worker_loop_outcome("event", "get_raised")
+                    raise
 
-            try:
-                self._handle_mutation(message, conn)
-            except Exception:
-                logger.exception(f"Event loop error: {message.get('type')}")
-            finally:
-                self._drain_due_disconnects()
+                self._record_worker_loop_outcome("event", "get_item")
+                message, conn = queued_event
+                try:
+                    self._handle_mutation(message, conn)
+                except Exception:
+                    logger.exception(f"Event loop error: {message.get('type')}")
+                finally:
+                    self._drain_due_disconnects()
+        finally:
+            self._record_worker_loop_outcome("event", "target_returned_before_operation")
 
-    def _enqueue_event(self, message: dict, conn: socket.socket | None = None) -> None:
+    def _enqueue_event(self, message: dict, conn: socket.socket | None = None) -> bool:
         """Enqueue a mutation event for the event loop thread."""
         if self.stop_event.is_set():
             self._close_dropped_event_handles(message)
-            return
+            return False
         try:
             self.event_queue.put_nowait((message, conn))
         except queue.Full:
             self._close_dropped_event_handles(message)
             logger.warning(f"Event queue full, dropping: {message.get('type')}")
+            return False
+        return True
 
     def enqueue(self, message: dict) -> None:
         """Public API for in-process callers (TUI) to submit mutations."""
@@ -6689,20 +6758,29 @@ class Server:
 
     def _writer_loop(self) -> None:
         """Dedicated writer thread alternating between lifecycle and ordinary traffic."""
-        while not self.stop_event.is_set():
-            selection = self.transport.select(lambda: not self.broadcast_queue.empty(), 0.1)
-            if selection is None:
-                continue
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    selection = self.transport.select(lambda: not self.broadcast_queue.empty(), 0.1)
+                except BaseException:
+                    self._record_worker_loop_outcome("writer", "select_raised")
+                    raise
+                if selection is None:
+                    self._record_worker_loop_outcome("writer", "select_none")
+                    continue
 
-            if selection.kind == LIFECYCLE:
-                self._send_to_cohort(selection.data, selection.cohort)
-                continue
+                self._record_worker_loop_outcome("writer", "select_non_none")
+                if selection.kind == LIFECYCLE:
+                    self._send_to_cohort(selection.data, selection.cohort)
+                    continue
 
-            try:
-                message = self.broadcast_queue.get_nowait()
-            except queue.Empty:
-                continue
-            self._send_to_clients(message)
+                try:
+                    message = self.broadcast_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                self._send_to_clients(message)
+        finally:
+            self._record_worker_loop_outcome("writer", "target_returned_before_operation")
 
     def _send_to_clients(self, message: dict) -> None:
         """Send an ordinary message to every client connected at send time."""
