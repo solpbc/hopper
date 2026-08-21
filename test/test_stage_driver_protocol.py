@@ -160,6 +160,12 @@ def test_frozen_markerless_connected_response_is_bounded_legacy_claude_shape(tmp
     assert received["request"]["lode_id"] == "legacyab"
     assert connected is not None
     assert classify_stage_driver_protocol(connected, "claude") is StageDriverProtocol.LEGACY_CLAUDE
+    legacy_lode = connected["lode"]
+    assert "stage_sessions" not in legacy_lode
+    session = lode_stage_session(legacy_lode, "mill")
+    assert session["provider_session_id"] == "11111111-1111-1111-1111-111111111111"
+    assert session["started"] is False
+    assert legacy_lode["driver"] == "claude"
     assert classify_stage_driver_protocol(None, "claude") is StageDriverProtocol.UNKNOWN
 
     missing = dict(response)

@@ -499,6 +499,12 @@ def lode_stage_session(lode: dict, stage: str) -> dict:
     """Return one validated canonical stage-session record."""
     if stage not in _STAGE_NAMES:
         raise _lode_record_error(lode, stage, "stage", "is not a managed interactive stage")
+    # A new runner can receive an untouched pre-foundation lode from an old
+    # server process.  Normalize that legacy-only wire payload at the accessor
+    # boundary before requiring canonical state.  An explicitly present but
+    # malformed canonical field must still fail instead of falling back.
+    if "stage_sessions" not in lode and "claude" in lode:
+        normalize_lode_stage_sessions(lode)
     sessions = lode.get("stage_sessions")
     if not isinstance(sessions, dict):
         raise _lode_record_error(lode, stage, "stage_sessions", "is required")
