@@ -1680,12 +1680,12 @@ def test_coder_default_set_replaces_invalid_saved_value(temp_config, monkeypatch
     [
         (
             ["hop", "coder", "default"],
-            b'{\n  "coder.default": 42\n}\n',
+            b'{\n    "z-last": true,\n    "coder.default": 42\n}',
             "observed: config key 'coder.default' in {path} is 42, which is not a supported coder.",
         ),
         (
             ["hop", "coder", "default", "unsupported"],
-            b'{\n  "name": "keep"\n}\n',
+            b'{\n    "z-last": true,\n    "a-first": { "nested": 1 }\n}',
             "observed: requested coder 'unsupported' is not supported; see `hop coder --help`.",
         ),
     ],

@@ -31,13 +31,18 @@ def coder_default_refusal_lines(error: CoderDefaultRefusal) -> list[str]:
     ]
 
 
+def _is_supported_coder(value: object) -> bool:
+    """Return whether a value names a supported refine coding provider."""
+    return isinstance(value, str) and value in CODER_PROVIDERS
+
+
 def resolve_coder_default() -> tuple[str, str]:
     """Return the saved coder default or the built-in fallback and its source."""
     settings = config.load_config()
     if "coder.default" not in settings:
         return DEFAULT_CODER_PROVIDER, "built in"
     provider = settings["coder.default"]
-    if isinstance(provider, str) and provider in CODER_PROVIDERS:
+    if _is_supported_coder(provider):
         return provider, "saved"
     raise CoderDefaultRefusal(
         f"config key 'coder.default' in {config.config_path()} is {provider!r}, "
@@ -47,7 +52,7 @@ def resolve_coder_default() -> tuple[str, str]:
 
 def set_coder_default(provider: object) -> None:
     """Persist one supported host-local refine coder default."""
-    if not isinstance(provider, str) or provider not in CODER_PROVIDERS:
+    if not _is_supported_coder(provider):
         raise CoderDefaultRefusal(
             f"requested coder {provider!r} is not supported; see `hop coder --help`."
         )
@@ -57,7 +62,7 @@ def set_coder_default(provider: object) -> None:
 
 def validate_coder_provider(provider: object) -> str:
     """Return a supported provider name or raise a user-facing ValueError."""
-    if not isinstance(provider, str) or provider not in CODER_PROVIDERS:
+    if not _is_supported_coder(provider):
         choices = ", ".join(CODER_PROVIDERS)
         raise ValueError(f"coder must be one of: {choices}")
     return provider

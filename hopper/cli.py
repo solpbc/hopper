@@ -1709,13 +1709,20 @@ def cmd_coder(args: list[str]) -> int:
     parser.add_argument("action", choices=["check", "default"])
     parser.add_argument("provider", nargs="?")
     parser.add_argument("--json", dest="json_output", action="store_true")
+    providers = ", ".join(CODER_PROVIDERS)
     parser.epilog = (
         "Actions:\n"
         "  hop coder check <provider> [--json]\n"
         "  hop coder default [provider]\n"
+        f"Providers: {providers}\n"
         "\n"
         "Use `hop coder default` to show this host's refine-stage creation default, "
-        "or provide a provider to set it. Use `hop coder check <provider>` to test readiness."
+        "or provide a provider to set it. "
+        f"When this host has no saved default, the built-in fallback is {DEFAULT_CODER_PROVIDER}. "
+        "An explicit create-time `--coder <provider>` wins and does not read this setting. "
+        "`hop -H HOST coder default <provider>` changes HOST only. This setting selects a "
+        "provider; it does not establish readiness or account quota. Use `hop coder check "
+        "<provider>` to test readiness."
     )
     try:
         parsed = parse_args(parser, args)
@@ -4221,7 +4228,7 @@ def cmd_lode(args: list[str]) -> int:
             return 1
         coder_provider = parsed.coder
         if coder_provider is None:
-            # _main already refuses invalid saved values before local dispatch.
+            # Resolve lazily; main() normally validates the saved value before dispatch.
             coder_provider = resolve_coder_default()[0]
         readiness = coder_check(coder_provider)
         if not readiness["ready"]:
