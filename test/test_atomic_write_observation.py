@@ -5,6 +5,7 @@
 
 import builtins
 import copy
+import errno
 import json
 import os
 from contextlib import ExitStack
@@ -83,6 +84,7 @@ class AtomicWriteHarness:
         self.directory_open_paths: list[Path] = []
         self.directory_fsync_fds: list[int] = []
         self.directory_close_fds: list[int] = []
+        self.directory_real_close_count = 0
         self.destination_at_parent_open: list[bytes] = []
         self.unlink_calls: list[Path] = []
         self.temp_bytes_before_cleanup: list[bytes | None] = []
@@ -164,8 +166,11 @@ class AtomicWriteHarness:
             self.directory_close_fds.append(fd)
             self.events.append(("directory_close", fd))
             error = self.faults.get("close_destination_parent")
+            result = self._real_close(fd)
+            self.directory_real_close_count += 1
             if error is not None:
                 raise error
+            return result
         return self._real_close(fd)
 
     def _unlink(self, candidate: Path, *args, **kwargs):
@@ -286,6 +291,7 @@ def test_success_observes_real_publication_chain_and_mid_call_destination(temp_c
     assert harness.directory_open_paths == [path.parent]
     assert harness.directory_fsync_fds == [harness.directory_fd]
     assert harness.directory_close_fds == [harness.directory_fd]
+    assert harness.directory_real_close_count == 1
     assert [event[0] for event in harness.events] == [
         "stream_write",
         "stream_write",
@@ -426,6 +432,8 @@ def test_observation_combined_fault_order_and_compatibility(
     assert observation.publication is publication
     _assert_destination(path, existing, publication, b'{"id": "payload"}\n')
     assert harness.unlink_calls == [harness.tmp_path]
+    if "close_destination_parent" in labels:
+        assert harness.directory_real_close_count == 1
     assert harness.tmp_path.exists() is (labels[0] == "fsync_temp")
     harness.assert_foreign_temp_unchanged()
 
@@ -609,3 +617,49 @@ def test_public_savers_preserve_combined_outward_close_exception(
     assert close_error.__suppress_context__ is False
     assert harness.unlink_calls == [harness.tmp_path]
     harness.assert_foreign_temp_unchanged()
+
+
+@pytest.mark.parametrize(
+    ("saver", "filename"),
+    [(lodes.save_lodes, "active.jsonl"), (lodes.save_archived_lodes, "archived.jsonl")],
+)
+def test_public_saver_preserves_writer_chain_inside_active_caller_exception(
+    temp_config, saver, filename
+):
+    path = temp_config / filename
+    close_error = OSError(errno.EIO, "close fault")
+    cleanup_error = OSError(errno.ENOSPC, "cleanup fault")
+    caller_error = ValueError("active caller fault")
+
+    with AtomicWriteHarness(
+        path,
+        {"close_temp": close_error, "cleanup_temp": cleanup_error},
+        parent_absent=False,
+    ):
+        with pytest.raises(OSError) as exc_info:
+            try:
+                raise caller_error
+            except ValueError:
+                saver([{"id": "first"}, {"bad": object()}])
+
+    type_error = close_error.__context__
+    assert exc_info.value is close_error
+    assert type(type_error) is TypeError
+    assert type_error.__context__ is caller_error
+    assert close_error.__cause__ is None
+    assert close_error.__suppress_context__ is False
+
+
+def test_observation_retains_non_null_errno_negative_oracle(temp_config):
+    path = temp_config / "active.jsonl"
+    sync_error = OSError(errno.ENOSPC, "temp sync fault")
+
+    with AtomicWriteHarness(
+        path,
+        {"fsync_temp": sync_error},
+        parent_absent=False,
+    ):
+        observation = lodes._observe_jsonl_atomic_write(path, [{"id": "payload"}])
+
+    _assert_fault(observation.errors[0], "fsync_temp", sync_error)
+    assert observation.errors[0].errno == errno.ENOSPC

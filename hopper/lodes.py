@@ -844,7 +844,19 @@ def _write_jsonl_atomic(path: Path, items: list[dict]) -> None:
     observation = _observe_jsonl_atomic_write(path, items)
     if observation.compatibility_exception is None:
         return None
-    raise observation.compatibility_exception
+    error = observation.compatibility_exception
+    original_context = error.__context__
+    original_cause = error.__cause__
+    original_suppress_context = error.__suppress_context__
+    try:
+        raise error
+    finally:
+        # Raising a retained exception while the caller is already handling a
+        # different exception overwrites __context__. Restore the chain formed
+        # at the original writer coordinate before it crosses this wrapper.
+        error.__context__ = original_context
+        error.__cause__ = original_cause
+        error.__suppress_context__ = original_suppress_context
 
 
 def save_archived_lodes(lodes: list[dict]) -> None:
