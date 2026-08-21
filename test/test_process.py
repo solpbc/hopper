@@ -1182,11 +1182,7 @@ class TestMillStage:
         runner.connection = connection
 
         with (
-            patch.object(
-                server,
-                "broadcast",
-                side_effect=lambda message, *, root=None: runner._on_server_message(message),
-            ),
+            patch.object(server, "broadcast", side_effect=runner._on_server_message),
             patch("hopper.process.create_worktree") as mock_create,
         ):
             assert runner._setup_mill() is None
@@ -1279,7 +1275,7 @@ class TestMillStage:
             on_connect()
             callback({"type": "lode_registered", "lode_id": "test-id"})
 
-        def broadcast(message, *, root=None):
+        def broadcast(message):
             if message.get("lode", {}).get("worktree_path") is not None:
                 callback_ref(message)
             return True
@@ -1756,9 +1752,7 @@ class TestDurableHandshakeConfirmation:
         case["ack_conn"].sendall.side_effect = lambda data: runner._on_server_message(
             json.loads(data.decode("utf-8"))
         )
-        case["server"].broadcast.side_effect = lambda message, *, root=None: (
-            runner._on_server_message(message)
-        )
+        case["server"].broadcast.side_effect = runner._on_server_message
         runner.connection.emit.side_effect = case["emit_to_server"]
 
         with patch.object(runner, "_publish_lode_worktree_path", side_effect=observe_publish):

@@ -54,7 +54,6 @@ from hopper.server import (
     start_server_with_tui,
 )
 from hopper.tmux import Liveness, WindowSpawnOutcome
-from hopper.transport import ACTIVE_ROOT
 from hopper.wait import classify
 
 
@@ -150,17 +149,6 @@ def _mock_client(server: Server) -> MagicMock:
         server.clients.append(conn)
         server.write_locks[conn] = threading.Lock()
     return conn
-
-
-def _drain_lifecycle(server: Server) -> list[dict]:
-    """Take every pending lifecycle envelope through the production selector and decode it."""
-    events = []
-    while True:
-        selection = server.transport.select(lambda: False, 0)
-        if selection is None:
-            break
-        events.append(json.loads(selection.data.decode("utf-8")))
-    return events
 
 
 TEST_RUN_GENERATION = "a" * 32
@@ -5643,7 +5631,7 @@ def test_concurrent_lode_create_responses_are_causally_bound(
 ):
     real_create_lode = hopper_server.create_lode
     real_enqueue_event = server._enqueue_event
-    real_send_to_cohort = server._send_to_cohort
+    real_send_to_clients = server._send_to_clients
     a_create_started = threading.Event()
     b_enqueued = threading.Event()
     release_a = threading.Event()
@@ -5676,15 +5664,14 @@ def test_concurrent_lode_create_responses_are_causally_bound(
         if message.get("type") == "lode_create" and message.get("scope") == "scope-b":
             b_enqueued.set()
 
-    def observed_send_to_cohort(data, cohort):
-        real_send_to_cohort(data, cohort)
-        message = json.loads(data.decode("utf-8"))
-        if message["type"] == "lode_created" and message["lode"].get("scope") == "scope-a":
+    def observed_send_to_clients(message):
+        real_send_to_clients(message)
+        if message.get("type") == "lode_created" and message["lode"].get("scope") == "scope-a":
             a_broadcast_delivered.set()
 
     monkeypatch.setattr(hopper_server, "create_lode", controlled_create_lode)
     monkeypatch.setattr(server, "_enqueue_event", observed_enqueue)
-    monkeypatch.setattr(server, "_send_to_cohort", observed_send_to_cohort)
+    monkeypatch.setattr(server, "_send_to_clients", observed_send_to_clients)
 
     def create(name, project, scope):
         results[name] = request_lode_creation(
@@ -6439,7 +6426,7 @@ def test_gated_spawn_without_recorded_pane_spawns(socket_path, make_lode):
     assert lode["active"] is False
     assert lode["pid"] is None
     mock_spawn.assert_called_once_with("fresh-id", "/repo", foreground=False, env=ANY)
-    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
+    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
 
 def test_gated_spawn_alive_refuses_even_when_active_is_false(socket_path, make_lode, caplog):
@@ -6938,7 +6925,7 @@ def test_resume_refine_proven_failure_keeps_refine_and_clears_gone_identity(sock
     assert lode["spawn_disposition"] == "proven_no_pane"
     assert mock_save.call_count == 2
     mock_save.assert_called_with(server.lodes)
-    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
+    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
 
 def test_resume_refine_live_pane_gates_without_changing_stage(socket_path, make_lode):
@@ -7114,11 +7101,7 @@ def test_registration_atomically_leaves_only_eligible_graces(socket_path, make_l
 
     with (
         patch("hopper.server.save_lodes", side_effect=observe_save),
-        patch.object(
-            server,
-            "broadcast",
-            side_effect=lambda message, *, root=None: broadcasts.append(message),
-        ),
+        patch.object(server, "broadcast", side_effect=lambda message: broadcasts.append(message)),
     ):
         assert server._register_lode_client(
             "register-id",
@@ -7855,8 +7838,6 @@ def test_server_handles_lode_set_state(socket_path, server, temp_config, make_lo
     lode = make_lode(id="test-id", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     # Connect client
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -7926,8 +7907,6 @@ def test_server_handles_lode_set_progress(socket_path, server, temp_config, make
     lode = make_lode(id="test-id", state="running")
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(str(socket_path))
@@ -7974,7 +7953,7 @@ def test_server_accepts_progress_for_live_states(socket_path, make_lode, state):
     assert lode["last_progress_at"] is not None
     assert lode["last_progress_summary"] == "working"
     mock_save.assert_called_once_with(srv.lodes)
-    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
+    mock_broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
 
 @pytest.mark.parametrize("state", ["gated", "error"])
@@ -8015,8 +7994,6 @@ def test_server_handles_lode_set_title(socket_path, server, temp_config, make_lo
     lode = make_lode(id="test-id", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     # Connect client
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -8052,8 +8029,6 @@ def test_server_handles_lode_set_branch(socket_path, server, temp_config, make_l
     lode = make_lode(id="test-id", state="running", active=True)
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(str(socket_path))
@@ -8179,7 +8154,6 @@ def test_in_band_action_refusal_reports_divergent_owner_without_persisting(socke
     assert owner_generation in response["status"]
     assert lode["status"] == "stale progress"
     assert server.broadcast_queue.empty()
-    assert server.transport.pending_ids() == []
 
 
 def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socket_path, make_lode):
@@ -8188,15 +8162,6 @@ def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socke
     server = Server(socket_path)
     lode = make_lode(id="abcd2345", pending_action=None)
     server.lodes = [lode]
-    server.reseed_lifecycle_baseline()
-    publishes = []
-    real_publish = server.transport.publish
-
-    def counted_publish(*args, **kwargs):
-        publishes.append(args[0]["lode"]["id"])
-        return real_publish(*args, **kwargs)
-
-    server.transport.publish = counted_publish
     request = {
         "lode_id": lode["id"],
         "action_id": action_id,
@@ -8219,9 +8184,7 @@ def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socke
     first_status = lode["status"]
     assert first_status
     assert first_status.startswith("action refused: ")
-    assert publishes == [lode["id"]]
-    assert server.transport.pending_ids() == [lode["id"]]
-    assert server.broadcast_queue.empty()
+    assert server.broadcast_queue.qsize() == 1
 
     server._send_action_ack(
         None,
@@ -8234,10 +8197,7 @@ def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socke
     )
 
     assert lode["status"] == first_status
-    assert publishes == [lode["id"]]
-    assert server.transport.pending_ids() == [lode["id"]]
-    assert server.broadcast_queue.empty()
-    assert [event["type"] for event in _drain_lifecycle(server)] == ["lode_updated"]
+    assert server.broadcast_queue.qsize() == 1
 
 
 def test_server_resumes_paused_lode_with_existing_stage(socket_path, temp_config, make_lode):
@@ -8800,8 +8760,6 @@ def test_server_handles_ready_state(socket_path, server, temp_config, make_lode)
     lode = make_lode(id="test-id", stage="refine", state="completed")
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(str(socket_path))
@@ -9118,8 +9076,6 @@ def test_server_handles_legacy_lode_set_codex_thread(socket_path, server, temp_c
     lode = make_lode(id="test-id", stage="refine", state="running")
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     # Connect client
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -9250,8 +9206,6 @@ def test_server_handles_lode_set_claude_started(socket_path, server, temp_config
     assert lode_stage_session(lode, "mill")["started"] is False
     server.lodes = [lode]
     save_lodes(server.lodes)
-    # The lode is pre-existing root state, exactly as a real start would load it.
-    server.reseed_lifecycle_baseline()
 
     # Connect client
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -9426,7 +9380,6 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     """Idle staged feedback resumes only after the title becomes processing."""
     srv = Server(socket_path)
     srv.lodes = [make_lode(id="test-id", stage="refine", state="running", tmux_pane="%1")]
-    srv.reseed_lifecycle_baseline()
     conn = _mock_client(srv)
 
     _capture, _title, mock_paste, mock_send, _sleep = _handle_delivery_with_tmux(
@@ -9448,10 +9401,8 @@ def test_lode_send_feedback_alive_pane_sends_keys(socket_path, make_lode):
     assert srv.lodes[0]["status"] == "Feedback accepted"
     assert srv.lodes[0]["gate_epoch"] == 0
     assert srv.lodes[0]["gate_body"] is None
-    events = _drain_lifecycle(srv)
-    assert [event["type"] for event in events] == ["lode_updated"]
-    assert events[0]["lode"]["id"] == "test-id"
-    assert srv.broadcast_queue.empty()
+    broadcast = srv.broadcast_queue.get_nowait()
+    assert broadcast["type"] == "lode_updated"
     response = _decode_mock_response(conn)
     assert response["type"] == "feedback_sent"
     assert response["lode_id"] == "test-id"
@@ -10743,7 +10694,6 @@ def test_lode_send_pane_input_answer_auto_submits_without_state_write(socket_pat
     mock_send.assert_called_once_with("%1", "Enter")
     assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
-    assert srv.transport.pending_ids() == []
     response = _decode_mock_response(conn)
     assert {key: response[key] for key in ("type", "lode_id", "tmux_pane")} == {
         "type": "pane_input_sent",
@@ -10777,7 +10727,6 @@ def test_lode_send_pane_input_nudge_uses_paste_without_state_write(socket_path, 
     mock_send.assert_called_once_with("%1", "Enter")
     assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
-    assert srv.transport.pending_ids() == []
     assert _decode_mock_response(conn)["type"] == "pane_input_sent"
 
 
@@ -10801,7 +10750,6 @@ def test_lode_send_pane_input_answer_without_processing_is_unverified(socket_pat
     mock_send.assert_called_once_with("%1", "Enter")
     assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
-    assert srv.transport.pending_ids() == []
     response = _decode_mock_response(conn)
     assert response["type"] == "error"
     assert response["outcome"] == "unverified"
@@ -10835,7 +10783,6 @@ def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_
     mock_send.assert_not_called()
     assert srv.lodes[0] == before
     assert srv.broadcast_queue.empty()
-    assert srv.transport.pending_ids() == []
     response = _decode_mock_response(conn)
     assert response["outcome"] == "pane_state_unknown"
     assert '"_ Land native skills port to main"' in response["error"]
@@ -11670,7 +11617,7 @@ class TestOomLifecycle:
         assert srv.lode_clients["test-id"] is owner
         assert srv.client_lodes[owner] == "test-id"
         assert srv.client_generations[owner] == lode["run_generation"]
-        broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
+        broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
     @pytest.mark.parametrize(
         ("proof_mode", "actual_unit", "run_generation"),
@@ -11787,7 +11734,7 @@ class TestOomLifecycle:
         assert lode["status"] == format_terminal_failure_status("oom", "test-id")
         assert save.call_count == 2
         save.assert_called_with(srv.lodes)
-        broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
+        broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
 
     def test_failed_terminal_persistence_is_retried_before_ack(self, socket_path, make_lode):
         srv = Server(socket_path)
@@ -11926,11 +11873,7 @@ class TestOomLifecycle:
                     "hopper.server.find_project",
                     return_value=Project(path="/repo", name="proj"),
                 ),
-                patch.object(
-                    srv,
-                    "broadcast",
-                    side_effect=lambda message, *, root=None: broadcasts.append(message),
-                ),
+                patch.object(srv, "broadcast", side_effect=broadcasts.append),
                 patch.object(srv, "_gated_spawn") as spawn,
                 patch.object(srv, "_cleanup_worktree") as cleanup,
             ):
@@ -11994,11 +11937,7 @@ class TestOomLifecycle:
         broadcasts = []
 
         with (
-            patch.object(
-                srv,
-                "broadcast",
-                side_effect=lambda message, *, root=None: broadcasts.append(message),
-            ),
+            patch.object(srv, "broadcast", side_effect=broadcasts.append),
             patch.object(srv, "_gated_spawn") as spawn,
         ):
             if oom_first:
@@ -12584,8 +12523,8 @@ def test_worktree_publication_is_idempotent_and_broadcasts_post_save(socket_path
     conn = _mock_client(srv)
     events = []
 
-    def record_broadcast(message, *, root=None):
-        events.append(("broadcast", message["lode"]["worktree_path"], root))
+    def record_broadcast(message):
+        events.append(("broadcast", message["lode"]["worktree_path"]))
 
     with (
         patch("hopper.lodes.save_lodes", side_effect=lambda _lodes: events.append(("save", None))),
@@ -12597,7 +12536,7 @@ def test_worktree_publication_is_idempotent_and_broadcasts_post_save(socket_path
     assert response["accepted"] is True
     assert response["reason"] == "accepted"
     assert lode["worktree_path"] == str(managed)
-    assert events == [("save", None), ("broadcast", str(managed), ACTIVE_ROOT)]
+    assert events == [("save", None), ("broadcast", str(managed))]
 
 
 def test_cleanup_uses_recorded_path_even_when_legacy_candidate_exists(socket_path, make_lode):
