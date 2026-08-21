@@ -129,13 +129,16 @@ class LifecycleTransport:
         """Adopt complete root membership as the baseline. No synthetic events are emitted."""
         mapping = build_baseline(active_ids, archived_ids)
         with self._cond:
-            self._baseline = mapping
+            if mapping != self._baseline:
+                self._discard_pending_locked("baseline reseed")
+                self._baseline = mapping
             self._refusal = None
             self._closed = False
 
     def disable(self, reason: str) -> None:
         """Refuse every further lifecycle publish until a valid baseline is seeded."""
         with self._cond:
+            self._discard_pending_locked(f"baseline refusal: {reason}")
             self._refusal = reason
 
     @property
@@ -158,7 +161,7 @@ class LifecycleTransport:
         declared: str,
         payload: str,
         ts: int,
-        cohort: tuple,
+        cohort_factory: Callable[[], tuple],
     ) -> None:
         """Take ownership of a frozen snapshot. Infallible once called."""
         with self._cond:
@@ -166,7 +169,7 @@ class LifecycleTransport:
             if entry is None:
                 entry = {
                     "baseline": self._baseline.get(lode_id),
-                    "cohort": cohort,
+                    "cohort": cohort_factory(),
                     "active_payload": None,
                     "active_ts": None,
                 }
@@ -242,10 +245,24 @@ class LifecycleTransport:
         """Discard pending envelopes and stale claims, and release the writer."""
         with self._cond:
             self._closed = True
-            self._pending.clear()
-            self._claims.clear()
+            self._refusal = "lifecycle transport is closed"
+            self._discard_pending_locked("transport close")
             self._last_kind = None
             self._cond.notify_all()
+
+    def _discard_pending_locked(self, reason: str) -> None:
+        """Discard pending lifecycle work while holding the transport condition."""
+        if not self._pending and not self._claims:
+            return
+        lode_ids = list(self._pending)
+        logger.warning(
+            "Discarding %d pending lifecycle lodes during %s: %s",
+            len(lode_ids),
+            reason,
+            lode_ids,
+        )
+        self._pending.clear()
+        self._claims.clear()
 
     # -- observation ----------------------------------------------------------------
 

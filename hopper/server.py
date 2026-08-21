@@ -6813,11 +6813,12 @@ class Server:
             logger.warning(f"Refusing {message['type']} for lode {lode['id']}: {e}")
             return False
 
-        with self.lock:
-            cohort = tuple(self.clients)
+        def cohort_factory() -> tuple:
+            with self.lock:
+                return tuple(self.clients)
 
         self.transport.publish(
-            lode["id"], root, message["type"], payload, current_time_ms(), cohort
+            lode["id"], root, message["type"], payload, current_time_ms(), cohort_factory
         )
         return True
 

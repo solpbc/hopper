@@ -4,6 +4,7 @@
 """Behavior tests for the bounded, immutable lode lifecycle notification transport."""
 
 import json
+import logging
 import socket
 import threading
 import time
@@ -283,10 +284,17 @@ def test_projects_reload_preserves_an_unchanged_map_and_reseeds_a_changed_one(sr
     srv.archived_lodes = [_lode("efgh5678", "A")]
     srv.reseed_lifecycle_baseline()
 
+    assert srv.broadcast(
+        {"type": "lode_updated", "lode": _lode("abcd1234", "PENDING")}, root=ACTIVE_ROOT
+    )
     srv._handle_mutation({"type": "projects_reload"}, None)
     assert srv.transport.refusal is None
     assert srv.transport.baseline_root("abcd1234") == ACTIVE_ROOT
     assert srv.transport.baseline_root("efgh5678") == ARCHIVE_ROOT
+    assert srv.transport.pending_ids() == ["abcd1234"]
+    assert [(event["type"], _markers(event)) for event in _drain(srv)] == [
+        ("lode_updated", {"PENDING"})
+    ]
 
     save_lodes([_lode("abcd1234", "A"), _lode("ijkl9012", "A")])
     srv._handle_mutation({"type": "projects_reload"}, None)
@@ -297,7 +305,32 @@ def test_projects_reload_preserves_an_unchanged_map_and_reseeds_a_changed_one(sr
     assert [event["type"] for event in _drain(srv)] == ["lode_updated"]
 
 
+def test_projects_reload_with_changed_map_discards_pending_lifecycle_state(srv, caplog):
+    active = [_lode("abcd1234", "A")]
+    srv.lodes = list(active)
+    srv.archived_lodes = [_lode("efgh5678", "A")]
+    srv.reseed_lifecycle_baseline()
+    assert srv.broadcast(
+        {"type": "lode_updated", "lode": _lode("abcd1234", "PENDING")}, root=ACTIVE_ROOT
+    )
+
+    save_lodes([_lode("abcd1234", "A"), _lode("ijkl9012", "A")])
+    save_archived_lodes([_lode("efgh5678", "A")])
+    with caplog.at_level(logging.WARNING, logger="hopper.transport"):
+        srv._handle_mutation({"type": "projects_reload"}, None)
+
+    assert srv.transport.pending_ids() == []
+    assert srv.transport.claims() == []
+    assert "Discarding 1 pending lifecycle lodes during baseline reseed" in caplog.text
+    assert "abcd1234" in caplog.text
+
+
 def test_projects_reload_visibly_refuses_a_cross_root_map_before_classifying_again(srv, caplog):
+    srv.lodes = [_lode("abcd1234", "A")]
+    srv.reseed_lifecycle_baseline()
+    assert srv.broadcast(
+        {"type": "lode_updated", "lode": _lode("abcd1234", "PENDING")}, root=ACTIVE_ROOT
+    )
     save_lodes([_lode("abcd1234", "A")])
     save_archived_lodes([_lode("abcd1234", "A")])
 
@@ -310,6 +343,19 @@ def test_projects_reload_visibly_refuses_a_cross_root_map_before_classifying_aga
         is False
     )
     assert srv.transport.pending_ids() == []
+    assert srv.transport.claims() == []
+    assert "Discarding 1 pending lifecycle lodes during baseline refusal" in caplog.text
+
+
+def test_closed_transport_refuses_lifecycle_broadcast_without_creating_a_claim(srv):
+    srv.transport.close()
+
+    assert (
+        srv.broadcast({"type": "lode_created", "lode": _lode("abcd1234", "A")}, root=ACTIVE_ROOT)
+        is False
+    )
+    assert srv.transport.pending_ids() == []
+    assert srv.transport.claims() == []
 
 
 def test_restart_discards_pending_state_and_seeds_from_the_reloaded_roots(socket_path):
@@ -406,8 +452,14 @@ def test_reducer_matches_the_oracle(srv, name, baseline, leading, final, expecte
 
     # No superseded snapshot survives its successor.
     final_marker = final[2]
-    for event in events[events.index(events[-1]) :]:
-        assert _markers(event) == {final_marker}
+    assert _markers(events[-1]) == {final_marker}
+    for event in events:
+        assert len(_markers(event)) == 1
+    expected_markers = {marker for _event_type, marker in expected}
+    published_markers = {marker for _declared, _root, marker in [*leading, final]}
+    serialized_events = json.dumps(events)
+    for marker in published_markers - expected_markers:
+        assert marker not in serialized_events
     assert "SEED" not in json.dumps(events)
 
 
@@ -587,6 +639,57 @@ def test_cohort_is_fixed_at_ownership_and_a_late_socket_receives_neither_envelop
     finally:
         early_server_end.close()
         early_client.close()
+
+
+def test_cohort_captures_a_socket_that_connects_before_pending_ownership(srv):
+    real_publish = srv.transport.publish
+    publish_entered = threading.Event()
+    release_publish = threading.Event()
+    outcome = []
+
+    def paused_publish(*args, **kwargs):
+        publish_entered.set()
+        release_publish.wait(5)
+        return real_publish(*args, **kwargs)
+
+    srv.transport.publish = paused_publish
+
+    def broadcast_lifecycle():
+        outcome.append(
+            srv.broadcast(
+                {"type": "lode_created", "lode": _lode("abcd1234", "A")}, root=ACTIVE_ROOT
+            )
+        )
+
+    thread = threading.Thread(target=broadcast_lifecycle, daemon=True)
+    thread.start()
+    server_end = client_end = None
+    try:
+        assert publish_entered.wait(5), "lifecycle publish did not reach the ownership barrier"
+        server_end, client_end = _register_socket(srv)
+        release_publish.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert outcome == [True]
+
+        selection = srv.transport.select(lambda: False, 0)
+        assert server_end in selection.cohort
+        srv._send_to_cohort(selection.data, selection.cohort)
+
+        (event,) = _recv_events(client_end, 1)
+        assert event["type"] == "lode_created"
+        assert _markers(event) == {"A"}
+    finally:
+        release_publish.set()
+        thread.join(timeout=5)
+        if server_end is not None:
+            with srv.lock:
+                if server_end in srv.clients:
+                    srv.clients.remove(server_end)
+                srv.write_locks.pop(server_end, None)
+            server_end.close()
+        if client_end is not None:
+            client_end.close()
 
 
 def test_a_departed_cohort_member_is_attempted_once_without_blocking_the_others(srv):
