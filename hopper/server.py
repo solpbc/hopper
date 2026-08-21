@@ -120,6 +120,15 @@ from hopper.tmux import (
     send_keys,
     spawn_lode_processor,
 )
+from hopper.transport import (
+    ACTIVE_ROOT,
+    ARCHIVE_ROOT,
+    LIFECYCLE,
+    LIFECYCLE_TYPES,
+    LifecycleTransport,
+    freeze_lode,
+    lifecycle_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1284,6 +1293,7 @@ class Server:
         self.server_socket: socket.socket | None = None
         self.broadcast_queue: queue.Queue = queue.Queue(maxsize=10000)
         self.event_queue: queue.Queue = queue.Queue(maxsize=10000)
+        self.transport = LifecycleTransport()
         self.writer_thread: threading.Thread | None = None
         self.event_thread: threading.Thread | None = None
         self.lodes: list[dict] = []
@@ -1529,12 +1539,17 @@ class Server:
         if active is not None:
             lode["active"] = active
         touch(lode)
-        if any(item is lode for item in self.lodes):
+        root = self._lode_root(lode)
+        if root == ACTIVE_ROOT:
             save_lodes(self.lodes)
         else:
             save_archived_lodes(self.archived_lodes)
         _log_state_change(lode["id"], lode["state"], lode["status"], via)
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=root)
+
+    def _lode_root(self, lode: dict) -> str:
+        """Authoritative root membership by object identity, never from lode["active"]."""
+        return ACTIVE_ROOT if any(item is lode for item in self.lodes) else ARCHIVE_ROOT
 
     def _cancel_generation_guard(self, lode_id: str, run_generation: str) -> None:
         key = (lode_id, run_generation)
@@ -1698,7 +1713,7 @@ class Server:
             save_lodes(self.lodes)
             status = result["record"]["degraded_reason"]
             _log_state_change(lode_id, lode.get("state", ""), status, "supervisor_capture_degraded")
-            self.broadcast({"type": "lode_updated", "lode": lode})
+            self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         self._record_action_spawn_adoption(lode_id, generation, kind)
 
@@ -1842,11 +1857,12 @@ class Server:
             return
         lode["status"] = status
         touch(lode)
-        if any(item is lode for item in self.lodes):
+        root = self._lode_root(lode)
+        if root == ACTIVE_ROOT:
             save_lodes(self.lodes)
         else:
             save_archived_lodes(self.archived_lodes)
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=root)
 
     @staticmethod
     def _completion_target(stage: str) -> str | None:
@@ -3667,7 +3683,7 @@ class Server:
             detail=record["target_disposition"],
         )
         self._persist_action(record, via="action_result:lode_mutation")
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
         return True
 
     def _apply_manual_archive(self, record: dict) -> bool:
@@ -3714,7 +3730,7 @@ class Server:
             detail="archive_action_id matched",
         )
         self._persist_action(record, via="action_result:archive")
-        self.broadcast({"type": "lode_archived", "lode": archived})
+        self.broadcast({"type": "lode_archived", "lode": archived}, root=ARCHIVE_ROOT)
         return True
 
     def _apply_completion_stage(self, record: dict) -> bool:
@@ -3792,7 +3808,7 @@ class Server:
             "completion_archive",
         )
         self._persist_action(record, via="completion_result:archive")
-        self.broadcast({"type": "lode_archived", "lode": archived})
+        self.broadcast({"type": "lode_archived", "lode": archived}, root=ARCHIVE_ROOT)
         return True
 
     def _apply_completion_backlog(self, record: dict) -> bool:
@@ -3878,7 +3894,7 @@ class Server:
                     promoted["status"],
                     "completion_backlog_promote",
                 )
-                self.broadcast({"type": "lode_created", "lode": promoted})
+                self.broadcast({"type": "lode_created", "lode": promoted}, root=ACTIVE_ROOT)
             else:
                 self._block_action(
                     record,
@@ -4085,7 +4101,7 @@ class Server:
                 touch(lode)
                 save_archived_lodes(self.archived_lodes)
                 _log_state_change(lode["id"], lode["state"], lode["status"], "completion_clear")
-                self.broadcast({"type": "lode_updated", "lode": lode})
+                self.broadcast({"type": "lode_updated", "lode": lode}, root=ARCHIVE_ROOT)
         else:
             actions.write_pending_action(record)
             lode = self._find_lode(record["lode_id"])
@@ -4097,7 +4113,7 @@ class Server:
                 touch(lode)
                 save_lodes(self.lodes)
                 _log_state_change(lode["id"], lode["state"], lode["status"], "completion_clear")
-                self.broadcast({"type": "lode_updated", "lode": lode})
+                self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
         actions.clear_pending_action(record)
 
     def _clear_completed_manual_action(self, record: dict) -> None:
@@ -4129,11 +4145,12 @@ class Server:
         actions.append_action_result(lode, record["result"])
         self._set_manual_terminal_status(lode, record["action_type"])
         touch(lode)
-        if any(item is lode for item in self.lodes):
+        root = self._lode_root(lode)
+        if root == ACTIVE_ROOT:
             save_lodes(self.lodes)
         else:
             save_archived_lodes(self.archived_lodes)
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=root)
         self._send_action_ack(
             None,
             outcome="completed",
@@ -4163,11 +4180,12 @@ class Server:
         actions.clear_pending_action(record)
         lode["pending_action"] = None
         touch(lode)
-        if any(item is lode for item in self.lodes):
+        root = self._lode_root(lode)
+        if root == ACTIVE_ROOT:
             save_lodes(self.lodes)
         else:
             save_archived_lodes(self.archived_lodes)
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=root)
 
     @staticmethod
     def _set_manual_terminal_status(lode: dict, action_type: str) -> None:
@@ -4826,7 +4844,7 @@ class Server:
             if gate_changed:
                 _sync_gate_artifact(lode)
             _log_state_change(lode["id"], lode["state"], lode["status"], "spawn")
-            self.broadcast({"type": "lode_updated", "lode": lode})
+            self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         generation = lode.get("run_generation")
         if self._lode_has_pending_action(lode["id"]):
@@ -4963,6 +4981,10 @@ class Server:
                 self.archived_lodes.append(archived)
                 logger.info(f"Startup: auto-archived shipped lode {lode['id']}")
                 self._cleanup_worktree(archived)
+
+        # Seeded only once both roots are settled, so no startup mutation is ever published
+        # as a create or an unarchive.
+        self.reseed_lifecycle_baseline()
 
         # Safe only because the singleton lock proves no live server owns it.
         if self.socket_path.exists():
@@ -5101,7 +5123,7 @@ class Server:
                 lode.get("status", ""),
                 "expected_teardown_disconnect",
             )
-            self.broadcast({"type": "lode_updated", "lode": lode})
+            self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
             self._enqueue_event({"type": "_action_reconcile", "lode_id": lode_id})
             return
         observed_result = self.runner_results.pop(key, None)
@@ -5138,7 +5160,7 @@ class Server:
         save_lodes(self.lodes)
 
         logger.info(f"Lode {lode_id} disconnected, active=False")
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
     def _set_terminal_failure(
         self,
@@ -5179,7 +5201,7 @@ class Server:
         if changed:
             _log_state_change(lode["id"], "error", status, f"terminal_failure:{failure_kind}")
         if changed and broadcast:
-            self.broadcast({"type": "lode_updated", "lode": lode})
+            self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
         return changed
 
     def _drain_due_disconnects(self) -> None:
@@ -5316,7 +5338,7 @@ class Server:
         lode["active"] = True
         touch(lode)
         save_lodes(self.lodes)
-        self.broadcast({"type": "lode_updated", "lode": lode})
+        self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         return True
 
@@ -5415,7 +5437,7 @@ class Server:
         lode["backlog"] = item.to_dict()
         save_lodes(self.lodes)
         logger.info(f"Lode {lode['id']} promoted from backlog {item.id}")
-        self.broadcast({"type": "lode_created", "lode": lode})
+        self.broadcast({"type": "lode_created", "lode": lode}, root=ACTIVE_ROOT)
         remove_backlog_item(self.backlog, item.id)
         self.broadcast({"type": "backlog_removed", "item": item.to_dict()})
         project_path = proj.path if proj else None
@@ -5536,7 +5558,7 @@ class Server:
             _persist_protocol_error(lode, reason)
             save_lodes(self.lodes)
             logger.warning("Stage protocol refusal lode=%s reason=%s", lode["id"], reason)
-            self.broadcast({"type": "lode_updated", "lode": lode})
+            self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         lode_id = message.get("lode_id")
         runner_gate_publication = msg_type == "lode_publish_gate" and (
@@ -5795,7 +5817,7 @@ class Server:
                 lode["backlog"] = backlog_data
                 save_lodes(self.lodes)
             logger.info(f"Lode {lode['id']} created project={project}")
-            self.broadcast({"type": "lode_created", "lode": lode})
+            self.broadcast({"type": "lode_created", "lode": lode}, root=ACTIVE_ROOT)
             if conn:
                 self._send_response(conn, {"type": "lode_created", "lode": lode})
             # Auto-spawn if requested
@@ -5810,7 +5832,7 @@ class Server:
                 lode = update_lode_stage(self.lodes, lode_id, stage)
                 if lode:
                     logger.info(f"Lode {lode_id} stage={stage}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_archive":
             self._send_action_ack(
@@ -5865,7 +5887,7 @@ class Server:
                         self._send_response(conn, {"type": "error", "error": "stale gate"})
                     return
                 _sync_gate_artifact(cleared)
-                self.broadcast({"type": "lode_updated", "lode": cleared})
+                self.broadcast({"type": "lode_updated", "lode": cleared}, root=ACTIVE_ROOT)
             project = find_project(lode.get("project", ""))
             outcome, pane_id = self._gated_spawn(
                 lode,
@@ -5909,7 +5931,7 @@ class Server:
                 lode = unarchive_lode(self.archived_lodes, self.lodes, lode_id)
                 if lode:
                     logger.info(f"Lode {lode_id} unarchived")
-                    self.broadcast({"type": "lode_unarchived", "lode": lode})
+                    self.broadcast({"type": "lode_unarchived", "lode": lode}, root=ACTIVE_ROOT)
                     if message.get("spawn"):
                         proj = find_project(lode.get("project", ""))
                         project_path = proj.path if proj else None
@@ -6011,13 +6033,13 @@ class Server:
                         return
                     _sync_gate_artifact(cleared)
                     _log_state_change(lode_id, state, status, "gate_observation")
-                    self.broadcast({"type": "lode_updated", "lode": cleared})
+                    self.broadcast({"type": "lode_updated", "lode": cleared}, root=ACTIVE_ROOT)
                     acknowledge_mutation(True, "accepted")
                     return
                 lode = update_lode_state(self.lodes, lode_id, state, status)
                 if lode:
                     _log_state_change(lode_id, state, status, "lode_set_state")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
                     acknowledge_mutation(True, "accepted")
                 else:
                     acknowledge_mutation(False, "lode_not_found")
@@ -6057,7 +6079,7 @@ class Server:
             artifact_written = _sync_gate_artifact(published)
             if changed:
                 _log_state_change(lode_id, "gated", published["status"], "gate_publication")
-                self.broadcast({"type": "lode_updated", "lode": published})
+                self.broadcast({"type": "lode_updated", "lode": published}, root=ACTIVE_ROOT)
             acknowledge_mutation(True, "committed")
             if conn:
                 self._send_response(
@@ -6085,7 +6107,7 @@ class Server:
                     lode["last_progress_summary"] = (summary or "")[:120]
                     touch(lode)
                     save_lodes(self.lodes)
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
                     logger.info(f"Lode {lode_id} progress: {lode['last_progress_summary']}")
 
         elif msg_type == "lode_set_pane_activity":
@@ -6097,7 +6119,7 @@ class Server:
                     lode["last_pane_activity_at"] = observed_at
                     touch(lode)
                     save_lodes(self.lodes)
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_set_status":
             lode_id = message.get("lode_id")
@@ -6106,7 +6128,7 @@ class Server:
                 lode = update_lode_status(self.lodes, lode_id, status)
                 if lode:
                     logger.info(f"Lode {lode_id} status={status}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_set_title":
             lode_id = message.get("lode_id")
@@ -6115,7 +6137,7 @@ class Server:
                 lode = update_lode_title(self.lodes, lode_id, title)
                 if lode:
                     logger.info(f"Lode {lode_id} title={title}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_set_branch":
             lode_id = message.get("lode_id")
@@ -6124,7 +6146,7 @@ class Server:
                 lode = update_lode_branch(self.lodes, lode_id, branch)
                 if lode:
                     logger.info(f"Lode {lode_id} branch={branch}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_set_worktree_path":
             lode_id = message.get("lode_id")
@@ -6133,7 +6155,7 @@ class Server:
                 lode = update_lode_worktree_path(self.lodes, lode_id, worktree_path)
                 if lode:
                     logger.info(f"Lode {lode_id} worktree_path={worktree_path}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_set_codex_thread":
             lode_id = message.get("lode_id")
@@ -6146,7 +6168,7 @@ class Server:
                     return
                 if lode:
                     logger.info(f"Lode {lode_id} codex_thread={thread_id}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_set_coder_session":
             lode_id = message.get("lode_id")
@@ -6160,7 +6182,7 @@ class Server:
                     return
                 if lode:
                     logger.info(f"Lode {lode_id} coder={provider} session={session_id}")
-                    self.broadcast({"type": "lode_updated", "lode": lode})
+                    self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
 
         elif msg_type == "lode_bind_stage_session":
             lode_id = message.get("lode_id")
@@ -6214,7 +6236,7 @@ class Server:
                 provider_session_id,
                 run_generation,
             )
-            self.broadcast({"type": "lode_updated", "lode": bound})
+            self.broadcast({"type": "lode_updated", "lode": bound}, root=ACTIVE_ROOT)
             acknowledge_mutation(True, outcome)
 
         elif msg_type == "lode_set_claude_started":
@@ -6243,7 +6265,7 @@ class Server:
                     claude_stage,
                     message["run_generation"],
                 )
-                self.broadcast({"type": "lode_updated", "lode": lode})
+                self.broadcast({"type": "lode_updated", "lode": lode}, root=ACTIVE_ROOT)
                 acknowledge_mutation(True, "committed")
             else:
                 acknowledge_mutation(False, "lode_not_found")
@@ -6396,7 +6418,7 @@ class Server:
                 message_template = _GATE_FEEDBACK_MESSAGES[reason]
             if updated:
                 _log_state_change(lode_id, updated["state"], updated["status"], "feedback")
-                self.broadcast({"type": "lode_updated", "lode": updated})
+                self.broadcast({"type": "lode_updated", "lode": updated}, root=ACTIVE_ROOT)
             if conn:
                 if accepted:
                     response = {
@@ -6596,6 +6618,11 @@ class Server:
             validate_lode_driver_data(self.lodes, "active.jsonl")
             validate_lode_driver_data(self.archived_lodes, "archived.jsonl")
             self.backlog = load_backlog()
+            try:
+                self.reseed_lifecycle_baseline()
+            except ValueError as e:
+                logger.error(f"Lifecycle baseline reseed refused: {e}")
+                self.transport.disable(str(e))
             logger.info("Projects and lodes reloaded from disk")
 
         else:
@@ -6663,17 +6690,24 @@ class Server:
         self._enqueue_event(message)
 
     def _writer_loop(self) -> None:
-        """Dedicated writer thread that serializes all broadcasts."""
+        """Dedicated writer thread alternating between lifecycle and ordinary traffic."""
         while not self.stop_event.is_set():
-            try:
-                message = self.broadcast_queue.get(timeout=0.1)
-            except queue.Empty:
+            selection = self.transport.select(lambda: not self.broadcast_queue.empty(), 0.1)
+            if selection is None:
                 continue
 
+            if selection.kind == LIFECYCLE:
+                self._send_to_cohort(selection.data, selection.cohort)
+                continue
+
+            try:
+                message = self.broadcast_queue.get_nowait()
+            except queue.Empty:
+                continue
             self._send_to_clients(message)
 
     def _send_to_clients(self, message: dict) -> None:
-        """Send a message to all connected clients."""
+        """Send an ordinary message to every client connected at send time."""
         message.pop("exchange_id", None)
         if "ts" not in message:
             message["ts"] = current_time_ms()
@@ -6685,37 +6719,114 @@ class Server:
 
         dead_clients = []
         for client, write_lock in clients_to_send:
-            try:
-                with write_lock:
-                    client.settimeout(2.0)
-                    client.sendall(data)
-            except Exception as e:
-                logger.debug(f"Failed to send to client: {e}")
+            if not self._write_frame(client, write_lock, data):
                 dead_clients.append(client)
 
-        if dead_clients:
-            with self.lock:
-                for client in dead_clients:
-                    if client in self.clients:
-                        self.clients.remove(client)
-                    self.write_locks.pop(client, None)
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
+        self._drop_dead_clients(dead_clients)
 
-    def broadcast(self, message: dict) -> bool:
-        """Queue message for broadcast to all connected clients."""
+    def _send_to_cohort(self, data: bytes, cohort: tuple) -> None:
+        """Fan a frozen lifecycle envelope out to the cohort captured at ownership."""
+        dead_clients = []
+        for client in cohort:
+            with self.lock:
+                write_lock = self.write_locks.get(client)
+            if write_lock is None:
+                # Already gone by another path: attempted once, and that is the attempt.
+                continue
+            if not self._write_frame(client, write_lock, data):
+                dead_clients.append(client)
+
+        self._drop_dead_clients(dead_clients)
+
+    @staticmethod
+    def _write_frame(client: socket.socket, write_lock: threading.Lock, data: bytes) -> bool:
+        """Write one whole JSONL frame under the connection's write lock."""
+        try:
+            with write_lock:
+                client.settimeout(2.0)
+                client.sendall(data)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send to client: {e}")
+            return False
+
+    def _drop_dead_clients(self, dead_clients: list) -> None:
+        """Forget and close connections that failed a write."""
+        if not dead_clients:
+            return
+        with self.lock:
+            for client in dead_clients:
+                if client in self.clients:
+                    self.clients.remove(client)
+                self.write_locks.pop(client, None)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def broadcast(self, message: dict, *, root: str | None = None) -> bool:
+        """Publish a message to connected clients.
+
+        Lode lifecycle events require the authoritative root membership of the owning
+        mutation and enter the bounded per-lode reducer. Every other message keeps the
+        ordinary FIFO and its drop-on-full behaviour.
+        """
         if "type" not in message:
             logger.warning("Skipping message without type field")
             return False
 
+        if message["type"] in LIFECYCLE_TYPES:
+            return self._broadcast_lifecycle(message, root)
+
+        if root is not None:
+            logger.warning(f"Root membership is meaningless for {message['type']}, dropping")
+            return False
+
         try:
             self.broadcast_queue.put_nowait(message)
-            return True
         except queue.Full:
             logger.warning(f"Broadcast queue full, dropping: {message.get('type')}")
             return False
+        self.transport.wake()
+        return True
+
+    def _broadcast_lifecycle(self, message: dict, root: str | None) -> bool:
+        """Freeze a lifecycle snapshot and hand ownership to the reducer.
+
+        Every fallible step runs before ownership, so a success return means the immutable
+        state was accepted whole and a failure return leaves transport state untouched.
+        """
+        refusal = self.transport.refusal
+        if refusal:
+            logger.warning(f"Refusing {message['type']}: lifecycle baseline unusable: {refusal}")
+            return False
+
+        refusal = lifecycle_refusal(message, root)
+        if refusal:
+            logger.warning(f"Refusing lifecycle broadcast: {refusal}")
+            return False
+
+        lode = message["lode"]
+        try:
+            payload = freeze_lode(lode)
+        except Exception as e:
+            logger.warning(f"Refusing {message['type']} for lode {lode['id']}: {e}")
+            return False
+
+        with self.lock:
+            cohort = tuple(self.clients)
+
+        self.transport.publish(
+            lode["id"], root, message["type"], payload, current_time_ms(), cohort
+        )
+        return True
+
+    def reseed_lifecycle_baseline(self) -> None:
+        """Adopt the complete roots as lifecycle baseline membership. Raises if not unique."""
+        self.transport.seed(
+            [lode["id"] for lode in self.lodes],
+            [lode["id"] for lode in self.archived_lodes],
+        )
 
     def stop(self) -> None:
         """Stop the server gracefully.
@@ -6739,6 +6850,7 @@ class Server:
 
         # Signal threads to stop
         self.stop_event.set()
+        self.transport.close()
 
         # Close server socket to unblock accept()
         if self.server_socket:

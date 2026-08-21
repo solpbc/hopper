@@ -192,6 +192,7 @@ def test_frozen_legacy_start_mutation_updates_only_current_stage_over_real_socke
     )
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     message = _fixture("legacy-lode-set-claude-started.json")
 
     try:
@@ -218,6 +219,7 @@ def test_fenced_binding_acknowledges_exact_duplicate_and_refuses_conflict_over_s
     lode = make_lode(id="boundabc", stage="mill", active=True, run_generation="generation-1")
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     session = lode_stage_session(lode, "mill")
     message = {
         "type": "lode_bind_stage_session",
@@ -255,6 +257,7 @@ def test_fenced_binding_activity_log_records_identity_without_request_bodies(
     lode = make_lode(id="diagbind", stage="mill", active=True, run_generation="generation-1")
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     session = lode_stage_session(lode, "mill")
     message = {
         "type": "lode_bind_stage_session",
@@ -299,6 +302,7 @@ def test_pending_stage_binding_never_launches_or_publishes_running_over_socket(
     )
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     original_handle_mutation = server._handle_mutation
 
     def hold_binding(message, conn):
@@ -331,6 +335,7 @@ def test_refused_stage_binding_never_launches_or_publishes_running_over_socket(
     )
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     runner = _current_binding_runner(lode, socket_path, stage="refine")
     try:
         result, launch = _attempt_current_binding_launch(runner)
@@ -353,6 +358,7 @@ def test_unknown_stage_binding_never_launches_or_publishes_running_over_socket(
     )
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     original_send_response = server._send_response
 
     def lose_binding_ack(conn, response):
@@ -388,6 +394,7 @@ def test_lost_binding_ack_requires_exact_durable_reconciliation_before_running(
     )
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     original_send_response = server._send_response
 
     def lose_binding_ack(conn, response):
@@ -444,6 +451,7 @@ def test_legacy_start_inside_restart_window_is_refused_without_rebinding_over_so
     lode["pending_action"] = actions.pending_action_projection(record)
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     before = lode_stage_session(lode, "mill").copy()
     message = _fixture("legacy-lode-set-claude-started.json")
     try:
@@ -469,6 +477,7 @@ def test_protocol_error_blocks_late_running_update_from_same_generation(
     lode = make_lode(id="errorabc", stage="mill", active=True, run_generation="generation-2")
     server.lodes[:] = [lode]
     save_lodes(server.lodes)
+    server.reseed_lifecycle_baseline()
     session = lode_stage_session(lode, "mill")
     wrong = {
         "type": "lode_bind_stage_session",
