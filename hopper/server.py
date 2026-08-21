@@ -126,8 +126,6 @@ from hopper.transport import (
     LIFECYCLE,
     LIFECYCLE_TYPES,
     LifecycleTransport,
-    freeze_lode,
-    lifecycle_refusal,
 )
 
 logger = logging.getLogger(__name__)
@@ -6620,7 +6618,7 @@ class Server:
             self.backlog = load_backlog()
             try:
                 self.reseed_lifecycle_baseline()
-            except ValueError as e:
+            except (RuntimeError, ValueError) as e:
                 logger.error(f"Lifecycle baseline reseed refused: {e}")
                 self.transport.disable(str(e))
             logger.info("Projects and lodes reloaded from disk")
@@ -6771,55 +6769,40 @@ class Server:
         mutation and enter the bounded per-lode reducer. Every other message keeps the
         ordinary FIFO and its drop-on-full behaviour.
         """
-        if "type" not in message:
-            logger.warning("Skipping message without type field")
+        if not isinstance(message, dict):
+            logger.warning("Skipping broadcast without a message mapping")
+            return False
+        message_type = message.get("type")
+        if not isinstance(message_type, str):
+            logger.warning("Skipping message without a string type field")
             return False
 
-        if message["type"] in LIFECYCLE_TYPES:
+        if message_type in LIFECYCLE_TYPES:
             return self._broadcast_lifecycle(message, root)
 
         if root is not None:
-            logger.warning(f"Root membership is meaningless for {message['type']}, dropping")
+            logger.warning(f"Root membership is meaningless for {message_type}, dropping")
             return False
 
         try:
             self.broadcast_queue.put_nowait(message)
         except queue.Full:
-            logger.warning(f"Broadcast queue full, dropping: {message.get('type')}")
+            logger.warning(f"Broadcast queue full, dropping: {message_type}")
             return False
         self.transport.wake()
         return True
 
     def _broadcast_lifecycle(self, message: dict, root: str | None) -> bool:
-        """Freeze a lifecycle snapshot and hand ownership to the reducer.
-
-        Every fallible step runs before ownership, so a success return means the immutable
-        state was accepted whole and a failure return leaves transport state untouched.
-        """
-        refusal = self.transport.refusal
-        if refusal:
-            logger.warning(f"Refusing {message['type']}: lifecycle baseline unusable: {refusal}")
-            return False
-
-        refusal = lifecycle_refusal(message, root)
-        if refusal:
-            logger.warning(f"Refusing lifecycle broadcast: {refusal}")
-            return False
-
-        lode = message["lode"]
-        try:
-            payload = freeze_lode(lode)
-        except Exception as e:
-            logger.warning(f"Refusing {message['type']} for lode {lode['id']}: {e}")
-            return False
+        """Atomically validate, freeze, and hand a lifecycle snapshot to the reducer."""
 
         def cohort_factory() -> tuple:
             with self.lock:
                 return tuple(self.clients)
 
-        self.transport.publish(
-            lode["id"], root, message["type"], payload, current_time_ms(), cohort_factory
-        )
+        refusal = self.transport.publish(message, root, current_time_ms(), cohort_factory)
+        if refusal is not None:
+            logger.warning(f"Refusing lifecycle broadcast: {refusal}")
+            return False
         return True
 
     def reseed_lifecycle_baseline(self) -> None:

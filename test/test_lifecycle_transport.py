@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+import hopper.server as server_module
+import hopper.transport as transport_module
 from hopper.lodes import (
     make_lode_stage_sessions,
     project_lode_claude_state,
@@ -155,7 +157,10 @@ def _recv_events(client_end, count, timeout=3.0):
 def test_broadcast_refuses_every_inconsistency_without_touching_transport_state(srv):
     lode = _lode("abcd1234", "A")
     refusals = [
+        ([], None),
         ({"data": "no type"}, None),
+        ({"type": []}, None),
+        ({"type": {}}, None),
         ({"type": "lode_updated", "lode": lode}, None),
         ({"type": "lode_updated", "lode": lode}, "somewhere-else"),
         ({"type": "lode_archived", "lode": lode}, ACTIVE_ROOT),
@@ -165,7 +170,31 @@ def test_broadcast_refuses_every_inconsistency_without_touching_transport_state(
         ({"type": "lode_updated", "lode": {"stage": "mill"}}, ACTIVE_ROOT),
         ({"type": "lode_updated", "lode": {"id": ""}}, ACTIVE_ROOT),
         ({"type": "lode_updated", "lode": {"id": 17}}, ACTIVE_ROOT),
+        ({"type": "lode_updated", "lode": {"id": "abcd1234"}}, ACTIVE_ROOT),
+        (
+            {"type": "lode_updated", "lode": _lode("abcd1234", "A", active="yes")},
+            ACTIVE_ROOT,
+        ),
         ({"type": "lode_updated", "lode": {"id": "abcd1234", "runs": {1, 2}}}, ACTIVE_ROOT),
+        (
+            {"type": "lode_updated", "lode": _lode("abcd1234", "A", runs={"n": float("nan")})},
+            ACTIVE_ROOT,
+        ),
+        (
+            {"type": "lode_updated", "lode": _lode("abcd1234", "A", runs={"n": float("inf")})},
+            ACTIVE_ROOT,
+        ),
+        (
+            {
+                "type": "lode_updated",
+                "lode": _lode("abcd1234", "A", runs={"n": float("-inf")}),
+            },
+            ACTIVE_ROOT,
+        ),
+        (
+            {"type": "lode_updated", "lode": _lode("abcd1234", "A", runs={1: "bad"})},
+            ACTIVE_ROOT,
+        ),
         ({"type": "backlog_added", "item": {}}, ACTIVE_ROOT),
     ]
     for message, root in refusals:
@@ -173,6 +202,32 @@ def test_broadcast_refuses_every_inconsistency_without_touching_transport_state(
         assert srv.transport.pending_ids() == [], message
         assert srv.transport.claims() == [], message
         assert srv.broadcast_queue.empty(), message
+
+
+@pytest.mark.parametrize("field", ["project", "stage", "state", "status"])
+def test_broadcast_independently_refuses_each_wrong_typed_required_string(srv, field):
+    assert (
+        srv.broadcast(
+            {"type": "lode_updated", "lode": _lode("abcd1234", "A", **{field: 17})},
+            root=ACTIVE_ROOT,
+        )
+        is False
+    )
+    assert srv.transport.pending_ids() == []
+    assert srv.transport.claims() == []
+
+
+def test_strict_json_accepts_a_finite_nested_float(srv):
+    assert srv.broadcast(
+        {
+            "type": "lode_created",
+            "lode": _lode("abcd1234", "FINITE", runs={"ratio": 1.25}),
+        },
+        root=ACTIVE_ROOT,
+    )
+
+    (event,) = _drain(srv)
+    assert event["lode"]["runs"] == {"ratio": 1.25}
 
 
 def test_transport_survives_a_refusal_and_still_delivers_both_classes(srv):
@@ -356,6 +411,109 @@ def test_closed_transport_refuses_lifecycle_broadcast_without_creating_a_claim(s
     )
     assert srv.transport.pending_ids() == []
     assert srv.transport.claims() == []
+
+
+def test_close_is_terminal_and_cannot_be_reopened_by_seed(srv):
+    srv.transport.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        srv.transport.seed(["abcd1234"], [])
+    srv.transport.disable("must not replace the terminal refusal")
+
+    assert srv.transport.refusal == "lifecycle transport is closed"
+    assert (
+        srv.broadcast({"type": "lode_created", "lode": _lode("abcd1234", "A")}, root=ACTIVE_ROOT)
+        is False
+    )
+    assert srv.transport.pending_ids() == []
+
+
+@pytest.mark.parametrize("transition", ["close", "disable", "reseed"])
+def test_publish_linearizes_before_concurrent_transport_transition(srv, monkeypatch, transition):
+    freeze_entered = threading.Event()
+    release_freeze = threading.Event()
+    transition_entered = threading.Event()
+    transition_done = threading.Event()
+    real_freeze = transport_module.freeze_lode
+    broadcast_outcome = []
+
+    def paused_freeze(lode):
+        freeze_entered.set()
+        assert release_freeze.wait(5)
+        return real_freeze(lode)
+
+    monkeypatch.setattr(transport_module, "freeze_lode", paused_freeze)
+    publisher = threading.Thread(
+        target=lambda: broadcast_outcome.append(
+            srv.broadcast(
+                {"type": "lode_created", "lode": _lode("abcd1234", "A")},
+                root=ACTIVE_ROOT,
+            )
+        ),
+        daemon=True,
+    )
+    publisher.start()
+    assert freeze_entered.wait(5), "publish never reached the in-lock freeze coordinate"
+
+    if transition == "close":
+        action = srv.transport.close
+    elif transition == "disable":
+
+        def action():
+            srv.transport.disable("test refusal")
+    else:
+
+        def action():
+            srv.transport.seed(["efgh5678"], [])
+
+    def run_transition():
+        transition_entered.set()
+        action()
+        transition_done.set()
+
+    transition_thread = threading.Thread(target=run_transition, daemon=True)
+    transition_thread.start()
+    assert transition_entered.wait(5), "transition thread never reached the lock attempt"
+    assert not transition_done.wait(0.05), "transition bypassed the ownership linearization lock"
+
+    release_freeze.set()
+    publisher.join(timeout=5)
+    transition_thread.join(timeout=5)
+    assert not publisher.is_alive()
+    assert not transition_thread.is_alive()
+    assert transition_done.is_set()
+    assert broadcast_outcome == [True]
+    assert srv.transport.pending_ids() == []
+    assert srv.transport.claims() == []
+
+
+def test_stop_racing_a_reload_cannot_reopen_the_transport(srv, monkeypatch):
+    load_entered = threading.Event()
+    release_load = threading.Event()
+    real_load = server_module.load_lodes
+
+    def paused_load():
+        load_entered.set()
+        assert release_load.wait(5)
+        return real_load()
+
+    monkeypatch.setattr(server_module, "load_lodes", paused_load)
+    reload_thread = threading.Thread(
+        target=lambda: srv._handle_mutation({"type": "projects_reload"}, None), daemon=True
+    )
+    reload_thread.start()
+    assert load_entered.wait(5), "reload never reached its disk-read barrier"
+
+    srv.stop()
+    release_load.set()
+    reload_thread.join(timeout=5)
+    assert not reload_thread.is_alive()
+    assert (
+        srv.broadcast({"type": "lode_created", "lode": _lode("abcd1234", "A")}, root=ACTIVE_ROOT)
+        is False
+    )
+    assert srv.transport.refusal == "lifecycle transport is closed"
+    assert srv.transport.pending_ids() == []
 
 
 def test_restart_discards_pending_state_and_seeds_from_the_reloaded_roots(socket_path):
@@ -732,9 +890,20 @@ def test_an_empty_cohort_still_advances_the_sequence(srv):
 def test_real_writer_delivers_every_lifecycle_type_over_real_sockets(socket_path):
     save_lodes([_lode("abcd1234", "SEED"), _lode("efgh5678", "SEED")])
     server = Server(socket_path)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    real_select = server.transport.select
+
+    def paused_select(*args, **kwargs):
+        writer_entered.set()
+        assert release_writer.wait(5)
+        return real_select(*args, **kwargs)
+
+    server.transport.select = paused_select
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
     assert server.ready.wait(5)
+    assert writer_entered.wait(5), "production writer never reached the selector barrier"
 
     healthy = [_register_socket(server) for _ in range(2)]
     failing_end, failing_peer = socket.socketpair()
@@ -745,8 +914,9 @@ def test_real_writer_delivers_every_lifecycle_type_over_real_sockets(socket_path
         server.write_locks[failing_end] = threading.Lock()
 
     try:
-        for index in range(40):
+        for index in range(server.broadcast_queue.maxsize):
             assert server.broadcast({"type": "backlog_updated", "item": {"id": f"i{index}"}})
+        assert server.broadcast_queue.full(), "ordinary FIFO was not filled to production capacity"
 
         assert server.broadcast(
             {"type": "lode_updated", "lode": _lode("abcd1234", "U1")}, root=ACTIVE_ROOT
@@ -760,6 +930,7 @@ def test_real_writer_delivers_every_lifecycle_type_over_real_sockets(socket_path
         assert server.broadcast(
             {"type": "lode_created", "lode": _lode("ijkl9012", "CR")}, root=ACTIVE_ROOT
         )
+        release_writer.set()
 
         def saw_last_publish(events):
             return any(
@@ -851,6 +1022,7 @@ def test_real_writer_delivers_every_lifecycle_type_over_real_sockets(socket_path
             survivor_end.close()
             survivor_client.close()
     finally:
+        release_writer.set()
         server.stop()
         thread.join(timeout=5)
 

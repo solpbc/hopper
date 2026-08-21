@@ -17,6 +17,7 @@ caller declared.
 
 import json
 import logging
+import math
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -58,7 +59,9 @@ class Selection(NamedTuple):
 
 def lifecycle_refusal(message: dict, root: str | None) -> str | None:
     """Return why this lifecycle message cannot be owned, or None when it is publishable."""
-    declared = message["type"]
+    declared = message.get("type")
+    if not isinstance(declared, str) or declared not in LIFECYCLE_TYPES:
+        return f"lifecycle event type must be one of {sorted(LIFECYCLE_TYPES)}, got {declared!r}"
     if root not in ROOTS:
         return f"{declared} requires authoritative root membership, got {root!r}"
     if (declared, root) in _CONTRADICTIONS:
@@ -69,12 +72,32 @@ def lifecycle_refusal(message: dict, root: str | None) -> str | None:
     lode_id = lode.get("id")
     if not isinstance(lode_id, str) or not lode_id:
         return f"{declared} requires a non-empty string lode id, got {lode_id!r}"
+    for field in ("project", "stage", "state", "status"):
+        value = lode.get(field)
+        if not isinstance(value, str):
+            return f"{declared} requires string lode {field}, got {type(value).__name__}"
+    if not isinstance(lode.get("active"), bool):
+        return f"{declared} requires boolean lode active, got {type(lode.get('active')).__name__}"
     return None
 
 
 def freeze_lode(lode: dict) -> str:
-    """Freeze a lode into publisher-owned wire text. Raises if the lode is unserializable."""
-    return json.dumps(lode)
+    """Freeze one strict JSON value tree into publisher-owned wire text."""
+
+    def strict_json(value) -> bool:
+        if value is None or isinstance(value, (str, bool, int)):
+            return True
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, list):
+            return all(strict_json(item) for item in value)
+        if isinstance(value, dict):
+            return all(isinstance(key, str) and strict_json(item) for key, item in value.items())
+        return False
+
+    if not strict_json(lode):
+        raise TypeError("lode is not a strict JSON value tree")
+    return json.dumps(lode, allow_nan=False)
 
 
 def compose_envelope(event_type: str, payload: str, ts: int) -> bytes:
@@ -129,15 +152,18 @@ class LifecycleTransport:
         """Adopt complete root membership as the baseline. No synthetic events are emitted."""
         mapping = build_baseline(active_ids, archived_ids)
         with self._cond:
+            if self._closed:
+                raise RuntimeError("lifecycle transport is closed")
             if mapping != self._baseline:
                 self._discard_pending_locked("baseline reseed")
                 self._baseline = mapping
             self._refusal = None
-            self._closed = False
 
     def disable(self, reason: str) -> None:
         """Refuse every further lifecycle publish until a valid baseline is seeded."""
         with self._cond:
+            if self._closed:
+                return
             self._discard_pending_locked(f"baseline refusal: {reason}")
             self._refusal = reason
 
@@ -156,20 +182,37 @@ class LifecycleTransport:
 
     def publish(
         self,
-        lode_id: str,
-        root: str,
-        declared: str,
-        payload: str,
+        message: dict,
+        root: str | None,
         ts: int,
         cohort_factory: Callable[[], tuple],
-    ) -> None:
-        """Take ownership of a frozen snapshot. Infallible once called."""
+    ) -> str | None:
+        """Atomically validate, freeze, and own one snapshot, or return a refusal."""
         with self._cond:
+            if self._closed:
+                return "lifecycle transport is closed"
+            if self._refusal is not None:
+                return f"lifecycle baseline unusable: {self._refusal}"
+            refusal = lifecycle_refusal(message, root)
+            if refusal is not None:
+                return refusal
+            lode = message["lode"]
+            try:
+                payload = freeze_lode(lode)
+            except Exception as error:
+                return f"{message['type']} lode serialization refused: {error}"
+
+            lode_id = lode["id"]
+            declared = message["type"]
             entry = self._pending.get(lode_id)
             if entry is None:
+                try:
+                    cohort = cohort_factory()
+                except Exception as error:
+                    return f"{declared} cohort capture refused: {error}"
                 entry = {
                     "baseline": self._baseline.get(lode_id),
-                    "cohort": cohort_factory(),
+                    "cohort": cohort,
                     "active_payload": None,
                     "active_ts": None,
                 }
@@ -185,6 +228,7 @@ class LifecycleTransport:
                 entry["active_payload"] = payload
                 entry["active_ts"] = ts
             self._cond.notify()
+            return None
 
     # -- schedule -------------------------------------------------------------------
 

@@ -8193,7 +8193,7 @@ def test_in_band_action_refusal_broadcasts_only_the_first_identical_status(socke
     real_publish = server.transport.publish
 
     def counted_publish(*args, **kwargs):
-        publishes.append(args[0])
+        publishes.append(args[0]["lode"]["id"])
         return real_publish(*args, **kwargs)
 
     server.transport.publish = counted_publish
