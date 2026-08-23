@@ -86,6 +86,11 @@ installed by `make install-user`.
 
 Supervise exactly one lode to a final outcome **(outside lode only)**:
 
+The `supervisor:` field in lode status is hopper's in-lode driver. It advances the
+lode to a hopper-terminal state; it does not review the work against your
+acceptance criteria, does not own the lode, and reports to nobody. `hop wait` is
+how a lode gets an owner.
+
 ```bash
 hop wait <lode-id>
 hop watch <lode-id>
