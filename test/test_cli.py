@@ -9848,6 +9848,56 @@ def test_lode_path_absent_candidate_is_never_printed(temp_config, capsys):
     assert "exists:true" not in captured.err
 
 
+def test_lode_path_reports_auto_reap_guidance(temp_config, capsys):
+    now = 1_000_000_000
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "state": "error",
+        "active": False,
+        "worktree_reap": {
+            "trigger": "shipped",
+            "path": str(config.worktree_root() / "abc12345"),
+            "worktree_removed_at": 1,
+            "reaped_at": now - 4 * 60 * 60 * 1000,
+        },
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.lodes.current_time_ms", return_value=now),
+    ):
+        assert cmd_lode(["path", "abc12345", "--json"]) == 1
+
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["outcome"] == "no_worktree"
+    assert "Worktree auto-reaped" in payload["error"]
+    assert "4h ago" in payload["error"]
+    assert "6-hour shipped retention period" in payload["error"]
+
+
+def test_lode_status_reports_auto_reap_guidance(capsys, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="abc12345",
+        worktree_reap={
+            "trigger": "error",
+            "path": "/worktree",
+            "worktree_removed_at": 1,
+            "reaped_at": now - 2 * 24 * 60 * 60 * 1000,
+        },
+    )
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.lodes.current_time_ms", return_value=now),
+    ):
+        assert cmd_lode(["status", "abc12345"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Worktree auto-reaped" in output
+    assert "2d ago" in output
+    assert "48-hour terminal-error retention period" in output
+
+
 @pytest.mark.parametrize(
     ("outcome", "error", "exit_code"),
     [

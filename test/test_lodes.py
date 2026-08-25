@@ -226,6 +226,7 @@ def test_create_lode(temp_config):
     assert lode["originating_extro_sid"] is None
     assert lode["branch"] == ""
     assert lode["worktree_path"] is None
+    assert lode["worktree_reap"] is None
     assert lode["last_progress_at"] is None
     assert lode["last_progress_summary"] == ""
     assert lode["last_pane_activity_at"] is None
@@ -233,6 +234,8 @@ def test_create_lode(temp_config):
     assert lode["run_generation"] is None
     assert lode["oom_scope"] is None
     assert lode["failure_kind"] is None
+    assert lode["shipped_at"] is None
+    assert lode["errored_at"] is None
     assert lode["spawn_disposition"] is None
     assert lode["archive_action_id"] is None
     assert lode["codex_thread_id"] is None

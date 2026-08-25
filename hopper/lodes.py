@@ -815,6 +815,7 @@ def create_lode(
     lode = {
         "id": new_lode_id,
         "stage": "mill",
+        "shipped_at": None,
         "created_at": now,
         "project": project,
         "scope": scope,
@@ -825,12 +826,14 @@ def create_lode(
         "title": "",
         "branch": "",
         "worktree_path": None,
+        "worktree_reap": None,
         "active": False,
         "tmux_pane": None,
         "pid": None,
         "run_generation": None,
         "oom_scope": None,
         "failure_kind": None,
+        "errored_at": None,
         "protocol_error": None,
         "gate_body": None,
         "gate_kind": None,
@@ -1389,6 +1392,8 @@ OOM_KILLED_STATUS = """OOM-KILLED: the operating system killed this Hopper lode'
 
 RUNNER_EXIT_UNVERIFIED_STATUS = """Runner exit UNVERIFIED: Hopper lost the guarded lode runner before it could classify the scope result. Automatic restart is suppressed. Inspect the worktree and branch, then recover explicitly: hop lode resume {lode_id} (preserve the stage session) or hop lode restart {lode_id} (fresh stage session)."""  # noqa: E501
 
+WORKTREE_REAPED_STATUS = """Worktree auto-reaped: Hopper removed this lode's worktree and branch {age} ago, after {policy}. Recover from a retained remote branch or start a new lode; inspect: hop lode status {lode_id}."""  # noqa: E501
+
 TERMINAL_FAILURE_KINDS = frozenset({"oom", "runner_exit_unverified"})
 
 # The branch advice is the final parenthetical in the constant.
@@ -1420,6 +1425,20 @@ def format_terminal_failure_status(failure_kind: str, lode_id: str) -> str:
     else:
         raise ValueError(f"unknown terminal failure kind: {failure_kind}")
     return template.format(lode_id=lode_id)
+
+
+def format_worktree_reaped_status(lode_id: str, worktree_reap: dict) -> str:
+    """Format the recovery guidance for a worktree Hopper auto-reaped."""
+    policy = {
+        "shipped": "the 6-hour shipped retention period",
+        "error": "the 48-hour terminal-error retention period",
+        "killed": "kill confirmation and a zero-unpushed-commit proof",
+    }.get(worktree_reap.get("trigger"), "the configured retention policy")
+    return WORKTREE_REAPED_STATUS.format(
+        lode_id=lode_id,
+        age=format_age(worktree_reap.get("reaped_at")),
+        policy=policy,
+    )
 
 
 def _lode_status_and_liveness(

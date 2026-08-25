@@ -481,8 +481,11 @@ class ProcessRunner(BaseRunner):
                 print(self._setup_error)
                 logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
                 return 1
-            if is_dirty(self.project_dir):
-                rc = self._quarantine_or_error("Commit or stash changes before milling.")
+            if is_dirty(self.project_dir) is not False:
+                rc = self._quarantine_or_error(
+                    "Commit or stash changes, and ensure Hopper can verify the repository "
+                    "is clean, before milling."
+                )
                 if rc is not None:
                     return rc
 
@@ -625,8 +628,11 @@ class ProcessRunner(BaseRunner):
             self.use_env = True
 
         # Pre-flight: project repo must be clean
-        if is_dirty(self.project_dir):
-            rc = self._quarantine_or_error("Commit or stash changes before shipping.")
+        if is_dirty(self.project_dir) is not False:
+            rc = self._quarantine_or_error(
+                "Commit or stash changes, and ensure Hopper can verify the repository is clean, "
+                "before shipping."
+            )
             if rc is not None:
                 return rc
 

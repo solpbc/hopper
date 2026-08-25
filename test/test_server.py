@@ -7377,8 +7377,9 @@ def test_cleanup_worktree_on_startup_archive(socket_path, temp_config, make_lode
             "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
         ),
         patch("hopper.server.is_dirty", return_value=False),
-        patch("hopper.server.remove_worktree") as mock_remove_worktree,
-        patch("hopper.server.delete_branch") as mock_delete_branch,
+        patch("hopper.server.remove_worktree", return_value=True) as mock_remove_worktree,
+        patch("hopper.server.branch_exists", return_value=True),
+        patch("hopper.server.delete_branch", return_value=True) as mock_delete_branch,
     ):
         srv = Server(socket_path)
         thread = threading.Thread(target=srv.start, daemon=True)
@@ -7429,7 +7430,8 @@ def test_cleanup_dirty_worktree_skips_remove_and_branch(
     mock_delete_branch.assert_not_called()
     assert worktree_dir.exists()
     assert any(
-        "worktree has uncommitted changes" in record.getMessage() for record in caplog.records
+        "worktree is dirty or cleanliness could not be proven" in record.getMessage()
+        for record in caplog.records
     )
 
 
@@ -7450,14 +7452,413 @@ def test_cleanup_clean_worktree_removes_and_deletes_branch(socket_path, temp_con
             "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
         ),
         patch("hopper.server.is_dirty", return_value=False) as mock_dirty,
-        patch("hopper.server.remove_worktree") as mock_remove_worktree,
-        patch("hopper.server.delete_branch") as mock_delete_branch,
+        patch("hopper.server.remove_worktree", return_value=True) as mock_remove_worktree,
+        patch("hopper.server.branch_exists", return_value=True),
+        patch("hopper.server.delete_branch", return_value=True) as mock_delete_branch,
     ):
         srv._cleanup_worktree(lode)
 
     mock_dirty.assert_called_once_with(str(worktree_dir))
     mock_remove_worktree.assert_called_once_with("/fake/repo", str(worktree_dir))
     mock_delete_branch.assert_called_once_with("/fake/repo", lode["branch"])
+
+
+def test_reap_cleanup_persists_partial_worktree_progress_before_retry(
+    socket_path, temp_config, make_lode
+):
+    lode = make_lode(id="test-id", project="myproject", branch="hopper-test-id")
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+
+    with (
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False) as dirty,
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=True),
+        patch("hopper.server.delete_branch", return_value=False),
+        patch("hopper.server.current_time_ms", return_value=10_000),
+    ):
+        assert srv._cleanup_worktree(lode) is False
+
+    assert lode["worktree_reap"] == {
+        "trigger": "shipped",
+        "path": str(worktree_dir),
+        "worktree_removed_at": 10_000,
+        "reaped_at": None,
+    }
+    dirty.assert_called_once_with(str(worktree_dir))
+    remove.assert_called_once_with("/fake/repo", str(worktree_dir))
+
+    with (
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty") as dirty,
+        patch("hopper.server.remove_worktree") as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch("hopper.server.current_time_ms", return_value=20_000),
+    ):
+        assert srv._cleanup_worktree(lode) is True
+
+    dirty.assert_not_called()
+    remove.assert_not_called()
+    assert lode["worktree_reap"]["reaped_at"] == 20_000
+
+
+def test_reap_sweep_reaps_shipped_lode_at_grace_boundary(socket_path, temp_config, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="test-id",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS,
+        project="myproject",
+        branch="hopper-test-id",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch.object(srv, "broadcast") as broadcast,
+    ):
+        srv._reap_eligible_worktrees()
+
+    remove.assert_called_once_with("/fake/repo", str(worktree_dir))
+    assert lode["worktree_reap"]["trigger"] == "shipped"
+    assert lode["worktree_reap"]["worktree_removed_at"] == now
+    assert lode["worktree_reap"]["reaped_at"] == now
+    broadcast.assert_called_once_with({"type": "lode_updated", "lode": lode})
+
+
+def test_reap_sweep_waits_for_error_grace_and_excludes_terminal_shipped_lodes(
+    socket_path, make_lode
+):
+    now = 1_000_000_000
+    shipped_terminal = make_lode(
+        id="shipterm",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS,
+        failure_kind="oom",
+    )
+    terminal_error = make_lode(
+        id="errdelay",
+        state="error",
+        failure_kind="oom",
+        errored_at=now - hopper_server.ERROR_WORKTREE_REAP_GRACE_MS + 1,
+    )
+    srv = Server(socket_path)
+    srv.lodes = [shipped_terminal, terminal_error]
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch.object(srv, "_prepare_worktree_reap") as prepare,
+    ):
+        srv._reap_eligible_worktrees()
+
+    prepare.assert_not_called()
+
+
+def test_reap_sweep_excludes_oom_terminal_error_after_grace(socket_path, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="oomerror",
+        state="error",
+        failure_kind="oom",
+        errored_at=now - hopper_server.ERROR_WORKTREE_REAP_GRACE_MS - 1,
+    )
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch.object(srv, "_prepare_worktree_reap") as prepare,
+    ):
+        srv._reap_eligible_worktrees()
+
+    prepare.assert_not_called()
+    assert lode["worktree_reap"] is None
+
+
+def test_reap_sweep_excludes_unverified_terminal_error_after_grace(socket_path, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="unverif1",
+        state="error",
+        failure_kind="runner_exit_unverified",
+        errored_at=now - hopper_server.ERROR_WORKTREE_REAP_GRACE_MS - 1,
+    )
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch.object(srv, "_prepare_worktree_reap") as prepare,
+    ):
+        srv._reap_eligible_worktrees()
+
+    prepare.assert_not_called()
+    assert lode["worktree_reap"] is None
+
+
+def test_reap_sweep_reaps_generic_error_after_grace(socket_path, temp_config, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="generror",
+        state="error",
+        errored_at=now - hopper_server.ERROR_WORKTREE_REAP_GRACE_MS - 1,
+        project="myproject",
+        branch="hopper-generror",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._reap_eligible_worktrees()
+
+    remove.assert_called_once_with("/fake/repo", str(worktree_dir))
+    assert lode["worktree_reap"]["trigger"] == "error"
+    assert type(lode["worktree_reap"]["reaped_at"]) is int
+
+
+def test_reap_sweep_shipped_grace_requires_elapsed_time(socket_path, temp_config, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="shipgrce",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS + 1,
+        project="myproject",
+        branch="hopper-shipgrce",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with patch("hopper.server.current_time_ms", return_value=now):
+        srv._reap_eligible_worktrees()
+
+    assert lode["worktree_reap"] is None
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now + 2),
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._reap_eligible_worktrees()
+
+    remove.assert_called_once_with("/fake/repo", str(worktree_dir))
+    assert type(lode["worktree_reap"]["reaped_at"]) is int
+
+
+def test_reap_sweep_generic_error_grace_requires_elapsed_time(socket_path, temp_config, make_lode):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="errgrace",
+        state="error",
+        errored_at=now - hopper_server.ERROR_WORKTREE_REAP_GRACE_MS + 1,
+        project="myproject",
+        branch="hopper-errgrace",
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with patch("hopper.server.current_time_ms", return_value=now):
+        srv._reap_eligible_worktrees()
+
+    assert lode["worktree_reap"] is None
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now + 2),
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._reap_eligible_worktrees()
+
+    remove.assert_called_once_with("/fake/repo", str(worktree_dir))
+    assert type(lode["worktree_reap"]["reaped_at"]) is int
+
+
+def test_reap_sweep_continues_after_one_cleanup_failure(socket_path, temp_config, make_lode):
+    now = 1_000_000_000
+    failed = make_lode(
+        id="failed11",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS - 1,
+        project="myproject",
+        branch="hopper-failed11",
+    )
+    succeeded = make_lode(
+        id="success1",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS - 1,
+        project="myproject",
+        branch="hopper-success1",
+    )
+    failed_path = temp_config / "lodes" / failed["id"] / "worktree"
+    succeeded_path = temp_config / "lodes" / succeeded["id"] / "worktree"
+    failed_path.mkdir(parents=True)
+    succeeded_path.mkdir(parents=True)
+    srv = Server(socket_path)
+    srv.lodes = [failed, succeeded]
+
+    with (
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree", side_effect=(False, True)) as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._reap_eligible_worktrees()
+
+    assert remove.call_args_list == [
+        call("/fake/repo", str(failed_path)),
+        call("/fake/repo", str(succeeded_path)),
+    ]
+    assert failed["worktree_reap"]["reaped_at"] is None
+    assert type(succeeded["worktree_reap"]["reaped_at"]) is int
+
+
+def test_reap_sweep_kill_requires_a_zero_unpushed_count(socket_path, temp_config, make_lode):
+    lode = make_lode(
+        id="test-id",
+        project="myproject",
+        branch="hopper-test-id",
+        state="error",
+        action_results=[{"action_type": "kill"}],
+    )
+    worktree_dir = temp_config / "lodes" / lode["id"] / "worktree"
+    worktree_dir.mkdir(parents=True)
+    srv = Server(socket_path)
+    srv.archived_lodes = [lode]
+
+    with (
+        patch("hopper.server.git.unpushed_commits", return_value=(None, None)),
+        patch("hopper.server.remove_worktree") as remove,
+    ):
+        srv._reap_eligible_worktrees()
+
+    assert lode["worktree_reap"]["trigger"] == "killed"
+    assert lode["worktree_reap"]["reaped_at"] is None
+    remove.assert_not_called()
+
+    with (
+        patch("hopper.server.git.unpushed_commits", return_value=(0, "origin/main")),
+        patch(
+            "hopper.server.find_project", return_value=Project(path="/fake/repo", name="myproject")
+        ),
+        patch("hopper.server.is_dirty", return_value=False),
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=False),
+        patch.object(srv, "broadcast"),
+    ):
+        srv._reap_eligible_worktrees()
+
+    remove.assert_called_once_with("/fake/repo", str(worktree_dir))
+    assert type(lode["worktree_reap"]["reaped_at"]) is int
+
+
+def test_reap_sweep_throttle_uses_monotonic_time(socket_path):
+    srv = Server(socket_path)
+    with (
+        patch("hopper.server.time.monotonic", side_effect=(100.0, 159.9, 160.0)),
+        patch.object(srv, "_reap_eligible_worktrees") as sweep,
+    ):
+        srv._maybe_reap_worktrees()
+        srv._maybe_reap_worktrees()
+        srv._maybe_reap_worktrees()
+
+    assert sweep.call_count == 2
+
+
+def test_reap_timestamps_are_written_at_terminal_transitions(socket_path, temp_config, make_lode):
+    record = _pending_completion_record(stage="ship")
+    srv = Server(socket_path)
+    shipped = make_lode(
+        id=record["lode_id"],
+        stage="ship",
+        state="teardown",
+        run_generation=record["expected_generation"],
+    )
+    srv.lodes = [shipped]
+
+    with patch("hopper.server.current_time_ms", return_value=10_000):
+        assert srv._apply_completion_stage(record) is True
+
+    assert shipped["stage"] == "shipped"
+    assert shipped["shipped_at"] == 10_000
+    assert shipped["errored_at"] is None
+
+    failed = make_lode(id="failure1", active=True, tmux_pane="%1", pid=1)
+    srv.lodes = [failed]
+    with patch("hopper.server.current_time_ms", return_value=20_000):
+        assert srv._set_terminal_failure(failed, "oom", None) is True
+
+    assert failed["errored_at"] == 20_000
+    with patch("hopper.server.current_time_ms", return_value=30_000):
+        assert srv._set_terminal_failure(failed, "oom", None) is False
+    assert failed["errored_at"] == 20_000
+
+
+def test_reap_resume_refuses_before_spawning(socket_path, make_lode):
+    srv = Server(socket_path)
+    srv.lodes = [
+        make_lode(
+            id="test-id",
+            stage="refine",
+            worktree_reap={
+                "trigger": "shipped",
+                "path": "/worktree",
+                "worktree_removed_at": 1,
+                "reaped_at": 2,
+            },
+        )
+    ]
+    conn = _mock_client(srv)
+
+    with patch.object(srv, "_gated_spawn") as spawn:
+        srv._handle_mutation({"type": "lode_resume", "lode_id": "test-id"}, conn)
+
+    spawn.assert_not_called()
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert "Worktree auto-reaped" in response["error"]
 
 
 def test_cleanup_skipped_without_worktree_dir(socket_path, temp_config, make_lode):
@@ -12557,8 +12958,9 @@ def test_cleanup_uses_recorded_path_even_when_legacy_candidate_exists(socket_pat
     with (
         patch("hopper.server.find_project", return_value=MagicMock(path="/project")),
         patch("hopper.server.is_dirty", return_value=False),
-        patch("hopper.server.remove_worktree") as remove,
-        patch("hopper.server.delete_branch") as delete,
+        patch("hopper.server.remove_worktree", return_value=True) as remove,
+        patch("hopper.server.branch_exists", return_value=True),
+        patch("hopper.server.delete_branch", return_value=True) as delete,
     ):
         srv._cleanup_worktree(lode)
 

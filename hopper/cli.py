@@ -45,6 +45,7 @@ from hopper.coder import (
 from hopper.lodes import (
     current_time_ms,
     format_age,
+    format_worktree_reaped_status,
     get_lode_dir,
     get_worktree_dir,
     is_canonical_lode_id,
@@ -2253,6 +2254,9 @@ def format_lode_detail(lode: dict) -> str:
     status_text = lode_status_for_display(lode)
     if status_text:
         lines.append(f"  status:   {status_text}")
+    worktree_reap = lode.get("worktree_reap")
+    if isinstance(worktree_reap, dict) and type(worktree_reap.get("reaped_at")) is int:
+        lines.extend(["", format_worktree_reaped_status(lode.get("id", ""), worktree_reap)])
     progress_text = lode.get("last_progress_summary", "")
     if progress_text:
         # A progress line with no clock reads as current. This one described a
@@ -4535,7 +4539,11 @@ def cmd_lode(args: list[str]) -> int:
             except OSError:
                 path = None
             if path is None or not path.is_dir():
-                message = f"No worktree exists for lode '{lode_id}'."
+                worktree_reap = resolved["lode"].get("worktree_reap")
+                if isinstance(worktree_reap, dict) and type(worktree_reap.get("reaped_at")) is int:
+                    message = format_worktree_reaped_status(lode_id, worktree_reap)
+                else:
+                    message = f"No worktree exists for lode '{lode_id}'."
                 if parsed.json_output:
                     print(
                         json.dumps(
@@ -4581,6 +4589,10 @@ def cmd_lode(args: list[str]) -> int:
                     and failure.get("outcome") == "no_worktree"
                     and failure.get("id") == lode_id
                 ):
+                    message = failure.get("error", "")
+                    if isinstance(message, str) and message.startswith("Worktree auto-reaped:"):
+                        print(message, file=sys.stderr if parsed.json_output else sys.stdout)
+                        return 1
                     print(
                         f"No worktree exists for lode '{lode_id}' on {host}.",
                         file=sys.stderr if parsed.json_output else sys.stdout,

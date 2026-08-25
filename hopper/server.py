@@ -55,7 +55,7 @@ from hopper.driver import (
     STAGE_DRIVER_PROTOCOL_VERSION,
     resolve_driver,
 )
-from hopper.git import delete_branch, is_dirty, remove_worktree
+from hopper.git import branch_exists, delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
     REFUSAL_STATUS_PREFIXES,
     archive_lode,
@@ -68,6 +68,7 @@ from hopper.lodes import (
     find_lodes_by_prefix,
     format_refusal_status,
     format_terminal_failure_status,
+    format_worktree_reaped_status,
     get_worktree_dir,
     is_terminal_failure_kind,
     load_archived_lodes,
@@ -152,6 +153,9 @@ HELD_RUNNER_MUTATION_TYPES = RUNNER_MUTATION_TYPES - {
 LISTEN_BACKLOG = 64
 PROCESS_GROUP_STATUS_TIMEOUT_SEC = 1.0
 GUARDED_DISCONNECT_HOLD_SEC = 60.0
+WORKTREE_REAP_SWEEP_INTERVAL_SEC = 60.0
+SHIPPED_WORKTREE_REAP_GRACE_MS = 6 * 60 * 60 * 1000
+ERROR_WORKTREE_REAP_GRACE_MS = 48 * 60 * 60 * 1000
 assert oom.SCOPE_RESULT_SETTLE_SEC < GUARDED_DISCONNECT_HOLD_SEC
 FROZEN_PANE_THRESHOLD_MS = 10 * 60_000
 FROZEN_PANE_THRESHOLD_MIN = FROZEN_PANE_THRESHOLD_MS // 60_000
@@ -1380,6 +1384,7 @@ class Server:
         self.client_lodes: dict[socket.socket, str] = {}
         self.client_generations: dict[socket.socket, str] = {}
         self.pending_disconnects: dict[tuple[str, str], dict] = {}
+        self._last_worktree_reap_sweep_at: float | None = None
         self.runner_results: dict[tuple[str, str], tuple[str | None, int]] = {}
         self.action_threads: dict[tuple[str, str], threading.Thread] = {}
         self.registration_threads: dict[str, threading.Thread] = {}
@@ -2865,11 +2870,13 @@ class Server:
         }
         if not accepted:
             return {"ok": False, "landing": landing, "error": verdict.detail}
-        if git.is_dirty(worktree):
+        if git.is_dirty(worktree) is not False:
             return {
                 "ok": False,
                 "landing": landing,
-                "error": "ship worktree became dirty after landing proof",
+                "error": (
+                    "ship worktree is dirty or cleanliness could not be proven after landing proof"
+                ),
             }
         count, basis = git.unpushed_commits(worktree)
         if count is None:
@@ -3817,6 +3824,8 @@ class Server:
         if lode.get("stage") == record["stage"]:
             stop_lode_runtime(lode)
             lode["stage"] = target
+            if target == "shipped":
+                lode["shipped_at"] = current_time_ms()
             touch(lode)
             if any(item is lode for item in self.lodes):
                 save_lodes(self.lodes)
@@ -4750,6 +4759,8 @@ class Server:
                         )
                     else:
                         lode["state"] = "error"
+                        if type(lode.get("errored_at")) is not int:
+                            lode["errored_at"] = current_time_ms()
                         lode["status"] = (
                             f"Recorded runner pane {pane} is gone after server replacement; "
                             f"inspect with: hop lode status {lode['id']} before starting "
@@ -4872,6 +4883,8 @@ class Server:
             elif outcome is SpawnOutcome.PROJECT_MISSING:
                 project = lode.get("project", "")
                 lode["state"] = "error"
+                if type(lode.get("errored_at")) is not int:
+                    lode["errored_at"] = current_time_ms()
                 lode["status"] = (
                     f"Project '{project}' is unavailable; restore its registration/path, "
                     f"then run: hop lode restart {lode['id']}."
@@ -4886,6 +4899,8 @@ class Server:
                 )
             elif outcome is SpawnOutcome.PROVEN_NO_PANE:
                 lode["state"] = "error"
+                if type(lode.get("errored_at")) is not int:
+                    lode["errored_at"] = current_time_ms()
                 lode["status"] = (
                     "tmux did not create a runner pane; repair or start tmux, then run: "
                     f"hop lode restart {lode['id']}."
@@ -5048,6 +5063,7 @@ class Server:
                 self.archived_lodes.append(archived)
                 logger.info(f"Startup: auto-archived shipped lode {lode['id']}")
                 self._cleanup_worktree(archived)
+                save_archived_lodes(self.archived_lodes)
 
         # Safe only because the singleton lock proves no live server owns it.
         if self.socket_path.exists():
@@ -5251,6 +5267,7 @@ class Server:
             or lode.get("active", False)
             or lode.get("tmux_pane") is not None
             or lode.get("pid") is not None
+            or type(lode.get("errored_at")) is not int
         )
         lode["state"] = "error"
         lode["status"] = status
@@ -5258,6 +5275,8 @@ class Server:
         lode["active"] = False
         lode["tmux_pane"] = None
         lode["pid"] = None
+        if type(lode.get("errored_at")) is not int:
+            lode["errored_at"] = current_time_ms()
         if changed:
             touch(lode)
         save_lodes(self.lodes)
@@ -5298,29 +5317,194 @@ class Server:
             else:
                 self._set_terminal_failure(lode, "runner_exit_unverified", run_generation)
 
-    def _cleanup_worktree(self, lode: dict) -> None:
-        """Remove git worktree and branch for an archived lode."""
-        lode_id = lode["id"]
+    def _prepare_worktree_reap(self, lode: dict, trigger: str) -> Path | None:
+        """Capture a reap path once for the cleanup primitive."""
+        worktree_reap = lode.get("worktree_reap")
+        if isinstance(worktree_reap, dict):
+            raw_path = worktree_reap.get("path")
+            if isinstance(raw_path, str) and raw_path:
+                changed = False
+                if worktree_reap.get("trigger") not in {"shipped", "killed", "error"}:
+                    worktree_reap["trigger"] = trigger
+                    changed = True
+                if changed:
+                    touch(lode)
+                return Path(raw_path)
+        else:
+            worktree_reap = None
+
         resolution = resolve_worktree_path(lode)
         worktree_path = resolution["path"]
         if worktree_path is None or not worktree_path.is_dir():
-            return
+            logger.warning("Worktree reap skipped for %s: worktree path is unavailable", lode["id"])
+            return None
+
+        if worktree_reap is None:
+            worktree_reap = {}
+            lode["worktree_reap"] = worktree_reap
+        worktree_reap.update(
+            {
+                "trigger": trigger,
+                "path": str(worktree_path),
+                "worktree_removed_at": None,
+                "reaped_at": None,
+            }
+        )
+        touch(lode)
+        return worktree_path
+
+    def _cleanup_worktree(self, lode: dict, *, trigger: str = "shipped") -> bool:
+        """Remove one confirmed-clean worktree and its branch, retrying partial cleanup."""
+        lode_id = lode["id"]
+        worktree_path = self._prepare_worktree_reap(lode, trigger)
+        if worktree_path is None:
+            return False
+        worktree_reap = lode["worktree_reap"]
         project_name = lode.get("project", "")
         if not project_name:
-            return
+            logger.warning("Worktree reap skipped for %s: project is unavailable", lode_id)
+            return False
         project = find_project(project_name)
         if not project:
-            logger.warning(f"Cleanup skipped for {lode_id}: project not found")
-            return
-        if is_dirty(str(worktree_path)):
-            logger.warning(
-                f"Cleanup skipped for {lode_id}: worktree has uncommitted changes; "
-                f"retaining {worktree_path}"
-            )
-            return
-        remove_worktree(project.path, str(worktree_path))
+            logger.warning("Worktree reap skipped for %s: project not found", lode_id)
+            return False
+
+        if type(worktree_reap.get("worktree_removed_at")) is not int:
+            if is_dirty(str(worktree_path)) is not False:
+                logger.warning(
+                    "Worktree reap skipped for %s: worktree is dirty or cleanliness could not be "
+                    "proven; retaining %s",
+                    lode_id,
+                    worktree_path,
+                )
+                return False
+            if not remove_worktree(project.path, str(worktree_path)):
+                logger.warning(
+                    "Worktree reap failed for %s: could not remove %s", lode_id, worktree_path
+                )
+                return False
+            worktree_reap["worktree_removed_at"] = current_time_ms()
+            touch(lode)
+
         branch = lode.get("branch", "") or f"hopper-{lode_id}"
-        delete_branch(project.path, branch)
+        exists = branch_exists(project.path, branch)
+        if exists is None:
+            logger.warning(
+                "Worktree reap incomplete for %s: branch existence is unverified", lode_id
+            )
+            return False
+        if exists and not delete_branch(project.path, branch):
+            logger.warning(
+                "Worktree reap incomplete for %s: could not remove branch %s", lode_id, branch
+            )
+            return False
+
+        worktree_reap["reaped_at"] = current_time_ms()
+        touch(lode)
+        logger.info("Worktree reaped for %s", lode_id)
+        return True
+
+    def _save_reap_progress(self, owner: list[dict]) -> None:
+        """Persist one lode's reap progress in its owning collection."""
+        if owner is self.lodes:
+            save_lodes(owner)
+        else:
+            save_archived_lodes(owner)
+
+    def _maybe_reap_worktrees(self) -> None:
+        """Run the reap pass at a bounded cadence independent of event polling."""
+        now = time.monotonic()
+        if (
+            self._last_worktree_reap_sweep_at is not None
+            and now - self._last_worktree_reap_sweep_at < WORKTREE_REAP_SWEEP_INTERVAL_SEC
+        ):
+            return
+        self._last_worktree_reap_sweep_at = now
+        self._reap_eligible_worktrees()
+
+    def _reap_eligible_worktrees(self) -> None:
+        """Reap terminal, inactive lode worktrees that have met their retention policy."""
+        now_ms = current_time_ms()
+        candidates: dict[str, tuple[dict, list[dict]]] = {}
+        for lode in self.lodes:
+            lode_id = lode.get("id")
+            if isinstance(lode_id, str):
+                candidates[lode_id] = (lode, self.lodes)
+        for lode in self.archived_lodes:
+            lode_id = lode.get("id")
+            if isinstance(lode_id, str):
+                candidates[lode_id] = (lode, self.archived_lodes)
+
+        for lode, owner in candidates.values():
+            reap_before = copy.deepcopy(lode.get("worktree_reap"))
+            completed = False
+            try:
+                worktree_reap = lode.get("worktree_reap")
+                if isinstance(worktree_reap, dict) and type(worktree_reap.get("reaped_at")) is int:
+                    continue
+                if lode.get("pending_action") is not None:
+                    continue
+                lode_id = lode["id"]
+                if lode.get("active") or lode_id in self.lode_clients:
+                    continue
+                generation = lode.get("run_generation")
+                if generation and (lode_id, generation) in self.pending_disconnects:
+                    continue
+
+                trigger = None
+                shipped_at = lode.get("shipped_at")
+                errored_at = lode.get("errored_at")
+                action_results = lode.get("action_results")
+                last_action = (
+                    action_results[-1]
+                    if isinstance(action_results, list) and action_results
+                    else None
+                )
+                if (
+                    lode.get("stage") == "shipped"
+                    and not is_terminal_failure_kind(lode.get("failure_kind"))
+                    and type(shipped_at) is int
+                    and now_ms - shipped_at >= SHIPPED_WORKTREE_REAP_GRACE_MS
+                ):
+                    trigger = "shipped"
+                elif isinstance(last_action, dict) and last_action.get("action_type") == "kill":
+                    trigger = "killed"
+                elif (
+                    lode.get("state") == "error"
+                    and not is_terminal_failure_kind(lode.get("failure_kind"))
+                    and type(errored_at) is int
+                    and now_ms - errored_at >= ERROR_WORKTREE_REAP_GRACE_MS
+                ):
+                    trigger = "error"
+                if trigger is None:
+                    continue
+
+                worktree_path = self._prepare_worktree_reap(lode, trigger)
+                if worktree_path is None:
+                    continue
+
+                worktree_reap = lode["worktree_reap"]
+                if (
+                    trigger == "killed"
+                    and type(worktree_reap.get("worktree_removed_at")) is not int
+                ):
+                    count, _basis = git.unpushed_commits(str(worktree_path))
+                    if count != 0:
+                        logger.warning(
+                            "Worktree reap skipped for %s: unpushed commit count is %s",
+                            lode_id,
+                            "unknown" if count is None else count,
+                        )
+                        continue
+
+                completed = self._cleanup_worktree(lode, trigger=trigger)
+            except Exception:
+                logger.exception("Worktree reap failed unexpectedly for lode=%s", lode.get("id"))
+            finally:
+                if lode.get("worktree_reap") != reap_before:
+                    self._save_reap_progress(owner)
+                if completed:
+                    self.broadcast({"type": "lode_updated", "lode": lode})
 
     def _register_lode_client(
         self,
@@ -5922,6 +6106,17 @@ class Server:
                 if conn:
                     self._send_response(
                         conn, {"type": "error", "error": f"lode {lode_id} not found"}
+                    )
+                return
+            worktree_reap = lode.get("worktree_reap")
+            if isinstance(worktree_reap, dict) and type(worktree_reap.get("reaped_at")) is int:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": format_worktree_reaped_status(lode_id, worktree_reap),
+                        },
                     )
                 return
             stage = lode.get("stage", "")
@@ -6743,6 +6938,7 @@ class Server:
         """
         while not self.stop_event.is_set():
             self._drain_due_disconnects()
+            self._maybe_reap_worktrees()
             try:
                 message, conn = self.event_queue.get(timeout=0.1)
             except queue.Empty:
@@ -6754,6 +6950,7 @@ class Server:
                 logger.exception(f"Event loop error: {message.get('type')}")
             finally:
                 self._drain_due_disconnects()
+                self._maybe_reap_worktrees()
 
     def _enqueue_event(self, message: dict, conn: socket.socket | None = None) -> None:
         """Enqueue a mutation event for the event loop thread."""

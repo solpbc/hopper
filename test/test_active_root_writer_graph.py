@@ -52,6 +52,7 @@ EXPECTED_DIRECT_SAVE_CALLERS = Counter(
         "hopper/server.py::Server._reconcile_action_records": 1,
         "hopper/server.py::Server._reconcile_startup_lodes": 1,
         "hopper/server.py::Server._register_lode_client": 1,
+        "hopper/server.py::Server._save_reap_progress": 1,
         "hopper/server.py::Server._set_action_refusal": 1,
         "hopper/server.py::Server._set_terminal_failure": 1,
     }

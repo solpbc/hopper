@@ -33,6 +33,7 @@ SHIP_ANCESTRY_TIMEOUT_SEC = 5.0
 SHIP_REVALIDATION_TIMEOUT_SEC = 5.0
 SHIP_LANDING_TIMEOUT_SEC = 155.0
 UNPUSHED_PROBE_TIMEOUT_SEC = 2.0
+DIRTY_PROBE_TIMEOUT_SEC = 2.0
 
 ShipLandingCause = Literal[
     "worktree_unreadable",
@@ -75,32 +76,28 @@ class ShipLandingVerdict:
     detail: str
 
 
-def _branch_exists(repo_dir: str, branch_name: str) -> bool | None:
+def branch_exists(
+    repo_dir: str,
+    branch_name: str,
+    *,
+    timeout: float = DIRTY_PROBE_TIMEOUT_SEC,
+) -> bool | None:
     """Return branch existence, or None when it cannot be proven."""
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                f"refs/heads/{branch_name}",
-            ],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1:
-            return False
-        logger.warning(
-            f"failed to check branch {branch_name}: git rev-parse exited {result.returncode}"
-        )
+    result = _git_probe(
+        repo_dir,
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        timeout,
+    )
+    if result is None:
         return None
-    except OSError as exc:
-        logger.warning(f"failed to check branch {branch_name}: {exc}")
-        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    logger.warning(
+        f"failed to check branch {branch_name}: git rev-parse exited {result.returncode}"
+    )
+    return None
 
 
 def _force_delete_branch(repo_dir: str, branch_name: str) -> bool:
@@ -271,7 +268,7 @@ def _create_worktree_locked(
         else:
             base_ref = "HEAD"
 
-        branch_absence_proven = _branch_exists(repo_dir, branch_name) is False
+        branch_absence_proven = branch_exists(repo_dir, branch_name) is False
         path_existed = worktree_path.exists()
         result = subprocess.run(
             [
@@ -311,7 +308,7 @@ def _create_worktree_locked(
                 except OSError as exc:
                     logger.warning(f"git worktree prune failed: {exc}")
 
-            if branch_absence_proven and _branch_exists(repo_dir, branch_name) is True:
+            if branch_absence_proven and branch_exists(repo_dir, branch_name) is True:
                 _force_delete_branch(repo_dir, branch_name)
             return False, error
         return True, None
@@ -1012,7 +1009,7 @@ def authorize_quarantine_cleanup(
     validation = revalidate_worktree_provenance(provenance, worktree_path=target)
     if validation["state"] != "match":
         return {"authorized": False, "error": validation["error"]}
-    if is_dirty(target):
+    if is_dirty(target) is not False:
         return {"authorized": False, "error": "quarantined worktree is dirty or unreadable"}
     count, basis = unpushed_commits(target)
     if count is None:
@@ -1146,30 +1143,27 @@ def delete_branch_if_unchanged(provenance: dict, *, base_ref: str | None) -> dic
     return {"state": "unknown", "error": "branch deletion could not be verified"}
 
 
-def is_dirty(repo_dir: str) -> bool:
+def is_dirty(
+    repo_dir: str,
+    *,
+    timeout: float = DIRTY_PROBE_TIMEOUT_SEC,
+) -> bool | None:
     """Check if a git repo has uncommitted changes.
 
     Args:
         repo_dir: Path to the git repository.
 
     Returns:
-        True if the repo has uncommitted changes, False if clean.
+        True if the repo has uncommitted changes, False if clean, or None if
+        cleanliness could not be determined.
     """
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                f"git status --porcelain failed in {repo_dir} (exit {result.returncode})"
-            )
-            return True
-        return bool(result.stdout.strip())
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return True  # Assume dirty if we can't check
+    result = _git_probe(repo_dir, ["status", "--porcelain"], timeout)
+    if result is None:
+        return None
+    if result.returncode != 0:
+        logger.warning(f"git status --porcelain failed in {repo_dir} (exit {result.returncode})")
+        return None
+    return bool(result.stdout.strip())
 
 
 def dirty_status(repo_dir: str) -> str:
@@ -1364,8 +1358,11 @@ def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
             )
             return None
 
-        if is_dirty(repo_dir):
-            logger.warning(f"quarantine failed: {repo_dir} still dirty after switch-back")
+        if is_dirty(repo_dir) is not False:
+            logger.warning(
+                f"quarantine failed: {repo_dir} is dirty or cleanliness could not be proven "
+                "after switch-back"
+            )
             return None
 
         logger.warning(

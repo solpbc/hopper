@@ -24,6 +24,7 @@ from hopper.git import (
     UPSTREAM_FETCH_REFSPEC,
     _resolve_default_branch,
     authorize_quarantine_cleanup,
+    branch_exists,
     capture_worktree_provenance,
     commit_all,
     create_worktree,
@@ -219,6 +220,7 @@ class TestCreateWorktree:
                 cwd="/repo",
                 capture_output=True,
                 text=True,
+                timeout=2.0,
             ),
             call(
                 [
@@ -326,6 +328,7 @@ class TestCreateWorktree:
                 cwd="/repo",
                 capture_output=True,
                 text=True,
+                timeout=2.0,
             ),
             call(
                 [
@@ -1184,17 +1187,43 @@ class TestIsDirty:
             assert is_dirty("/repo") is True
 
     def test_git_not_found(self):
-        """Returns True (assumes dirty) when git is not found."""
+        """Returns None when git is not found."""
         with patch("subprocess.run", side_effect=FileNotFoundError):
-            assert is_dirty("/repo") is True
+            assert is_dirty("/repo") is None
 
-    def test_nonzero_status_exit_is_conservatively_dirty(self, caplog):
+    def test_nonzero_status_exit_is_unavailable(self, caplog):
         mock_result = MagicMock(returncode=128, stdout="", stderr="fatal")
 
         with patch("subprocess.run", return_value=mock_result):
-            assert is_dirty("/repo") is True
+            assert is_dirty("/repo") is None
 
         assert "git status --porcelain failed in /repo (exit 128)" in caplog.messages
+
+    def test_timeout_is_unavailable_and_probe_is_bounded(self):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="git status", timeout=0.25),
+        ) as run:
+            assert is_dirty("/repo", timeout=0.25) is None
+
+        assert run.call_args.kwargs["timeout"] == 0.25
+
+
+class TestBranchExists:
+    def test_returns_git_ref_existence(self):
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            assert branch_exists("/repo", "hopper-test") is True
+        with patch("subprocess.run", return_value=MagicMock(returncode=1)):
+            assert branch_exists("/repo", "hopper-test") is False
+
+    def test_timeout_is_unavailable_and_probe_is_bounded(self):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="git rev-parse", timeout=0.25),
+        ) as run:
+            assert branch_exists("/repo", "hopper-test", timeout=0.25) is None
+
+        assert run.call_args.kwargs["timeout"] == 0.25
 
 
 class TestDirtyStatus:
