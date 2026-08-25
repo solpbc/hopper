@@ -43,6 +43,7 @@ from hopper.lodes import (
     publish_lode_gate,
     save_archived_lodes,
     save_lodes,
+    update_lode_state,
 )
 from hopper.projects import Project, touch_project
 from hopper.server import (
@@ -7834,6 +7835,58 @@ def test_reap_timestamps_are_written_at_terminal_transitions(socket_path, temp_c
     with patch("hopper.server.current_time_ms", return_value=30_000):
         assert srv._set_terminal_failure(failed, "oom", None) is False
     assert failed["errored_at"] == 20_000
+
+
+def test_lode_state_error_sets_errored_at(socket_path, temp_config, make_lode):
+    lode = make_lode(id="generic1", state="running")
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with patch("hopper.lodes.current_time_ms", return_value=10_000):
+        assert update_lode_state(srv.lodes, lode["id"], "error", "Runner failed") is lode
+
+    assert lode["state"] == "error"
+    assert lode["errored_at"] == 10_000
+
+
+def test_lode_state_error_notification_preserves_errored_at(socket_path, temp_config, make_lode):
+    lode = make_lode(id="generic2", state="error", errored_at=10_000)
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with patch("hopper.lodes.current_time_ms", return_value=20_000):
+        assert update_lode_state(srv.lodes, lode["id"], "error", "Runner still failed") is lode
+
+    assert lode["errored_at"] == 10_000
+
+
+def test_lode_state_error_new_episode_refreshes_timestamp_and_reap_grace(
+    socket_path, temp_config, make_lode
+):
+    first_error_at = 1_000_000
+    second_error_at = first_error_at + hopper_server.ERROR_WORKTREE_REAP_GRACE_MS + 10
+    lode = make_lode(id="generic3", state="running")
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with patch("hopper.lodes.current_time_ms", return_value=first_error_at):
+        assert update_lode_state(srv.lodes, lode["id"], "error", "First failure") is lode
+    with patch("hopper.lodes.current_time_ms", return_value=first_error_at + 1):
+        assert update_lode_state(srv.lodes, lode["id"], "running", "Recovered") is lode
+    assert lode["errored_at"] is None
+
+    with patch("hopper.lodes.current_time_ms", return_value=second_error_at):
+        assert update_lode_state(srv.lodes, lode["id"], "error", "Second failure") is lode
+
+    assert lode["errored_at"] == second_error_at
+    with (
+        patch("hopper.server.current_time_ms", return_value=second_error_at + 1),
+        patch.object(srv, "_prepare_worktree_reap") as prepare,
+    ):
+        srv._reap_eligible_worktrees()
+
+    prepare.assert_not_called()
+    assert lode["worktree_reap"] is None
 
 
 def test_reap_resume_refuses_before_spawning(socket_path, make_lode):

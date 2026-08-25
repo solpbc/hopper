@@ -4758,8 +4758,9 @@ class Server:
                             "waiting for a deliberate handoff"
                         )
                     else:
+                        previous_state = lode.get("state")
                         lode["state"] = "error"
-                        if type(lode.get("errored_at")) is not int:
+                        if previous_state != "error" or type(lode.get("errored_at")) is not int:
                             lode["errored_at"] = current_time_ms()
                         lode["status"] = (
                             f"Recorded runner pane {pane} is gone after server replacement; "
@@ -4882,8 +4883,9 @@ class Server:
                 lode["tmux_pane"] = pane_id
             elif outcome is SpawnOutcome.PROJECT_MISSING:
                 project = lode.get("project", "")
+                previous_state = lode.get("state")
                 lode["state"] = "error"
-                if type(lode.get("errored_at")) is not int:
+                if previous_state != "error" or type(lode.get("errored_at")) is not int:
                     lode["errored_at"] = current_time_ms()
                 lode["status"] = (
                     f"Project '{project}' is unavailable; restore its registration/path, "
@@ -4898,8 +4900,9 @@ class Server:
                     lode, body=status, kind="explicit", status=status
                 )
             elif outcome is SpawnOutcome.PROVEN_NO_PANE:
+                previous_state = lode.get("state")
                 lode["state"] = "error"
-                if type(lode.get("errored_at")) is not int:
+                if previous_state != "error" or type(lode.get("errored_at")) is not int:
                     lode["errored_at"] = current_time_ms()
                 lode["status"] = (
                     "tmux did not create a runner pane; repair or start tmux, then run: "
@@ -5260,6 +5263,7 @@ class Server:
         if lode.get("failure_kind") == "oom" and failure_kind != "oom":
             return False
         status = format_terminal_failure_status(failure_kind, lode["id"])
+        previous_state = lode.get("state")
         changed = (
             lode.get("failure_kind") != failure_kind
             or lode.get("status") != status
@@ -5275,7 +5279,7 @@ class Server:
         lode["active"] = False
         lode["tmux_pane"] = None
         lode["pid"] = None
-        if type(lode.get("errored_at")) is not int:
+        if previous_state != "error" or type(lode.get("errored_at")) is not int:
             lode["errored_at"] = current_time_ms()
         if changed:
             touch(lode)
@@ -5423,7 +5427,7 @@ class Server:
         self._reap_eligible_worktrees()
 
     def _reap_eligible_worktrees(self) -> None:
-        """Reap terminal, inactive lode worktrees that have met their retention policy."""
+        """Reap eligible inactive lode worktrees that have met their retention policy."""
         now_ms = current_time_ms()
         candidates: dict[str, tuple[dict, list[dict]]] = {}
         for lode in self.lodes:

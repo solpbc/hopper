@@ -989,9 +989,15 @@ def update_lode_state(lodes: list[dict], lode_id: str, state: str, status: str) 
 
 def _set_lode_state_fields(lode: dict, state: str, status: str) -> None:
     """Apply state fields and their existing runtime bookkeeping without saving."""
+    previous_state = lode.get("state")
     lode["state"] = state
     lode["status"] = status
     lode["spawn_disposition"] = None
+    if state == "error":
+        if previous_state != "error" or type(lode.get("errored_at")) is not int:
+            lode["errored_at"] = current_time_ms()
+    else:
+        lode["errored_at"] = None
     stage = lode.get("stage", "")
     if stage in _STAGE_NAMES:
         runs = lode.setdefault("runs", {})
