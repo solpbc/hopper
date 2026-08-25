@@ -24,7 +24,16 @@ from hopper.tmux import (
 )
 
 LABEL = "Claude"
-_FLAGS = ("--dangerously-skip-permissions", "--disallowed-tools=AskUserQuestion")
+CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_EFFORT = "xhigh"
+_FLAGS = (
+    "--dangerously-skip-permissions",
+    "--disallowed-tools=AskUserQuestion",
+    "--model",
+    CLAUDE_MODEL,
+    "--effort",
+    CLAUDE_EFFORT,
+)
 
 
 def build_command(*, session_id: str, prompt: str | None, resume: bool) -> list[str]:

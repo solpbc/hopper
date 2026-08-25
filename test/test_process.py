@@ -722,6 +722,10 @@ class TestMillStage:
             "claude",
             "--dangerously-skip-permissions",
             "--disallowed-tools=AskUserQuestion",
+            "--model",
+            "claude-sonnet-5",
+            "--effort",
+            "xhigh",
             "--resume",
             PROVIDER_SESSION_IDS["mill"],
         ]
@@ -745,10 +749,18 @@ class TestMillStage:
             runner.run()
 
         cmd = mock_popen.call_args[0][0]
-        assert cmd[0] == "claude"
-        assert cmd[2] == "--disallowed-tools=AskUserQuestion"
-        assert cmd[3:5] == ["--session-id", PROVIDER_SESSION_IDS["mill"]]
-        assert len(cmd) == 6  # claude, skip, disallowed, --session-id, id, prompt
+        assert cmd[:-1] == [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--disallowed-tools=AskUserQuestion",
+            "--model",
+            "claude-sonnet-5",
+            "--effort",
+            "xhigh",
+            "--session-id",
+            PROVIDER_SESSION_IDS["mill"],
+        ]
+        assert len(cmd) == 10  # claude, permissions, model/effort, session id, prompt
         assert cmd[-1] != "--disallowed-tools=AskUserQuestion"
         started_index = next(
             index for index, event in enumerate(emitted) if event[0] == "lode_bind_stage_session"

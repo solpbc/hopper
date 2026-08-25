@@ -151,9 +151,24 @@ def test_supervisor_commands_are_interactive_and_exact():
         "claude",
         "--dangerously-skip-permissions",
         "--disallowed-tools=AskUserQuestion",
+        "--model",
+        "claude-sonnet-5",
+        "--effort",
+        "xhigh",
         "--session-id",
         CODEX_SESSION_ID,
         "scope",
+    ]
+    assert claude.build_command(session_id=CODEX_SESSION_ID, prompt=None, resume=True) == [
+        "claude",
+        "--dangerously-skip-permissions",
+        "--disallowed-tools=AskUserQuestion",
+        "--model",
+        "claude-sonnet-5",
+        "--effort",
+        "xhigh",
+        "--resume",
+        CODEX_SESSION_ID,
     ]
 
     codex_cmd = codex.build_command(session_id=CODEX_SESSION_ID, prompt="scope", resume=False)
