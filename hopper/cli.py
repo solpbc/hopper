@@ -4441,9 +4441,11 @@ def cmd_lode(args: list[str]) -> int:
                     }
                 )
             )
+            print(f"Always use 'hop watch {lode['id']}' to monitor your lode.", file=sys.stderr)
             return 0
         if lode:
             print(f"Created lode {lode['id']} ({project_name})")
+            print(f"Always use 'hop watch {lode['id']}' to monitor your lode.")
         else:
             print("error: lode was not created", file=sys.stderr)
             return 1

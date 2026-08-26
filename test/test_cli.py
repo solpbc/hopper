@@ -1580,11 +1580,13 @@ def test_lode_create_can_select_grok(capsys):
 
     check.assert_called_once_with("grok")
     assert create.call_args.kwargs["coder_provider"] == "grok"
-    assert json.loads(capsys.readouterr().out) == {
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
         "id": "abc12345",
         "project": "myproj",
         "host": "local",
     }
+    assert "Always use 'hop watch abc12345' to monitor your lode." in captured.err
 
 
 @pytest.mark.parametrize(
@@ -8397,11 +8399,13 @@ def test_lode_create_json(capsys):
                     with patch("sys.stdin", StringIO(LONG_SCOPE)):
                         assert cmd_lode(["create", "myproj", "--json"]) == 0
 
-    assert json.loads(capsys.readouterr().out) == {
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
         "id": "abc12345",
         "project": "myproj",
         "host": "local",
     }
+    assert "Always use 'hop watch abc12345' to monitor your lode." in captured.err
 
 
 def test_lode_status_json_remote(capsys):
