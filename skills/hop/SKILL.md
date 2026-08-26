@@ -441,6 +441,11 @@ before taking another action; do not submit the output again blindly.
 - If failure says the delivery outcome is unknown, run `hop lode peek <lode-id>`
   before deciding whether to retry; never resend blindly. `hop feedback <lode-id>`
   is an alias with the same contract and input forms.
+- **After exit 0, re-invoke `hop wait <lode-id>`.** A successful send is what
+  clears `gated` — `gated` is not sticky — but nothing re-checks that for you.
+  A caller that only watched `hop wait`'s exit `2` and never re-armed it has
+  no way to learn the lode moved on; this matters most for a cron-dispatched
+  session with no human watching for the next gate.
 
 ```bash
 hop gate show <lode-id>                        # view the gate prompt
