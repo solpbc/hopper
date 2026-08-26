@@ -438,6 +438,10 @@ before taking another action; do not submit the output again blindly.
 - Use these after a lode prints a gate banner and waits for your reply. Exit 0 from
   `hop gate feedback` means Claude accepted a new user turn; any reported failure
   leaves the lode gated and prints a safe next action.
+- **While `hop lode status <lode-id>` shows `state: gated`, only a single-character
+  body is accepted** (for example `y`) — the multi-character examples below are
+  refused with `gated_character_only` and nothing is pasted. The refusal names the
+  recovery itself: retry with exactly one character.
 - If failure says the delivery outcome is unknown, run `hop lode peek <lode-id>`
   before deciding whether to retry; never resend blindly. `hop feedback <lode-id>`
   is an alias with the same contract and input forms.
@@ -466,7 +470,9 @@ cat feedback.md | hop feedback <lode-id> -
 hop ping                            # check server connectivity
 hop screenshot                      # render TUI window as ANSI text
 hop lode peek <lode-id>             # plain-text tail of the lode pane
-hop lode nudge <lode-id>            # submit "continue" via buffer paste
+hop lode nudge <lode-id>            # submit "continue" via buffer paste; NOT gate-aware —
+                                     # it pastes regardless of `state: gated` and is not the
+                                     # accepted-turn path § "Responding to a gate" relies on
 hop lode nudge <lode-id> "focus the failing test"
 hop lode nudge <lode-id> --text "..."
 hop lode nudge <lode-id> -- -leading-dash-text
