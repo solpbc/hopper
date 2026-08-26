@@ -1,4 +1,6 @@
-.PHONY: install install-user test ci clean timing
+-include .env
+
+.PHONY: install install-user install-skills test ci clean timing
 
 install:
 	uv sync
@@ -12,6 +14,26 @@ install-user: install
 	ln -sfn $(CURDIR)/skills/hop ~/.claude/skills/hop
 	@echo "Symlinked ~/.local/bin/hop → $(CURDIR)/.venv/bin/hop"
 	@echo "Symlinked ~/.claude/skills/hop → $(CURDIR)/skills/hop"
+	@echo "Note: run 'make install-skills' (needs EXTRO_ROOT) to also land the hop skill in the org repo's .agents/skills — the path Grok sessions read (compat.claude is off for Grok, so ~/.claude/skills/hop above is Claude/Codex-only)."
+
+# EXTRO_ROOT-scoped install — lands `hop` in the org repo's .claude/skills AND
+# .agents/skills (Grok's native, project-scoped skill root; see
+# cto/playbooks/grok-build-fleet.md). install-user alone only reaches
+# ~/.claude/skills, which Grok never reads (compat.claude.skills=false by
+# design). Every other extro-* tool Makefile already installs to both roots
+# (see extro-hub/Makefile, extro-tools/Makefile); this target brings hop to
+# parity. Not wired into install-user because EXTRO_ROOT (the org repo) does
+# not exist on every fleet host that runs `make install-user`.
+install-skills:
+ifndef EXTRO_ROOT
+	$(error EXTRO_ROOT is not set. Create .env with: EXTRO_ROOT=/path/to/extro)
+endif
+	@for dir in $(EXTRO_ROOT)/.claude/skills $(EXTRO_ROOT)/.agents/skills; do \
+		mkdir -p $$dir; \
+		rm -rf $$dir/hop; \
+		ln -sfn $(CURDIR)/skills/hop $$dir/hop; \
+	done
+	@echo "  hop → $(CURDIR)/skills/hop"
 
 test:
 	uv run pytest
