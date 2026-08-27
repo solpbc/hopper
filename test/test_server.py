@@ -5048,6 +5048,42 @@ def test_completion_target_maps_shipped_only_for_cleanup_retry():
     assert Server._completion_target("shipped", shipped_retry=True) == "shipped_archived"
 
 
+def test_ship_stage_completion_resubmission_unaffected_by_shipped_cleanup_retry(
+    socket_path, make_lode
+):
+    record = _pending_completion_record(stage="ship")
+    _earn_degraded_containment_proof(record)
+    _complete_marker(record, "containment")
+    actions.write_pending_action(record)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="ship",
+        state="teardown",
+        active=False,
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    message = {
+        "type": "lode_action",
+        "action_id": record["action_id"],
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_type": "completion",
+        "target_disposition": record["target_disposition"],
+        "force_consent": False,
+        "stage": "ship",
+        "wait_for_disposition": True,
+    }
+
+    with patch.object(server, "_continue_action") as continuation:
+        server._handle_lode_action(message, conn)
+
+    continuation.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("marker_name", "archived"),
     [("archive", False), ("worktree_remove", True), ("branch_delete", True)],
@@ -5166,8 +5202,10 @@ def test_shipped_cleanup_completion_identity_mismatch_remains_refused(
 
 @pytest.mark.parametrize("marker_name", ["worktree_remove", "branch_delete"])
 def test_shipped_cleanup_restart_finishes_real_quarantine_cleanup(
-    socket_path, make_lode, tmp_path, marker_name
+    socket_path, make_lode, tmp_path, monkeypatch, marker_name
 ):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
     record = _real_blocked_ship_cleanup_record(tmp_path, marker_name)
     archived = make_lode(
         id=record["lode_id"],
