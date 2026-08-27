@@ -1050,7 +1050,7 @@ def remove_quarantined_worktree(repo_identity: dict, quarantine: dict) -> dict:
         if _path_matches(repo_identity[name]["realpath"], repo_identity[name]) is not True:
             return {"state": "retained", "error": f"{name} identity changed"}
     try:
-        result = subprocess.run(
+        subprocess.run(
             ["git", "worktree", "remove", target],
             cwd=project,
             capture_output=True,
