@@ -27,7 +27,7 @@ from pathlib import Path
 import setproctitle
 
 import hopper.code as hopper_code
-from hopper import __version__, config
+from hopper import __version__, config, oom
 from hopper import deadline as deadline_utils
 from hopper.cleanup import reap_swiftpm_testing_helpers
 from hopper.client import set_lode_progress
@@ -50,11 +50,13 @@ from hopper.lodes import (
     get_worktree_dir,
     is_canonical_lode_id,
     is_terminal_failure_kind,
+    is_terminal_oom_scope_archive_candidate,
     lode_coder,
     lode_driver,
     lode_icon,
     lode_status_for_display,
     lode_with_status_annotations,
+    resolve_worktree_path,
 )
 from hopper.runner import _sum_process_tree_cpu_ms
 from hopper.supervisor import (
@@ -2165,6 +2167,28 @@ def _lode_needs_archive_recovery(lode: dict) -> bool:
     except (OSError, ValueError, json.JSONDecodeError):
         return True
     return ownership is None
+
+
+def _terminal_oom_scope_is_archiveable(lode: dict) -> bool:
+    """Return whether a terminal OOM scope and its worktree are both proven absent."""
+    if not is_terminal_oom_scope_archive_candidate(lode):
+        return False
+    resolved = resolve_worktree_path(lode)
+    worktree = resolved["path"]
+    if worktree is None:
+        if resolved["basis"] != "absent":
+            return False
+    else:
+        try:
+            if worktree.exists():
+                return False
+        except OSError:
+            return False
+    systemctl = oom.find_systemctl()
+    if systemctl is None:
+        return False
+    observation = oom.read_scope_control_group(systemctl, lode["oom_scope"])
+    return observation["state"] == "absent"
 
 
 def _load_lode_recovery(lode_id: str) -> dict | None:
@@ -4912,21 +4936,29 @@ def cmd_lode(args: list[str]) -> int:
             print(f"Cannot archive: lode {lode_id} stage is {stage}.")
             print(f"Check its current state with: hop lode status {lode_id}")
             return 1
-        if lode.get("active") or any(
-            lode.get(field) is not None for field in ("tmux_pane", "pid", "oom_scope")
-        ):
-            blockers = []
-            if lode.get("active"):
-                blockers.append(f"active={lode.get('active')!r}")
-            for field in ("tmux_pane", "pid", "oom_scope"):
-                value = lode.get(field)
-                if value is not None:
-                    blockers.append(f"{field}={value!r}")
+        stale_oom_scope = is_terminal_oom_scope_archive_candidate(lode)
+        allow_stale_oom_scope = stale_oom_scope and (
+            resolved["host"] != "local" or _terminal_oom_scope_is_archiveable(lode)
+        )
+        blockers = []
+        if lode.get("active"):
+            blockers.append(f"active={lode.get('active')!r}")
+        for field in ("tmux_pane", "pid", "oom_scope"):
+            value = lode.get(field)
+            if value is not None and not (field == "oom_scope" and allow_stale_oom_scope):
+                blockers.append(f"{field}={value!r}")
+        if blockers:
             print(f"Cannot archive: lode {lode_id} has recorded blockers: {', '.join(blockers)}.")
-            print(
-                "This check reads the lode's recorded fields; it does not probe the "
-                "live pane or process."
-            )
+            if stale_oom_scope and resolved["host"] == "local":
+                print(
+                    "The OOM-terminal exception requires the exact scope and worktree to be "
+                    "proven absent; Hopper did not archive."
+                )
+            else:
+                print(
+                    "This check reads the lode's recorded fields; it does not probe the "
+                    "live pane or process."
+                )
             print(
                 f"Recovery: hop lode kill {lode_id} clears the recorded handles only "
                 "while the run ownership record is loadable."

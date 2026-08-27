@@ -1646,6 +1646,127 @@ def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(
     assert lode_id not in server.action_acceptances
 
 
+def test_terminal_oom_archive_requires_absent_exact_scope_and_missing_worktree(
+    socket_path, make_lode, tmp_path
+):
+    lode_id = "abcd2345"
+    generation = TEST_RUN_GENERATION
+    lode = make_lode(
+        id=lode_id,
+        state="error",
+        active=False,
+        run_generation=generation,
+        failure_kind="oom",
+        oom_scope=hopper_server.oom.scope_unit_name(lode_id, generation),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    missing_worktree = tmp_path / "missing-worktree"
+
+    with (
+        patch(
+            "hopper.server.resolve_worktree_path",
+            return_value={"path": missing_worktree, "basis": "recorded", "reason": None},
+        ),
+        patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+        patch(
+            "hopper.server.oom.read_scope_control_group",
+            return_value={"state": "absent", "error": None},
+        ) as scope,
+        patch("hopper.server.git.unpushed_commits") as durability,
+    ):
+        server._handle_mutation(_manual_action_message("archive", generation=generation), conn)
+        _apply_prepared_action(server, lode_id, generation)
+
+    scope.assert_called_once_with(
+        "systemctl", hopper_server.oom.scope_unit_name(lode_id, generation)
+    )
+    durability.assert_not_called()
+    assert server.lodes == []
+    assert len(server.archived_lodes) == 1
+    assert _decode_mock_response(conn)["outcome"] == "completed"
+
+
+def test_terminal_oom_archive_refuses_when_scope_is_still_present(socket_path, make_lode, tmp_path):
+    lode_id = "abcd2345"
+    generation = TEST_RUN_GENERATION
+    lode = make_lode(
+        id=lode_id,
+        state="error",
+        active=False,
+        run_generation=generation,
+        failure_kind="oom",
+        oom_scope=hopper_server.oom.scope_unit_name(lode_id, generation),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    with (
+        patch(
+            "hopper.server.resolve_worktree_path",
+            return_value={
+                "path": tmp_path / "missing-worktree",
+                "basis": "recorded",
+                "reason": None,
+            },
+        ),
+        patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+        patch(
+            "hopper.server.oom.read_scope_control_group",
+            return_value={"state": "present", "error": None},
+        ),
+    ):
+        server._handle_mutation(_manual_action_message("archive", generation=generation), conn)
+        _apply_prepared_action(server, lode_id, generation)
+
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "refused"
+    assert response["reason"] == "ownership_unavailable"
+    assert "OOM scope is not proven absent" in response["detail"]
+    assert server.lodes == [lode]
+    assert server.archived_lodes == []
+    assert actions.load_pending_action(lode_id) is None
+
+
+def test_terminal_oom_archive_refuses_when_worktree_still_exists(socket_path, make_lode, tmp_path):
+    lode_id = "abcd2345"
+    generation = TEST_RUN_GENERATION
+    lode = make_lode(
+        id=lode_id,
+        state="error",
+        active=False,
+        run_generation=generation,
+        failure_kind="oom",
+        oom_scope=hopper_server.oom.scope_unit_name(lode_id, generation),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    with (
+        patch(
+            "hopper.server.resolve_worktree_path",
+            return_value={"path": worktree, "basis": "recorded", "reason": None},
+        ),
+        patch("hopper.server.oom.find_systemctl", return_value="systemctl"),
+        patch("hopper.server.oom.read_scope_control_group") as scope,
+    ):
+        server._handle_mutation(_manual_action_message("archive", generation=generation), conn)
+        _apply_prepared_action(server, lode_id, generation)
+
+    scope.assert_not_called()
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "refused"
+    assert response["reason"] == "ownership_unavailable"
+    assert f"worktree still exists at {worktree}" in response["detail"]
+    assert server.lodes == [lode]
+    assert server.archived_lodes == []
+
+
 def test_async_manual_action_response_keeps_exchange_id_over_real_socket(
     server, socket_path, make_lode
 ):

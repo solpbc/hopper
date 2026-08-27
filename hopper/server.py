@@ -71,6 +71,7 @@ from hopper.lodes import (
     format_worktree_reaped_status,
     get_worktree_dir,
     is_terminal_failure_kind,
+    is_terminal_oom_scope_archive_candidate,
     load_archived_lodes,
     load_lodes,
     lode_coder,
@@ -141,6 +142,31 @@ _CLAUDE_PANE_EXPORTS = (
 logger = logging.getLogger(__name__)
 
 _CURRENT_EXCHANGE = object()
+
+
+def _prove_terminal_oom_scope_archiveable(lode: dict) -> None:
+    """Raise unless the exact terminal OOM scope and recorded worktree are absent."""
+    if not is_terminal_oom_scope_archive_candidate(lode):
+        raise RuntimeError("lode is not an inactive OOM scope archive candidate")
+    resolved = resolve_worktree_path(lode)
+    worktree = resolved["path"]
+    if worktree is None:
+        if resolved["basis"] != "absent":
+            raise RuntimeError("worktree location is unavailable")
+    else:
+        try:
+            if worktree.exists():
+                raise RuntimeError(f"worktree still exists at {worktree}")
+        except OSError as error:
+            raise RuntimeError(f"could not inspect worktree {worktree}: {error}") from error
+    systemctl = oom.find_systemctl()
+    if systemctl is None:
+        raise RuntimeError("systemctl is unavailable to inspect the OOM scope")
+    observed = oom.read_scope_control_group(systemctl, lode["oom_scope"])
+    if observed["state"] != "absent":
+        detail = observed["error"] or observed["state"]
+        raise RuntimeError(f"OOM scope is not proven absent: {detail}")
+
 
 PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "reconnecting", "teardown", "error"})
 SUPPORTED_LODE_STATES = frozenset(
@@ -2073,7 +2099,22 @@ class Server:
             }
 
         key = (lode_id, expected_generation)
-        if is_terminal_failure_kind(lode.get("failure_kind")):
+        terminal_oom_candidate = bool(
+            action_type == "archive"
+            and lode_id not in self.lode_clients
+            and is_terminal_oom_scope_archive_candidate(lode)
+        )
+        terminal_oom_archive = bool(
+            terminal_oom_candidate and prepared.get("already_empty") is True
+        )
+        if is_terminal_failure_kind(lode.get("failure_kind")) and not terminal_oom_archive:
+            if terminal_oom_candidate and prepared.get("ok") is not True:
+                return {
+                    "outcome": "refused",
+                    "reason": prepared.get("reason", "ownership_unavailable"),
+                    "action_id": action_id,
+                    "detail": prepared.get("error"),
+                }
             return {"outcome": "refused", "reason": "terminal_failure", "action_id": action_id}
         if key in self.runner_results or key in self.pending_disconnects:
             return {
@@ -2158,7 +2199,7 @@ class Server:
         if (
             lode.get("run_generation") != expected_generation
             or lode.get("stage") != stage
-            or is_terminal_failure_kind(lode.get("failure_kind"))
+            or (is_terminal_failure_kind(lode.get("failure_kind")) and not terminal_oom_archive)
             or _pending_action_file_exists(lode_id)
             or (
                 prepared.get("safety_snapshot") is not None
@@ -2173,6 +2214,7 @@ class Server:
                         "pid",
                         "oom_scope",
                         "failure_kind",
+                        "worktree_path",
                     )
                 }
             )
@@ -2590,6 +2632,11 @@ class Server:
             and lode_id not in self.lode_clients
             and all(lode.get(field) is None for field in ("tmux_pane", "pid", "oom_scope"))
         )
+        stale_oom_scope = bool(
+            action_type == "archive"
+            and lode_id not in self.lode_clients
+            and is_terminal_oom_scope_archive_candidate(lode)
+        )
         self.action_acceptances[lode_id] = (
             action_id,
             binding,
@@ -2601,7 +2648,9 @@ class Server:
             try:
                 ownership = None
                 source_digest = None
-                if not already_empty:
+                if stale_oom_scope:
+                    _prove_terminal_oom_scope_archiveable(snapshot)
+                if not already_empty and not stale_oom_scope:
                     if generation is None:
                         raise RuntimeError("active action has no run generation")
                     source_path = actions.run_ownership_path(lode_id, generation)
@@ -2611,7 +2660,7 @@ class Server:
                         raise RuntimeError("generation ownership is absent")
                 durability = None
                 if action_type in {"kill", "archive"}:
-                    required = not already_empty
+                    required = not (already_empty or stale_oom_scope)
                     if required:
                         preflight = self._durability_observation(
                             lode_id,
@@ -2645,7 +2694,7 @@ class Server:
                     "ownership": ownership,
                     "source_digest": source_digest,
                     "durability": durability,
-                    "already_empty": already_empty,
+                    "already_empty": already_empty or stale_oom_scope,
                     "safety_snapshot": {
                         field: snapshot.get(field)
                         for field in (
@@ -2656,6 +2705,7 @@ class Server:
                             "pid",
                             "oom_scope",
                             "failure_kind",
+                            "worktree_path",
                         )
                     },
                 }

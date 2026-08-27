@@ -298,10 +298,12 @@ a new lode if it still needs to run. Restart remains the recovery when ownership
 available.
 
 `hop lode archive` refuses unless the lode record's `active` flag is false and its
-recorded `tmux_pane`, `pid`, and `oom_scope` fields are all empty. This checks the
-lode record, not the machine: a recorded handle to a pane that has already been
-killed still blocks archive, because the command reads recorded fields and does
-not probe the pane or process. The refusal names the fields that blocked it.
+recorded `tmux_pane`, `pid`, and `oom_scope` fields are all empty. The one narrow
+exception is an OOM-terminal lode with no pane or PID: archive may proceed only
+when its scope name exactly matches the recorded generation, `systemctl` proves
+that scope absent, and the recorded worktree is absent. The server repeats that
+proof before accepting the archive action. A live, unknown, or mismatched scope
+still refuses; no command treats a missing pane or process as sufficient evidence.
 
 Kill a lode (the pane and process go; the worktree and branch are retained):
 

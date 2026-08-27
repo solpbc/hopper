@@ -2863,6 +2863,109 @@ def test_lode_archive_refuses_pid_only_and_names_no_other_blockers(capsys):
     assert "oom_scope" not in output
 
 
+def _terminal_oom_scope_lode() -> dict:
+    lode_id = "abcd2345"
+    generation = "b" * 32
+    return {
+        "id": lode_id,
+        "stage": "mill",
+        "state": "error",
+        "failure_kind": "oom",
+        "active": False,
+        "tmux_pane": None,
+        "pid": None,
+        "oom_scope": hopper_cli.oom.scope_unit_name(lode_id, generation),
+        "run_generation": generation,
+    }
+
+
+def test_terminal_oom_scope_archive_requires_absent_scope_and_worktree(tmp_path: Path):
+    lode = _terminal_oom_scope_lode()
+    missing_worktree = tmp_path / "missing-worktree"
+
+    with (
+        patch(
+            "hopper.cli.resolve_worktree_path",
+            return_value={"path": missing_worktree, "basis": "recorded", "reason": None},
+        ),
+        patch("hopper.cli.oom.find_systemctl", return_value="systemctl"),
+        patch(
+            "hopper.cli.oom.read_scope_control_group",
+            return_value={"state": "absent", "error": None},
+        ) as scope,
+    ):
+        assert hopper_cli._terminal_oom_scope_is_archiveable(lode) is True
+
+    scope.assert_called_once_with("systemctl", lode["oom_scope"])
+
+
+def test_lode_archive_allows_only_proven_absent_terminal_oom_scope(capsys):
+    lode = _terminal_oom_scope_lode()
+    response = {
+        "type": "lode_action_ack",
+        "outcome": "completed",
+        "disposition": "archived",
+        "status": "Archived lode abcd2345; worktree retained",
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.cli._terminal_oom_scope_is_archiveable", return_value=True),
+        patch("hopper.client.archive_lode", return_value=response) as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 0
+
+    archive.assert_called_once()
+    assert "Archived lode abcd2345" in capsys.readouterr().out
+
+
+def test_lode_archive_explains_unproven_terminal_oom_scope(capsys):
+    lode = _terminal_oom_scope_lode()
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.cli._terminal_oom_scope_is_archiveable", return_value=False),
+        patch("hopper.client.archive_lode") as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 1
+
+    archive.assert_not_called()
+    output = capsys.readouterr().out
+    assert "exact scope and worktree" in output
+    assert "does not probe the live pane" not in output
+
+
+def test_lode_archive_refuses_mismatched_terminal_oom_scope(capsys):
+    lode = _terminal_oom_scope_lode()
+    lode["oom_scope"] = "hopper-other.scope"
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.archive_lode") as archive,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 1
+
+    archive.assert_not_called()
+    assert "oom_scope" in capsys.readouterr().out
+
+
+def test_lode_archive_routes_terminal_oom_scope_to_its_host_without_local_probe():
+    lode = _terminal_oom_scope_lode()
+    resolved = {
+        "outcome": "found",
+        "canonical_id": lode["id"],
+        "lode": lode,
+        "host": "fedora.local",
+    }
+    with (
+        patch("hopper.cli._resolve_lode_once", return_value=resolved),
+        patch("hopper.cli._terminal_oom_scope_is_archiveable") as local_probe,
+        patch("hopper.cli._run_remote_cli", return_value=0) as remote,
+    ):
+        assert cmd_lode(["archive", "abcd2345"]) == 0
+
+    local_probe.assert_not_called()
+    assert remote.call_args.args[0] == "fedora.local"
+    assert remote.call_args.args[1][:3] == ["lode", "archive", "abcd2345"]
+
+
 def test_lode_kill_reports_delivery_failure(capsys):
     lode = {"id": "test1234", "stage": "mill", "state": "running", "active": True}
     with patch("hopper.cli.require_server", return_value=None):

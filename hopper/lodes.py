@@ -60,7 +60,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hopper import config
+from hopper import config, oom
 from hopper.coder import DEFAULT_CODER_PROVIDER, validate_coder_provider
 from hopper.tmux import Liveness, pane_liveness
 
@@ -1420,6 +1420,27 @@ def format_park_status(reason: str, lode_id: str) -> str:
 def is_terminal_failure_kind(failure_kind: str | None) -> bool:
     """Return whether failure_kind latches automatic runner launch."""
     return failure_kind in TERMINAL_FAILURE_KINDS
+
+
+def is_terminal_oom_scope_archive_candidate(lode: dict) -> bool:
+    """Return whether an OOM-terminal lode has only a potentially stale scope handle."""
+    lode_id = lode.get("id")
+    generation = lode.get("run_generation")
+    scope = lode.get("oom_scope")
+    if (
+        not is_canonical_lode_id(lode_id)
+        or not isinstance(generation, str)
+        or not isinstance(scope, str)
+        or lode.get("state") != "error"
+        or lode.get("failure_kind") != "oom"
+        or lode.get("active")
+        or any(lode.get(field) is not None for field in ("tmux_pane", "pid"))
+    ):
+        return False
+    try:
+        return scope == oom.scope_unit_name(lode_id, generation)
+    except ValueError:
+        return False
 
 
 def format_terminal_failure_status(failure_kind: str, lode_id: str) -> str:
