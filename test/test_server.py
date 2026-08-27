@@ -8178,6 +8178,22 @@ def test_server_write_locks_follow_client_lifecycle(socket_path):
     stop_conn.close.assert_called_once()
 
 
+def test_server_send_response_evicts_connection_on_partial_send_failure(socket_path):
+    """A partial sendall (e.g. the per-connection 2.0s timeout firing mid-send) must
+    not leave the connection registered for reuse — the next response would land on
+    top of the undelivered fragment and desynchronize every later message on it."""
+    server = Server(socket_path)
+    dead_conn = _mock_client(server)
+    dead_conn.sendall.side_effect = socket.timeout("timed out")
+
+    server._send_response(dead_conn, {"type": "test"})
+
+    with server.lock:
+        assert dead_conn not in server.clients
+        assert dead_conn not in server.write_locks
+    dead_conn.close.assert_called_once()
+
+
 def test_server_write_lock_preserves_jsonl_framing_at_sub_line_granularity(socket_path):
     class InstrumentedLock:
         def __init__(self):

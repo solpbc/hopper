@@ -6982,7 +6982,21 @@ class Server:
             with write_lock:
                 conn.sendall(response.encode("utf-8"))
         except Exception as e:
+            # A partial sendall (e.g. the socket's own 2.0s timeout firing mid-send
+            # on a large payload) leaves the stream desynchronized: bytes already
+            # in flight are not retractable, so any later send on this connection
+            # would be appended onto a truncated fragment. Evict and close rather
+            # than keep it registered for reuse, mirroring _send_to_clients' dead
+            # client handling.
             logger.debug(f"Failed to send response: {e}")
+            with self.lock:
+                if conn in self.clients:
+                    self.clients.remove(conn)
+                self.write_locks.pop(conn, None)
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _event_loop(self) -> None:
         """Dedicated thread that serializes state mutations and snapshot reads.
