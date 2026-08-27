@@ -461,8 +461,9 @@ class TestBaseRunnerActivityMonitor:
             patch(
                 "hopper.runner.trust_claude_workspace",
                 side_effect=WorkspaceTrustError("config is locked"),
-            ),
+            ) as trust,
             patch("hopper.runner.subprocess.Popen") as launch,
+            patch("hopper.runner.time.sleep") as sleep,
         ):
             result = runner._run_claude()
 
@@ -471,6 +472,33 @@ class TestBaseRunnerActivityMonitor:
             "Failed to pre-trust Claude workspace: config is locked",
         )
         launch.assert_not_called()
+        assert trust.call_count == runner_module.WORKSPACE_TRUST_MAX_ATTEMPTS
+        assert sleep.call_count == runner_module.WORKSPACE_TRUST_MAX_ATTEMPTS - 1
+
+    def test_run_claude_retries_pretrust_and_recovers_from_transient_lock_contention(self):
+        runner = self._make_runner()
+        proc = MagicMock(returncode=0, stderr=None)
+        attempts = []
+
+        def trust_workspace(cwd, env):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < runner_module.WORKSPACE_TRUST_MAX_ATTEMPTS:
+                raise WorkspaceTrustError("timed out waiting for Claude config lock")
+            return Path("/repo")
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["claude"], "/repo")),
+            patch("hopper.runner.trust_claude_workspace", side_effect=trust_workspace),
+            patch("hopper.runner.subprocess.Popen", return_value=proc),
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+            patch("hopper.runner.time.sleep") as sleep,
+        ):
+            assert runner._run_claude() == (0, None)
+
+        assert len(attempts) == runner_module.WORKSPACE_TRUST_MAX_ATTEMPTS
+        assert sleep.call_count == runner_module.WORKSPACE_TRUST_MAX_ATTEMPTS - 1
+        sleep.assert_called_with(runner_module.WORKSPACE_TRUST_RETRY_BACKOFF_SEC)
 
     def test_current_binding_refusal_starts_no_provider_process(self):
         runner = self._make_runner()

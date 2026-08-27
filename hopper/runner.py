@@ -61,6 +61,8 @@ WORKTREE_PUBLICATION_TIMEOUT_SEC = 15.0
 DURABLE_CONFIRMATION_TIMEOUT_SEC = 1.0
 DURABLE_CONFIRMATION_POLL_INTERVAL_SEC = 0.05
 PS_SCAN_TIMEOUT_SEC = 5.0
+WORKSPACE_TRUST_MAX_ATTEMPTS = 3
+WORKSPACE_TRUST_RETRY_BACKOFF_SEC = 2.0
 
 
 class StageDriverProtocol(Enum):
@@ -665,15 +667,27 @@ class BaseRunner:
         logger.debug(f"Running: {' '.join(cmd[:3])}...")
 
         if self.driver.requires_workspace_trust():
-            try:
-                trust_root = trust_claude_workspace(cwd, env)
-                if trust_root is not None:
-                    logger.debug(
-                        f"Claude workspace pre-trusted lode={self.lode_id} path={trust_root}"
-                    )
-            except WorkspaceTrustError as exc:
-                message = f"Failed to pre-trust Claude workspace: {exc}"
-                logger.error(f"workspace trust failed lode={self.lode_id}: {exc}")
+            trust_error: WorkspaceTrustError | None = None
+            for attempt in range(1, WORKSPACE_TRUST_MAX_ATTEMPTS + 1):
+                try:
+                    trust_root = trust_claude_workspace(cwd, env)
+                    trust_error = None
+                    if trust_root is not None:
+                        logger.debug(
+                            f"Claude workspace pre-trusted lode={self.lode_id} path={trust_root}"
+                        )
+                    break
+                except WorkspaceTrustError as exc:
+                    trust_error = exc
+                    if attempt < WORKSPACE_TRUST_MAX_ATTEMPTS:
+                        logger.warning(
+                            f"workspace trust attempt {attempt}/{WORKSPACE_TRUST_MAX_ATTEMPTS} "
+                            f"failed lode={self.lode_id}: {exc}; retrying"
+                        )
+                        time.sleep(WORKSPACE_TRUST_RETRY_BACKOFF_SEC)
+            if trust_error is not None:
+                message = f"Failed to pre-trust Claude workspace: {trust_error}"
+                logger.error(f"workspace trust failed lode={self.lode_id}: {trust_error}")
                 return 1, message
 
         if not self._admit_stage_start_before_launch():
