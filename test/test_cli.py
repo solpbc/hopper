@@ -2280,6 +2280,88 @@ def test_lode_restart_pending_completion_uses_retry_not_stage_reset(capsys):
     assert "Completed durable teardown" in capsys.readouterr().out
 
 
+def test_lode_restart_shipped_cleanup_blocked_completion_uses_retry(capsys):
+    action_id = "a" * 32
+    generation = "b" * 32
+    lode = {
+        "id": "abcd2345",
+        "stage": "shipped",
+        "state": "teardown",
+        "active": False,
+        "run_generation": generation,
+        "pending_action": {
+            "action_id": action_id,
+            "expected_generation": generation,
+            "action_type": "completion",
+            "target_disposition": "shipped_archived",
+            "force_consent": False,
+            "stage": "ship",
+            "phase": "cleanup_blocked",
+            "recovery": {"kind": "cleanup"},
+        },
+    }
+    with (
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.submit_lode_action",
+            return_value={
+                "type": "lode_action_ack",
+                "outcome": "completed",
+                "disposition": "shipped_archived",
+                "status": "Completed durable teardown for abcd2345 (shipped archived)",
+            },
+        ) as retry,
+        patch("hopper.client.restart_lode") as restart,
+    ):
+        assert cmd_lode(["restart", "abcd2345"]) == 0
+
+    retry.assert_called_once_with(
+        config.server_socket_path(),
+        action_id=action_id,
+        lode_id="abcd2345",
+        expected_generation=generation,
+        action_type="completion",
+        target_disposition="shipped_archived",
+        force_consent=False,
+        stage="shipped",
+        wait_for_disposition=True,
+    )
+    restart.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["complete", "output_blocked", "containment_blocked", "ship_blocked", "durability_blocked"],
+)
+def test_lode_restart_shipped_refuses_noncleanup_pending_completion(phase, capsys):
+    lode = {
+        "id": "test1234",
+        "stage": "shipped",
+        "state": "teardown",
+        "active": False,
+        "run_generation": "b" * 32,
+        "pending_action": {
+            "action_id": "a" * 32,
+            "expected_generation": "b" * 32,
+            "action_type": "completion",
+            "target_disposition": "shipped_archived",
+            "force_consent": False,
+            "stage": "ship",
+            "phase": phase,
+            "recovery": {"kind": "cleanup"},
+        },
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.submit_lode_action") as retry,
+    ):
+        assert cmd_lode(["restart", "test1234"]) == 1
+
+    retry.assert_not_called()
+    assert "shipped" in capsys.readouterr().out.lower()
+
+
 def test_lode_repair_output_sends_exact_bytes_and_record_identity(capsys):
     data = b"accepted bytes\n"
     record = {

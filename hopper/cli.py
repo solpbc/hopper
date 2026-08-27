@@ -3605,6 +3605,24 @@ def _add_action_identity_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-generation", help=argparse.SUPPRESS)
 
 
+def _is_shipped_cleanup_retry(lode: dict) -> bool:
+    """Return whether a lode snapshot names an exact blocked ship-cleanup retry."""
+    pending = lode.get("pending_action")
+    recovery = pending.get("recovery") if isinstance(pending, dict) else None
+    return bool(
+        lode.get("stage") == "shipped"
+        and isinstance(pending, dict)
+        and pending.get("action_type") == "completion"
+        and pending.get("stage") == "ship"
+        and pending.get("target_disposition") == "shipped_archived"
+        and pending.get("force_consent") is False
+        and pending.get("phase") == "cleanup_blocked"
+        and pending.get("expected_generation") == lode.get("run_generation")
+        and isinstance(recovery, dict)
+        and recovery.get("kind") in {"cleanup", "spawn"}
+    )
+
+
 def _manual_action_identity(parsed, lode: dict, verb: str) -> dict | None:
     """Bind one CLI invocation without retargeting a forwarded identity."""
     supplied_id = getattr(parsed, "action_id", None)
@@ -4734,7 +4752,7 @@ def cmd_lode(args: list[str]) -> int:
         lode_id = resolved["canonical_id"]
         lode = resolved["lode"]
         stage = lode.get("stage", "")
-        if stage not in ("mill", "refine", "ship"):
+        if stage not in ("mill", "refine", "ship") and not _is_shipped_cleanup_retry(lode):
             print(f"Cannot restart: lode {lode_id} stage is {stage}.")
             print(f"Check its current state with: hop lode status {lode_id}")
             return 1

@@ -993,7 +993,7 @@ def repair_quarantined_worktree(provenance: dict, quarantine: dict) -> dict:
     if result.returncode != 0:
         return {
             "state": "retained",
-            "error": result.stderr.strip() or "git worktree repair failed",
+            "error": "git worktree repair did not complete",
         }
     validation = revalidate_worktree_provenance(provenance, worktree_path=target)
     if validation["state"] != "match":
@@ -1067,7 +1067,7 @@ def remove_quarantined_worktree(repo_identity: dict, quarantine: dict) -> dict:
     )
     if not Path(target).exists() and post_registration == "absent":
         return {"state": "removed", "error": None}
-    detail = result.stderr.strip() or "non-forcing git worktree removal did not complete"
+    detail = "non-forcing git worktree removal did not complete"
     return {"state": "retained", "error": detail}
 
 

@@ -353,6 +353,149 @@ def _blocked_output_record(
     return record
 
 
+def _blocked_ship_cleanup_record(marker_name: str) -> dict:
+    record = _pending_completion_record(stage="ship")
+    _earn_degraded_containment_proof(record)
+    for name in (
+        "containment",
+        "ship_landing",
+        "quarantine_rename",
+        "worktree_repair",
+        "cleanup_authorization",
+        "lode_mutation",
+    ):
+        _complete_marker(record, name)
+    if marker_name != "archive":
+        _complete_marker(record, "archive")
+        _complete_marker(record, "backlog")
+        record["ship"]["archive_published"] = True
+    if marker_name == "branch_delete":
+        _complete_marker(record, "worktree_remove")
+        record["ship"]["quarantine"]["removal_outcome"] = "removed"
+    actions.transition_marker(record, marker_name, "intent")
+    actions.transition_marker(
+        record,
+        marker_name,
+        "blocked",
+        attempt_id=record["markers"][marker_name]["attempt_id"],
+        detail="cleanup interrupted",
+    )
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "cleanup",
+        "message": "cleanup interrupted",
+        "command": actions.recovery_command(record, "cleanup"),
+    }
+    actions.write_pending_action(record)
+    return record
+
+
+def _shipped_cleanup_retry_message(record: dict) -> dict:
+    return {
+        "type": "lode_action",
+        "action_id": record["action_id"],
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_type": "completion",
+        "target_disposition": "shipped_archived",
+        "force_consent": False,
+        "stage": "shipped",
+        "wait_for_disposition": True,
+    }
+
+
+def _run_cleanup_test_git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _real_blocked_ship_cleanup_record(tmp_path: Path, marker_name: str) -> dict:
+    try:
+        subprocess.run(["git", "--version"], check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        pytest.skip("git not on PATH")
+
+    project = tmp_path / "ship-cleanup-project"
+    project.mkdir()
+    _run_cleanup_test_git(project, "init", "-b", "main")
+    _run_cleanup_test_git(project, "config", "user.email", "test@example.com")
+    _run_cleanup_test_git(project, "config", "user.name", "Test User")
+    (project / "README.md").write_text("init\n")
+    _run_cleanup_test_git(project, "add", "README.md")
+    _run_cleanup_test_git(project, "commit", "-m", "init")
+
+    lode_id = "abcd2345"
+    worktree = tmp_path / "ship-cleanup-worktree"
+    _run_cleanup_test_git(
+        project, "worktree", "add", "-b", f"hopper-{lode_id}", str(worktree), "main"
+    )
+    provenance = git.capture_worktree_provenance(project, worktree)
+    record = _pending_completion_record(lode_id=lode_id, stage="ship")
+    quarantine = {
+        "original_path": str(worktree),
+        "quarantine_path": str(tmp_path / f".{lode_id}-quarantine-{record['action_id']}"),
+        "expected_identity": provenance["worktree"]["identity"],
+        "registration_repaired": False,
+        "removal_outcome": "pending",
+        "branch_outcome": "pending",
+    }
+    assert git.quarantine_worktree(provenance, quarantine)["state"] == "renamed"
+    assert git.repair_quarantined_worktree(provenance, quarantine)["state"] == "repaired"
+    assert git.authorize_quarantine_cleanup(provenance, quarantine, base_ref="main") == {
+        "authorized": True,
+        "error": None,
+    }
+
+    record["ship"].update(
+        provenance=provenance,
+        landing={
+            "cause": "ancestry_contained",
+            "base_ref": "main",
+            "detail": "landed",
+            "accepted": True,
+        },
+        archive_published=True,
+        quarantine={**quarantine, "registration_repaired": True},
+    )
+    _earn_degraded_containment_proof(record)
+    for name in (
+        "containment",
+        "ship_landing",
+        "quarantine_rename",
+        "worktree_repair",
+        "cleanup_authorization",
+        "lode_mutation",
+        "archive",
+        "backlog",
+    ):
+        _complete_marker(record, name)
+    if marker_name == "branch_delete":
+        assert git.remove_quarantined_worktree(provenance, quarantine)["state"] == "removed"
+        _complete_marker(record, "worktree_remove")
+        record["ship"]["quarantine"]["removal_outcome"] = "removed"
+    actions.transition_marker(record, marker_name, "intent")
+    actions.transition_marker(
+        record,
+        marker_name,
+        "blocked",
+        attempt_id=record["markers"][marker_name]["attempt_id"],
+        detail="cleanup interrupted",
+    )
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "cleanup",
+        "message": "cleanup interrupted",
+        "command": actions.recovery_command(record, "cleanup"),
+    }
+    actions.write_pending_action(record)
+    return record
+
+
 def _repair_output_message(record: dict, data=b"accepted\n") -> dict:
     return {
         "type": "lode_repair_output",
@@ -4895,6 +5038,169 @@ def test_retained_ship_branch_cleanup_completes_and_clears_pending_action(socket
         "cleanup_failure": None,
         "marker_detail": reason,
     }
+
+
+def test_completion_target_maps_shipped_only_for_cleanup_retry():
+    assert Server._completion_target("mill") == "advance_refine"
+    assert Server._completion_target("refine") == "advance_ship"
+    assert Server._completion_target("ship") == "shipped_archived"
+    assert Server._completion_target("shipped") is None
+    assert Server._completion_target("shipped", shipped_retry=True) == "shipped_archived"
+
+
+@pytest.mark.parametrize(
+    ("marker_name", "archived"),
+    [("archive", False), ("worktree_remove", True), ("branch_delete", True)],
+)
+def test_shipped_cleanup_retry_reaches_retry_for_matching_completion(
+    socket_path, make_lode, marker_name, archived
+):
+    record = _blocked_ship_cleanup_record(marker_name)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="shipped",
+        state="teardown",
+        active=False,
+        run_generation=record["expected_generation"],
+        archive_action_id=record["action_id"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    if archived:
+        server.archived_lodes = [lode]
+    else:
+        server.lodes = [lode]
+    conn = _mock_client(server)
+
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(_shipped_cleanup_retry_message(record), conn)
+
+    retry.assert_called_once_with(record["lode_id"], None)
+    assert server.action_waiters == {record["action_id"]: [(conn, None)]}
+
+
+@pytest.mark.parametrize(
+    "phase", ["output_blocked", "containment_blocked", "ship_blocked", "durability_blocked"]
+)
+def test_shipped_noncleanup_completion_remains_refused(socket_path, make_lode, phase):
+    record = _blocked_ship_cleanup_record("worktree_remove")
+    record["phase"] = phase
+    actions.write_pending_action(record)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="shipped",
+        state="teardown",
+        active=False,
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    server.archived_lodes = [lode]
+    conn = _mock_client(server)
+
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(_shipped_cleanup_retry_message(record), conn)
+
+    retry.assert_not_called()
+    assert _decode_mock_response(conn)["reason"] == "invalid_action"
+
+
+def test_shipped_completion_without_pending_action_remains_refused(socket_path, make_lode):
+    lode = make_lode(
+        id="abcd2345",
+        stage="shipped",
+        state="teardown",
+        active=False,
+        run_generation=TEST_RUN_GENERATION,
+    )
+    server = Server(socket_path)
+    server.archived_lodes = [lode]
+    conn = _mock_client(server)
+    message = {
+        "type": "lode_action",
+        "action_id": "c" * 32,
+        "lode_id": lode["id"],
+        "expected_generation": TEST_RUN_GENERATION,
+        "action_type": "completion",
+        "target_disposition": "shipped_archived",
+        "force_consent": False,
+        "stage": "shipped",
+        "wait_for_disposition": True,
+    }
+
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(message, conn)
+
+    retry.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "refused"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("action_id", "d" * 32), ("expected_generation", "d" * 32)]
+)
+def test_shipped_cleanup_completion_identity_mismatch_remains_refused(
+    socket_path, make_lode, field, value
+):
+    record = _blocked_ship_cleanup_record("worktree_remove")
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="shipped",
+        state="teardown",
+        active=False,
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    server.archived_lodes = [lode]
+    conn = _mock_client(server)
+    message = _shipped_cleanup_retry_message(record)
+    message[field] = value
+
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(message, conn)
+
+    retry.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "refused"
+    assert actions.load_pending_action(record["lode_id"])["action_id"] == record["action_id"]
+
+
+@pytest.mark.parametrize("marker_name", ["worktree_remove", "branch_delete"])
+def test_shipped_cleanup_restart_finishes_real_quarantine_cleanup(
+    socket_path, make_lode, tmp_path, marker_name
+):
+    record = _real_blocked_ship_cleanup_record(tmp_path, marker_name)
+    archived = make_lode(
+        id=record["lode_id"],
+        stage="shipped",
+        state="teardown",
+        active=False,
+        run_generation=record["expected_generation"],
+        archive_action_id=record["action_id"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    server = Server(socket_path)
+    server.archived_lodes = [archived]
+    conn = _mock_client(server)
+    completed = []
+    real_clear = server._clear_completed_action
+
+    def capture_completed_record(completed_record):
+        completed.append(copy.deepcopy(completed_record))
+        real_clear(completed_record)
+
+    with patch.object(server, "_clear_completed_action", side_effect=capture_completed_record):
+        server._handle_lode_action(_shipped_cleanup_retry_message(record), conn)
+        for _ in range(2 if marker_name == "worktree_remove" else 1):
+            current = actions.load_pending_action(record["lode_id"])
+            assert current is not None
+            step = _join_action_step(server, current, "quarantining")
+            server._handle_action_step_result(step)
+
+    assert len(completed) == 1
+    assert completed[0]["markers"][marker_name]["state"] == "done"
+    assert actions.load_pending_action(record["lode_id"]) is None
+    assert archived["pending_action"] is None
+    assert archived["state"] == "ready"
 
 
 @pytest.mark.parametrize("state", ["anomalous", "unknown"])

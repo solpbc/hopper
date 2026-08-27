@@ -1964,8 +1964,41 @@ class Server:
             save_archived_lodes(self.archived_lodes)
         self.broadcast({"type": "lode_updated", "lode": lode})
 
+    def _shipped_cleanup_retry_lode(
+        self,
+        lode_id: str,
+        action_id,
+        binding: tuple[str, str | None, str, str, bool],
+    ) -> dict | None:
+        """Return the lode only for an exact blocked ship-cleanup retry."""
+        if not _pending_action_file_exists(lode_id):
+            return None
+        try:
+            record = self._load_action_slot(lode_id)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if record is None:
+            return None
+        if (
+            record["action_type"] != "completion"
+            or record["stage"] != "ship"
+            or record["target_disposition"] != "shipped_archived"
+            or record["force_consent"] is not False
+            or record["phase"] != "cleanup_blocked"
+            or record["recovery"]["kind"] not in {"cleanup", "spawn"}
+            or record["action_id"] != action_id
+            or actions.record_binding(record) != binding
+        ):
+            return None
+        lode = self._find_action_lode(lode_id)
+        if lode is None or lode.get("stage") != "shipped":
+            return None
+        return lode
+
     @staticmethod
-    def _completion_target(stage: str) -> str | None:
+    def _completion_target(stage: str, *, shipped_retry: bool = False) -> str | None:
+        if stage == "shipped" and shipped_retry:
+            return "shipped_archived"
         return {
             "mill": "advance_refine",
             "refine": "advance_ship",
@@ -2307,9 +2340,16 @@ class Server:
         if action_type != "completion":
             self._handle_manual_lode_action(message, conn, binding)
             return
+        shipped_cleanup_retry = False
+        if message.get("stage") == "shipped":
+            candidate = self._shipped_cleanup_retry_lode(lode_id, action_id, binding)
+            if candidate is not None:
+                lode = candidate
+                shipped_cleanup_retry = True
         if (
-            message.get("stage") not in STAGES
-            or binding[3] != self._completion_target(message["stage"])
+            (message.get("stage") not in STAGES and not shipped_cleanup_retry)
+            or binding[3]
+            != self._completion_target(message["stage"], shipped_retry=shipped_cleanup_retry)
             or binding[4]
         ):
             self._send_action_ack(
@@ -2337,7 +2377,9 @@ class Server:
             )
             self._send_action_open_result(conn, action_type, result, message)
             return
-        if message.get("stage") != lode.get("stage") or lode.get("stage") not in STAGES:
+        if message.get("stage") != lode.get("stage") or (
+            lode.get("stage") not in STAGES and not shipped_cleanup_retry
+        ):
             self._send_action_ack(
                 conn, outcome="refused", reason="stage_mismatch", action_id=action_id
             )

@@ -1681,6 +1681,70 @@ class TestDurableShipQuarantine:
         )
         assert delete_branch_if_unchanged(provenance, base_ref="main")["state"] == "deleted"
 
+    def test_repair_failure_does_not_expose_git_stderr(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="repair-failure-project")
+        worktree = tmp_path / "repair-failure-worktree"
+        _run_git(project, "worktree", "add", "-b", "hopper-abcd2345", str(worktree), "main")
+        provenance = capture_worktree_provenance(project, worktree)
+        quarantine_path = tmp_path / f".abcd2345-quarantine-{'a' * 32}"
+        quarantine = {
+            "original_path": str(worktree),
+            "quarantine_path": str(quarantine_path),
+            "expected_identity": provenance["worktree"]["identity"],
+        }
+        assert quarantine_worktree(provenance, quarantine)["state"] == "renamed"
+        (quarantine_path / ".git").write_text("broken gitdir\n")
+
+        raw_stderr = []
+        real_run = subprocess.run
+
+        def capture_repair_stderr(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            if args[0][3:5] == ["worktree", "repair"]:
+                raw_stderr.append(result.stderr)
+            return result
+
+        with patch("hopper.git.subprocess.run", side_effect=capture_repair_stderr):
+            result = repair_quarantined_worktree(provenance, quarantine)
+
+        assert result == {"state": "retained", "error": "git worktree repair did not complete"}
+        assert raw_stderr and "unable to locate repository" in raw_stderr[0]
+        assert raw_stderr[0].strip() not in result["error"]
+
+    def test_remove_failure_does_not_expose_git_stderr(self, tmp_path):
+        project = _init_git_repo(tmp_path, name="remove-failure-project")
+        worktree = tmp_path / "remove-failure-worktree"
+        _run_git(project, "worktree", "add", "-b", "hopper-abcd2345", str(worktree), "main")
+        provenance = capture_worktree_provenance(project, worktree)
+        quarantine_path = tmp_path / f".abcd2345-quarantine-{'a' * 32}"
+        quarantine = {
+            "original_path": str(worktree),
+            "quarantine_path": str(quarantine_path),
+            "expected_identity": provenance["worktree"]["identity"],
+        }
+        assert quarantine_worktree(provenance, quarantine)["state"] == "renamed"
+        assert repair_quarantined_worktree(provenance, quarantine)["state"] == "repaired"
+        (quarantine_path / ".git").write_text("broken gitdir\n")
+
+        raw_stderr = []
+        real_run = subprocess.run
+
+        def capture_remove_stderr(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            if args[0][:3] == ["git", "worktree", "remove"]:
+                raw_stderr.append(result.stderr)
+            return result
+
+        with patch("hopper.git.subprocess.run", side_effect=capture_remove_stderr):
+            result = remove_quarantined_worktree(provenance, quarantine)
+
+        assert result == {
+            "state": "retained",
+            "error": "non-forcing git worktree removal did not complete",
+        }
+        assert raw_stderr and "validation failed" in raw_stderr[0]
+        assert raw_stderr[0].strip() not in result["error"]
+
     def test_branch_delete_uses_landing_base_when_local_default_is_stale(self, stale_clone_factory):
         registered, local_sha, _upstream_sha = stale_clone_factory("main")
         branch = "hopper-ac1"
