@@ -8,7 +8,7 @@ import subprocess
 
 from hopper import config
 
-CODER_PROVIDERS = ("codex", "grok")
+CODER_PROVIDERS = ("codex", "grok", "antigravity")
 DEFAULT_CODER_PROVIDER = "codex"
 CODER_CHECK_TIMEOUT_SEC = 5.0
 
@@ -75,10 +75,14 @@ def bootstrap_coder(provider: str, prompt: str, cwd: str, env: dict | None = Non
         from hopper.codex import bootstrap_codex
 
         return bootstrap_codex(prompt, cwd, env=env)
+    if provider == "grok":
+        from hopper.grok import bootstrap_grok
 
-    from hopper.grok import bootstrap_grok
+        return bootstrap_grok(prompt, cwd, env=env)
 
-    return bootstrap_grok(prompt, cwd, env=env)
+    from hopper.antigravity import bootstrap_antigravity
+
+    return bootstrap_antigravity(prompt, cwd, env=env)
 
 
 def run_coder(
@@ -103,10 +107,21 @@ def run_coder(
             env=env,
             on_event=on_event,
         )
+    if provider == "grok":
+        from hopper.grok import run_grok
 
-    from hopper.grok import run_grok
+        return run_grok(
+            prompt,
+            cwd,
+            output_file,
+            session_id,
+            env=env,
+            on_event=on_event,
+        )
 
-    return run_grok(
+    from hopper.antigravity import run_antigravity
+
+    return run_antigravity(
         prompt,
         cwd,
         output_file,
@@ -123,10 +138,14 @@ def coder_failure_message(provider: str, event: dict) -> str | None:
         from hopper.codex import turn_failed_message
 
         return turn_failed_message(event)
+    if provider == "grok":
+        from hopper.grok import grok_failure_message
 
-    from hopper.grok import grok_failure_message
+        return grok_failure_message(event)
 
-    return grok_failure_message(event)
+    from hopper.antigravity import antigravity_failure_message
+
+    return antigravity_failure_message(event)
 
 
 def coder_unavailable_message(provider: str, error: object) -> str:
@@ -141,6 +160,11 @@ def coder_unavailable_message(provider: str, error: object) -> str:
 def coder_check(provider: str) -> dict:
     """Check whether a provider executable is locally runnable without authenticating."""
     provider = validate_coder_provider(provider)
+    if provider == "antigravity":
+        from hopper.antigravity import check_antigravity_ready
+
+        ready, version, error = check_antigravity_ready()
+        return {"provider": provider, "ready": ready, "version": version, "error": error}
     executable = shutil.which(provider)
     if executable is None:
         return {

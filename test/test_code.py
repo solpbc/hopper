@@ -587,6 +587,43 @@ class TestSummarizeEvent:
             == "grok turn done (42 tok)"
         )
 
+    def test_antigravity_reports_lifecycle_and_terminal_events(self):
+        assert _summarize_event({"event": "init"}, "antigravity") == "antigravity session started"
+        assert (
+            _summarize_event(
+                {
+                    "event": "step_update",
+                    "step_update": {"step_type": "agent_response", "state": "ACTIVE"},
+                },
+                "antigravity",
+            )
+            == "antigravity thinking"
+        )
+        assert (
+            _summarize_event(
+                {
+                    "event": "step_update",
+                    "step_update": {"step_type": "tool", "state": "ACTIVE"},
+                },
+                "antigravity",
+            )
+            == "antigravity: tool"
+        )
+        assert (
+            _summarize_event(
+                {
+                    "event": "step_update",
+                    "step_update": {"step_type": "tool", "state": "ERROR"},
+                },
+                "antigravity",
+            )
+            == ""
+        )
+        assert (
+            _summarize_event({"event": "result", "result": {"status": "SUCCESS"}}, "antigravity")
+            == "antigravity turn done"
+        )
+
 
 class TestProgressHeartbeat:
     def test_periodically_emits_summary(self):
@@ -842,4 +879,23 @@ class TestExecHeartbeat:
 
         assert hb.summary(4_000) == "grok: running make ci (3s)"
         hb.on_event({"type": "tool_call_update", "toolCallId": "tool-1", "status": "completed"})
+        assert hb.summary(5_000) is None
+
+    def test_antigravity_tool_step_uses_same_command_heartbeat_semantics(self, monkeypatch):
+        monkeypatch.setattr("hopper.code.current_time_ms", lambda: 1_000)
+        hb = ExecHeartbeat(lambda summary: None, provider="antigravity")
+        hb.on_event(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "tool", "state": "ACTIVE"},
+            }
+        )
+
+        assert hb.summary(4_000) == "antigravity: running tool (3s)"
+        hb.on_event(
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "tool", "state": "ERROR"},
+            }
+        )
         assert hb.summary(5_000) is None

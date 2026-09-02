@@ -307,7 +307,7 @@ def test_validate_lode_driver_data_rejects_invalid_driver():
 def test_create_lode_rejects_unknown_coder_before_writing(temp_config):
     lodes = []
 
-    with pytest.raises(ValueError, match="codex, grok"):
+    with pytest.raises(ValueError, match="codex, grok, antigravity"):
         create_lode(lodes, "test-project", coder_provider="other")
 
     assert lodes == []

@@ -4827,8 +4827,12 @@ def test_completion_spawn_adopts_only_the_fsynced_receipt_pane(socket_path, make
             {"provider": "grok", "session_id": "source-session"},
             {"provider": "grok", "session_id": None},
         ),
+        (
+            {"provider": "antigravity", "session_id": "source-session"},
+            {"provider": "antigravity", "session_id": None},
+        ),
     ],
-    ids=["codex", "grok"],
+    ids=["codex", "grok", "antigravity"],
 )
 @pytest.mark.parametrize("source_driver", ["claude", "codex", "grok"])
 def test_ship_action_archives_and_applies_one_recorded_backlog_disposition(

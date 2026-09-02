@@ -15,6 +15,7 @@ from hopper.coder import (
     bootstrap_coder,
     coder_check,
     coder_default_refusal_lines,
+    coder_failure_message,
     coder_unavailable_message,
     resolve_coder_default,
     run_coder,
@@ -33,6 +34,7 @@ def test_codex_is_the_default():
         (None, ("codex", "built in")),
         ("codex", ("codex", "saved")),
         ("grok", ("grok", "saved")),
+        ("antigravity", ("antigravity", "saved")),
     ],
 )
 def test_resolve_coder_default_uses_builtin_or_saved_provider(temp_config, saved, expected):
@@ -96,13 +98,23 @@ def test_coder_unavailable_message_always_names_provider_and_diagnostic(error, e
 
 @pytest.mark.parametrize("provider", [None, "", "claude", 3])
 def test_validate_coder_provider_rejects_unknown_values(provider):
-    with pytest.raises(ValueError, match="codex, grok"):
+    with pytest.raises(ValueError, match="codex, grok, antigravity"):
         validate_coder_provider(provider)
 
 
 def test_bootstrap_dispatches_to_grok_without_model_configuration():
     with patch("hopper.grok.bootstrap_grok", return_value=(0, "session", None)) as bootstrap:
         result = bootstrap_coder("grok", "prompt", "/tmp", env={"PATH": "/bin"})
+
+    assert result == (0, "session", None)
+    bootstrap.assert_called_once_with("prompt", "/tmp", env={"PATH": "/bin"})
+
+
+def test_bootstrap_dispatches_to_antigravity_with_existing_contract():
+    with patch(
+        "hopper.antigravity.bootstrap_antigravity", return_value=(0, "session", None)
+    ) as bootstrap:
+        result = bootstrap_coder("antigravity", "prompt", "/tmp", env={"PATH": "/bin"})
 
     assert result == (0, "session", None)
     bootstrap.assert_called_once_with("prompt", "/tmp", env={"PATH": "/bin"})
@@ -129,6 +141,40 @@ def test_run_dispatches_to_codex_with_existing_contract():
         env=None,
         on_event=callback,
     )
+
+
+def test_run_dispatches_to_antigravity_with_existing_contract():
+    callback = object()
+    with patch("hopper.antigravity.run_antigravity", return_value=(0, ["agy"])) as run:
+        result = run_coder(
+            "antigravity",
+            "prompt",
+            "/tmp",
+            "/tmp/out.md",
+            "session",
+            on_event=callback,
+        )
+
+    assert result == (0, ["agy"])
+    run.assert_called_once_with(
+        "prompt",
+        "/tmp",
+        "/tmp/out.md",
+        "session",
+        env=None,
+        on_event=callback,
+    )
+
+
+def test_failure_message_dispatches_to_antigravity():
+    event = {"event": "result", "result": {"status": "ERROR"}}
+    with patch(
+        "hopper.antigravity.antigravity_failure_message", return_value="failure"
+    ) as failure_message:
+        result = coder_failure_message("antigravity", event)
+
+    assert result == "failure"
+    failure_message.assert_called_once_with(event)
 
 
 def test_coder_check_reports_missing_executable():
@@ -203,3 +249,18 @@ def test_grok_coder_check_uses_machine_readable_version_without_auth_or_model():
     command = run.call_args.args[0]
     assert command == ["grok", "version", "--json"]
     assert "--model" not in command
+
+
+def test_antigravity_coder_check_delegates_to_provider_readiness():
+    with patch(
+        "hopper.antigravity.check_antigravity_ready", return_value=(True, "agy 1.2.3", "")
+    ) as check:
+        result = coder_check("antigravity")
+
+    assert result == {
+        "provider": "antigravity",
+        "ready": True,
+        "version": "agy 1.2.3",
+        "error": "",
+    }
+    check.assert_called_once_with()

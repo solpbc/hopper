@@ -1760,7 +1760,7 @@ def test_coder_check_rejects_unsupported_provider_with_existing_validation_text(
     assert hopper_cli.cmd_coder(["check", "unsupported"]) == 1
 
     captured = capsys.readouterr()
-    assert captured.out.startswith("error: coder must be one of: codex, grok\n")
+    assert captured.out.startswith("error: coder must be one of: codex, grok, antigravity\n")
     assert "usage: hop coder" in captured.out
 
 

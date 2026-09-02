@@ -147,6 +147,9 @@ class ExecHeartbeat(ProgressHeartbeat):
             if self.provider == "grok":
                 self._on_grok_event(event)
                 return
+            if self.provider == "antigravity":
+                self._on_antigravity_event(event)
+                return
             item = event.get("item")
             if not isinstance(item, dict):
                 return
@@ -183,6 +186,20 @@ class ExecHeartbeat(ProgressHeartbeat):
             with self._lock:
                 self._in_flight.pop(tool_call_id, None)
 
+    def _on_antigravity_event(self, event: dict) -> None:
+        if event.get("event") != "step_update":
+            return
+        step = event.get("step_update")
+        if not isinstance(step, dict) or step.get("step_type") != "tool":
+            return
+        state = step.get("state")
+        if state == "ACTIVE":
+            with self._lock:
+                self._in_flight["tool"] = ("tool", current_time_ms())
+        elif state in {"DONE", "ERROR"}:
+            with self._lock:
+                self._in_flight.pop("tool", None)
+
     def summary(self, now_ms: int) -> str | None:
         """Return the current in-flight command summary, if any."""
         try:
@@ -204,6 +221,25 @@ def _summarize_event(event: dict, provider: str = "codex") -> str:
         return ""
     provider = validate_coder_provider(provider)
     event_type = event.get("type") or "event"
+    if provider == "antigravity":
+        envelope = event.get("event") or "event"
+        if envelope == "init":
+            return "antigravity session started"
+        if envelope == "step_update":
+            step = event.get("step_update")
+            if not isinstance(step, dict):
+                return ""
+            step_type, state = step.get("step_type"), step.get("state")
+            if step_type == "agent_response" and state == "ACTIVE":
+                return "antigravity thinking"
+            if step_type == "tool" and state == "ACTIVE":
+                return "antigravity: tool"
+            return ""
+        if envelope == "result":
+            result = event.get("result")
+            status = result.get("status") if isinstance(result, dict) else None
+            return "antigravity turn done" if status == "SUCCESS" else "antigravity: turn failed"
+        return f"antigravity: {envelope}"
     if provider == "grok":
         if event_type in {"available_commands", "thought", "text", "usage"}:
             return ""

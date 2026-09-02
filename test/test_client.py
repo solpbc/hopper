@@ -256,7 +256,7 @@ def test_server_advertises_additive_coder_capability(server, socket_path):
     )
 
     assert response["type"] == "coder_capabilities"
-    assert response["providers"] == ["codex", "grok"]
+    assert response["providers"] == ["codex", "grok", "antigravity"]
 
 
 def test_connect_with_tmux_location(server_with_tmux, socket_path):

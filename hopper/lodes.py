@@ -30,9 +30,9 @@ Lodes are plain dicts with these fields:
 - archive_action_id: str | None - action that published this archive (default None)
 - codex_thread_id: str | None - Codex thread ID for stage resumption (default None)
 - coder: optional dict - non-Codex refine-stage provider and resumable session:
-    {"provider": "grok", "session_id": str | None}; presence means its session
-    lives in coder.session_id; absence means Codex, whose session lives in
-    codex_thread_id
+    {"provider": <non-Codex coder provider>, "session_id": str | None}; presence
+    means its session lives in coder.session_id; absence means Codex, whose
+    session lives in codex_thread_id
 - last_progress_at: int | None - timestamp of most recent progress heartbeat
 - last_progress_summary: str - short progress summary for UI display
 - last_pane_activity_at: int | None - timestamp of most recent real pane change (default None)
