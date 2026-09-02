@@ -177,8 +177,8 @@ def test_parse_conversation_id_returns_first_nonempty_init_value():
     assert (
         _parse_conversation_id(
             [
-                {"event": "init", "init": {"conversation_id": ""}},
-                {"event": "init", "init": {"conversation_id": CONVERSATION_ID}},
+                {"event": "init", "conversation_id": "", "init": {}},
+                {"event": "init", "conversation_id": CONVERSATION_ID, "init": {}},
             ]
         )
         == CONVERSATION_ID
@@ -188,7 +188,7 @@ def test_parse_conversation_id_returns_first_nonempty_init_value():
 def test_bootstrap_antigravity_returns_conversation_id_from_init():
     proc = MagicMock(returncode=0)
     proc.communicate.return_value = (
-        _line({"event": "init", "init": {"conversation_id": CONVERSATION_ID}}),
+        _line({"event": "init", "conversation_id": CONVERSATION_ID, "init": {}}),
         "",
     )
     with patch("hopper.antigravity.subprocess.Popen", return_value=proc) as popen:
@@ -200,7 +200,10 @@ def test_bootstrap_antigravity_returns_conversation_id_from_init():
 
 def test_bootstrap_antigravity_rejects_missing_conversation_id():
     proc = MagicMock(returncode=0)
-    proc.communicate.return_value = (_line({"event": "init", "init": {}}), "")
+    proc.communicate.return_value = (
+        _line({"event": "init", "init": {}}),
+        "",
+    )  # no top-level conversation_id
     with patch("hopper.antigravity.subprocess.Popen", return_value=proc):
         result = bootstrap_antigravity("prompt", "/work")
 

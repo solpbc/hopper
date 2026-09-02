@@ -67,11 +67,12 @@ def _parse_stream(stdout: str) -> tuple[list[dict], str | None]:
 
 
 def _parse_conversation_id(events: list[dict]) -> str | None:
+    # Verified live: conversation_id is a top-level field on the init event,
+    # a sibling of "init", not nested inside it.
     for event in events:
         if event.get("event") != "init":
             continue
-        init = event.get("init")
-        conversation_id = init.get("conversation_id") if isinstance(init, dict) else None
+        conversation_id = event.get("conversation_id")
         if isinstance(conversation_id, str) and conversation_id:
             return conversation_id
     return None
