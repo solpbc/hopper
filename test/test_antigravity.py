@@ -207,12 +207,16 @@ def test_bootstrap_antigravity_rejects_missing_conversation_id():
     assert result == (1, None, "Antigravity bootstrap did not return a conversation ID")
 
 
-def test_run_antigravity_retains_events_and_writes_final_post_tool_text(tmp_path):
+def test_run_antigravity_retains_events_and_writes_final_result_response(tmp_path):
     output_path = tmp_path / "audit.out.md"
     events = [
         {
             "event": "step_update",
-            "step_update": {"step_type": "agent_response", "state": "DONE", "text": "Before tool."},
+            "step_update": {
+                "step_type": "agent_response",
+                "state": "DONE",
+                "text_delta": "Before tool.",
+            },
         },
         {"event": "step_update", "step_update": {"step_type": "tool", "state": "ACTIVE"}},
         {"event": "step_update", "step_update": {"step_type": "tool", "state": "DONE"}},
@@ -221,10 +225,10 @@ def test_run_antigravity_retains_events_and_writes_final_post_tool_text(tmp_path
             "step_update": {
                 "step_type": "agent_response",
                 "state": "DONE",
-                "text": "All tests pass.",
+                "text_delta": "All tests pass.",
             },
         },
-        {"event": "result", "result": {"status": "SUCCESS"}},
+        {"event": "result", "result": {"status": "SUCCESS", "response": "All tests pass."}},
     ]
     proc = MagicMock(returncode=0)
     proc.stdout = _stream(*events)

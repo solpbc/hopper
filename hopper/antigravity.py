@@ -109,23 +109,18 @@ def _first_failure(events: list[dict]) -> str | None:
 
 
 def _final_text(events: list[dict]) -> str:
-    chunks: list[str] = []
+    # Verified live: the terminal `result` event's `response` field carries the
+    # complete final text. Per-step agent_response updates use `text_delta`, not
+    # `text`, and are incremental — they are not a reliable reconstruction source.
     for event in events:
-        if event.get("event") != "step_update":
+        if event.get("event") != "result":
             continue
-        step = event.get("step_update")
-        if not isinstance(step, dict):
-            continue
-        if step.get("step_type") == "tool":
-            chunks.clear()
-        elif (
-            step.get("step_type") == "agent_response"
-            and step.get("state") == "DONE"
-            and isinstance(step.get("text"), str)
-        ):
-            # The final-response field name awaits verification from a live agy call.
-            chunks.append(step["text"])
-    return "".join(chunks)
+        result = event.get("result")
+        if isinstance(result, dict):
+            response = result.get("response")
+            if isinstance(response, str):
+                return response
+    return ""
 
 
 def _events_path(output_file: str) -> Path:
