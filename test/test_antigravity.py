@@ -204,7 +204,10 @@ def test_bootstrap_antigravity_rejects_missing_conversation_id():
     with patch("hopper.antigravity.subprocess.Popen", return_value=proc):
         result = bootstrap_antigravity("prompt", "/work")
 
-    assert result == (1, None, "Antigravity bootstrap did not return a conversation ID")
+    assert result[0] == 1
+    assert result[1] is None
+    assert "did not return a conversation ID" in result[2]
+    assert "parsed 1 events" in result[2]
 
 
 def test_run_antigravity_retains_events_and_writes_final_result_response(tmp_path):

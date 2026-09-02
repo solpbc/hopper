@@ -204,7 +204,12 @@ def bootstrap_antigravity(
         return 1, None, failure
     conversation_id = _parse_conversation_id(events)
     if conversation_id is None:
-        return 1, None, "Antigravity bootstrap did not return a conversation ID"
+        fallback = (
+            f"Antigravity bootstrap did not return a conversation ID "
+            f"(parsed {len(events)} events, {len(stdout)} raw stdout bytes, "
+            f"{len(stderr)} raw stderr bytes)"
+        )
+        return 1, None, _diagnostic(events, stderr, fallback)
     return 0, conversation_id, None
 
 
