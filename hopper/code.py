@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 sol pbc
 
-"""Code runner - runs a prompt by resuming a lode's selected coder session."""
+"""Code runner - resumes coder sessions, except overgrown Antigravity sessions reset fresh."""
 
 import json
 import logging
@@ -302,8 +302,9 @@ def _summarize_event(event: dict, provider: str = "codex") -> str:
 def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> int:
     """Run a stage prompt through the selected coder for a refine-stage lode.
 
-    Resumes the lode's coder session so that context accumulates across
-    stages. Validates the prompt exists, lode is in refine stage,
+    Resumes the lode's coder session, except Antigravity may bootstrap fresh
+    after reaching its cumulative usage reset threshold. Validates the prompt
+    exists, lode is in refine stage,
     cwd matches the lode worktree, and a coder session ID is present.
     Saves artifacts (<stage>.in.md, <stage>.out.md, <stage>.json) to the
     lode directory and prints the output to stdout.

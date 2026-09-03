@@ -245,7 +245,8 @@ def test_bootstrap_antigravity_emits_events_and_writes_output_on_success(tmp_pat
         },
     ]
     proc = MagicMock(returncode=0)
-    proc.communicate.return_value = ("".join(_line(event) for event in events), "")
+    stdout = "".join(_line(event) for event in events)
+    proc.communicate.return_value = (stdout, "")
     observed = []
 
     with patch("hopper.antigravity.subprocess.Popen", return_value=proc):
@@ -256,13 +257,15 @@ def test_bootstrap_antigravity_emits_events_and_writes_output_on_success(tmp_pat
     assert result == (0, CONVERSATION_ID, None)
     assert observed == events
     assert output_path.read_text() == "reset result"
+    assert (tmp_path / "reset.events.jsonl").read_text() == stdout
 
 
 def test_bootstrap_antigravity_emits_events_without_writing_output_on_failure(tmp_path):
     output_path = tmp_path / "reset.out.md"
     event = {"event": "result", "result": {"status": "ERROR", "message": "denied"}}
     proc = MagicMock(returncode=1)
-    proc.communicate.return_value = (_line(event), "")
+    stdout = _line(event)
+    proc.communicate.return_value = (stdout, "")
     observed = []
 
     with patch("hopper.antigravity.subprocess.Popen", return_value=proc):
@@ -273,6 +276,7 @@ def test_bootstrap_antigravity_emits_events_without_writing_output_on_failure(tm
     assert result == (1, None, "denied")
     assert observed == [event]
     assert not output_path.exists()
+    assert (tmp_path / "reset.events.jsonl").read_text() == stdout
 
 
 def test_bootstrap_antigravity_rejects_missing_conversation_id():

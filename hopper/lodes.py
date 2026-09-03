@@ -1226,8 +1226,8 @@ def update_lode_coder_session(
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("coder session_id must be a non-empty string")
     if usage_total_tokens is not None:
-        if provider == "codex":
-            raise ValueError("Codex sessions do not carry usage_total_tokens")
+        if provider != "antigravity":
+            raise ValueError(f"{provider.capitalize()} sessions do not carry usage_total_tokens")
         if (
             isinstance(usage_total_tokens, bool)
             or not isinstance(usage_total_tokens, int)

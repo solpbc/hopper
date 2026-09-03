@@ -29,9 +29,10 @@ ANTIGRAVITY_RUN_TIMEOUT_SEC = 25 * 60
 ANTIGRAVITY_MODEL = "gemini-3.7-flash-high"
 # Observed live: a resumed conversation's cumulative usage grows from ~4M
 # tokens early to ~118M by round 10 (~12.7M/round average). At that rate,
-# usage would already be ~29M by round 3, so resetting at 20M -- 5x the
-# early-round baseline but only ~17% of the pathological level -- keeps
-# resets genuinely periodic instead of firing once near the end of a lode.
+# usage crosses 20M during round 3, so the fresh bootstrap starts on round 4's
+# dispatch. Resetting at 20M -- 5x the early-round baseline but only ~17% of
+# the pathological level -- keeps resets genuinely periodic instead of firing
+# once near the end of a lode.
 ANTIGRAVITY_CONVERSATION_RESET_TOKENS = 20_000_000
 _READINESS_TIMEOUT_SEC = 5.0
 
@@ -237,6 +238,8 @@ def bootstrap_antigravity(
         return 130, None, None
 
     events, parse_error = _parse_stream(stdout)
+    if output_file:
+        _atomic_write(_events_path(output_file), stdout)
     if on_event:
         for event in events:
             try:

@@ -1152,6 +1152,16 @@ def test_coder_session_rejects_codex_usage(temp_config):
         )
 
 
+def test_coder_session_rejects_grok_usage(temp_config):
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project", coder_provider="grok")
+
+    with pytest.raises(ValueError, match="Grok sessions do not carry usage_total_tokens"):
+        update_lode_coder_session(
+            lodes_list, lode["id"], "grok", "session", usage_total_tokens=1
+        )
+
+
 def test_update_lode_coder_session_not_found(temp_config):
     """update_lode_coder_session returns None for unknown lode."""
     result = update_lode_coder_session([], "nonexistent", "grok", "thread-123")
