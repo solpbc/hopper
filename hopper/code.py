@@ -11,14 +11,27 @@ from collections.abc import Callable
 from pathlib import Path
 
 from hopper import prompt
-from hopper.client import connect, set_lode_progress, set_lode_state, set_lode_status
+from hopper.antigravity import (
+    ANTIGRAVITY_CONVERSATION_RESET_TOKENS,
+    antigravity_usage_total_tokens,
+    bootstrap_antigravity,
+)
+from hopper.client import (
+    connect,
+    set_coder_session,
+    set_lode_progress,
+    set_lode_state,
+    set_lode_status,
+)
 from hopper.coder import coder_failure_message, run_coder, validate_coder_provider
+from hopper.git import get_diff_stat, get_recent_commit_log
 from hopper.lodes import (
     current_time_ms,
     format_duration_ms,
     get_lode_dir,
     get_worktree_dir,
     lode_coder,
+    lode_coder_usage,
 )
 from hopper.projects import find_project
 
@@ -31,6 +44,15 @@ TURN_FAILED_BANNER = """\
 ============================================================
 {provider} TURN FAILED
 {message}
+============================================================
+"""
+
+ANTIGRAVITY_RESET_FAILED_BANNER = """\
+============================================================
+ANTIGRAVITY RESET BOOTSTRAP FAILED
+{message}
+The previous Antigravity conversation was left intact and was not resumed
+this round. Re-run this stage to retry the reset.
 ============================================================
 """
 
@@ -325,6 +347,10 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         else:
             print("Re-run 'hop refine' to bootstrap the coder session.")
         return 1
+    stored_usage = lode_coder_usage(lode_data) if provider == "antigravity" else 0
+    reset_required = (
+        provider == "antigravity" and stored_usage >= ANTIGRAVITY_CONVERSATION_RESET_TOKENS
+    )
 
     # Validate cwd is the lode worktree
     worktree_path = get_worktree_dir(lode_id)
@@ -356,6 +382,26 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         print(f"Prompt not found: prompts/{stage_name}.md")
         return 1
 
+    if reset_required:
+        diff_stat = get_diff_stat(str(cwd)) or "(no diff stat available or no differences reported)"
+        commit_log = (
+            get_recent_commit_log(str(cwd)) or "(no lode commits found or commit log unavailable)"
+        )
+        dispatch_prompt = (
+            "Hopper recap: the prior Antigravity conversation was reset after "
+            "reaching its conversation token budget. Work from the current "
+            "worktree; this recap is context, not a replacement for the stage "
+            "instruction.\n\n"
+            "## Diff stat against the current default branch\n"
+            f"{diff_stat}\n\n"
+            "## Recent lode commits not on the current default branch (up to 10)\n"
+            f"{commit_log}\n\n"
+            "## Stage instruction\n"
+            f"{prompt_text}"
+        )
+    else:
+        dispatch_prompt = prompt_text
+
     # Save input prompt
     lode_dir = get_lode_dir(lode_id)
     version = _next_version(lode_dir, stage_name)
@@ -364,15 +410,15 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     else:
         suffix = f"{stage_name}_{version}"
     input_path = lode_dir / f"{suffix}.in.md"
-    _atomic_write(input_path, prompt_text)
+    _atomic_write(input_path, dispatch_prompt)
 
     set_lode_status(socket_path, lode_id, f"Running {stage_name}")
 
-    # Resume the existing provider session.
+    # Resume the existing provider session, or reset an overgrown Antigravity conversation.
     output_path = lode_dir / f"{suffix}.out.md"
     started_at = current_time_ms()
     hb = ExecHeartbeat(lambda s: set_lode_progress(socket_path, lode_id, s), provider=provider)
-    captured = {"turn_failed": None}
+    captured = {"turn_failed": None, "usage_total_tokens": None}
 
     def _on_event(event):
         hb.on_event(event)
@@ -388,21 +434,63 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
                 captured["turn_failed"] = msg
         except Exception:
             logger.debug("turn.failed capture failed", exc_info=True)
+        if provider == "antigravity":
+            try:
+                usage = antigravity_usage_total_tokens(event)
+                if usage is not None:
+                    captured["usage_total_tokens"] = usage
+            except Exception:
+                logger.debug("usage capture failed", exc_info=True)
 
     hb.start()
     try:
-        exit_code, cmd = run_coder(
-            provider,
-            prompt_text,
-            str(cwd),
-            str(output_path),
-            session_id,
-            on_event=_on_event,
-        )
+        if reset_required:
+            exit_code, new_session_id, reset_error = bootstrap_antigravity(
+                dispatch_prompt,
+                str(cwd),
+                output_file=str(output_path),
+                on_event=_on_event,
+            )
+            cmd = None
+            if exit_code == 0 and not new_session_id:
+                exit_code = 1
+                reset_error = "Antigravity reset bootstrap did not return a conversation ID"
+        else:
+            exit_code, cmd = run_coder(
+                provider,
+                dispatch_prompt,
+                str(cwd),
+                str(output_path),
+                session_id,
+                on_event=_on_event,
+            )
     finally:
         hb.stop()
     finished_at = current_time_ms()
     turn_failed = captured["turn_failed"]
+    captured_usage = captured["usage_total_tokens"]
+    reset_failed = reset_required and exit_code != 0
+
+    if provider == "antigravity":
+        if reset_required:
+            if not reset_failed:
+                assert new_session_id is not None
+                session_id = new_session_id
+                set_coder_session(
+                    socket_path,
+                    lode_id,
+                    provider,
+                    session_id,
+                    usage_total_tokens=captured_usage if captured_usage is not None else 0,
+                )
+        elif captured_usage is not None:
+            set_coder_session(
+                socket_path,
+                lode_id,
+                provider,
+                session_id,
+                usage_total_tokens=stored_usage + captured_usage,
+            )
 
     # Save run metadata
     metadata = {
@@ -414,19 +502,29 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         "exit_code": exit_code,
         "cmd": cmd,
     }
-    if provider == "codex":
+    if reset_required:
+        metadata["dispatch"] = "antigravity_reset_bootstrap"
+        metadata["coder_provider"] = provider
+        metadata["coder_session_id"] = session_id
+        if reset_failed:
+            metadata["reset_bootstrap_failed_message"] = reset_error or (
+                f"Antigravity reset bootstrap failed (exit {exit_code})"
+            )
+    elif provider == "codex":
         metadata["codex_thread_id"] = session_id
     else:
         metadata["coder_provider"] = provider
         metadata["coder_session_id"] = session_id
-    if turn_failed:
+    if turn_failed and not reset_failed:
         metadata["turn_failed_message"] = turn_failed
     meta_path = lode_dir / f"{suffix}.json"
     _atomic_write(meta_path, json.dumps(metadata, indent=2) + "\n")
 
     # Update status with stage result and duration
     duration = format_duration_ms(finished_at - started_at)
-    if exit_code == 0:
+    if reset_failed:
+        status = f"{stage_name} failed: antigravity reset bootstrap"
+    elif exit_code == 0:
         status = f"{stage_name} ran for {duration}"
     elif turn_failed:
         if _is_quota_message(provider, turn_failed):
@@ -438,7 +536,13 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
     set_lode_state(socket_path, lode_id, "running", status)
 
     # Print output if it was written
-    if turn_failed and exit_code != 0:
+    if reset_failed:
+        print(
+            ANTIGRAVITY_RESET_FAILED_BANNER.format(
+                message=reset_error or f"Antigravity reset bootstrap failed (exit {exit_code})"
+            )
+        )
+    elif turn_failed and exit_code != 0:
         print(TURN_FAILED_BANNER.format(provider=provider.upper(), message=turn_failed))
         if provider == "codex" and _is_quota_message(provider, turn_failed):
             print(QUOTA_GUIDANCE)

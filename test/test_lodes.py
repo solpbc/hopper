@@ -47,6 +47,7 @@ from hopper.lodes import (
     load_archived_lodes,
     load_lodes,
     lode_coder,
+    lode_coder_usage,
     lode_driver,
     lode_icon,
     lode_stage_session,
@@ -173,6 +174,21 @@ def test_legacy_lode_defaults_to_codex_session():
         "codex_thread_id": "codex-uuid-1234",
     }
     assert lode_coder(lode) == ("codex", "codex-uuid-1234")
+
+
+def test_lode_coder_usage_defaults_to_zero_and_rejects_invalid_values():
+    assert lode_coder_usage({"codex_thread_id": "thread"}) == 0
+    assert lode_coder_usage({"coder": {"provider": "antigravity", "session_id": None}}) == 0
+    assert (
+        lode_coder_usage(
+            {"coder": {"provider": "antigravity", "session_id": None, "usage_total_tokens": 42}}
+        )
+        == 42
+    )
+    with pytest.raises(ValueError, match="invalid coder usage_total_tokens"):
+        lode_coder_usage(
+            {"coder": {"provider": "antigravity", "session_id": None, "usage_total_tokens": -1}}
+        )
 
 
 def test_lode_coder_session_roundtrip():
@@ -321,6 +337,23 @@ def test_validate_lode_coder_data_accepts_legacy_codex_records():
 def test_validate_lode_coder_data_rejects_malformed_optional_provider():
     with pytest.raises(ValueError, match="invalid coder data"):
         validate_lode_coder_data([{"id": "badlode1", "coder": "grok"}], "active")
+
+
+def test_validate_lode_coder_data_rejects_invalid_usage():
+    with pytest.raises(ValueError, match="invalid coder usage_total_tokens"):
+        validate_lode_coder_data(
+            [
+                {
+                    "id": "badlode1",
+                    "coder": {
+                        "provider": "antigravity",
+                        "session_id": "conversation",
+                        "usage_total_tokens": -1,
+                    },
+                }
+            ],
+            "active",
+        )
 
 
 def test_validate_lode_coder_data_rejects_reencoding_codex():
@@ -1066,6 +1099,57 @@ def test_grok_coder_session_roundtrips_and_codex_path_is_refused(temp_config, mo
     assert loaded[0]["coder"]["session_id"] == "thread-123"
     assert loaded[0]["codex_thread_id"] is None
     assert loaded[0]["updated_at"] == 2000
+
+
+def test_coder_session_usage_is_written_only_when_supplied(temp_config, monkeypatch):
+    timestamps = iter((1000, 2000, 3000))
+    monkeypatch.setattr("hopper.lodes.current_time_ms", lambda: next(timestamps))
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project", coder_provider="antigravity")
+    lode["coder"]["usage_total_tokens"] = 9
+
+    update_lode_coder_session(lodes_list, lode["id"], "antigravity", "session-1")
+    assert lode["coder"] == {
+        "provider": "antigravity",
+        "session_id": "session-1",
+        "usage_total_tokens": 9,
+    }
+
+    update_lode_coder_session(
+        lodes_list, lode["id"], "antigravity", "session-2", usage_total_tokens=14
+    )
+    assert lode["coder"] == {
+        "provider": "antigravity",
+        "session_id": "session-2",
+        "usage_total_tokens": 14,
+    }
+
+
+@pytest.mark.parametrize("usage_total_tokens", [True, -1, "14"])
+def test_coder_session_rejects_invalid_usage_without_persisting(temp_config, usage_total_tokens):
+    lodes_list = []
+    lode = create_lode(lodes_list, "test-project", coder_provider="antigravity")
+    before = json.loads(json.dumps(lode))
+
+    with pytest.raises(ValueError, match="usage_total_tokens must be a non-negative integer"):
+        update_lode_coder_session(
+            lodes_list,
+            lode["id"],
+            "antigravity",
+            "session",
+            usage_total_tokens=usage_total_tokens,
+        )
+
+    assert lode == before
+
+
+def test_coder_session_rejects_codex_usage(temp_config):
+    lodes_list = [{"id": "testid11", "updated_at": 1000, "codex_thread_id": None}]
+
+    with pytest.raises(ValueError, match="Codex sessions do not carry usage_total_tokens"):
+        update_lode_coder_session(
+            lodes_list, "testid11", "codex", "thread-123", usage_total_tokens=1
+        )
 
 
 def test_update_lode_coder_session_not_found(temp_config):

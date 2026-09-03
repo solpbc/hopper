@@ -10139,6 +10139,61 @@ def test_server_refuses_invalid_coder_session_provider(server, make_lode, caplog
     assert "Refusing invalid coder session mutation" in caplog.text
 
 
+def test_server_stores_antigravity_coder_usage(server, temp_config, make_lode):
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="running",
+        coder={"provider": "antigravity", "session_id": "old", "usage_total_tokens": 7},
+    )
+    server.lodes = [lode]
+
+    server._handle_mutation(
+        _runner_message(
+            server,
+            "lode_set_coder_session",
+            "test-id",
+            provider="antigravity",
+            session_id="new",
+            usage_total_tokens=12,
+        ),
+        None,
+    )
+
+    assert lode["coder"] == {
+        "provider": "antigravity",
+        "session_id": "new",
+        "usage_total_tokens": 12,
+    }
+
+
+def test_server_refuses_invalid_antigravity_usage(server, make_lode, caplog):
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="running",
+        coder={"provider": "antigravity", "session_id": "old", "usage_total_tokens": 7},
+    )
+    server.lodes = [lode]
+    before = copy.deepcopy(lode)
+
+    with caplog.at_level(logging.WARNING):
+        server._handle_mutation(
+            _runner_message(
+                server,
+                "lode_set_coder_session",
+                "test-id",
+                provider="antigravity",
+                session_id="new",
+                usage_total_tokens=-1,
+            ),
+            None,
+        )
+
+    assert lode == {**before, "run_generation": TEST_RUN_GENERATION}
+    assert "usage_total_tokens must be a non-negative integer" in caplog.text
+
+
 def test_server_handles_lode_set_claude_started(socket_path, server, temp_config, make_lode):
     """Server handles lode_set_claude_started message."""
     lode = make_lode(id="test-id", stage="mill", state="running")

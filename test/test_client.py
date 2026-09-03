@@ -199,6 +199,31 @@ def test_set_coder_session_routes_by_literal_provider_identity(socket_path):
         )
 
         fire_and_forget.reset_mock()
+        assert (
+            set_coder_session(
+                socket_path,
+                "test-id",
+                "antigravity",
+                "antigravity-session",
+                usage_total_tokens=123,
+            )
+            is True
+        )
+
+        fire_and_forget.assert_called_once_with(
+            socket_path,
+            {
+                "type": "lode_set_coder_session",
+                "lode_id": "test-id",
+                "provider": "antigravity",
+                "session_id": "antigravity-session",
+                "ts": 123,
+                "usage_total_tokens": 123,
+            },
+            2.0,
+        )
+
+        fire_and_forget.reset_mock()
         assert set_coder_session(socket_path, "test-id", "codex", "codex-session") is True
 
         set_codex_thread.assert_called_once_with(socket_path, "test-id", "codex-session", 2.0)

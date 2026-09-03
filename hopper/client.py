@@ -1147,6 +1147,8 @@ def set_coder_session(
     provider: str,
     session_id: str,
     timeout: float = 2.0,
+    *,
+    usage_total_tokens: int | None = None,
 ) -> bool:
     """Set a lode's selected coder session ID (fire-and-forget).
 
@@ -1170,6 +1172,8 @@ def set_coder_session(
         "session_id": session_id,
         "ts": current_time_ms(),
     }
+    if usage_total_tokens is not None:
+        msg["usage_total_tokens"] = usage_total_tokens
     return _fire_and_forget(socket_path, msg, timeout)
 
 

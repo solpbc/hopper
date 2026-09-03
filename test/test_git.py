@@ -34,6 +34,7 @@ from hopper.git import (
     dirty_status,
     get_diff_numstat,
     get_diff_stat,
+    get_recent_commit_log,
     head_sha,
     is_dirty,
     quarantine_dirty_repo,
@@ -1376,6 +1377,35 @@ class TestGetDiffStat:
 
         assert result == ""
         mock_run.assert_not_called()
+
+
+class TestGetRecentCommitLog:
+    def test_returns_commit_log_for_resolved_default_branch(self):
+        mock_result = MagicMock(returncode=0, stdout="abc1234 feature\n")
+
+        with (
+            patch(
+                "hopper.git._resolve_default_branch",
+                return_value=("origin/main", ("origin/main", "origin/master")),
+            ),
+            patch("subprocess.run", return_value=mock_result) as mock_run,
+        ):
+            result = get_recent_commit_log("/worktree")
+
+        assert result == "abc1234 feature"
+        mock_run.assert_called_once_with(
+            ["git", "log", "--oneline", "-10", "origin/main..HEAD"],
+            cwd="/worktree",
+            capture_output=True,
+            text=True,
+        )
+
+    def test_returns_empty_on_error_or_missing_default_branch(self):
+        with patch("hopper.git._resolve_default_branch", return_value=(None, ())):
+            assert get_recent_commit_log("/worktree") == ""
+
+        with patch("hopper.git._resolve_default_branch", side_effect=FileNotFoundError):
+            assert get_recent_commit_log("/worktree") == ""
 
 
 class TestGetDiffNumstat:

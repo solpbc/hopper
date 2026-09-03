@@ -110,6 +110,14 @@ def test_bootstrap_dispatches_to_grok_without_model_configuration():
     bootstrap.assert_called_once_with("prompt", "/tmp", env={"PATH": "/bin"})
 
 
+def test_bootstrap_dispatches_to_codex_with_existing_contract():
+    with patch("hopper.codex.bootstrap_codex", return_value=(0, "session", None)) as bootstrap:
+        result = bootstrap_coder("codex", "prompt", "/tmp", env={"PATH": "/bin"})
+
+    assert result == (0, "session", None)
+    bootstrap.assert_called_once_with("prompt", "/tmp", env={"PATH": "/bin"})
+
+
 def test_bootstrap_dispatches_to_antigravity_with_existing_contract():
     with patch(
         "hopper.antigravity.bootstrap_antigravity", return_value=(0, "session", None)
@@ -156,6 +164,29 @@ def test_run_dispatches_to_antigravity_with_existing_contract():
         )
 
     assert result == (0, ["agy"])
+    run.assert_called_once_with(
+        "prompt",
+        "/tmp",
+        "/tmp/out.md",
+        "session",
+        env=None,
+        on_event=callback,
+    )
+
+
+def test_run_dispatches_to_grok_with_existing_contract():
+    callback = object()
+    with patch("hopper.grok.run_grok", return_value=(0, ["grok"])) as run:
+        result = run_coder(
+            "grok",
+            "prompt",
+            "/tmp",
+            "/tmp/out.md",
+            "session",
+            on_event=callback,
+        )
+
+    assert result == (0, ["grok"])
     run.assert_called_once_with(
         "prompt",
         "/tmp",

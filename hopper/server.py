@@ -6532,9 +6532,12 @@ class Server:
             lode_id = message.get("lode_id")
             provider = message.get("provider")
             session_id = message.get("session_id")
+            usage_total_tokens = message.get("usage_total_tokens")
             if lode_id and provider and session_id:
                 try:
-                    lode = update_lode_coder_session(self.lodes, lode_id, provider, session_id)
+                    lode = update_lode_coder_session(
+                        self.lodes, lode_id, provider, session_id, usage_total_tokens
+                    )
                 except ValueError as error:
                     logger.warning("Refusing invalid coder session mutation: %s", error)
                     return

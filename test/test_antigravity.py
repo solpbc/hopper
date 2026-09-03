@@ -16,6 +16,7 @@ from hopper.antigravity import (
     _parse_conversation_id,
     _resume_command,
     antigravity_failure_message,
+    antigravity_usage_total_tokens,
     bootstrap_antigravity,
     check_antigravity_ready,
     run_antigravity,
@@ -179,6 +180,36 @@ def test_antigravity_failure_message_only_reads_terminal_results():
     )
 
 
+def test_antigravity_usage_total_tokens_reads_only_valid_terminal_usage():
+    assert (
+        antigravity_usage_total_tokens(
+            {
+                "event": "result",
+                "result": {"status": "SUCCESS", "usage": {"total_tokens": 123}},
+            }
+        )
+        == 123
+    )
+    assert (
+        antigravity_usage_total_tokens(
+            {
+                "event": "result",
+                "result": {"status": "ERROR", "usage": {"total_tokens": 7}},
+            }
+        )
+        == 7
+    )
+    for event in (
+        {"event": "step_update"},
+        {"event": "result", "result": {}},
+        {"event": "result", "result": {"usage": {}}},
+        {"event": "result", "result": {"usage": {"total_tokens": True}}},
+        {"event": "result", "result": {"usage": {"total_tokens": -1}}},
+        {"event": "result", "result": {"usage": {"total_tokens": "123"}}},
+    ):
+        assert antigravity_usage_total_tokens(event) is None
+
+
 def test_parse_conversation_id_returns_first_nonempty_init_value():
     assert (
         _parse_conversation_id(
@@ -202,6 +233,46 @@ def test_bootstrap_antigravity_returns_conversation_id_from_init():
 
     assert result == (0, CONVERSATION_ID, None)
     assert popen.call_args.args[0] == _new_command("prompt")
+
+
+def test_bootstrap_antigravity_emits_events_and_writes_output_on_success(tmp_path):
+    output_path = tmp_path / "reset.out.md"
+    events = [
+        {"event": "init", "conversation_id": CONVERSATION_ID, "init": {}},
+        {
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": "reset result"},
+        },
+    ]
+    proc = MagicMock(returncode=0)
+    proc.communicate.return_value = ("".join(_line(event) for event in events), "")
+    observed = []
+
+    with patch("hopper.antigravity.subprocess.Popen", return_value=proc):
+        result = bootstrap_antigravity(
+            "prompt", "/work", output_file=str(output_path), on_event=observed.append
+        )
+
+    assert result == (0, CONVERSATION_ID, None)
+    assert observed == events
+    assert output_path.read_text() == "reset result"
+
+
+def test_bootstrap_antigravity_emits_events_without_writing_output_on_failure(tmp_path):
+    output_path = tmp_path / "reset.out.md"
+    event = {"event": "result", "result": {"status": "ERROR", "message": "denied"}}
+    proc = MagicMock(returncode=1)
+    proc.communicate.return_value = (_line(event), "")
+    observed = []
+
+    with patch("hopper.antigravity.subprocess.Popen", return_value=proc):
+        result = bootstrap_antigravity(
+            "prompt", "/work", output_file=str(output_path), on_event=observed.append
+        )
+
+    assert result == (1, None, "denied")
+    assert observed == [event]
+    assert not output_path.exists()
 
 
 def test_bootstrap_antigravity_rejects_missing_conversation_id():

@@ -44,12 +44,15 @@ def _mock_response(
     scope="build widget",
     provider="codex",
     session_id=THREAD_ID,
+    usage_total_tokens=None,
 ):
-    coder_data = (
-        {"codex_thread_id": session_id}
-        if provider == "codex"
-        else {"coder": {"provider": provider, "session_id": session_id}}
-    )
+    if provider == "codex":
+        coder_data = {"codex_thread_id": session_id}
+    else:
+        coder = {"provider": provider, "session_id": session_id}
+        if usage_total_tokens is not None:
+            coder["usage_total_tokens"] = usage_total_tokens
+        coder_data = {"coder": coder}
     return {
         "type": "connected",
         "tmux": None,
@@ -518,6 +521,171 @@ class TestRunCode:
         assert (session_dir / "audit_2.in.md").exists()
         assert (session_dir / "audit_2.out.md").exists()
         assert (session_dir / "audit_2.json").exists()
+
+    def test_antigravity_usage_accumulates_across_stage_names(self, tmp_path, monkeypatch):
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+        response = _mock_response(
+            provider="antigravity", session_id="conversation", usage_total_tokens=0
+        )
+        saved_usage = []
+        turn_usage = iter((4, 5, 6))
+
+        def mock_run_coder(_provider, _prompt, _cwd, _output_file, _session_id, **kwargs):
+            kwargs["on_event"](
+                {
+                    "event": "result",
+                    "result": {"status": "SUCCESS", "usage": {"total_tokens": next(turn_usage)}},
+                }
+            )
+            return 0, ["agy"]
+
+        def save_session(*_args, **kwargs):
+            saved_usage.append(kwargs["usage_total_tokens"])
+            response["lode"]["coder"]["usage_total_tokens"] = saved_usage[-1]
+            return True
+
+        with (
+            patch("hopper.code.connect", return_value=response),
+            patch(
+                "hopper.code.prompt.load", side_effect=lambda stage, **_kwargs: f"{stage} prompt"
+            ),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
+            patch("hopper.code.set_coder_session", side_effect=save_session),
+        ):
+            for stage_name in ("prep", "design", "implement"):
+                assert run_code("test-sid", Path("/tmp/test.sock"), stage_name, "request") == 0
+
+        assert saved_usage == [4, 9, 15]
+
+    def test_antigravity_reset_bootstraps_with_recap_and_replaces_usage(
+        self, tmp_path, monkeypatch
+    ):
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+        response = _mock_response(
+            provider="antigravity", session_id="old-conversation", usage_total_tokens=20_000_000
+        )
+
+        def bootstrap(dispatch_prompt, _cwd, *, output_file, on_event):
+            assert "files changed: 2" in dispatch_prompt
+            assert "abc1234 saved progress" in dispatch_prompt
+            assert dispatch_prompt.endswith("stage instruction")
+            on_event(
+                {
+                    "event": "result",
+                    "result": {"status": "SUCCESS", "usage": {"total_tokens": 17}},
+                }
+            )
+            Path(output_file).write_text("fresh output")
+            return 0, "new-conversation", None
+
+        with (
+            patch("hopper.code.connect", return_value=response),
+            patch("hopper.code.prompt.load", return_value="stage instruction"),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.get_diff_stat", return_value="files changed: 2"),
+            patch("hopper.code.get_recent_commit_log", return_value="abc1234 saved progress"),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.bootstrap_antigravity", side_effect=bootstrap),
+            patch("hopper.code.run_coder") as run_coder,
+            patch("hopper.code.set_coder_session", return_value=True) as set_session,
+        ):
+            assert run_code("test-sid", Path("/tmp/test.sock"), "audit", "request") == 0
+
+        run_coder.assert_not_called()
+        set_session.assert_called_once_with(
+            Path("/tmp/test.sock"),
+            "test-sid",
+            "antigravity",
+            "new-conversation",
+            usage_total_tokens=17,
+        )
+        assert "stage instruction" in (session_dir / "audit.in.md").read_text()
+        metadata = json.loads((session_dir / "audit.json").read_text())
+        assert metadata["cmd"] is None
+        assert metadata["dispatch"] == "antigravity_reset_bootstrap"
+        assert metadata["coder_session_id"] == "new-conversation"
+
+    def test_antigravity_reset_failure_leaves_existing_session_intact(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+        response = _mock_response(
+            provider="antigravity", session_id="old-conversation", usage_total_tokens=20_000_000
+        )
+
+        with (
+            patch("hopper.code.connect", return_value=response),
+            patch("hopper.code.prompt.load", return_value="stage instruction"),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.get_diff_stat", return_value=""),
+            patch("hopper.code.get_recent_commit_log", return_value=""),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.bootstrap_antigravity", return_value=(124, None, "timed out")),
+            patch("hopper.code.run_coder") as run_coder,
+            patch("hopper.code.set_coder_session") as set_session,
+        ):
+            assert run_code("test-sid", Path("/tmp/test.sock"), "audit", "request") == 124
+
+        run_coder.assert_not_called()
+        set_session.assert_not_called()
+        output = capsys.readouterr().out
+        assert "ANTIGRAVITY RESET BOOTSTRAP FAILED" in output
+        assert "ANTIGRAVITY TURN FAILED" not in output
+        metadata = json.loads((session_dir / "audit.json").read_text())
+        assert metadata["coder_session_id"] == "old-conversation"
+        assert metadata["reset_bootstrap_failed_message"] == "timed out"
+
+    def test_antigravity_reset_without_conversation_id_leaves_existing_session_intact(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+        response = _mock_response(
+            provider="antigravity", session_id="old-conversation", usage_total_tokens=20_000_000
+        )
+
+        with (
+            patch("hopper.code.connect", return_value=response),
+            patch("hopper.code.prompt.load", return_value="stage instruction"),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.get_diff_stat", return_value=""),
+            patch("hopper.code.get_recent_commit_log", return_value=""),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.bootstrap_antigravity", return_value=(0, None, None)),
+            patch("hopper.code.run_coder") as run_coder,
+            patch("hopper.code.set_coder_session") as set_session,
+        ):
+            assert run_code("test-sid", Path("/tmp/test.sock"), "audit", "request") == 1
+
+        run_coder.assert_not_called()
+        set_session.assert_not_called()
+        assert "ANTIGRAVITY RESET BOOTSTRAP FAILED" in capsys.readouterr().out
+        metadata = json.loads((session_dir / "audit.json").read_text())
+        assert metadata["coder_session_id"] == "old-conversation"
+        assert metadata["reset_bootstrap_failed_message"] == (
+            "Antigravity reset bootstrap did not return a conversation ID"
+        )
 
 
 class TestNextVersion:

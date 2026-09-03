@@ -1400,6 +1400,33 @@ def get_diff_stat(worktree_path: str) -> str:
     return ""
 
 
+def get_recent_commit_log(worktree_path: str) -> str:
+    """Get up to 10 recent commit summaries not on the default branch.
+
+    Args:
+        worktree_path: Path to the git worktree.
+
+    Returns:
+        `git log --oneline` output for commits ahead of the default branch,
+        or empty string on error.
+    """
+    try:
+        base_ref, _candidates = _resolve_default_branch(worktree_path, allow_local=True)
+        if base_ref is None:
+            return ""
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-10", f"{base_ref}..HEAD"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
 def get_diff_numstat(worktree_path: str) -> str:
     """Get diff numstat output against the upstream-preferred default branch.
 

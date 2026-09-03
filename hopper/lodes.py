@@ -1189,6 +1189,19 @@ def lode_coder(lode: dict) -> tuple[str, str | None]:
     return provider, session_id
 
 
+def lode_coder_usage(lode: dict) -> int:
+    """Return the lode's stored Antigravity cumulative usage; 0 if absent."""
+    if "coder" not in lode:
+        return 0
+    coder = lode["coder"]
+    if not isinstance(coder, dict):
+        raise ValueError("lode contains invalid coder data")
+    usage = coder.get("usage_total_tokens", 0)
+    if isinstance(usage, bool) or not isinstance(usage, int) or usage < 0:
+        raise ValueError("lode contains invalid coder usage_total_tokens")
+    return usage
+
+
 def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: str) -> dict | None:
     """Update the Codex thread ID on a lode."""
     for lode in lodes:
@@ -1202,12 +1215,25 @@ def update_lode_codex_thread(lodes: list[dict], lode_id: str, codex_thread_id: s
 
 
 def update_lode_coder_session(
-    lodes: list[dict], lode_id: str, provider: str, session_id: str
+    lodes: list[dict],
+    lode_id: str,
+    provider: str,
+    session_id: str,
+    usage_total_tokens: int | None = None,
 ) -> dict | None:
     """Store a session only when it belongs to the lode's selected coder."""
     provider = validate_coder_provider(provider)
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("coder session_id must be a non-empty string")
+    if usage_total_tokens is not None:
+        if provider == "codex":
+            raise ValueError("Codex sessions do not carry usage_total_tokens")
+        if (
+            isinstance(usage_total_tokens, bool)
+            or not isinstance(usage_total_tokens, int)
+            or usage_total_tokens < 0
+        ):
+            raise ValueError("usage_total_tokens must be a non-negative integer")
     if provider == "codex":
         return None
     for lode in lodes:
@@ -1217,6 +1243,8 @@ def update_lode_coder_session(
         if selected_provider != provider:
             return None
         lode["coder"]["session_id"] = session_id
+        if usage_total_tokens is not None:
+            lode["coder"]["usage_total_tokens"] = usage_total_tokens
         touch(lode)
         save_lodes(lodes)
         return lode
@@ -1230,6 +1258,7 @@ def validate_lode_coder_data(lodes: list[dict], source: str) -> None:
             continue
         try:
             lode_coder(lode)
+            lode_coder_usage(lode)
         except ValueError as error:
             raise ValueError(f"{source} contains invalid coder data: {error}") from error
 

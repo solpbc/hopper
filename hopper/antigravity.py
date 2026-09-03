@@ -27,6 +27,12 @@ ANTIGRAVITY_PRINT_TIMEOUT = "20m"
 # has no external bound today; this gives one.
 ANTIGRAVITY_RUN_TIMEOUT_SEC = 25 * 60
 ANTIGRAVITY_MODEL = "gemini-3.7-flash-high"
+# Observed live: a resumed conversation's cumulative usage grows from ~4M
+# tokens early to ~118M by round 10 (~12.7M/round average). At that rate,
+# usage would already be ~29M by round 3, so resetting at 20M -- 5x the
+# early-round baseline but only ~17% of the pathological level -- keeps
+# resets genuinely periodic instead of firing once near the end of a lode.
+ANTIGRAVITY_CONVERSATION_RESET_TOKENS = 20_000_000
 _READINESS_TIMEOUT_SEC = 5.0
 
 
@@ -116,6 +122,22 @@ def antigravity_failure_message(event: dict) -> str | None:
     return "Antigravity turn failed with no status"
 
 
+def antigravity_usage_total_tokens(event: dict) -> int | None:
+    """Return result.usage.total_tokens from a terminal Antigravity result event."""
+    if not isinstance(event, dict) or event.get("event") != "result":
+        return None
+    result = event.get("result")
+    if not isinstance(result, dict):
+        return None
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return None
+    return total
+
+
 def _first_failure(events: list[dict]) -> str | None:
     for event in events:
         if message := antigravity_failure_message(event):
@@ -188,6 +210,9 @@ def bootstrap_antigravity(
     cwd: str,
     env: dict | None = None,
     timeout_sec: float = ANTIGRAVITY_BOOTSTRAP_TIMEOUT_SEC,
+    *,
+    output_file: str | None = None,
+    on_event=None,
 ) -> tuple[int, str | None, str | None]:
     """Create and validate a fresh Antigravity conversation."""
     cmd = _new_command(prompt)
@@ -212,6 +237,12 @@ def bootstrap_antigravity(
         return 130, None, None
 
     events, parse_error = _parse_stream(stdout)
+    if on_event:
+        for event in events:
+            try:
+                on_event(event)
+            except Exception:
+                logger.debug("Failed to process Antigravity bootstrap event", exc_info=True)
     return_code = proc.returncode if proc.returncode is not None else 1
     if return_code != 0:
         return return_code, None, _diagnostic(events, stderr, f"Antigravity exited {return_code}")
@@ -225,6 +256,8 @@ def bootstrap_antigravity(
             f"{len(stderr)} raw stderr bytes)"
         )
         return 1, None, _diagnostic(events, stderr, fallback)
+    if output_file:
+        _atomic_write(Path(output_file), _final_text(events))
     return 0, conversation_id, None
 
 
