@@ -485,12 +485,17 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
                     usage_total_tokens=captured_usage if captured_usage is not None else 0,
                 )
         elif captured_usage is not None:
+            # Live-verified: agy's reported result.usage.total_tokens is already
+            # cumulative for the whole resumed conversation (turn 2 of a fresh
+            # conversation reports turn 1's tokens plus its own, not just its
+            # own) -- store it directly. Adding it to stored_usage would double
+            # count everything from before this round, compounding every turn.
             set_coder_session(
                 socket_path,
                 lode_id,
                 provider,
                 session_id,
-                usage_total_tokens=stored_usage + captured_usage,
+                usage_total_tokens=captured_usage,
             )
 
     # Save run metadata

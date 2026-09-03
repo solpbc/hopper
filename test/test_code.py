@@ -522,7 +522,7 @@ class TestRunCode:
         assert (session_dir / "audit_2.out.md").exists()
         assert (session_dir / "audit_2.json").exists()
 
-    def test_antigravity_usage_accumulates_across_stage_names(self, tmp_path, monkeypatch):
+    def test_antigravity_usage_tracks_latest_total_across_stage_names(self, tmp_path, monkeypatch):
         session_dir = tmp_path / "lodes" / "test-sid"
         worktree = session_dir / "worktree"
         worktree.mkdir(parents=True)
@@ -562,7 +562,10 @@ class TestRunCode:
             for stage_name in ("prep", "design", "implement"):
                 assert run_code("test-sid", Path("/tmp/test.sock"), stage_name, "request") == 0
 
-        assert saved_usage == [4, 9, 15]
+        # agy's own reported usage.total_tokens is already cumulative for the
+        # whole conversation -- stored usage is that value directly, not a
+        # running sum on our side (which would double count every round).
+        assert saved_usage == [4, 5, 6]
 
     def test_antigravity_reset_bootstraps_with_recap_and_replaces_usage(
         self, tmp_path, monkeypatch
