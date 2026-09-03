@@ -16,6 +16,16 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 ANTIGRAVITY_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
+# Live-observed: a growing resumed conversation's turn latency climbs with its
+# cumulative context, and agy's own default (5m) starts silently timing out
+# and retrying well before a real turn is done. Raised, not removed -- this is
+# a symptom mitigation, not a fix for the underlying unbounded-growth cause.
+ANTIGRAVITY_PRINT_TIMEOUT = "20m"
+# Safety net beyond --print-timeout, not the primary mechanism: agy has a known
+# open bug (antigravity-cli#318) where -p can hang indefinitely in some
+# non-TTY/headless conditions even with --print-timeout set. run_antigravity
+# has no external bound today; this gives one.
+ANTIGRAVITY_RUN_TIMEOUT_SEC = 25 * 60
 ANTIGRAVITY_MODEL = "gemini-3.7-flash-high"
 _READINESS_TIMEOUT_SEC = 5.0
 
@@ -30,6 +40,8 @@ def _new_command(prompt: str) -> list[str]:
         "--dangerously-skip-permissions",
         "--model",
         ANTIGRAVITY_MODEL,
+        "--print-timeout",
+        ANTIGRAVITY_PRINT_TIMEOUT,
         "--output-format",
         "stream-json",
     ]
@@ -46,6 +58,8 @@ def _resume_command(prompt: str, conversation_id: str) -> list[str]:
         conversation_id,
         "--model",
         ANTIGRAVITY_MODEL,
+        "--print-timeout",
+        ANTIGRAVITY_PRINT_TIMEOUT,
         "--output-format",
         "stream-json",
     ]
@@ -245,6 +259,7 @@ def run_antigravity(
     session_id: str,
     env: dict | None = None,
     on_event=None,
+    timeout_sec: float = ANTIGRAVITY_RUN_TIMEOUT_SEC,
 ) -> tuple[int, list[str]]:
     """Resume an Antigravity conversation and retain its raw stream."""
     cmd = _resume_command(prompt, session_id)
@@ -252,6 +267,8 @@ def run_antigravity(
     events: list[dict] = []
     stderr_chunks: list[str] = []
     events_path = _events_path(output_file)
+    finished = threading.Event()
+    timed_out = threading.Event()
 
     try:
         proc = subprocess.Popen(
@@ -262,16 +279,31 @@ def run_antigravity(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            process_group=0,
         )
 
         def _drain_stderr() -> None:
             if proc is not None and proc.stderr is not None:
                 stderr_chunks.extend(proc.stderr.readlines())
 
+        def _watchdog() -> None:
+            # A stalled read loop never reaches proc.wait() on its own -- this is
+            # the only thing that can interrupt it. Terminating the process group
+            # closes proc.stdout, which unblocks the `for line in proc.stdout` read
+            # loop below with a clean EOF rather than leaving it stuck forever.
+            if not finished.wait(timeout=timeout_sec):
+                timed_out.set()
+                if proc is not None:
+                    _terminate_process_group(proc)
+
         stderr_thread = threading.Thread(
             target=_drain_stderr, name="antigravity-stderr", daemon=True
         )
         stderr_thread.start()
+        watchdog_thread = threading.Thread(
+            target=_watchdog, name="antigravity-watchdog", daemon=True
+        )
+        watchdog_thread.start()
         parse_error = None
         with events_path.open("a") as events_file:
             if proc.stdout is not None:
@@ -300,12 +332,20 @@ def run_antigravity(
                         except Exception:
                             logger.debug("Failed to process Antigravity event", exc_info=True)
             proc.wait()
+            finished.set()
+            watchdog_thread.join(timeout=5)
             stderr_thread.join()
             return_code = proc.returncode if proc.returncode is not None else 1
             stderr = "".join(stderr_chunks)
             native_failure = _first_failure(events)
             failure = native_failure
-            if return_code == 0:
+            if timed_out.is_set():
+                failure = (
+                    f"Antigravity run exceeded {timeout_sec:.0f}s and was terminated "
+                    f"(parsed {len(events)} events before termination)"
+                )
+                return_code = 124
+            elif return_code == 0:
                 failure = failure or parse_error
                 if failure is None and not _has_successful_result(events):
                     failure = "Antigravity stream did not contain a successful result"
@@ -322,6 +362,7 @@ def run_antigravity(
         logger.error("agy command not found")
         return 127, cmd
     except KeyboardInterrupt:
+        finished.set()
         try:
             if proc and proc.poll() is None:
                 proc.terminate()

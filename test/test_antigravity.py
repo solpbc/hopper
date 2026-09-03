@@ -5,11 +5,13 @@
 
 import io
 import json
+import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
 from hopper.antigravity import (
     ANTIGRAVITY_MODEL,
+    ANTIGRAVITY_PRINT_TIMEOUT,
     _new_command,
     _parse_conversation_id,
     _resume_command,
@@ -55,6 +57,8 @@ def test_commands_keep_required_flags_on_new_and_resume():
         "--dangerously-skip-permissions",
         "--model",
         ANTIGRAVITY_MODEL,
+        "--print-timeout",
+        ANTIGRAVITY_PRINT_TIMEOUT,
         "--output-format",
         "stream-json",
     ]
@@ -68,6 +72,8 @@ def test_commands_keep_required_flags_on_new_and_resume():
         CONVERSATION_ID,
         "--model",
         ANTIGRAVITY_MODEL,
+        "--print-timeout",
+        ANTIGRAVITY_PRINT_TIMEOUT,
         "--output-format",
         "stream-json",
     ]
@@ -275,3 +281,32 @@ def test_run_antigravity_emits_synthetic_failure_without_native_result(tmp_path)
         "synthetic": True,
     }
     assert observed == [synthetic]
+
+
+def test_run_antigravity_terminates_and_reports_on_timeout(tmp_path):
+    output_path = tmp_path / "audit.out.md"
+    read_fd, write_fd = os.pipe()
+    proc = MagicMock(returncode=None)
+    proc.stdout = os.fdopen(read_fd, "r")
+    proc.stderr = io.StringIO("")
+    terminated = []
+
+    def fake_terminate(target):
+        terminated.append(target)
+        target.returncode = -15
+        os.close(write_fd)  # unblocks the real, still-open read end with EOF
+
+    with (
+        patch("hopper.antigravity.subprocess.Popen", return_value=proc),
+        patch("hopper.antigravity._terminate_process_group", side_effect=fake_terminate),
+    ):
+        exit_code, _command = run_antigravity(
+            "continue", "/work", str(output_path), CONVERSATION_ID, timeout_sec=0.05
+        )
+
+    assert exit_code == 124
+    assert terminated == [proc]
+    assert not output_path.exists()
+    synthetic = json.loads((tmp_path / "audit.events.jsonl").read_text())
+    assert synthetic["result"]["status"] == "ERROR"
+    assert "exceeded" in synthetic["result"]["message"]
