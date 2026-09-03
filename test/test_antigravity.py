@@ -15,6 +15,7 @@ from hopper.antigravity import (
     _new_command,
     _parse_conversation_id,
     _resume_command,
+    _tmux_global_env,
     antigravity_failure_message,
     antigravity_usage_total_tokens,
     bootstrap_antigravity,
@@ -145,11 +146,60 @@ def test_check_antigravity_ready_reports_missing_or_empty_api_key(tmp_path):
         with (
             patch("hopper.antigravity.shutil.which", return_value="/usr/bin/agy"),
             _ready_run(),
+            patch("hopper.antigravity._tmux_global_env", return_value=None),
         ):
             ready, version, error = check_antigravity_ready(env)
 
         assert (ready, version) == (False, "agy 1.2.3")
         assert error == "GEMINI_API_KEY is not set"
+
+
+def test_check_antigravity_ready_falls_back_to_tmux_global_env(tmp_path):
+    # Live-verified gap: `tmux set-environment -g GEMINI_API_KEY` (the fleet's
+    # propagation mechanism) only seeds *new* panes -- an already-running
+    # session's own shell can lack the key in os.environ while it is
+    # correctly set fleet-wide. `hop implement` must not refuse to create the
+    # lode in that case.
+    _write_settings(tmp_path)
+    env = {"HOME": str(tmp_path)}
+    with (
+        patch("hopper.antigravity.shutil.which", return_value="/usr/bin/agy"),
+        _ready_run(),
+        patch("hopper.antigravity._tmux_global_env", return_value="from-tmux"),
+    ):
+        assert check_antigravity_ready(env) == (True, "agy 1.2.3", "")
+
+
+def test_tmux_global_env_parses_present_variable():
+    completed = subprocess.CompletedProcess([], 0, stdout="GEMINI_API_KEY=abc123\n", stderr="")
+    with patch("hopper.antigravity.subprocess.run", return_value=completed) as run:
+        assert _tmux_global_env("GEMINI_API_KEY") == "abc123"
+    run.assert_called_once_with(
+        ["tmux", "show-environment", "-g", "GEMINI_API_KEY"],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+
+def test_tmux_global_env_returns_none_when_unset_or_no_server():
+    completed = subprocess.CompletedProcess([], 1, stdout="", stderr="unknown variable")
+    with patch("hopper.antigravity.subprocess.run", return_value=completed):
+        assert _tmux_global_env("GEMINI_API_KEY") is None
+
+
+def test_tmux_global_env_returns_none_when_tmux_missing_or_hangs():
+    with patch(
+        "hopper.antigravity.subprocess.run",
+        side_effect=FileNotFoundError("tmux not found"),
+    ):
+        assert _tmux_global_env("GEMINI_API_KEY") is None
+    with patch(
+        "hopper.antigravity.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=5.0),
+    ):
+        assert _tmux_global_env("GEMINI_API_KEY") is None
 
 
 def test_antigravity_failure_message_only_reads_terminal_results():

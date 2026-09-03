@@ -411,6 +411,39 @@ def run_antigravity(
         return 130, cmd
 
 
+def _tmux_global_env(name: str) -> str | None:
+    """Best-effort read of one variable from the tmux server's global environment.
+
+    `tmux set-environment -g` (the fleet's GEMINI_API_KEY propagation
+    mechanism, see cto/playbooks/antigravity-build-fleet.md) only seeds the
+    *initial* environment of panes/windows created after it runs -- it does
+    not retroactively reach an already-running shell. A long-lived session's
+    own process (or `hop`'s own CLI invocation from one) can therefore be
+    missing the key in `os.environ` even though it is correctly set
+    fleet-wide, which falsely reports Antigravity as unavailable and blocks
+    `hop implement` from ever creating the lode. This lets the readiness
+    check consult the same source a human would reach for manually.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "show-environment", "-g", name],
+            capture_output=True,
+            text=True,
+            timeout=_READINESS_TIMEOUT_SEC,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    line = result.stdout.strip()
+    prefix = f"{name}="
+    if not line.startswith(prefix):
+        return None
+    value = line[len(prefix) :]
+    return value or None
+
+
 def check_antigravity_ready(env: dict | None = None) -> tuple[bool, str, str]:
     """Check local Antigravity prerequisites without authenticating or using the network."""
     env = env if env is not None else os.environ
@@ -452,6 +485,6 @@ def check_antigravity_ready(env: dict | None = None) -> tuple[bool, str, str]:
             version,
             f"Antigravity settings file must set modelProvider to gemini: {settings_path}",
         )
-    if not env.get("GEMINI_API_KEY"):
+    if not env.get("GEMINI_API_KEY") and not _tmux_global_env("GEMINI_API_KEY"):
         return False, version, "GEMINI_API_KEY is not set"
     return True, version, ""
