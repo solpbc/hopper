@@ -389,6 +389,29 @@ class TestRunMakeInstall:
 
         assert _make_install_target(tmp_path) == "hopper-install"
 
+    def test_recognizes_the_public_agent_setup_alias(self, tmp_path):
+        """A repo that keeps no hopper/lode jargon can declare `agent-setup`
+        instead of `hopper-install` (req_co4dukes)."""
+        (tmp_path / "Makefile").write_text(
+            "install:\n\t@echo full > selected\nagent-setup:\n\t@echo lean > selected\n"
+        )
+
+        target = _make_install_target(tmp_path)
+        ok, detail = _run_make_install(tmp_path, target=target)
+
+        assert target == "agent-setup"
+        assert ok is True
+        assert detail is None
+        assert (tmp_path / "selected").read_text().strip() == "lean"
+
+    def test_hopper_install_wins_if_both_recognized_targets_are_declared(self, tmp_path):
+        """The legacy name takes precedence if a repo somehow declares both."""
+        (tmp_path / "Makefile").write_text(
+            "hopper-install:\n\t@echo lean > selected\nagent-setup:\n\t@echo public > selected\n"
+        )
+
+        assert _make_install_target(tmp_path) == "hopper-install"
+
     def test_declared_hopper_install_failure_does_not_fall_back(self, tmp_path):
         """A broken lean target fails loudly instead of provisioning a runtime."""
         (tmp_path / "Makefile").write_text(

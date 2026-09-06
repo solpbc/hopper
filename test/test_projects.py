@@ -261,7 +261,7 @@ def test_add_project_no_makefile(mock_config, tmp_path):
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
 
-    with pytest.raises(ValueError, match="No Makefile with 'hopper-install' or 'install' target"):
+    with pytest.raises(ValueError, match="No Makefile with a 'hopper-install', 'agent-setup', 'install' target"):
         add_project(str(repo))
 
 
@@ -273,7 +273,7 @@ def test_add_project_makefile_no_install_target(mock_config, tmp_path):
     (repo / "Makefile").write_text(".PHONY: test\ntest:\n\t@true\n")
     assert validate_makefile_install(str(repo)) is False
 
-    with pytest.raises(ValueError, match="No Makefile with 'hopper-install' or 'install' target"):
+    with pytest.raises(ValueError, match="No Makefile with a 'hopper-install', 'agent-setup', 'install' target"):
         add_project(str(repo))
 
 
@@ -286,6 +286,17 @@ def test_add_project_hopper_install_only(mock_config, tmp_path):
 
     assert validate_makefile_install(str(repo)) is True
     assert add_project(str(repo)).name == "hopper-install-only"
+
+
+def test_add_project_agent_setup_only(mock_config, tmp_path):
+    """add_project accepts the publicly-meaningful alias (req_co4dukes)."""
+    repo = tmp_path / "agent-setup-only"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    (repo / "Makefile").write_text(".PHONY: agent-setup\nagent-setup:\n\t@true\n")
+
+    assert validate_makefile_install(str(repo)) is True
+    assert add_project(str(repo)).name == "agent-setup-only"
 
 
 # Tests for remove_project

@@ -553,11 +553,13 @@ alive for operator inspection. Use `hop lode peek <id>` to inspect it, then
 choose an explicit pause, restart, or kill action. These actions retain the
 worktree; none treats terminal silence as permission to clean it up.
 
-On a fresh Make-based worktree, refine setup prefers `make hopper-install` when
-the project declares that target and otherwise falls back to `make install`.
-Use `hopper-install` for the dependencies and agent tooling needed to edit and
-run unit CI; keep host runtime provisioning and large model/artifact downloads
-in the project's normal install target.
+On a fresh Make-based worktree, refine setup prefers `make hopper-install` (or
+its publicly-meaningful alias, `make agent-setup`, for a repo that keeps no
+hopper/lode jargon in its Makefile) when the project declares one of those
+targets, and otherwise falls back to `make install`. Use it for the
+dependencies and agent tooling needed to edit and run unit CI; keep host
+runtime provisioning and large model/artifact downloads in the project's
+normal install target.
 
 The selected setup target is bounded by a 20-minute **inactivity** timeout and
 a 60-minute absolute cap. Command output and descendant CPU count as progress

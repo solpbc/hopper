@@ -10,6 +10,12 @@ from pathlib import Path
 from hopper.config import ConfigError, config_path, config_transaction, load_config
 from hopper.lodes import current_time_ms
 
+# Kept in sync with hopper.process's RECOGNIZED_INSTALL_TARGETS /
+# DEFAULT_INSTALL_TARGET by hand -- importing from hopper.process here would
+# be circular (process -> runner -> projects).
+_RECOGNIZED_INSTALL_TARGETS = ("hopper-install", "agent-setup")
+_DEFAULT_INSTALL_TARGET = "install"
+
 
 @dataclass
 class Project:
@@ -61,10 +67,10 @@ def validate_makefile_install(path: str) -> bool:
         path: Path to check.
 
     Returns:
-        True if `make -n hopper-install` or `make -n install` succeeds,
+        True if `make -n <recognized-target>` or `make -n install` succeeds,
         False otherwise.
     """
-    for target in ("hopper-install", "install"):
+    for target in (*_RECOGNIZED_INSTALL_TARGETS, _DEFAULT_INSTALL_TARGET):
         try:
             result = subprocess.run(
                 ["make", "-n", target, "-C", path],
@@ -189,7 +195,8 @@ def add_project(path: str) -> Project:
     if not validate_git_dir(abs_path):
         raise ValueError(f"Not a git repository: {abs_path}")
     if not validate_makefile_install(abs_path):
-        raise ValueError(f"No Makefile with 'hopper-install' or 'install' target: {abs_path}")
+        target_list = "', '".join((*_RECOGNIZED_INSTALL_TARGETS, _DEFAULT_INSTALL_TARGET))
+        raise ValueError(f"No Makefile with a '{target_list}' target: {abs_path}")
 
     name = Path(abs_path).name
     with config_transaction() as config:

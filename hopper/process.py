@@ -44,6 +44,13 @@ SETUP_OUTPUT_TAIL_LINES = 20
 QUARANTINE_STATUS = "Quarantined dirty project repo to branch {branch}; continuing"
 DEFAULT_INSTALL_TARGET = "install"
 HOPPER_INSTALL_TARGET = "hopper-install"
+# The publicly-meaningful alternative: a product repo can declare this instead
+# of `hopper-install` so its Makefile carries no internal hopper/lode jargon
+# for an external reader. Checked in this order (legacy name wins if both
+# exist, which should never happen in practice). req_co4dukes / cto-review
+# 2026-09-06: hop must recognize this before any repo renames its target.
+PUBLIC_INSTALL_TARGET = "agent-setup"
+RECOGNIZED_INSTALL_TARGETS = (HOPPER_INSTALL_TARGET, PUBLIC_INSTALL_TARGET)
 
 
 def _has_makefile(worktree_path: Path) -> bool:
@@ -58,13 +65,14 @@ def _make_install_target(worktree_path: Path) -> str:
     except OSError:
         return DEFAULT_INSTALL_TARGET
 
-    target_prefix = f"{HOPPER_INSTALL_TARGET}:"
+    target_prefixes = {f"{name}:": name for name in RECOGNIZED_INSTALL_TARGETS}
     for raw_line in lines:
         if raw_line.startswith("\t"):
             continue
         line = raw_line.lstrip()
-        if line.startswith(target_prefix) and not line[len(target_prefix) :].startswith("="):
-            return HOPPER_INSTALL_TARGET
+        for prefix, name in target_prefixes.items():
+            if line.startswith(prefix) and not line[len(prefix) :].startswith("="):
+                return name
     return DEFAULT_INSTALL_TARGET
 
 
