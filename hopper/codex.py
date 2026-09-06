@@ -20,6 +20,9 @@ CODEX_MODEL = "gpt-5.6-terra"
 CODEX_REASONING_CONFIG = 'model_reasoning_effort="xhigh"'
 CODEX_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
 LABEL = "Codex"
+# Codex's TUI renders to stdout; stderr carries only crash diagnostics, so
+# Hopper's default of capturing it for error extraction is correct here.
+PIPE_STDERR = True
 _SUPERVISOR_BOOTSTRAP_PROMPT = "Reply with exactly HOPPER_READY."
 _SUPERVISOR_BOOTSTRAP_FLAGS = (
     "--ignore-user-config",

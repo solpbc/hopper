@@ -437,6 +437,28 @@ class TestBaseRunnerActivityMonitor:
             ("launch", "/repo"),
         ]
 
+    def test_run_claude_pipes_stderr_by_driver_preference(self):
+        """Claude/codex keep stderr piped for crash-diagnostic extraction; grok's
+        fullscreen TUI draws to stderr, so piping it away leaves the pane blank
+        (cto/requests/260906-a-grok-supervised-lode...) -- it must be inherited.
+        """
+        from hopper import grok
+
+        runner = self._make_runner()
+        runner.driver = grok
+        runner.driver_name = "grok"
+        proc = MagicMock(returncode=0, stderr=None)
+
+        with (
+            patch.object(runner, "_build_command", return_value=(["grok"], "/repo")),
+            patch("hopper.runner.subprocess.Popen", return_value=proc) as popen,
+            patch.object(runner, "_emit_state"),
+            patch.object(runner, "_start_monitor"),
+        ):
+            assert runner._run_claude() == (0, None)
+
+        assert popen.call_args.kwargs["stderr"] is None
+
     def test_run_claude_keeps_live_process_reference_after_interrupt(self):
         runner = self._make_runner()
         proc = MagicMock(stderr=None)

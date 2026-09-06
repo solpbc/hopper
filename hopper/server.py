@@ -478,7 +478,6 @@ _DELIVERY_FAILURE_OUTCOMES = {
     "idle_timeout": "busy",
     "pane_state_unknown": "pane_state_unknown",
     "pane_blocked": "awaiting_operator",
-    "pane_character_unsupported": "not_sent",
     "pane_frozen": "pane_frozen",
     "pane_awaiting_choice": "awaiting_choice",
     "pane_not_awaiting_choice": "not_sent",
@@ -541,10 +540,6 @@ _GATE_FEEDBACK_MESSAGES = {
         "Feedback was not sent because pane {pane} is showing a supervisor menu, card, or "
         "authentication screen. Nothing was typed. Inspect with `hop lode peek {lode_id}` "
         "and resolve it in the pane."
-    ),
-    "pane_character_unsupported": (
-        "The character was not sent because this lode's supervisor does not support Hopper's "
-        "single-character shortcut. Nothing was typed. Inspect pane {pane} and respond there."
     ),
     "paste_failed": (
         "Feedback was not sent because Hopper could not paste it into pane {pane}. Nothing "
@@ -636,10 +631,6 @@ _PANE_INPUT_MESSAGES = {
         "Input was not sent because pane {pane} is showing a supervisor menu, card, or "
         "authentication screen. Nothing was typed. Inspect with `hop lode peek {lode_id}` "
         "and resolve it in the pane."
-    ),
-    "pane_character_unsupported": (
-        "Input was not sent because this lode's supervisor does not support Hopper's "
-        "single-character shortcut. Nothing was typed. Inspect pane {pane} and respond there."
     ),
     "pane_not_awaiting_choice": (
         "Choice was not sent because pane {pane} is not a recognized numbered selector. "
@@ -1140,18 +1131,17 @@ def _attempt_character_delivery(
     if latest_capture is None:
         return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
 
-    if driver_name != "claude":
-        return {
-            "reason": "pane_character_unsupported",
-            "capture": latest_capture,
-            "title": pane_title(pane_id),
-        }
-
     observed_title = pane_title(pane_id)
     phase, keyboard = driver.observe_pane(observed_title, latest_capture)
     if phase is PanePhase.UNKNOWN:
         return {
             "reason": "pane_state_unknown",
+            "capture": latest_capture,
+            "title": observed_title,
+        }
+    if phase in {PanePhase.BLOCKED, PanePhase.AUTH}:
+        return {
+            "reason": "pane_blocked",
             "capture": latest_capture,
             "title": observed_title,
         }

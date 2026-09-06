@@ -693,11 +693,15 @@ class BaseRunner:
         if not self._admit_stage_start_before_launch():
             return 1, "Stage launch was not durably acknowledged; inspect before retrying"
 
+        # A driver whose interactive UI renders to stderr (PIPE_STDERR = False)
+        # needs stderr connected to the real pane, not captured here — piping
+        # it away leaves the pane permanently blank. See hopper/grok.py.
+        pipe_stderr = getattr(self.driver, "PIPE_STDERR", True)
         try:
             proc = subprocess.Popen(
                 cmd,
                 env=env,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.PIPE if pipe_stderr else None,
                 cwd=cwd,
             )
             self._claude_proc = proc

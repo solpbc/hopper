@@ -438,12 +438,13 @@ before taking another action; do not submit the output again blindly.
 ## Responding to a gate
 
 - Use these after a lode prints a gate banner and waits for your reply. Exit 0 from
-  `hop gate feedback` means Claude accepted a new user turn; any reported failure
-  leaves the lode gated and prints a safe next action.
+  `hop gate feedback` means the supervisor (claude, codex, or grok) accepted a new
+  user turn; any reported failure leaves the lode gated and prints a safe next action.
 - **While `hop lode status <lode-id>` shows `state: gated`, only a single-character
   body is accepted** (for example `y`) — the multi-character examples below are
   refused with `gated_character_only` and nothing is pasted. The refusal names the
-  recovery itself: retry with exactly one character.
+  recovery itself: retry with exactly one character. This holds for every supervisor,
+  not claude only.
 - If failure says the delivery outcome is unknown, run `hop lode peek <lode-id>`
   before deciding whether to retry; never resend blindly. `hop feedback <lode-id>`
   is an alias with the same contract and input forms.

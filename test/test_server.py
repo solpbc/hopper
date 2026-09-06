@@ -11245,7 +11245,7 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
         "character_failed",
         "character_failed_unknown",
     }
-    provider_only = {"pane_blocked", "pane_character_unsupported"}
+    provider_only = {"pane_blocked"}
     assert set(hopper_server._DELIVERY_FAILURE_OUTCOMES) == (
         shared | choice_only | character_only | provider_only
     )

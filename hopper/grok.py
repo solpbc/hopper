@@ -18,6 +18,14 @@ from hopper.tmux import KeyboardOwnership, PanePhase, normalize_terminal_text
 logger = logging.getLogger(__name__)
 
 LABEL = "Grok"
+# Grok's --fullscreen TUI draws its entire UI -- including the alternate-screen
+# switch and the terminal-capability negotiation that gates when the composer
+# accepts input -- on stderr, not stdout. Piping stderr away (Hopper's default,
+# for capturing a crash diagnostic) leaves the interactive pane permanently
+# blank and its input path stalled. Verified live 2026-09-06: `grok --fullscreen
+# ... 2>file` sends every escape sequence, including `\e[?1049h`, to `file`
+# while the pty gets nothing.
+PIPE_STDERR = False
 _SUPERVISOR_FLAGS = (
     "--fullscreen",
     "--permission-mode",

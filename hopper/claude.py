@@ -24,6 +24,9 @@ from hopper.tmux import (
 )
 
 LABEL = "Claude"
+# Claude Code's TUI renders to stdout; stderr carries only crash diagnostics,
+# so Hopper's default of capturing it for error extraction is correct here.
+PIPE_STDERR = True
 CLAUDE_MODEL = "claude-sonnet-5"
 CLAUDE_EFFORT = "xhigh"
 _FLAGS = (

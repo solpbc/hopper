@@ -98,6 +98,18 @@ def test_registry_resolves_exact_three_supervisors():
     assert [resolve_driver(name) for name in RUNNABLE_STAGE_DRIVERS] == [claude, codex, grok]
 
 
+def test_every_runnable_driver_declares_a_stderr_render_channel():
+    """A driver whose interactive UI draws to stderr must say so explicitly
+    (PIPE_STDERR = False), or BaseRunner._run_claude's default of piping
+    stderr away leaves its pane permanently blank -- grok's actual failure
+    mode (cto/requests/260906-a-grok-supervised-lode...). This is a class
+    guard: a future fourth driver must make this choice, not inherit a
+    silent default.
+    """
+    for driver in (claude, codex, grok):
+        assert isinstance(driver.PIPE_STDERR, bool)
+
+
 def test_supervisor_default_round_trip_and_validation():
     assert resolve_supervisor_default() == ("claude", "built in")
     set_supervisor_default("grok")
@@ -379,8 +391,31 @@ def test_non_claude_delivery_uses_idle_composer_and_verifies_acceptance(
     send.assert_called_once_with("%1", "Enter")
 
 
+@pytest.mark.parametrize("driver_name,busy", [("codex", CODEX_BUSY), ("grok", GROK_BUSY)])
+def test_non_claude_character_delivery_sends_to_a_busy_pane_without_idle_wait(driver_name, busy):
+    """The single-character gate-reply shortcut is not claude-only: it already worked
+    generically through the driver abstraction and was blocked only by a blanket
+    driver-name check (cto/requests/260906-a-grok-supervised-lode...). Once that check
+    is removed, a non-claude supervisor's busy pane takes the character exactly the way
+    claude's does.
+    """
+    with (
+        patch("hopper.server.capture_pane", return_value=busy),
+        patch("hopper.server.pane_title", return_value=None),
+        patch("hopper.server.send_keys", return_value=True) as send,
+        patch("hopper.server.time.sleep") as sleep,
+    ):
+        result = _attempt_character_delivery("%1", "y", driver_name=driver_name)
+    assert result["reason"] == "character_sent"
+    send.assert_called_once_with("%1", "y", literal=True)
+    sleep.assert_not_called()
+
+
 @pytest.mark.parametrize("driver_name,blocked", [("codex", CODEX_WAIT), ("grok", GROK_CARD)])
-def test_non_claude_blockers_and_character_shortcut_send_nothing(driver_name, blocked):
+def test_non_claude_blockers_refuse_both_delivery_paths(driver_name, blocked):
+    """A non-claude supervisor's menu/card/auth screen refuses full-body AND
+    single-character delivery alike -- the driver is otherwise fully supported.
+    """
     with (
         patch("hopper.server.capture_pane", side_effect=[blocked, blocked]),
         patch("hopper.server.pane_title", return_value=None),
@@ -399,7 +434,7 @@ def test_non_claude_blockers_and_character_shortcut_send_nothing(driver_name, bl
         patch("hopper.server.send_keys") as send,
     ):
         result = _attempt_character_delivery("%1", "y", driver_name=driver_name)
-    assert result["reason"] == "pane_character_unsupported"
+    assert result["reason"] == "pane_blocked"
     send.assert_not_called()
 
 
