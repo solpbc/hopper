@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from hopper.antigravity import (
     ANTIGRAVITY_MODEL,
     ANTIGRAVITY_PRINT_TIMEOUT,
+    _antigravity_env,
     _new_command,
     _parse_conversation_id,
     _resume_command,
@@ -155,11 +156,8 @@ def test_check_antigravity_ready_reports_missing_or_empty_api_key(tmp_path):
 
 
 def test_check_antigravity_ready_falls_back_to_tmux_global_env(tmp_path):
-    # Live-verified gap: `tmux set-environment -g GEMINI_API_KEY` (the fleet's
-    # propagation mechanism) only seeds *new* panes -- an already-running
-    # session's own shell can lack the key in os.environ while it is
-    # correctly set fleet-wide. `hop implement` must not refuse to create the
-    # lode in that case.
+    # An already-running session's own shell can lack the tmux-global key.
+    # Readiness and the real agy launch must use the same fallback.
     _write_settings(tmp_path)
     env = {"HOME": str(tmp_path)}
     with (
@@ -200,6 +198,22 @@ def test_tmux_global_env_returns_none_when_tmux_missing_or_hangs():
         side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=5.0),
     ):
         assert _tmux_global_env("GEMINI_API_KEY") is None
+
+
+def test_antigravity_env_injects_tmux_global_key_without_mutating_source():
+    source = {"HOME": "/work"}
+    with patch("hopper.antigravity._tmux_global_env", return_value="from-tmux"):
+        effective = _antigravity_env(source)
+
+    assert effective == {"HOME": "/work", "GEMINI_API_KEY": "from-tmux"}
+    assert source == {"HOME": "/work"}
+
+
+def test_antigravity_env_preserves_explicit_key_without_reading_tmux():
+    source = {"GEMINI_API_KEY": "explicit"}
+    with patch("hopper.antigravity._tmux_global_env") as tmux_env:
+        assert _antigravity_env(source) is source
+    tmux_env.assert_not_called()
 
 
 def test_antigravity_failure_message_only_reads_terminal_results():
@@ -278,11 +292,15 @@ def test_bootstrap_antigravity_returns_conversation_id_from_init():
         _line({"event": "init", "conversation_id": CONVERSATION_ID, "init": {}}),
         "",
     )
-    with patch("hopper.antigravity.subprocess.Popen", return_value=proc) as popen:
-        result = bootstrap_antigravity("prompt", "/work")
+    with (
+        patch("hopper.antigravity._tmux_global_env", return_value="from-tmux"),
+        patch("hopper.antigravity.subprocess.Popen", return_value=proc) as popen,
+    ):
+        result = bootstrap_antigravity("prompt", "/work", env={"HOME": "/work"})
 
     assert result == (0, CONVERSATION_ID, None)
     assert popen.call_args.args[0] == _new_command("prompt")
+    assert popen.call_args.kwargs["env"]["GEMINI_API_KEY"] == "from-tmux"
 
 
 def test_bootstrap_antigravity_emits_events_and_writes_output_on_success(tmp_path):
@@ -371,9 +389,17 @@ def test_run_antigravity_retains_events_and_writes_final_result_response(tmp_pat
     proc.stdout = _stream(*events)
     proc.stderr = io.StringIO("")
     observed = []
-    with patch("hopper.antigravity.subprocess.Popen", return_value=proc) as popen:
+    with (
+        patch("hopper.antigravity._tmux_global_env", return_value="from-tmux"),
+        patch("hopper.antigravity.subprocess.Popen", return_value=proc) as popen,
+    ):
         exit_code, command = run_antigravity(
-            "continue", "/work", str(output_path), CONVERSATION_ID, on_event=observed.append
+            "continue",
+            "/work",
+            str(output_path),
+            CONVERSATION_ID,
+            env={"HOME": "/work"},
+            on_event=observed.append,
         )
 
     assert exit_code == 0
@@ -384,6 +410,7 @@ def test_run_antigravity_retains_events_and_writes_final_result_response(tmp_pat
     assert observed == events
     assert command == popen.call_args.args[0]
     assert command == _resume_command("continue", CONVERSATION_ID)
+    assert popen.call_args.kwargs["env"]["GEMINI_API_KEY"] == "from-tmux"
 
 
 def test_run_antigravity_emits_synthetic_failure_without_native_result(tmp_path):

@@ -217,6 +217,7 @@ def bootstrap_antigravity(
 ) -> tuple[int, str | None, str | None]:
     """Create and validate a fresh Antigravity conversation."""
     cmd = _new_command(prompt)
+    env = _antigravity_env(env)
     try:
         proc = subprocess.Popen(
             cmd,
@@ -299,6 +300,7 @@ def run_antigravity(
 ) -> tuple[int, list[str]]:
     """Resume an Antigravity conversation and retain its raw stream."""
     cmd = _resume_command(prompt, session_id)
+    env = _antigravity_env(env)
     proc = None
     events: list[dict] = []
     stderr_chunks: list[str] = []
@@ -442,6 +444,19 @@ def _tmux_global_env(name: str) -> str | None:
         return None
     value = line[len(prefix) :]
     return value or None
+
+
+def _antigravity_env(env: dict | None = None) -> dict | None:
+    """Give the real agy process the same tmux-global key readiness trusts."""
+    source = os.environ if env is None else env
+    if source.get("GEMINI_API_KEY"):
+        return env
+    api_key = _tmux_global_env("GEMINI_API_KEY")
+    if not api_key:
+        return env
+    effective = dict(source)
+    effective["GEMINI_API_KEY"] = api_key
+    return effective
 
 
 def check_antigravity_ready(env: dict | None = None) -> tuple[bool, str, str]:
