@@ -818,10 +818,6 @@ def test_backlog_add_refuses_unresponsive_server(capsys):
         patch("hopper.backlog.add_backlog_item") as mock_local_add,
         patch("hopper.client.add_backlog") as mock_remote_add,
     ):
-        # NOTE: text must precede --project. `backlog add -p proj "text"` is a real
-        # argparse allocation bug (an optional between two positionals swallows the
-        # trailing `text`); tracked separately. Use the working order so this test
-        # actually exercises the unresponsive-server refusal instead of an arg error.
         assert cmd_backlog(["add", "Do work", "--project", "myproj"]) == 1
 
     mock_local_add.assert_not_called()
@@ -1010,6 +1006,248 @@ def test_backlog_queue_missing_lode_id(capsys):
 
     out = capsys.readouterr().out
     assert "lode ID required" in out
+
+
+def test_backlog_add_project_option_before_text(capsys):
+    with patch("hopper.client.probe_server", return_value="down"):
+        with patch("hopper.backlog.load_backlog", return_value=[]):
+            with patch("hopper.backlog.add_backlog_item", return_value=MagicMock()) as mock_add:
+                assert cmd_backlog(["add", "-p", "myproj", "Do", "work"]) == 0
+
+    mock_add.assert_called_once()
+    _, project, description = mock_add.call_args.args[:3]
+    assert project == "myproj"
+    assert description == "Do work"
+    assert "Added: [myproj] Do work" in capsys.readouterr().out
+
+
+def test_backlog_add_project_option_after_text(capsys):
+    with patch("hopper.client.probe_server", return_value="down"):
+        with patch("hopper.backlog.load_backlog", return_value=[]):
+            with patch("hopper.backlog.add_backlog_item", return_value=MagicMock()) as mock_add:
+                assert cmd_backlog(["add", "Do", "work", "-p", "myproj"]) == 0
+
+    mock_add.assert_called_once()
+    _, project, description = mock_add.call_args.args[:3]
+    assert project == "myproj"
+    assert description == "Do work"
+    assert "Added: [myproj] Do work" in capsys.readouterr().out
+
+
+def test_backlog_remove_project_option_before_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch("hopper.client.remove_backlog") as mock_remove:
+                        assert cmd_backlog(["remove", "-p", "myproj", "abc"]) == 0
+
+    mock_remove.assert_called_once_with(socket_path, "abc123")
+    out = capsys.readouterr().out
+    assert "Removed: abc123 [myproj] Fix bug" in out
+
+
+def test_backlog_remove_project_option_after_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch("hopper.client.remove_backlog") as mock_remove:
+                        assert cmd_backlog(["remove", "abc", "-p", "myproj"]) == 0
+
+    mock_remove.assert_called_once_with(socket_path, "abc123")
+    out = capsys.readouterr().out
+    assert "Removed: abc123 [myproj] Fix bug" in out
+
+
+def test_backlog_promote_project_option_before_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with (
+                        patch("hopper.cli.coder_check") as check,
+                        patch(
+                            "hopper.client.promote_backlog",
+                            return_value={"id": "newlode1"},
+                        ) as mock_promote,
+                    ):
+                        check.return_value = {
+                            "provider": "codex",
+                            "ready": True,
+                            "version": "test-ready",
+                            "error": "",
+                        }
+                        assert cmd_backlog(["promote", "-p", "myproj", "abc"]) == 0
+
+    check.assert_called_once_with("codex")
+    mock_promote.assert_called_once_with(
+        socket_path,
+        "abc123",
+        scope="",
+        coder_provider="codex",
+        supervisor_provider="claude",
+    )
+    out = capsys.readouterr().out
+    assert "Promoted: newlode1" in out
+
+
+def test_backlog_promote_project_option_after_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with (
+                        patch("hopper.cli.coder_check") as check,
+                        patch(
+                            "hopper.client.promote_backlog",
+                            return_value={"id": "newlode1"},
+                        ) as mock_promote,
+                    ):
+                        check.return_value = {
+                            "provider": "codex",
+                            "ready": True,
+                            "version": "test-ready",
+                            "error": "",
+                        }
+                        assert cmd_backlog(["promote", "abc", "-p", "myproj"]) == 0
+
+    check.assert_called_once_with("codex")
+    mock_promote.assert_called_once_with(
+        socket_path,
+        "abc123",
+        scope="",
+        coder_provider="codex",
+        supervisor_provider="claude",
+    )
+    out = capsys.readouterr().out
+    assert "Promoted: newlode1" in out
+
+
+def test_backlog_promote_with_scope_project_option_before_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.promote_backlog",
+                        return_value={"id": "newlode1"},
+                    ) as mock_promote:
+                        assert (
+                            cmd_backlog(["promote", "-p", "myproj", "abc", "custom", "scope"]) == 0
+                        )
+
+    mock_promote.assert_called_once_with(
+        socket_path,
+        "abc123",
+        scope="custom scope",
+        coder_provider="codex",
+        supervisor_provider="claude",
+    )
+    out = capsys.readouterr().out
+    assert "custom scope" in out
+
+
+def test_backlog_promote_with_scope_project_option_after_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.promote_backlog",
+                        return_value={"id": "newlode1"},
+                    ) as mock_promote:
+                        assert (
+                            cmd_backlog(["promote", "abc", "custom", "scope", "-p", "myproj"]) == 0
+                        )
+
+    mock_promote.assert_called_once_with(
+        socket_path,
+        "abc123",
+        scope="custom scope",
+        coder_provider="codex",
+        supervisor_provider="claude",
+    )
+    out = capsys.readouterr().out
+    assert "custom scope" in out
+
+
+def test_backlog_queue_project_option_before_positionals(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch("hopper.client.set_backlog_queued", return_value=True):
+                        assert cmd_backlog(["queue", "-p", "myproj", "abc", "lode42"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Queued:" in out
+    assert "→ lode42" in out
+
+
+def test_backlog_queue_project_option_after_positionals(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch("hopper.client.set_backlog_queued", return_value=True):
+                        assert cmd_backlog(["queue", "abc", "lode42", "-p", "myproj"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Queued:" in out
+    assert "→ lode42" in out
+
+
+def test_backlog_queue_clear_option_before_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.set_backlog_queued",
+                        return_value=True,
+                    ) as mock_set_queued:
+                        assert cmd_backlog(["queue", "--clear", "abc"]) == 0
+
+    mock_set_queued.assert_called_once_with(socket_path, "abc123", None)
+    out = capsys.readouterr().out
+    assert "Cleared queue for:" in out
+
+
+def test_backlog_queue_clear_option_after_prefix(capsys):
+    item = _mock_backlog_item()
+    socket_path = MagicMock()
+    with patch("hopper.cli._socket", return_value=socket_path):
+        with patch("hopper.client.probe_server", return_value="up"):
+            with patch("hopper.backlog.load_backlog", return_value=[item]):
+                with patch("hopper.backlog.find_by_prefix", return_value=item):
+                    with patch(
+                        "hopper.client.set_backlog_queued",
+                        return_value=True,
+                    ) as mock_set_queued:
+                        assert cmd_backlog(["queue", "abc", "--clear"]) == 0
+
+    mock_set_queued.assert_called_once_with(socket_path, "abc123", None)
+    out = capsys.readouterr().out
+    assert "Cleared queue for:" in out
 
 
 # --- cmd_lode tests ---

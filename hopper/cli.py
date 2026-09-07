@@ -1911,38 +1911,52 @@ def cmd_backlog(args: list[str]) -> int:
     if args and args[0] == "ls":
         args = ["list"] + args[1:]
 
-    parser = make_parser(
-        "backlog",
-        "Manage backlog items. Items track future work for projects.",
-    )
-    parser.add_argument(
-        "action",
-        nargs="?",
-        choices=["list", "add", "remove", "promote", "queue"],
-        default="list",
-        help="Action to perform (default: list)",
-    )
-    parser.add_argument(
-        "text", nargs="*", help="Description (add) or ID prefix (remove/promote/queue)"
-    )
-    parser.add_argument("--project", "-p", help="Project name (required if no active lode)")
-    parser.add_argument(
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--project", "-p", help="Project name (required if no active lode)")
+    common.add_argument(
         "--clear",
         action="store_true",
         help="Clear queued assignment (for queue action)",
     )
-    parser.add_argument(
+    common.add_argument(
         "--coder",
         choices=CODER_PROVIDERS,
         default=DEFAULT_CODER_PROVIDER,
         help=f"Coder for promote (default: {DEFAULT_CODER_PROVIDER})",
     )
-    parser.add_argument(
+    common.add_argument(
         "--supervisor",
         choices=SUPERVISOR_PROVIDERS,
         default=None,
         help="Supervisor for promote (default: this host's `hop supervisor default`)",
     )
+
+    parser = HopperArgumentParser(
+        prog="hop backlog",
+        description="Manage backlog items. Items track future work for projects.",
+        exit_on_error=False,
+        parents=[common],
+    )
+    parser.set_defaults(action="list")
+    subparsers = parser.add_subparsers(dest="action", required=False)
+
+    subparsers.add_parser("list", parents=[common], help="List backlog items (default)")
+
+    add_parser = subparsers.add_parser("add", parents=[common], help="Add a backlog item")
+    add_parser.add_argument("text", nargs="*", help="Description")
+
+    remove_parser = subparsers.add_parser("remove", parents=[common], help="Remove a backlog item")
+    remove_parser.add_argument("text", nargs="*", help="ID prefix")
+
+    promote_parser = subparsers.add_parser(
+        "promote", parents=[common], help="Promote a backlog item to a lode"
+    )
+    promote_parser.add_argument("text", nargs="*", help="ID prefix and optional scope")
+
+    queue_parser = subparsers.add_parser(
+        "queue", parents=[common], help="Queue a backlog item onto a lode"
+    )
+    queue_parser.add_argument("text", nargs="*", help="ID prefix and optional lode ID")
     try:
         parsed = parse_args(parser, args)
     except SystemExit:
