@@ -2268,6 +2268,26 @@ class TestQuarantineDirtyRepoIntegration:
         message = _run_git(repo_dir, "log", "-1", "--format=%s", branch).stdout.strip()
         assert message == "hopper: quarantined dirty project repo blocking lode test-id"
 
+    def test_quarantine_logs_swept_file_list_and_recovery_hint(self, tmp_path, caplog):
+        """A quarantine on a checkout shared with another live session used to be
+
+        silent except for a branch name in a log line — the swept session's
+        files simply vanished until someone went looking. The log now names
+        exactly what moved and how to get it back (req_2gzgel7e).
+        """
+        caplog.set_level("WARNING")
+        repo_dir = _init_git_repo(tmp_path)
+        (repo_dir / "README.md").write_text("changed\n")
+        (repo_dir / "new.txt").write_text("new\n")
+
+        branch = quarantine_dirty_repo(str(repo_dir), "test-id")
+
+        assert branch is not None
+        messages = "\n".join(caplog.messages)
+        assert "README.md" in messages
+        assert "new.txt" in messages
+        assert f"recover with: git show {branch}" in messages
+
     def test_precondition_merge_in_progress_returns_none(self, tmp_path):
         repo_dir = _init_git_repo(tmp_path)
         (repo_dir / "README.md").write_text("changed\n")

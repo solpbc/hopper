@@ -1324,6 +1324,12 @@ def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
             logger.warning(f"quarantine skipped: no current branch in {repo_dir}")
             return None
 
+        # Capture what's about to be swept before it moves, so the incident is
+        # loud rather than a silent commit a session discovers only when its
+        # files vanish. On a checkout shared with other live sessions, this is
+        # the whole difference between a hazard and a routine cleanup.
+        dirty_files = dirty_status(repo_dir)
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         branch = f"hopper-quarantine-{timestamp}"
 
@@ -1366,8 +1372,11 @@ def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
             )
             return None
 
+        file_list = "\n".join(f"  {line}" for line in dirty_files.splitlines()) or "  (unknown — status captured empty)"
         logger.warning(
-            f"quarantined dirty project repo {repo_dir} onto branch {branch} (lode {lode_id})"
+            f"quarantined dirty project repo {repo_dir} onto branch {branch} (lode {lode_id}); "
+            f"swept files:\n{file_list}\n"
+            f"recover with: git show {branch} (or git log {branch})"
         )
         return branch
     except (FileNotFoundError, subprocess.SubprocessError) as err:

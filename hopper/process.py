@@ -605,6 +605,12 @@ class ProcessRunner(BaseRunner):
             print(f"hint: after fixing, restart with: hop restart {self.lode_id}")
             logger.error(f"setup error lode={self.lode_id}: {self._setup_error}")
             return 1
+        print(
+            f"NOTE: {self.project_dir} had uncommitted changes; quarantined onto "
+            f"branch {branch} to keep the lode moving. If this checkout is shared "
+            f"with another live session, that work is not lost — recover with: "
+            f"git show {branch} (see the hopper log for the exact file list)."
+        )
         set_lode_status(self.socket_path, self.lode_id, QUARANTINE_STATUS.format(branch=branch))
         return None
 

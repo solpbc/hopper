@@ -38,6 +38,8 @@ EOF
 
 `hop implement` is an alias for `hop lode create`. `hop submit` is an alias for `hop implement`. Use `--force` to override dirty-repo checks. Scope must be at least 42 characters. Add `--json` when a wrapper needs the lode id as data. Add `--coder <provider>` at creation time to select a provider explicitly. Hopper pins Codex to `gpt-5.6-terra` with `xhigh` reasoning. Hopper does not set a Grok model name, so Grok uses the authenticated account's current CLI default.
 
+⚠ **`--force` only bypasses the create-time dirty check — a project checkout shared with other live sessions is never the clone to force it against.** Every stage boundary (mill/ship setup) quarantines a dirty checkout unconditionally, `--force` or not: it commits every uncommitted file onto a fresh `hopper-quarantine-*` branch and continues, which is correct for a single-owner dirty clone but sweeps a sibling session's in-progress untracked work with no warning to that session if the checkout is shared (`req_2gzgel7e`, 2026-09-07). Point a lode at its own private checkout instead when the project is one live sessions edit directly.
+
 If `remote.<project>` has a pool and the project is disabled or absent locally,
 `hop implement <project>` probes every pool member concurrently, compares
 active-lode load, and creates once on a least-loaded eligible host. A locally
