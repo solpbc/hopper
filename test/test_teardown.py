@@ -369,15 +369,40 @@ def test_non_linux_identity_uses_mockable_ps(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize(
-    "result",
-    [
-        subprocess.CompletedProcess([], 1, stdout="", stderr="not found"),
-        subprocess.CompletedProcess([], 0, stdout="garbled", stderr=""),
-    ],
-)
-def test_non_linux_ps_failure_is_unknown_never_gone(monkeypatch, result):
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: result)
+def test_non_linux_ps_failure_exited_descendant_is_gone(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 1, stdout="", stderr=""),
+    )
+
+    def fake_check_alive(_pid):
+        raise ProcessLookupError
+
+    result = teardown.read_process_identity(99, platform="darwin", check_alive=fake_check_alive)
+    assert result["state"] == "gone"
+
+
+def test_non_linux_ps_failure_permission_error_is_cannot_tell(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 1, stdout="", stderr=""),
+    )
+
+    def fake_check_alive(_pid):
+        raise PermissionError
+
+    result = teardown.read_process_identity(99, platform="darwin", check_alive=fake_check_alive)
+    assert result["state"] == "cannot-tell"
+
+
+def test_non_linux_ps_garbled_stdout_is_cannot_tell(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, stdout="garbled", stderr=""),
+    )
     assert teardown.read_process_identity(99, platform="darwin")["state"] == "cannot-tell"
 
 

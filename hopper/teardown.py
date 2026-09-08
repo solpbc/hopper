@@ -196,12 +196,14 @@ def read_ps_process_identity(
     pid: int,
     *,
     run: Callable | None = None,
+    check_alive: Callable[[int], None] | None = None,
     timeout: float = PROCESS_QUERY_TIMEOUT_SEC,
 ) -> dict:
     """Read a Darwin/degraded identity; every ps failure remains unknown."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
         return _process_result("cannot-tell", error="invalid PID")
     run = subprocess.run if run is None else run
+    check_alive = (lambda p: os.kill(p, 0)) if check_alive is None else check_alive
     try:
         result = run(
             ["ps", "-o", "pid=,ppid=,pgid=,lstart=", "-p", str(pid)],
@@ -212,6 +214,12 @@ def read_ps_process_identity(
     except (OSError, subprocess.SubprocessError) as error:
         return _process_result("cannot-tell", error=str(error))
     if result.returncode != 0:
+        try:
+            check_alive(pid)
+        except ProcessLookupError:
+            return _process_result("gone")
+        except Exception:
+            pass
         return _process_result(
             "cannot-tell", error=result.stderr.strip() or f"ps exited {result.returncode}"
         )
