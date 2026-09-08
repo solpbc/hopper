@@ -3746,6 +3746,14 @@ def _render_manual_action_disposition(
         print(response["status"])
         return 1
 
+    if (
+        response
+        and response.get("outcome") == "accepted"
+        and isinstance(response.get("status"), str)
+    ):
+        print(response["status"])
+        return 1
+
     print(f"{verb.capitalize()} disposition is UNKNOWN; no success was reported.")
     print(f"Action ID: {identity['action_id']}")
     print(f"Expected generation: {generation}")

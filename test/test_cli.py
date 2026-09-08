@@ -2812,6 +2812,60 @@ def test_lode_restart_repeated_refusal_never_reports_success(capsys):
     assert capsys.readouterr().out.count("Restart refused") == 2
 
 
+def test_lode_restart_accepted_renders_status_and_returns_nonzero(capsys):
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "run_generation": "b" * 32,
+    }
+    accepted = {
+        "type": "lode_action_ack",
+        "outcome": "accepted",
+        "reason": "accepted",
+        "status": "Restart: teardown in progress",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.restart_lode", return_value=accepted),
+    ):
+        assert cmd_lode(["restart", "test1234"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Restart: teardown in progress" in out
+    assert "disposition is UNKNOWN" not in out
+
+
+def test_lode_restart_accepted_is_never_treated_as_success(capsys):
+    lode = {
+        "id": "test1234",
+        "stage": "mill",
+        "state": "error",
+        "active": False,
+        "run_generation": "b" * 32,
+    }
+    accepted = {
+        "type": "lode_action_ack",
+        "outcome": "accepted",
+        "reason": "accepted",
+        "status": "Restart: teardown in progress",
+    }
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.restart_lode", return_value=accepted),
+    ):
+        rc = cmd_lode(["restart", "test1234"])
+
+    assert rc != 0
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Restart completed" not in out
+    assert "disposition is UNKNOWN" not in out
+
+
 def test_lode_restart_unknown_ack_gives_status_next_step(capsys):
     lode = {
         "id": "test1234",
