@@ -243,6 +243,7 @@ def test_create_lode(temp_config):
     assert lode["branch"] == ""
     assert lode["worktree_path"] is None
     assert lode["worktree_reap"] is None
+    assert lode["worktree_reap_unavailable"] is None
     assert lode["last_progress_at"] is None
     assert lode["last_progress_summary"] == ""
     assert lode["last_pane_activity_at"] is None

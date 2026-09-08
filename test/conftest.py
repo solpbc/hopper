@@ -104,6 +104,7 @@ def make_lode():
             "branch": "",
             "worktree_path": None,
             "worktree_reap": None,
+            "worktree_reap_unavailable": None,
             "active": False,
             "tmux_pane": None,
             "pid": None,

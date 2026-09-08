@@ -5422,7 +5422,19 @@ class Server:
         resolution = resolve_worktree_path(lode)
         worktree_path = resolution["path"]
         if worktree_path is None or not worktree_path.is_dir():
+            unavailable = lode.get("worktree_reap_unavailable")
+            current_generation = lode.get("run_generation")
+            if (
+                isinstance(unavailable, dict)
+                and unavailable.get("run_generation") == current_generation
+            ):
+                return None
             logger.warning("Worktree reap skipped for %s: worktree path is unavailable", lode["id"])
+            lode["worktree_reap_unavailable"] = {
+                "run_generation": current_generation,
+                "detected_at": current_time_ms(),
+            }
+            touch(lode)
             return None
 
         if worktree_reap is None:
@@ -5523,6 +5535,7 @@ class Server:
 
         for lode, owner in candidates.values():
             reap_before = copy.deepcopy(lode.get("worktree_reap"))
+            unavailable_before = copy.deepcopy(lode.get("worktree_reap_unavailable"))
             completed = False
             try:
                 worktree_reap = lode.get("worktree_reap")
@@ -5587,7 +5600,10 @@ class Server:
             except Exception:
                 logger.exception("Worktree reap failed unexpectedly for lode=%s", lode.get("id"))
             finally:
-                if lode.get("worktree_reap") != reap_before:
+                if (
+                    lode.get("worktree_reap") != reap_before
+                    or lode.get("worktree_reap_unavailable") != unavailable_before
+                ):
                     self._save_reap_progress(owner)
                 if completed:
                     self.broadcast({"type": "lode_updated", "lode": lode})

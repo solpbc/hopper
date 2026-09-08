@@ -8264,6 +8264,91 @@ def test_reap_sweep_kill_requires_a_zero_unpushed_count(socket_path, temp_config
     assert type(lode["worktree_reap"]["reaped_at"]) is int
 
 
+def test_reap_sweep_warns_once_and_marks_unavailable_worktree(
+    socket_path, temp_config, make_lode, caplog
+):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="unavail-1",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS - 1,
+        run_generation="gen-1",
+    )
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    # a. First sweep against a lode whose worktree path is missing/non-dir
+    with (
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        patch("hopper.server.current_time_ms", return_value=now),
+    ):
+        srv._reap_eligible_worktrees()
+
+    expected_msg = f"Worktree reap skipped for {lode['id']}: worktree path is unavailable"
+    assert caplog.messages.count(expected_msg) == 1
+    assert lode["worktree_reap_unavailable"] == {
+        "run_generation": "gen-1",
+        "detected_at": now,
+    }
+    unavailable_snapshot = copy.deepcopy(lode["worktree_reap_unavailable"])
+
+    # b. Second sweep (same lode, same run_generation, still unavailable)
+    with (
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        patch("hopper.server.current_time_ms", return_value=now + 1000),
+    ):
+        srv._reap_eligible_worktrees()
+
+    assert caplog.messages.count(expected_msg) == 1
+    assert lode["worktree_reap_unavailable"] == unavailable_snapshot
+
+
+def test_reap_sweep_without_trigger_never_marks_unavailable(socket_path, temp_config, make_lode):
+    lode = make_lode(
+        id="no-trigger",
+        stage="mill",
+        state="new",
+        run_generation="gen-1",
+    )
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    srv._reap_eligible_worktrees()
+    srv._reap_eligible_worktrees()
+
+    assert lode["worktree_reap_unavailable"] is None
+
+
+def test_reap_sweep_warns_again_when_run_generation_changes(
+    socket_path, temp_config, make_lode, caplog
+):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="unavail-gen",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS - 1,
+        run_generation="gen-1",
+        worktree_reap_unavailable={"run_generation": "gen-1", "detected_at": now - 5000},
+    )
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    lode["run_generation"] = "gen-2"
+
+    with (
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        patch("hopper.server.current_time_ms", return_value=now),
+    ):
+        srv._reap_eligible_worktrees()
+
+    expected_msg = f"Worktree reap skipped for {lode['id']}: worktree path is unavailable"
+    assert caplog.messages.count(expected_msg) == 1
+    assert lode["worktree_reap_unavailable"] == {
+        "run_generation": "gen-2",
+        "detected_at": now,
+    }
+
+
 def test_reap_sweep_throttle_uses_monotonic_time(socket_path):
     srv = Server(socket_path)
     with (
