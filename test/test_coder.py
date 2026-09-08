@@ -5,6 +5,7 @@
 
 import json
 import subprocess
+import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -295,3 +296,15 @@ def test_antigravity_coder_check_delegates_to_provider_readiness():
         "error": "",
     }
     check.assert_called_once_with()
+
+
+def test_coder_check_runs_in_temp_directory():
+    completed = subprocess.CompletedProcess([], 0, stdout="codex 0.1.0\n", stderr="")
+    with (
+        patch("hopper.coder.shutil.which", return_value="/usr/bin/codex"),
+        patch("hopper.coder.subprocess.run", return_value=completed) as run,
+    ):
+        result = coder_check("codex")
+
+    assert result["ready"] is True
+    assert run.call_args.kwargs["cwd"] == tempfile.gettempdir()

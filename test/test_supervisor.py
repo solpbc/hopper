@@ -6,6 +6,7 @@
 import copy
 import json
 import subprocess
+import tempfile
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -155,6 +156,7 @@ def test_claude_supervisor_check_uses_version_command(monkeypatch):
             "error": "",
         }
     assert run.call_args.args[0] == ["claude", "--version"]
+    assert run.call_args.kwargs["cwd"] == tempfile.gettempdir()
 
 
 def test_supervisor_commands_are_interactive_and_exact():

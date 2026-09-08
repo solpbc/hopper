@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 from unittest.mock import MagicMock, patch
 
 from hopper.antigravity import (
@@ -166,6 +167,20 @@ def test_check_antigravity_ready_falls_back_to_tmux_global_env(tmp_path):
         patch("hopper.antigravity._tmux_global_env", return_value="from-tmux"),
     ):
         assert check_antigravity_ready(env) == (True, "agy 1.2.3", "")
+
+
+def test_check_antigravity_ready_runs_in_temp_directory(tmp_path):
+    _write_settings(tmp_path)
+    env = {"HOME": str(tmp_path), "GEMINI_API_KEY": "key"}
+    completed = subprocess.CompletedProcess([], 0, stdout="agy 1.2.3\n", stderr="")
+    with (
+        patch("hopper.antigravity.shutil.which", return_value="/usr/bin/agy"),
+        patch("hopper.antigravity.subprocess.run", return_value=completed) as run,
+    ):
+        ready, version, error = check_antigravity_ready(env)
+
+    assert ready is True
+    assert run.call_args.kwargs["cwd"] == tempfile.gettempdir()
 
 
 def test_tmux_global_env_parses_present_variable():

@@ -5,6 +5,7 @@
 
 import shutil
 import subprocess
+import tempfile
 
 from hopper import config
 from hopper.coder import CODER_CHECK_TIMEOUT_SEC, coder_check
@@ -97,6 +98,7 @@ def supervisor_check(provider: str) -> dict:
             text=True,
             timeout=CODER_CHECK_TIMEOUT_SEC,
             check=False,
+            cwd=tempfile.gettempdir(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return {

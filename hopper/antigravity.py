@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -471,6 +472,7 @@ def check_antigravity_ready(env: dict | None = None) -> tuple[bool, str, str]:
             text=True,
             timeout=_READINESS_TIMEOUT_SEC,
             check=False,
+            cwd=tempfile.gettempdir(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, "", f"agy version check failed: {error}"
