@@ -125,7 +125,7 @@ def test_default_coder_is_explicit_on_create_wire_contract(monkeypatch, socket_p
         "scope-a",
         spawn=False,
         coder_provider="codex",
-    ) == {"id": "abc12345"}
+    ) == {"lode": {"id": "abc12345"}, "error": None}
     assert sent == [
         (
             {"type": "coder_capabilities"},

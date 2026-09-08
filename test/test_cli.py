@@ -1787,7 +1787,10 @@ def test_lode_create_happy(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=project):
             with patch("hopper.git.dirty_status", return_value=""):
-                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                with patch(
+                    "hopper.client.create_lode",
+                    return_value={"lode": created_lode, "error": None},
+                ) as mock_create:
                     with patch("sys.stdin", StringIO(LONG_SCOPE)):
                         assert cmd_lode(["create", "myproj"]) == 0
                     mock_create.assert_called_once()
@@ -1811,7 +1814,10 @@ def test_lode_create_can_select_grok(capsys):
             "hopper.cli.coder_check",
             return_value={"provider": "grok", "ready": True, "version": "1.0.3", "error": ""},
         ) as check,
-        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch(
+            "hopper.client.create_lode",
+            return_value={"lode": created_lode, "error": None},
+        ) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
         assert cmd_lode(["create", "myproj", "--coder", "grok", "--json"]) == 0
@@ -1870,7 +1876,13 @@ def test_codex_lode_create_does_not_report_success_when_server_refuses(capsys):
             "hopper.cli.coder_check",
             return_value={"provider": "codex", "ready": True, "version": "1.0.3", "error": ""},
         ) as check,
-        patch("hopper.client.create_lode", return_value=None),
+        patch(
+            "hopper.client.create_lode",
+            return_value={
+                "lode": None,
+                "error": "grok supervisor unavailable: version check failed: boom",
+            },
+        ),
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
         assert cmd_lode(["create", "myproj", "--coder", "codex"]) == 1
@@ -1878,7 +1890,32 @@ def test_codex_lode_create_does_not_report_success_when_server_refuses(capsys):
     check.assert_called_once_with("codex")
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "error: lode was not created\n"
+    assert captured.err == "error: grok supervisor unavailable: version check failed: boom\n"
+
+
+def test_lode_create_json_reports_real_error_on_server_refusal(capsys):
+    from io import StringIO
+
+    project = Project(path="/fake/repo", name="myproj")
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.projects.find_project", return_value=project),
+        patch("hopper.git.dirty_status", return_value=""),
+        patch(
+            "hopper.client.create_lode",
+            return_value={
+                "lode": None,
+                "error": "grok supervisor unavailable: version check failed: boom",
+            },
+        ),
+        patch("sys.stdin", StringIO(LONG_SCOPE)),
+    ):
+        assert cmd_lode(["create", "myproj", "--json"]) == 1
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "error": "grok supervisor unavailable: version check failed: boom"
+    }
 
 
 def test_coder_check_json_is_machine_readable(capsys):
@@ -2050,7 +2087,10 @@ def test_create_captures_originating_extro_sid(
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.projects.find_project", return_value=project),
         patch("hopper.git.dirty_status", return_value=""),
-        patch("hopper.client.create_lode", return_value=created_lode) as mock_create,
+        patch(
+            "hopper.client.create_lode",
+            return_value={"lode": created_lode, "error": None},
+        ) as mock_create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
         assert handler(command_args) == 0
@@ -2120,7 +2160,8 @@ def test_lode_create_dirty_repo_force_override(capsys):
             with patch("hopper.git.dirty_status", return_value=" M file.py"):
                 with patch("hopper.cli.require_server", return_value=None):
                     with patch(
-                        "hopper.client.create_lode", return_value=created_lode
+                        "hopper.client.create_lode",
+                        return_value={"lode": created_lode, "error": None},
                     ) as mock_create:
                         with patch("sys.stdin", StringIO("A" * 50)):
                             rc = cmd_lode(["create", "--force", "myproj"])
@@ -2159,7 +2200,10 @@ def test_lode_create_reads_scope_from_stdin(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=project):
             with patch("hopper.git.dirty_status", return_value=""):
-                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                with patch(
+                    "hopper.client.create_lode",
+                    return_value={"lode": created_lode, "error": None},
+                ) as mock_create:
                     with patch(
                         "sys.stdin",
                         StringIO(LONG_SCOPE),
@@ -2183,7 +2227,10 @@ def test_local_create_uses_saved_coder_default(temp_config, capsys):
             "hopper.cli.coder_check",
             return_value={"provider": "grok", "ready": True, "version": "test", "error": ""},
         ),
-        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch(
+            "hopper.client.create_lode",
+            return_value={"lode": created_lode, "error": None},
+        ) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
         assert cmd_lode(["create", "myproj"]) == 0
@@ -2261,7 +2308,10 @@ def test_implement_delegates_to_lode_create(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=project):
             with patch("hopper.git.dirty_status", return_value=""):
-                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                with patch(
+                    "hopper.client.create_lode",
+                    return_value={"lode": created_lode, "error": None},
+                ) as mock_create:
                     with patch("sys.stdin", StringIO(LONG_SCOPE)):
                         assert cmd_implement(["myproj"]) == 0
                     mock_create.assert_called_once()
@@ -2286,7 +2336,10 @@ def test_implement_warns_with_registered_runner_count_and_still_creates(capsys):
             "hopper.client.list_lodes",
             return_value=[{"active": True}, {"active": True}, {"active": False}],
         ),
-        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch(
+            "hopper.client.create_lode",
+            return_value={"lode": created_lode, "error": None},
+        ) as create,
         patch("sys.stdin", StringIO(LONG_SCOPE)),
         # Pin free space above the floor: this assertion is exact, and the real
         # disk of the box running the suite is exactly the thing under test.
@@ -2367,7 +2420,10 @@ def test_implement_reads_stdin(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=project):
             with patch("hopper.git.dirty_status", return_value=""):
-                with patch("hopper.client.create_lode", return_value=created_lode) as mock_create:
+                with patch(
+                    "hopper.client.create_lode",
+                    return_value={"lode": created_lode, "error": None},
+                ) as mock_create:
                     with patch(
                         "sys.stdin",
                         StringIO(LONG_SCOPE),
@@ -6255,7 +6311,10 @@ def test_submit_delegates_to_lode_create(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=project):
             with patch("hopper.git.dirty_status", return_value=""):
-                with patch("hopper.client.create_lode", return_value=created_lode):
+                with patch(
+                    "hopper.client.create_lode",
+                    return_value={"lode": created_lode, "error": None},
+                ):
                     with patch("sys.stdin", StringIO(LONG_SCOPE)):
                         assert cmd_submit(["myproj"]) == 0
     out = capsys.readouterr().out
@@ -8256,7 +8315,10 @@ def emitted_create_json(monkeypatch, capsys):
         patch("hopper.cli.require_server", return_value=None),
         patch("hopper.projects.find_project", return_value=project),
         patch("hopper.git.dirty_status", return_value=""),
-        patch("hopper.client.create_lode", return_value=created_lode),
+        patch(
+            "hopper.client.create_lode",
+            return_value={"lode": created_lode, "error": None},
+        ),
         patch("sys.stdin", StringIO(LONG_SCOPE)),
     ):
         monkeypatch.setattr(sys, "argv", ["hop", "lode", "create", "journal", "--json"])
@@ -8367,7 +8429,10 @@ def test_explicit_local_coder_spelling_skips_default_config_read(
             "hopper.cli.coder_check",
             return_value={"provider": "grok", "ready": True, "version": "test", "error": ""},
         ),
-        patch("hopper.client.create_lode", return_value=created_lode) as create,
+        patch(
+            "hopper.client.create_lode",
+            return_value={"lode": created_lode, "error": None},
+        ) as create,
     ):
         assert main() == 0
 
@@ -8818,7 +8883,10 @@ def test_lode_create_json(capsys):
     with patch("hopper.cli.require_server", return_value=None):
         with patch("hopper.projects.find_project", return_value=project):
             with patch("hopper.git.dirty_status", return_value=""):
-                with patch("hopper.client.create_lode", return_value=created_lode):
+                with patch(
+                    "hopper.client.create_lode",
+                    return_value={"lode": created_lode, "error": None},
+                ):
                     with patch("sys.stdin", StringIO(LONG_SCOPE)):
                         assert cmd_lode(["create", "myproj", "--json"]) == 0
 

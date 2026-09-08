@@ -5912,7 +5912,7 @@ def test_lode_create_preserves_originating_extro_sid_over_socket(socket_path, se
         spawn=False,
         originating_extro_sid="extro-session-1",
         coder_provider="codex",
-    )
+    )["lode"]
 
     assert created["originating_extro_sid"] == "extro-session-1"
     assert server.lodes[0]["originating_extro_sid"] == "extro-session-1"
@@ -5927,7 +5927,7 @@ def test_lode_create_persists_selected_grok_provider(socket_path, server, temp_c
         "scope-a",
         spawn=False,
         coder_provider="grok",
-    )
+    )["lode"]
 
     assert created["coder"] == {"provider": "grok", "session_id": None}
     persisted = json.loads((temp_config / "active.jsonl").read_text().strip())
@@ -5951,7 +5951,7 @@ def test_create_refuses_before_mutation_when_server_lacks_provider_protocol(tmp_
         coder_provider="codex",
     )
 
-    assert created is None
+    assert created["lode"] is None
     assert [message["type"] for message in calls] == ["coder_capabilities"]
 
 
@@ -5972,7 +5972,7 @@ def test_create_refuses_malformed_provider_capabilities(tmp_path, monkeypatch, p
             "scope-a",
             spawn=False,
             coder_provider="codex",
-        )
+        )["lode"]
         is None
     )
     assert [message["type"] for message in calls] == ["coder_capabilities"]
@@ -6007,7 +6007,7 @@ def test_lode_create_refuses_codex_before_durable_creation_when_readiness_fails(
             coder_provider="codex",
         )
 
-    assert created is None
+    assert created["lode"] is None
     assert server.lodes == []
     assert (temp_config / "active.jsonl").read_text() == ""
 
@@ -6089,7 +6089,7 @@ def test_sender_explicit_codex_crosses_prior_grok_default_receiver(
         "scope-a",
         spawn=False,
         coder_provider="codex",
-    )
+    )["lode"]
 
     assert created["codex_thread_id"] is None
     assert "coder" not in created
@@ -6151,7 +6151,7 @@ def test_concurrent_lode_create_responses_are_causally_bound(
             spawn=False,
             timeout=5,
             coder_provider="codex",
-        )
+        )["lode"]
 
     a_thread = threading.Thread(
         target=create,
@@ -6220,7 +6220,7 @@ def test_persistent_subscriber_and_one_shot_commands_are_isolated(socket_path, s
             spawn=False,
             timeout=5,
             coder_provider="codex",
-        )
+        )["lode"]
 
     threads = [
         threading.Thread(target=create, args=("a", "subscriber-a"), daemon=True),

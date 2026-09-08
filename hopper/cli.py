@@ -4475,7 +4475,7 @@ def cmd_lode(args: list[str]) -> int:
             else os.environ.get("EXTRO_SESSION")
         )
         originating_extro_sid = (raw_originating_extro_sid or "").strip() or None
-        lode = client.create_lode(
+        created = client.create_lode(
             socket_path,
             project_name,
             scope,
@@ -4484,9 +4484,11 @@ def cmd_lode(args: list[str]) -> int:
             coder_provider=coder_provider,
             supervisor_provider=supervisor_provider,
         )
+        lode = created.get("lode")
+        error = created.get("error") or "lode was not created"
         if getattr(parsed, "json_output", False):
             if not lode:
-                print("error: lode was not created", file=sys.stderr)
+                print(json.dumps({"error": error}))
                 return 1
             print(
                 json.dumps(
@@ -4503,7 +4505,7 @@ def cmd_lode(args: list[str]) -> int:
             print(f"Created lode {lode['id']} ({project_name})")
             print(f"Always use 'hop watch {lode['id']}' to monitor your lode.")
         else:
-            print("error: lode was not created", file=sys.stderr)
+            print(f"error: {error}", file=sys.stderr)
             return 1
         return 0
 

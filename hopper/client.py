@@ -648,18 +648,27 @@ def create_lode(
     originating_extro_sid: str | None = None,
     coder_provider: str,
     supervisor_provider: str = "claude",
-) -> dict | None:
-    """Create a new lode via the server. Returns the created lode dict or None."""
+) -> dict:
+    """Create a new lode via the server.
+
+    Returns a dict {"lode": dict | None, "error": str | None}.
+    """
     coder_provider = validate_coder_provider(coder_provider)
     from hopper.supervisor import validate_supervisor_provider
 
     supervisor_provider = validate_supervisor_provider(supervisor_provider)
     if not _server_supports_coder_provider(socket_path, coder_provider, timeout):
-        return None
+        return {
+            "lode": None,
+            "error": f"coder provider '{coder_provider}' is not supported by the server",
+        }
     if supervisor_provider != "claude" and not _server_supports_supervisor_provider(
         socket_path, supervisor_provider, timeout
     ):
-        return None
+        return {
+            "lode": None,
+            "error": f"supervisor provider '{supervisor_provider}' is not supported by the server",
+        }
     message = {
         "type": "lode_create",
         "project": project,
@@ -676,8 +685,9 @@ def create_lode(
         wait_for_response=True,
     )
     if response and response.get("type") == "lode_created":
-        return response.get("lode")
-    return None
+        return {"lode": response.get("lode"), "error": None}
+    error = response.get("error") if response else None
+    return {"lode": None, "error": error or "lode was not created"}
 
 
 def send_gate_feedback(
