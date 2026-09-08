@@ -1546,6 +1546,17 @@ def transition_marker(
 
 def recovery_command(record: dict, kind: str) -> str:
     """Return the single operator command for a blocked action phase."""
+    if (
+        kind == "landing"
+        and isinstance(record.get("ship"), dict)
+        and isinstance(record["ship"].get("landing"), dict)
+        and record["ship"]["landing"].get("cause") == "cleanliness_dirty"
+    ):
+        path = record["ship"]["quarantine"]["original_path"]
+        return (
+            f"inspect and clean the worktree at {path} (e.g. `git -C {path} status`), "
+            "then retry teardown"
+        )
     if kind == "output":
         return (
             f"hop lode repair-output {record['lode_id']} - "

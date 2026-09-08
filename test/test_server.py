@@ -5401,6 +5401,55 @@ def test_ship_landing_budget_runs_off_event_loop(socket_path, make_lode):
         thread.join(timeout=2)
 
 
+def test_ship_blocked_cleanliness_dirty_with_dirty_detail_and_custom_recovery(
+    socket_path, make_lode
+):
+    record = _pending_completion_record(stage="ship")
+    actions.transition_marker(record, "ship_landing", "intent")
+    record["phase"] = "proving_ship_landing"
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="ship",
+        state="teardown",
+        run_generation=record["expected_generation"],
+    )
+    server.lodes = [lode]
+    dirty_detail = "canonical worktree has staged, unstaged, or untracked changes:\n?? scratch.txt"
+    verdict = git.ShipLandingVerdict(
+        "dirty", "indeterminate", "origin/main", "cleanliness_dirty", dirty_detail
+    )
+
+    with patch("hopper.server.git.ship_landing_verdict", return_value=verdict):
+        result = server._prove_ship_landing(record)
+
+    assert result["ok"] is False
+    assert result["error"] == dirty_detail
+
+    message = {
+        "type": "_action_step_result",
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_id": record["action_id"],
+        "marker_name": "ship_landing",
+        "phase": "proving_ship_landing",
+        "attempt_id": record["markers"]["ship_landing"]["attempt_id"],
+        "result": result,
+    }
+    server._handle_action_step_result(message)
+
+    persisted = actions.load_pending_action(record["lode_id"])
+    assert persisted["phase"] == "ship_blocked"
+    assert "?? scratch.txt" in persisted["recovery"]["message"]
+    assert "inspect and clean the worktree at" in persisted["recovery"]["command"]
+    assert "hop lode restart" not in persisted["recovery"]["command"]
+    status_text = actions.action_status(persisted)
+    assert "?? scratch.txt" in status_text
+    assert "inspect and clean the worktree at" in status_text
+    assert "hop lode restart" not in status_text
+
+
 def test_startup_completion_reconciliation_projects_before_ordinary_paths(socket_path, make_lode):
     record = _pending_completion_record()
     server = Server(socket_path)

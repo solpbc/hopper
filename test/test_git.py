@@ -22,6 +22,7 @@ from hopper.git import (
     SHIP_REMOTE_DETECTION_TIMEOUT_SEC,
     SHIP_REVALIDATION_TIMEOUT_SEC,
     UPSTREAM_FETCH_REFSPEC,
+    _probe_worktree_cleanliness,
     _resolve_default_branch,
     authorize_quarantine_cleanup,
     branch_exists,
@@ -1085,6 +1086,19 @@ class TestShipLandingVerdictDeadlines:
         assert verdict.cleanliness == "dirty"
         assert verdict.containment == "indeterminate"
         assert verdict.cause == "cleanliness_dirty"
+        assert "?? late.txt" in verdict.detail
+
+    def test_probe_worktree_cleanliness_includes_porcelain_output(self, tmp_path):
+        dirty_output = "?? file.py\n?? untracked.txt\n"
+        with patch(
+            "hopper.git._git_probe",
+            return_value=MagicMock(returncode=0, stdout=dirty_output, stderr=""),
+        ):
+            state, reason, detail = _probe_worktree_cleanliness(str(tmp_path), 5.0)
+        assert state == "dirty"
+        assert reason == "dirty"
+        expected_prefix = "canonical worktree has staged, unstaged, or untracked changes:\n"
+        assert detail == expected_prefix + dirty_output.strip()
 
     def test_overall_monotonic_deadline_stops_before_next_probe(self, tmp_path):
         with (

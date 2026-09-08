@@ -369,7 +369,8 @@ def _probe_worktree_cleanliness(
         return (
             "dirty",
             "dirty",
-            "canonical worktree has staged, unstaged, or untracked changes",
+            "canonical worktree has staged, unstaged, or untracked changes:\n"
+            + result.stdout.strip(),
         )
     return "clean", "clean", "canonical worktree is clean"
 

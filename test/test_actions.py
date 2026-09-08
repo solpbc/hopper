@@ -877,3 +877,46 @@ def test_validate_pending_completion_does_not_mutate_input():
     before = copy.deepcopy(pending)
     assert actions.validate_pending_action(pending) is pending
     assert pending == before
+
+
+def test_recovery_command_landing_cleanliness_dirty():
+    record = {
+        "lode_id": "test1234",
+        "action_type": "completion",
+        "stage": "ship",
+        "force_consent": False,
+        "ship": {
+            "quarantine": {
+                "original_path": "/tmp/worktree/test1234",
+            },
+            "landing": {
+                "cause": "cleanliness_dirty",
+            },
+        },
+    }
+    cmd = actions.recovery_command(record, "landing")
+    assert "/tmp/worktree/test1234" in cmd
+    assert cmd == (
+        "inspect and clean the worktree at /tmp/worktree/test1234 "
+        "(e.g. `git -C /tmp/worktree/test1234 status`), then retry teardown"
+    )
+    assert "hop lode restart" not in cmd
+
+
+def test_recovery_command_landing_other_cause_falls_back_to_restart():
+    record = {
+        "lode_id": "test1234",
+        "action_type": "completion",
+        "stage": "ship",
+        "force_consent": False,
+        "ship": {
+            "quarantine": {
+                "original_path": "/tmp/worktree/test1234",
+            },
+            "landing": {
+                "cause": "ancestry_not_contained",
+            },
+        },
+    }
+    cmd = actions.recovery_command(record, "landing")
+    assert cmd == "hop lode restart test1234"
