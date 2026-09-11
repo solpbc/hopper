@@ -314,9 +314,7 @@ def test_coder_check_runs_in_temp_directory():
 
 
 def test_coder_live_check_runs_bootstrap_with_diagnostic_timeout():
-    with patch(
-        "hopper.coder.bootstrap_coder", return_value=(0, "sess-1", None)
-    ) as bootstrap:
+    with patch("hopper.coder.bootstrap_coder", return_value=(0, "sess-1", None)) as bootstrap:
         result = coder_live_check("codex")
 
     assert result == {"ok": True, "error": "", "session_id": "sess-1"}

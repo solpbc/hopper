@@ -1967,7 +1967,12 @@ def test_coder_check_live_skips_turn_when_local_fails(capsys):
 
 
 def test_coder_check_live_ok_prints_two_lines(capsys):
-    local = {"provider": "grok", "ready": True, "version": '{"currentVersion":"1.0.13"}', "error": ""}
+    local = {
+        "provider": "grok",
+        "ready": True,
+        "version": '{"currentVersion":"1.0.13"}',
+        "error": "",
+    }
     live = {"ok": True, "error": "", "session_id": "abc"}
     with (
         patch("hopper.cli.coder_check", return_value=local),
