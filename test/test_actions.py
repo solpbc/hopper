@@ -244,6 +244,62 @@ def test_action_refusal_composes_without_an_expected_generation():
     assert isinstance(detail, str) and detail
     assert isinstance(status, str) and status
     assert "None" not in detail
+    assert response["preserved"] == {
+        "worktree": False,
+        "branch": False,
+        "stage_session": False,
+    }
+    assert "Preserved: none" in status
+
+
+def test_action_refusal_observes_lode_footprint_instead_of_asserting_it():
+    empty = actions.action_ack_projection(
+        outcome="refused",
+        reason="lifecycle_grace_pending",
+        action_id=ACTION_ID,
+        lode_id="abcd2345",
+        expected_generation=None,
+        action_type="archive",
+        lode={
+            "worktree_path": None,
+            "branch": "",
+            "stage_sessions": {
+                "mill": {"started": False},
+                "refine": {"started": False},
+                "ship": {"started": False},
+            },
+        },
+    )
+    assert empty["preserved"] == {
+        "worktree": False,
+        "branch": False,
+        "stage_session": False,
+    }
+    assert "Preserved: none" in empty["status"]
+
+    present = actions.action_ack_projection(
+        outcome="refused",
+        reason="ownership_unavailable",
+        action_id=ACTION_ID,
+        lode_id="abcd2345",
+        expected_generation=GEN_B,
+        action_type="kill",
+        lode={
+            "worktree_path": "/tmp/worktree",
+            "branch": "hopper-abcd2345",
+            "stage_sessions": {
+                "mill": {"started": True},
+                "refine": {"started": False},
+                "ship": {"started": False},
+            },
+        },
+    )
+    assert present["preserved"] == {
+        "worktree": True,
+        "branch": True,
+        "stage_session": True,
+    }
+    assert "Preserved: worktree, branch, stage session" in present["status"]
 
 
 def _run_ownership() -> dict:

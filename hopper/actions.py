@@ -1570,8 +1570,27 @@ def recovery_command(record: dict, kind: str) -> str:
     return f"hop lode {record['action_type']} {record['lode_id']}{suffix}"
 
 
-def _preserved_artifacts(action_type: str, *, record: dict | None = None) -> dict:
-    """Describe user-owned artifacts retained while an action is blocked."""
+def _stage_session_started(lode: dict) -> bool:
+    """Return whether any recorded stage session actually started."""
+    sessions = lode.get("stage_sessions")
+    if not isinstance(sessions, dict):
+        return False
+    return any(
+        isinstance(session, dict) and session.get("started") is True
+        for session in sessions.values()
+    )
+
+
+def _preserved_artifacts(
+    action_type: str, *, record: dict | None = None, lode: dict | None = None
+) -> dict:
+    """Describe user-owned artifacts retained while an action is blocked.
+
+    Prefer observed facts: ship-quarantine outcomes on a pending record, then
+    the lode row. A pending-action record carries no footprint, so that path
+    keeps the historical asserted default. With neither source, do not name
+    artifacts that were never checked.
+    """
     if action_type == "completion" and record is not None and record["stage"] == "ship":
         quarantine = record["ship"]["quarantine"]
         return {
@@ -1579,10 +1598,22 @@ def _preserved_artifacts(action_type: str, *, record: dict | None = None) -> dic
             "branch": quarantine["branch_outcome"] != "deleted",
             "stage_session": False,
         }
+    if lode is not None:
+        return {
+            "worktree": bool(lode.get("worktree_path")),
+            "branch": bool(lode.get("branch")),
+            "stage_session": _stage_session_started(lode) and action_type != "restart",
+        }
+    if record is not None:
+        return {
+            "worktree": True,
+            "branch": True,
+            "stage_session": action_type != "restart",
+        }
     return {
-        "worktree": True,
-        "branch": True,
-        "stage_session": action_type != "restart",
+        "worktree": False,
+        "branch": False,
+        "stage_session": False,
     }
 
 
@@ -1637,6 +1668,7 @@ def action_ack_projection(
     record: dict | None = None,
     receipt: dict | None = None,
     owner: dict | None = None,
+    lode: dict | None = None,
 ) -> dict:
     """Build the single wire/status projection for an action response."""
     if record is not None:
@@ -1712,7 +1744,7 @@ def action_ack_projection(
         preserved = (
             dict(owner["preserved"])
             if isinstance(owner, dict) and isinstance(owner.get("preserved"), dict)
-            else _preserved_artifacts(action_type or "")
+            else _preserved_artifacts(action_type or "", lode=lode)
         )
         explanation = detail or (
             "This request uses a retired mixed-version control message; upgrade the "
@@ -1739,7 +1771,7 @@ def action_ack_projection(
         response["recovery_command"] = record["recovery"]["command"]
         response["status"] = action_status(record)
     elif outcome in {"completed", "idempotent"} and disposition is not None:
-        preserved = response.get("preserved", _preserved_artifacts(action_type or ""))
+        preserved = response.get("preserved", _preserved_artifacts(action_type or "", lode=lode))
         response["status"] = (
             f"{(action_type or 'Action').capitalize()} completed: "
             f"{disposition.replace('_', ' ')}. Preserved: {_preserved_text(preserved)}."

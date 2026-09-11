@@ -1866,6 +1866,7 @@ class Server:
             }
         lode_id = request.get("lode_id")
         owner = None
+        lode = None
         if isinstance(lode_id, str):
             lode = self._find_action_lode(lode_id)
             if lode and isinstance(lode.get("pending_action"), dict):
@@ -1891,6 +1892,7 @@ class Server:
             record=record,
             receipt=receipt,
             owner=owner,
+            lode=lode,
         )
         response["type"] = "lode_action_ack"
         if outcome == "refused" and conn is None and isinstance(lode_id, str):
@@ -2309,7 +2311,12 @@ class Server:
             )
             return
         lode = self._find_lode(lode_id) if isinstance(lode_id, str) else None
-        if lode and generation == lode.get("run_generation") and _lifecycle_grace_pending(lode):
+        if (
+            action_type == "completion"
+            and lode
+            and generation == lode.get("run_generation")
+            and _lifecycle_grace_pending(lode)
+        ):
             if is_terminal_failure_kind(lode.get("failure_kind")):
                 self._send_action_ack(
                     conn,

@@ -1753,12 +1753,13 @@ def test_restart_force_consent_is_enforced_at_raw_server_boundary(socket_path, m
 
 
 @pytest.mark.parametrize("generation", [None, "b" * 32])
+@pytest.mark.parametrize("state", ["new", "ready", "reconnecting", "running"])
 def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(
-    socket_path, make_lode, generation
+    socket_path, make_lode, generation, state
 ):
     lode_id = "abcd2345"
     server = Server(socket_path)
-    lode = make_lode(id=lode_id, state="running", active=False, run_generation=generation)
+    lode = make_lode(id=lode_id, state=state, active=False, run_generation=generation)
     server.lodes = [lode]
     conn = _mock_client(server)
 
@@ -1777,6 +1778,7 @@ def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(
     response = _decode_mock_response(conn)
     assert response["accepted"] is True
     assert response["outcome"] == "completed"
+    assert response["reason"] != "lifecycle_grace_pending"
 
     retry = _mock_client(server)
     archived_before = copy.deepcopy(archived)
@@ -1787,6 +1789,33 @@ def test_inactive_archive_accepts_no_owner_proof_and_publishes_one_receipt(
     assert retry_response["disposition"] == "archived"
     assert archived == archived_before
     assert lode_id not in server.action_acceptances
+
+
+@pytest.mark.parametrize("action_type", ["pause", "restart", "kill"])
+@pytest.mark.parametrize("state", ["new", "ready", "reconnecting"])
+def test_lifecycle_grace_does_not_hold_operator_disposition_on_never_started_lode(
+    socket_path, make_lode, action_type, state
+):
+    lode_id = "abcd2345"
+    server = Server(socket_path)
+    lode = make_lode(id=lode_id, state=state, active=False, run_generation=None)
+    before = copy.deepcopy(lode)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    server._handle_mutation(_manual_action_message(action_type, generation=None), conn)
+    _apply_prepared_action(server, lode_id, None)
+
+    response = _decode_mock_response(conn)
+    assert response["reason"] != "lifecycle_grace_pending"
+    if response.get("outcome") == "refused":
+        assert response["preserved"] == {
+            "worktree": False,
+            "branch": False,
+            "stage_session": False,
+        }
+        assert "Preserved: none" in response["status"]
+        assert lode == before
 
 
 def test_terminal_oom_archive_requires_absent_exact_scope_and_missing_worktree(
@@ -3218,7 +3247,7 @@ def test_legacy_completion_wire_is_refusal_only(socket_path, make_lode):
     assert response["accepted"] is False
     assert response["reason"] == "protocol_upgrade_required"
     assert "Action unbound did not acquire generation none" in response["status"]
-    assert "Preserved: worktree, branch, stage session" in response["status"]
+    assert "Preserved: none" in response["status"]
     assert "Inspect with: hop lode status abcd2345" in response["status"]
     assert lode == before
 
@@ -3969,7 +3998,12 @@ def test_completion_acceptance_and_terminal_result_have_one_serialized_winner(
             "action_type": "completion",
         }
         assert acceptance["expected_generation"] == generation
-        assert acceptance["preserved"]["worktree"] is True
+        assert acceptance["preserved"] == {
+            "worktree": False,
+            "branch": False,
+            "stage_session": False,
+        }
+        assert "Preserved: none" in acceptance["status"]
         assert f"hop lode status {lode_id}" in acceptance["status"]
         assert _decode_mock_response(result_conn)["disposition"] == "oom"
         assert actions.load_pending_action(lode_id) is None
@@ -9149,7 +9183,7 @@ def test_legacy_manual_action_wire_refuses_without_mutation(socket_path, make_lo
     assert response["reason"] == "protocol_upgrade_required"
     assert "retired mixed-version control message" in response["status"]
     assert "Action unbound did not acquire generation none" in response["status"]
-    assert "Preserved: worktree, branch, stage session" in response["status"]
+    assert "Preserved: none" in response["status"]
     assert "Inspect with: hop lode status test-id" in response["status"]
 
 
@@ -9175,7 +9209,7 @@ def test_in_band_action_refusal_projects_only_without_an_action_owner(socket_pat
 
     assert lode["status"].startswith("action refused: Restart refused")
     assert "restart requires explicit force consent" in lode["status"]
-    assert "Preserved: worktree, branch" in lode["status"]
+    assert "Preserved: none" in lode["status"]
     assert "hop lode restart test-id" in lode["status"]
     lode["pending_action"] = {"action_id": "a" * 32}
     before = copy.deepcopy(lode)
