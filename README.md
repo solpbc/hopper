@@ -44,8 +44,8 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop backlog` | Manage backlog items |
 | `hop lode` | Manage lodes |
 | `hop implement` | Create a lode for an implementation request |
-| `hop coder` | Query or set the host-local refine coder default; check provider readiness |
-| `hop supervisor` | Query or set the host-local supervisor default; check provider readiness |
+| `hop coder` | Query or set the host-local refine coder default; check local install/config |
+| `hop supervisor` | Query or set the host-local supervisor default; check provider CLI install |
 | `hop ping` | Check if server is running |
 
 **Inside a lode**
@@ -68,7 +68,7 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop restart` | Restart an inactive lode (alias for lode restart) |
 Run `hop <command> -h` for detailed usage.
 
-The effective refine-stage creation default is host-local. Query it with `hop coder default`, or set it with `hop coder default <provider>`. When no value is saved on that host, Hopper uses its built-in Codex fallback. An explicit `--coder <provider>` on any create alias wins and does not consult the saved setting. `hop -H HOST coder default <provider>` changes the default on `HOST` only. This setting selects a provider; it does not establish provider readiness or account quota. Use `hop coder check <provider>` for readiness.
+The effective refine-stage creation default is host-local. Query it with `hop coder default`, or set it with `hop coder default <provider>`. When no value is saved on that host, Hopper uses its built-in Codex fallback. An explicit `--coder <provider>` on any create alias wins and does not consult the saved setting. `hop -H HOST coder default <provider>` changes the default on `HOST` only. This setting selects a provider; it does not establish provider readiness or account quota. `hop coder check <provider>` tests local install and config (binary and version; antigravity also the settings file and API key). It does not run a turn and does not prove quota or that refine bootstrap will succeed.
 
 ```bash
 hop coder default

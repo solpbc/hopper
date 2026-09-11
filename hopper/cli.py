@@ -1759,12 +1759,12 @@ def cmd_code(args: list[str]) -> int:
     return run_code(lode_id, _socket(), parsed.stage, request)
 
 
-@command("coder", "Manage host-local refine coder defaults and check coding-provider readiness")
+@command("coder", "Manage host-local refine coder defaults and check local install/config")
 def cmd_coder(args: list[str]) -> int:
-    """Manage the host-local default or check a coding provider's readiness."""
+    """Manage the host-local default or check a coding provider's local install/config."""
     parser = make_parser(
         "coder",
-        "Manage host-local refine coder defaults and check coding-provider readiness",
+        "Manage host-local refine coder defaults and check local install/config",
     )
     parser.add_argument("action", choices=["check", "default"])
     parser.add_argument("provider", nargs="?")
@@ -1781,8 +1781,10 @@ def cmd_coder(args: list[str]) -> int:
         f"When this host has no saved default, the built-in fallback is {DEFAULT_CODER_PROVIDER}. "
         "An explicit create-time `--coder <provider>` wins and does not read this setting. "
         "`hop -H HOST coder default <provider>` changes HOST only. This setting selects a "
-        "provider; it does not establish readiness or account quota. Use `hop coder check "
-        "<provider>` to test readiness."
+        "provider; it does not establish readiness or account quota. `hop coder check "
+        "<provider>` tests local install and config (binary and version; antigravity also "
+        "the settings file and API key). It does not run a turn and does not prove quota "
+        "or that refine bootstrap will succeed."
     )
     try:
         parsed = parse_args(parser, args)
