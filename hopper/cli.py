@@ -37,6 +37,7 @@ from hopper.coder import (
     CoderDefaultRefusal,
     coder_check,
     coder_default_refusal_lines,
+    coder_live_check,
     coder_unavailable_message,
     resolve_coder_default,
     set_coder_default,
@@ -1769,10 +1770,15 @@ def cmd_coder(args: list[str]) -> int:
     parser.add_argument("action", choices=["check", "default"])
     parser.add_argument("provider", nargs="?")
     parser.add_argument("--json", dest="json_output", action="store_true")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="after the local probe, run one billed turn in this process",
+    )
     providers = ", ".join(CODER_PROVIDERS)
     parser.epilog = (
         "Actions:\n"
-        "  hop coder check <provider> [--json]\n"
+        "  hop coder check <provider> [--json] [--live]\n"
         "  hop coder default [provider]\n"
         f"Providers: {providers}\n"
         "\n"
@@ -1784,7 +1790,9 @@ def cmd_coder(args: list[str]) -> int:
         "provider; it does not establish readiness or account quota. `hop coder check "
         "<provider>` tests local install and config (binary and version; antigravity also "
         "the settings file and API key). It does not run a turn and does not prove quota "
-        "or that refine bootstrap will succeed."
+        "or that refine bootstrap will succeed. `hop coder check <provider> --live` then "
+        "runs one bootstrap-shaped turn in this CLI process (billed; not a lode pane). "
+        "Create, supervisor, TUI, and pooled probes never pass --live."
     )
     try:
         parsed = parse_args(parser, args)
@@ -1798,6 +1806,10 @@ def cmd_coder(args: list[str]) -> int:
     if parsed.action == "default":
         if parsed.json_output:
             print("error: --json applies only to: hop coder check")
+            parser.print_usage()
+            return 1
+        if parsed.live:
+            print("error: --live applies only to: hop coder check")
             parser.print_usage()
             return 1
         if parsed.provider is None:
@@ -1819,13 +1831,28 @@ def cmd_coder(args: list[str]) -> int:
         parser.print_usage()
         return 1
     result = coder_check(provider)
+    live = None
+    if parsed.live:
+        if result["ready"]:
+            live = coder_live_check(provider)
+        else:
+            live = {"ok": False, "error": "local check failed", "session_id": None}
+        result = {**result, "live": live}
     if parsed.json_output:
         print(json.dumps(result))
-    elif result["ready"]:
-        print(f"{provider} ready: {result['version']}")
-    else:
+    elif not result["ready"]:
         print(f"{provider} unavailable: {result['error']}")
-    return 0 if result["ready"] else 1
+        if live is not None:
+            print(f"live skipped: {live['error']}")
+    else:
+        print(f"{provider} ready: {result['version']}")
+        if live is not None:
+            if live["ok"]:
+                print("live: ok")
+            else:
+                print(f"live failed: {live['error']}")
+    live_ok = live is None or live["ok"]
+    return 0 if result["ready"] and live_ok else 1
 
 
 @command("supervisor", "Manage host-local supervisor defaults and check provider readiness")

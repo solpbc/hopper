@@ -11,12 +11,15 @@ from unittest.mock import patch
 import pytest
 
 from hopper.coder import (
+    CODER_LIVE_PROMPT,
+    CODER_LIVE_TIMEOUT_SEC,
     DEFAULT_CODER_PROVIDER,
     CoderDefaultRefusal,
     bootstrap_coder,
     coder_check,
     coder_default_refusal_lines,
     coder_failure_message,
+    coder_live_check,
     coder_unavailable_message,
     resolve_coder_default,
     run_coder,
@@ -308,3 +311,50 @@ def test_coder_check_runs_in_temp_directory():
 
     assert result["ready"] is True
     assert run.call_args.kwargs["cwd"] == tempfile.gettempdir()
+
+
+def test_coder_live_check_runs_bootstrap_with_diagnostic_timeout():
+    with patch(
+        "hopper.coder.bootstrap_coder", return_value=(0, "sess-1", None)
+    ) as bootstrap:
+        result = coder_live_check("codex")
+
+    assert result == {"ok": True, "error": "", "session_id": "sess-1"}
+    bootstrap.assert_called_once_with(
+        "codex",
+        CODER_LIVE_PROMPT,
+        tempfile.gettempdir(),
+        timeout_sec=CODER_LIVE_TIMEOUT_SEC,
+    )
+
+
+def test_coder_live_check_surfaces_provider_failure_message():
+    with patch(
+        "hopper.coder.bootstrap_coder",
+        return_value=(1, None, "You've hit your usage limit."),
+    ):
+        result = coder_live_check("codex")
+
+    assert result == {
+        "ok": False,
+        "error": "You've hit your usage limit.",
+        "session_id": None,
+    }
+
+
+def test_coder_live_check_names_timeout():
+    with patch("hopper.coder.bootstrap_coder", return_value=(124, None, None)):
+        result = coder_live_check("grok")
+
+    assert result == {
+        "ok": False,
+        "error": f"live turn timed out after {int(CODER_LIVE_TIMEOUT_SEC)}s",
+        "session_id": None,
+    }
+
+
+def test_bootstrap_coder_passes_timeout_only_when_set():
+    with patch("hopper.codex.bootstrap_codex", return_value=(0, "s", None)) as bootstrap:
+        bootstrap_coder("codex", "prompt", "/tmp", env={"A": "1"}, timeout_sec=12.0)
+
+    bootstrap.assert_called_once_with("prompt", "/tmp", env={"A": "1"}, timeout_sec=12.0)

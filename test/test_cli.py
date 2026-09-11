@@ -1926,6 +1926,61 @@ def test_coder_check_json_is_machine_readable(capsys):
     assert json.loads(capsys.readouterr().out) == result
 
 
+def test_coder_check_json_live_keeps_local_keys_and_adds_live(capsys):
+    local = {"provider": "codex", "ready": True, "version": "0.154.0", "error": ""}
+    live = {"ok": False, "error": "You've hit your usage limit.", "session_id": None}
+    with (
+        patch("hopper.cli.coder_check", return_value=local) as check,
+        patch("hopper.cli.coder_live_check", return_value=live) as live_check,
+    ):
+        assert hopper_cli.cmd_coder(["check", "codex", "--json", "--live"]) == 1
+
+    check.assert_called_once_with("codex")
+    live_check.assert_called_once_with("codex")
+    assert json.loads(capsys.readouterr().out) == {**local, "live": live}
+
+
+def test_coder_check_json_without_live_does_not_run_a_turn(capsys):
+    local = {"provider": "codex", "ready": True, "version": "0.154.0", "error": ""}
+    with (
+        patch("hopper.cli.coder_check", return_value=local),
+        patch("hopper.cli.coder_live_check") as live_check,
+    ):
+        assert hopper_cli.cmd_coder(["check", "codex", "--json"]) == 0
+
+    live_check.assert_not_called()
+    assert json.loads(capsys.readouterr().out) == local
+
+
+def test_coder_check_live_skips_turn_when_local_fails(capsys):
+    local = {"provider": "codex", "ready": False, "version": "", "error": "codex command not found"}
+    with (
+        patch("hopper.cli.coder_check", return_value=local),
+        patch("hopper.cli.coder_live_check") as live_check,
+    ):
+        assert hopper_cli.cmd_coder(["check", "codex", "--live"]) == 1
+
+    live_check.assert_not_called()
+    captured = capsys.readouterr()
+    assert "codex unavailable: codex command not found" in captured.out
+    assert "live skipped: local check failed" in captured.out
+
+
+def test_coder_check_live_ok_prints_two_lines(capsys):
+    local = {"provider": "grok", "ready": True, "version": '{"currentVersion":"1.0.13"}', "error": ""}
+    live = {"ok": True, "error": "", "session_id": "abc"}
+    with (
+        patch("hopper.cli.coder_check", return_value=local),
+        patch("hopper.cli.coder_live_check", return_value=live),
+    ):
+        assert hopper_cli.cmd_coder(["check", "grok", "--live"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        'grok ready: {"currentVersion":"1.0.13"}',
+        "live: ok",
+    ]
+
+
 @pytest.mark.parametrize(
     ("saved", "expected"),
     [
@@ -2045,6 +2100,15 @@ def test_coder_default_rejects_json(args, capsys):
 
     captured = capsys.readouterr()
     assert captured.out.startswith("error: --json applies only to: hop coder check\n")
+    assert "usage: hop coder" in captured.out
+
+
+@pytest.mark.parametrize("args", [["default", "--live"], ["default", "grok", "--live"]])
+def test_coder_default_rejects_live(args, capsys):
+    assert hopper_cli.cmd_coder(args) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("error: --live applies only to: hop coder check\n")
     assert "usage: hop coder" in captured.out
 
 

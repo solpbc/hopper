@@ -12,6 +12,8 @@ from hopper import config
 CODER_PROVIDERS = ("codex", "grok", "antigravity")
 DEFAULT_CODER_PROVIDER = "codex"
 CODER_CHECK_TIMEOUT_SEC = 5.0
+CODER_LIVE_PROMPT = "Reply with exactly pong and nothing else."
+CODER_LIVE_TIMEOUT_SEC = 120.0
 
 
 class CoderDefaultRefusal(Exception):
@@ -69,21 +71,30 @@ def validate_coder_provider(provider: object) -> str:
     return provider
 
 
-def bootstrap_coder(provider: str, prompt: str, cwd: str, env: dict | None = None):
+def bootstrap_coder(
+    provider: str,
+    prompt: str,
+    cwd: str,
+    env: dict | None = None,
+    timeout_sec: float | None = None,
+):
     """Bootstrap the selected provider and return its session result tuple."""
     provider = validate_coder_provider(provider)
+    kwargs: dict = {"env": env}
+    if timeout_sec is not None:
+        kwargs["timeout_sec"] = timeout_sec
     if provider == "codex":
         from hopper.codex import bootstrap_codex
 
-        return bootstrap_codex(prompt, cwd, env=env)
+        return bootstrap_codex(prompt, cwd, **kwargs)
     if provider == "grok":
         from hopper.grok import bootstrap_grok
 
-        return bootstrap_grok(prompt, cwd, env=env)
+        return bootstrap_grok(prompt, cwd, **kwargs)
 
     from hopper.antigravity import bootstrap_antigravity
 
-    return bootstrap_antigravity(prompt, cwd, env=env)
+    return bootstrap_antigravity(prompt, cwd, **kwargs)
 
 
 def run_coder(
@@ -203,3 +214,30 @@ def coder_check(provider: str) -> dict:
             "error": f"version check failed: {detail}",
         }
     return {"provider": provider, "ready": True, "version": output, "error": ""}
+
+
+def coder_live_check(provider: str) -> dict:
+    """Run one bootstrap-shaped turn in this process. Opt-in diagnostics only.
+
+    Not called from lode create, supervisor check, the TUI, or pooled probes.
+    Antigravity goes through bootstrap_antigravity, so tmux-global key injection
+    applies; the subprocess is still this CLI process, not a lode pane.
+    """
+    provider = validate_coder_provider(provider)
+    exit_code, session_id, failed_msg = bootstrap_coder(
+        provider,
+        CODER_LIVE_PROMPT,
+        tempfile.gettempdir(),
+        timeout_sec=CODER_LIVE_TIMEOUT_SEC,
+    )
+    if exit_code == 0 and session_id:
+        return {"ok": True, "error": "", "session_id": session_id}
+    if exit_code == 124:
+        error = f"live turn timed out after {int(CODER_LIVE_TIMEOUT_SEC)}s"
+    elif exit_code == 127:
+        error = f"{provider} command not found"
+    elif isinstance(failed_msg, str) and failed_msg:
+        error = failed_msg
+    else:
+        error = f"live turn failed (exit {exit_code})"
+    return {"ok": False, "error": error, "session_id": None}
