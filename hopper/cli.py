@@ -5487,10 +5487,14 @@ def cmd_check(args: list[str]) -> int:
 
     shown = min(parsed.lines, total)
     truncated = f", showing last {shown} of {total} lines" if total > shown else ""
-    print(
-        f"hop check: `{' '.join(command)}` exited {proc.returncode}{truncated}",
-        file=sys.stderr,
-    )
+    verdict = f"hop check: `{' '.join(command)}` exited {proc.returncode}{truncated}"
+    # Printed on stderr for immediate visibility AND as the last stdout line: a
+    # piped caller's stdout is typically block-buffered while stderr is not, so
+    # under `2>&1 | tail -N` the stderr-only verdict can reach the pipe before a
+    # large buffered tail flushes and fall outside the kept window. Repeating it
+    # as the final stdout line makes it survive `tail -N` by construction.
+    print(verdict, file=sys.stderr)
+    print(verdict)
     return proc.returncode
 
 

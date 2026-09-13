@@ -11400,7 +11400,7 @@ def test_check_redirects_output_to_a_file_not_an_inheritable_pipe(monkeypatch, c
     assert cmd_check(["--", "command"]) == 0
     assert observed["stdout"] != subprocess.PIPE
     assert observed["stderr"] == subprocess.STDOUT
-    assert capsys.readouterr().out == "parent done\n"
+    assert capsys.readouterr().out == "parent done\nhop check: `command` exited 0\n"
 
 
 def test_check_preserves_nonzero_exit_code_value(capsys):
@@ -11408,6 +11408,21 @@ def test_check_preserves_nonzero_exit_code_value(capsys):
     result = cmd_check(["--", *_noisy_failing_cmd(3, 7)])
     assert result == 7
     assert "exited 7" in capsys.readouterr().err
+
+
+def test_check_verdict_survives_a_trailing_tail_on_stdout(capsys):
+    """roadmap § 28 item 1: the verdict repeats as the LAST stdout line.
+
+    A caller piping `2>&1 | tail -N` keeps only the last N lines of the merged
+    stream. Before this fix the verdict existed only on stderr, printed after a
+    large buffered stdout chunk flushes at process exit — so under `2>&1` a
+    `tail -N` window built from the combined stream could evict it. Repeating
+    the verdict as the final stdout line makes `tail -1` alone sufficient.
+    """
+    result = cmd_check(["-n", "2", "--", *_noisy_failing_cmd(50, 3)])
+    assert result == 3
+    out = capsys.readouterr().out
+    assert out.rstrip().endswith("exited 3, showing last 2 of 50 lines")
 
 
 def test_check_progress_surfaces_sustained_process_tree_cpu_silence(monkeypatch):
@@ -11461,7 +11476,7 @@ def test_check_heartbeats_over_real_socket_and_stops_after_child(
 
     assert result == 0
     captured = capsys.readouterr()
-    assert captured.out == "done\n"
+    assert captured.out == f"done\nhop check: `{' '.join(command)}` exited 0\n"
     assert f"hop check: `{' '.join(command)}` exited 0" in captured.err
     deadline = time.monotonic() + 1
     while server.lodes[0].get("last_progress_at") is None and time.monotonic() < deadline:
@@ -11484,9 +11499,10 @@ def test_check_without_lode_does_not_construct_heartbeat(monkeypatch, capsys):
 
     monkeypatch.setattr("hopper.cli.hopper_code.ProgressHeartbeat", UnexpectedHeartbeat)
 
-    assert cmd_check(["--", sys.executable, "-c", "print('all good')"]) == 0
+    command = [sys.executable, "-c", "print('all good')"]
+    assert cmd_check(["--", *command]) == 0
     captured = capsys.readouterr()
-    assert captured.out == "all good\n"
+    assert captured.out == f"all good\nhop check: `{' '.join(command)}` exited 0\n"
     assert "exited 0" in captured.err
 
 
@@ -11498,7 +11514,7 @@ def test_check_dead_socket_preserves_command_contract(tmp_path, monkeypatch, cap
 
     assert cmd_check(["--", *command]) == 0
     captured = capsys.readouterr()
-    assert captured.out == "all good\n"
+    assert captured.out == f"all good\nhop check: `{' '.join(command)}` exited 0\n"
     assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
 
 
@@ -11513,7 +11529,7 @@ def test_check_heartbeat_construction_failure_preserves_contract(monkeypatch, ca
 
     assert cmd_check(["--", *command]) == 0
     captured = capsys.readouterr()
-    assert captured.out == "all good\n"
+    assert captured.out == f"all good\nhop check: `{' '.join(command)}` exited 0\n"
     assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
 
 
@@ -11534,7 +11550,7 @@ def test_check_heartbeat_lifecycle_failures_preserve_contract(monkeypatch, capsy
 
     assert cmd_check(["--", *command]) == 0
     captured = capsys.readouterr()
-    assert captured.out == "all good\n"
+    assert captured.out == f"all good\nhop check: `{' '.join(command)}` exited 0\n"
     assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
 
 
@@ -11548,7 +11564,7 @@ def test_check_heartbeat_emit_failure_preserves_contract(monkeypatch, capsys):
 
     assert cmd_check(["--", *command]) == 0
     captured = capsys.readouterr()
-    assert captured.out == "all good\n"
+    assert captured.out == f"all good\nhop check: `{' '.join(command)}` exited 0\n"
     assert captured.err == f"hop check: `{' '.join(command)}` exited 0\n"
 
 
