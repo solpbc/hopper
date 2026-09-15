@@ -123,7 +123,14 @@ def observe_pane(
     if any(marker in normalized for marker in _AUTH_MARKERS):
         return PanePhase.AUTH, KeyboardOwnership.NONE
     hint = _hint_line(normalized)
-    if "Ctrl+x:shortcuts" in hint:
+    # The composer footer's tail ("Ctrl+x:shortcuts") is the last thing on the
+    # line and the first thing a narrow pane clips: staging a suggested reply
+    # prepends "Enter:send" to this same row, and at 80 columns that pushes
+    # "shortcuts" past the visible edge, leaving only "...Ctrl+x:". "Shift+Tab:
+    # mode" sits earlier in every composer variant (idle/staged/busy/background)
+    # and is absent from every card footer, so it survives the clip that broke
+    # a real gated lode (z7xvs2dm, 2026-09-15).
+    if "Shift+Tab:mode" in hint:
         keyboard = KeyboardOwnership.COMPOSER
         if _TURN_ACTIVE_RE.search(normalized):
             return PanePhase.BUSY, keyboard

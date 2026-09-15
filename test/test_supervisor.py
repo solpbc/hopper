@@ -88,6 +88,16 @@ GROK_CARD = """
 ◆ Waiting on plan approval
 a:approve │ q:quit plan
 """
+# Real capture from a wedged lode (z7xvs2dm, 2026-09-15, 80x24 pane): a staged
+# suggested reply prepends "Enter:send" to the footer, and at 80 columns that
+# pushes "shortcuts" past the visible edge -- the row is genuinely idle but
+# renders with "shortcuts" clipped off "Ctrl+x:".
+GROK_STAGED_CLIPPED_FOOTER = """
+╭──────────────────────────────────────╮
+│ ❯ yes — honesty layer plus a fix     │
+╰──────────────── Grok 4.6 (high) ─────╯
+Enter:send  │  Tab/→:accept suggestion  │  Shift+Tab:mode  │  Ctrl+x:
+"""
 
 
 def _ansi(text: str) -> str:
@@ -369,6 +379,18 @@ def test_grok_pane_states_and_composer(decorator):
     auth = "Approve in your browser to finish signing in.\nWaiting for approval...\n"
     assert grok.observe_pane(None, decorator(auth))[0] is PanePhase.AUTH
     assert grok.observe_pane(None, decorator("unrecognized chrome\n"))[0] is PanePhase.UNKNOWN
+
+
+@pytest.mark.parametrize("decorator", [lambda value: value, _ansi], ids=["plain", "ansi"])
+def test_grok_composer_survives_a_clipped_shortcuts_footer(decorator):
+    """A staged reply's "Enter:send" prefix can push "Ctrl+x:shortcuts" past a
+    narrow (80-column) pane's right edge, clipping it to "Ctrl+x:" -- the
+    footer must still read as an idle composer, not PanePhase.UNKNOWN.
+    """
+    assert grok.observe_pane(None, decorator(GROK_STAGED_CLIPPED_FOOTER)) == (
+        PanePhase.IDLE,
+        KeyboardOwnership.COMPOSER,
+    )
 
 
 @pytest.mark.parametrize(
