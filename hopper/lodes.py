@@ -929,7 +929,9 @@ def archive_lode_for_action(
     if len(active_matches) > 1:
         raise ValueError("active lode identity is duplicated")
     if active_matches and active_matches[0].get("archive_action_id") not in {None, action_id}:
-        raise ValueError("active lode belongs to a different archive action")
+        owner = active_matches[0].get("pending_action")
+        if not isinstance(owner, dict) or owner.get("action_id") != action_id:
+            raise ValueError("active lode belongs to a different archive action")
     if not archived_matches and not active_matches:
         raise ValueError("action lode is absent from active and archived storage")
 
@@ -969,6 +971,7 @@ def unarchive_lode(
         if lode["id"] == lode_id:
             restored = archived_lodes.pop(i)
             restored.pop("archived_at", None)
+            restored["archive_action_id"] = None
             active_lodes.append(restored)
 
             save_archived_lodes(archived_lodes)

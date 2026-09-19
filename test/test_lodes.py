@@ -1913,3 +1913,153 @@ def test_lode_status_annotations_distinguish_unknown_from_not_probed(make_lode):
     assert unknown["pane_liveness"] == "unknown"
     assert not_probed["pane_liveness"] == PANE_LIVENESS_NOT_PROBED
     assert unknown["pane_liveness"] != not_probed["pane_liveness"]
+
+
+def test_unarchive_lode_clears_archive_action_id(temp_config, make_lode):
+    archived_lode = make_lode(
+        id="unarch01",
+        state="new",
+        archived_at=5000,
+        archive_action_id="a" * 32,
+    )
+    archived_lodes = [archived_lode]
+    active_lodes = []
+    save_archived_lodes(archived_lodes)
+    save_lodes(active_lodes)
+
+    restored = unarchive_lode(archived_lodes, active_lodes, "unarch01")
+
+    assert restored is not None
+    assert restored["id"] == "unarch01"
+    assert restored["archive_action_id"] is None
+    assert "archived_at" not in restored
+    assert len(archived_lodes) == 0
+    assert len(active_lodes) == 1
+    assert active_lodes[0]["archive_action_id"] is None
+
+    persisted_active = load_lodes()
+    assert len(persisted_active) == 1
+    assert persisted_active[0]["archive_action_id"] is None
+
+
+def test_archive_lode_for_action_supersedes_leftover_with_conclusive_owner(temp_config, make_lode):
+    active_lodes = [
+        make_lode(
+            id="super01",
+            archive_action_id="a" * 32,
+            pending_action={"action_id": "b" * 32},
+        )
+    ]
+    archived_lodes = []
+    save_lodes(active_lodes)
+    save_archived_lodes(archived_lodes)
+
+    archived = archive_lode_for_action(active_lodes, archived_lodes, "super01", "b" * 32)
+
+    assert archived["id"] == "super01"
+    assert archived["archive_action_id"] == "b" * 32
+    assert len(active_lodes) == 0
+    assert len(archived_lodes) == 1
+    assert archived_lodes[0]["archive_action_id"] == "b" * 32
+
+    persisted_archived = load_archived_lodes()
+    assert len(persisted_archived) == 1
+    assert persisted_archived[0]["archive_action_id"] == "b" * 32
+    assert len(load_lodes()) == 0
+
+
+def test_archive_lode_for_action_refuses_live_claim(temp_config, make_lode):
+    active_lodes = [
+        make_lode(
+            id="live0001",
+            archive_action_id="a" * 32,
+            pending_action={"action_id": "a" * 32},
+        )
+    ]
+    archived_lodes = []
+    save_lodes(active_lodes)
+    save_archived_lodes(archived_lodes)
+
+    with pytest.raises(ValueError, match="^active lode belongs to a different archive action$"):
+        archive_lode_for_action(active_lodes, archived_lodes, "live0001", "b" * 32)
+
+
+def test_archive_lode_for_action_refuses_competing_claim(temp_config, make_lode):
+    active_lodes = [
+        make_lode(
+            id="comp0001",
+            archive_action_id="a" * 32,
+            pending_action={"action_id": "c" * 32},
+        )
+    ]
+    archived_lodes = []
+    save_lodes(active_lodes)
+    save_archived_lodes(archived_lodes)
+
+    with pytest.raises(ValueError, match="^active lode belongs to a different archive action$"):
+        archive_lode_for_action(active_lodes, archived_lodes, "comp0001", "b" * 32)
+
+
+@pytest.mark.parametrize(
+    "pending_action_val",
+    [
+        "missing",
+        None,
+        "not-a-dict",
+        {},
+        {"action_id": None},
+        {"action_id": 12345},
+    ],
+)
+def test_archive_lode_for_action_refuses_inconclusive_owner(
+    temp_config, make_lode, pending_action_val
+):
+    lode = make_lode(id="inconc01", archive_action_id="a" * 32)
+    if pending_action_val == "missing":
+        lode.pop("pending_action", None)
+    else:
+        lode["pending_action"] = pending_action_val
+
+    active_lodes = [lode]
+    archived_lodes = []
+    save_lodes(active_lodes)
+    save_archived_lodes(archived_lodes)
+
+    with pytest.raises(ValueError, match="^active lode belongs to a different archive action$"):
+        archive_lode_for_action(active_lodes, archived_lodes, "inconc01", "b" * 32)
+
+
+def test_archive_lode_for_action_refuses_already_archived_other_action(temp_config, make_lode):
+    archived_lodes = [
+        make_lode(
+            id="arch0001",
+            archived_at=5000,
+            archive_action_id="a" * 32,
+        )
+    ]
+    active_lodes = []
+    save_archived_lodes(archived_lodes)
+    save_lodes(active_lodes)
+
+    with pytest.raises(ValueError, match="^lode is archived by a different action$"):
+        archive_lode_for_action(active_lodes, archived_lodes, "arch0001", "b" * 32)
+
+
+def test_archive_lode_for_action_allows_archived_only_same_action_retry(temp_config, make_lode):
+    archived_lodes = [
+        make_lode(
+            id="retry001",
+            archived_at=5000,
+            archive_action_id="a" * 32,
+        )
+    ]
+    active_lodes = []
+    save_archived_lodes(archived_lodes)
+    save_lodes(active_lodes)
+
+    result = archive_lode_for_action(active_lodes, archived_lodes, "retry001", "a" * 32)
+
+    assert result["id"] == "retry001"
+    assert result["archive_action_id"] == "a" * 32
+    assert len(archived_lodes) == 1
+
