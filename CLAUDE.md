@@ -20,13 +20,13 @@ Refine-stage coding dispatch stays deliberately small: `hopper/coder.py` selects
 the existing Codex wrapper or the Grok wrapper. Provider streams remain raw in
 stage event artifacts; `hopper/code.py` translates only provider events that map
 to the existing progress and command-heartbeat behavior. Codex bootstrap and
-resume subprocesses are pinned to `gpt-5.6-terra` at `xhigh`; do not add a
+resume subprocesses are pinned to `gpt-6-luna` at `xhigh`; do not add a
 generic event framework or pin a Grok model.
 
 Interactive supervision follows the same small adapter shape through
 `hopper/driver.py`: each provider owns only its command, environment, and pane
 parsing. Codex supervisor sessions are bootstrapped read-only on
-`gpt-5.6-terra` at `xhigh`, then resumed in the full interactive TUI. Keep
+`gpt-6-luna` at `xhigh`, then resumed in the full interactive TUI. Keep
 provider-specific TUI rules in the provider modules rather than growing a
 generic framework.
 

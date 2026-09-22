@@ -84,7 +84,7 @@ hop supervisor default codex
 cat scope.md | hop implement myproject --supervisor codex --coder grok
 ```
 
-Hopper pins every Codex subprocess to `gpt-5.6-terra` with `xhigh` reasoning,
+Hopper pins every Codex subprocess to `gpt-6-luna` with `xhigh` reasoning,
 independent of the host Codex configuration.
 
 Hopper does not pass a Grok model name, so the CLI uses the current default model

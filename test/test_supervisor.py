@@ -37,18 +37,18 @@ CODEX_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 CODEX_IDLE = """
 › Ask Codex to do anything
 
-  gpt-5.6-terra xhigh · /repo
+  gpt-6-luna xhigh · /repo
 """
 CODEX_STAGED = """
 › Please inspect the failing test
 
-  gpt-5.6-terra xhigh · /repo
+  gpt-6-luna xhigh · /repo
 """
 CODEX_BUSY = """
 • Working (0s • esc to interrupt)
 
 › Ask Codex to do anything
-  gpt-5.6-terra xhigh · /repo
+  gpt-6-luna xhigh · /repo
 """
 CODEX_WAIT = """
 Our systems are thinking a bit more about this request before responding.
@@ -249,7 +249,7 @@ def test_codex_bootstrap_pins_terra_xhigh_and_returns_one_uuid():
     assert "--ignore-user-config" in cmd
     assert "--ignore-rules" in cmd
     assert cmd[cmd.index("-s") + 1] == "read-only"
-    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
+    assert cmd[cmd.index("-m") + 1] == "gpt-6-luna"
     assert 'model_reasoning_effort="xhigh"' in cmd
     assert "--json" in cmd
 

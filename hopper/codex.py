@@ -16,7 +16,7 @@ from hopper.tmux import KeyboardOwnership, PanePhase, normalize_terminal_text
 logger = logging.getLogger(__name__)
 
 CODEX_FLAGS = "--dangerously-bypass-approvals-and-sandbox"
-CODEX_MODEL = "gpt-5.6-terra"
+CODEX_MODEL = "gpt-6-luna"
 CODEX_REASONING_CONFIG = 'model_reasoning_effort="xhigh"'
 CODEX_BOOTSTRAP_TIMEOUT_SEC = 10 * 60
 LABEL = "Codex"

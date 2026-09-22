@@ -25,7 +25,7 @@ MOCK_CMD = [
     "exec",
     "--dangerously-bypass-approvals-and-sandbox",
     "-m",
-    "gpt-5.6-terra",
+    "gpt-6-luna",
     "-c",
     'model_reasoning_effort="xhigh"',
     "--json",
