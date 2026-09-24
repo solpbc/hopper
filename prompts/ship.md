@@ -78,16 +78,17 @@ The retry rule below needs two recorded facts. Record both before every merge at
 
 If step 2 used the `origin/master` fallback, read `origin/master` instead of `origin/main` everywhere in this section.
 
+⚠ **Address `$dir` explicitly in every land command — `git -C "$dir" …`, never a bare `git` after a `cd`.** Your shell's working directory can reset to the worktree between tool calls. A bare `git merge --ff-only $branch` run there merges the branch into itself ("Already up to date"), and the push then fails with no upstream, so nothing lands. This gated ship on four lodes in four repos between 2026-09-09 and 09-22.
+
 Verify the original repo is on main (or master) before merging:
 
 ```
-cd $dir
-git rev-parse --abbrev-ref HEAD   # must be main or master
-git merge --ff-only $branch
-git push
+git -C "$dir" rev-parse --abbrev-ref HEAD   # must be main or master
+git -C "$dir" merge --ff-only $branch
+git -C "$dir" push
 ```
 
-If the branch is not main or master, switch to main first: `git checkout main` (or `git checkout master`).
+If the branch is not main or master, switch to main first: `git -C "$dir" checkout main` (or `master`).
 
 If there is no remote configured, skip `git push`.
 
@@ -105,7 +106,7 @@ The last one matters most: `$dir` is shared with other lodes on this project, an
 When all four pass, undo only your own fast-forward:
 
 ```
-git reset --hard <pre-merge main SHA>
+git -C "$dir" reset --hard <pre-merge main SHA>
 ```
 
 If the merge itself failed, this is a no-op, which is expected. If the reset does not succeed, stop and gate: rebasing from here would rewrite the feature branch while local main still points at the old tip, which invalidates the check above and cannot be undone by retrying.
@@ -121,11 +122,10 @@ If the merge itself failed, this is a no-op, which is expected. If the reset doe
 5. Retry. Re-record the pre-merge main SHA first, because re-validation takes time and a sibling lode may have moved local main while it ran:
 
 ```
-cd $dir
-git rev-parse --abbrev-ref HEAD   # must be main or master
-git rev-parse HEAD                # the new pre-merge main SHA
-git merge --ff-only $branch
-git push
+git -C "$dir" rev-parse --abbrev-ref HEAD   # must be main or master
+git -C "$dir" rev-parse HEAD                # the new pre-merge main SHA
+git -C "$dir" merge --ff-only $branch
+git -C "$dir" push
 ```
 
 Apply this same rule to every later failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
