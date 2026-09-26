@@ -26,7 +26,14 @@ LABEL = "Grok"
 # ... 2>file` sends every escape sequence, including `\e[?1049h`, to `file`
 # while the pty gets nothing.
 PIPE_STDERR = False
+# --trust: a repo carrying AGENTS.md/CLAUDE.md opens on "Do you trust the
+# contents of this directory?" until its checkout is trusted, and nothing in a
+# lode pane answers it -- the first Grok-supervised lode per host and project
+# sat there until stuck (x6rggm7m 2026-09-17, ly2hfw5n 2026-09-26). The -p
+# coder path below already passes it; verified live on 1.0.41 that it
+# suppresses the dialog in interactive mode too.
 _SUPERVISOR_FLAGS = (
+    "--trust",
     "--fullscreen",
     "--permission-mode",
     "bypassPermissions",

@@ -218,6 +218,7 @@ def test_supervisor_commands_are_interactive_and_exact():
     resume = grok.build_command(session_id=CODEX_SESSION_ID, prompt=None, resume=True)
     assert resume[-2:] == ["--resume", CODEX_SESSION_ID]
     for required in (
+        "--trust",
         "--fullscreen",
         "bypassPermissions",
         "off",
