@@ -1158,9 +1158,7 @@ def test_coder_session_rejects_grok_usage(temp_config):
     lode = create_lode(lodes_list, "test-project", coder_provider="grok")
 
     with pytest.raises(ValueError, match="Grok sessions do not carry usage_total_tokens"):
-        update_lode_coder_session(
-            lodes_list, lode["id"], "grok", "session", usage_total_tokens=1
-        )
+        update_lode_coder_session(lodes_list, lode["id"], "grok", "session", usage_total_tokens=1)
 
 
 def test_update_lode_coder_session_not_found(temp_config):
@@ -2062,4 +2060,3 @@ def test_archive_lode_for_action_allows_archived_only_same_action_retry(temp_con
     assert result["id"] == "retry001"
     assert result["archive_action_id"] == "a" * 32
     assert len(archived_lodes) == 1
-

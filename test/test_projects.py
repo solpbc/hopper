@@ -261,7 +261,9 @@ def test_add_project_no_makefile(mock_config, tmp_path):
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
 
-    with pytest.raises(ValueError, match="No Makefile with a 'hopper-install', 'agent-setup', 'install' target"):
+    with pytest.raises(
+        ValueError, match="No Makefile with a 'hopper-install', 'agent-setup', 'install' target"
+    ):
         add_project(str(repo))
 
 
@@ -273,7 +275,9 @@ def test_add_project_makefile_no_install_target(mock_config, tmp_path):
     (repo / "Makefile").write_text(".PHONY: test\ntest:\n\t@true\n")
     assert validate_makefile_install(str(repo)) is False
 
-    with pytest.raises(ValueError, match="No Makefile with a 'hopper-install', 'agent-setup', 'install' target"):
+    with pytest.raises(
+        ValueError, match="No Makefile with a 'hopper-install', 'agent-setup', 'install' target"
+    ):
         add_project(str(repo))
 
 

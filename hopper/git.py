@@ -1372,7 +1372,10 @@ def quarantine_dirty_repo(repo_dir: str, lode_id: str) -> str | None:
             )
             return None
 
-        file_list = "\n".join(f"  {line}" for line in dirty_files.splitlines()) or "  (unknown — status captured empty)"
+        file_list = (
+            "\n".join(f"  {line}" for line in dirty_files.splitlines())
+            or "  (unknown — status captured empty)"
+        )
         logger.warning(
             f"quarantined dirty project repo {repo_dir} onto branch {branch} (lode {lode_id}); "
             f"swept files:\n{file_list}\n"
