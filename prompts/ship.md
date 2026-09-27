@@ -53,7 +53,8 @@ If the rebase has conflicts:
 Run the repository's canonical full validation gate exactly once after rebase.
 Prefer `make ci` when it exists; otherwise use the repository's documented full
 equivalent. Inspect the target first and do not separately run commands already
-included by it. Every ship requires a successful full gate.
+included by it. Every ship requires a successful full gate; the one exception is
+a proven inherited red, below.
 
 Run the gate bare through `hop check` so a failure cannot be misreported as success:
 
@@ -67,7 +68,9 @@ hop check --allow-capture -- make ci
 
 Do **not** pipe validation straight through a pager yourself. `make ci 2>&1 | tail -30` reports `tail`'s exit code, not make's, so a red build silently looks green. If you ever must hand-build such a pipeline instead of using `hop check`, prefix it with `set -o pipefail`, or capture to a file and check `$?` explicitly.
 
-If tests fail due to rebase conflicts you resolved, fix the issues and amend the relevant commit. If tests were already failing on the feature branch before rebase, note it but proceed.
+If tests fail due to rebase conflicts you resolved, fix the issues and amend the relevant commit.
+
+A red gate may land only when it is **inherited**: every failure also fails on the validated base SHA, without this branch. Ship does not repair unrelated main, so a proven inherited red is noted and landed. Prove it before you land. Check the validated base out into a detached scratch worktree (`git worktree add --detach <scratch> <validated base SHA>`), run only the failing tests there through `hop check` (the repository's single-test target when it has one), then remove the scratch worktree. A failure reproduces only when the **same test fails with the same error** on the base; a base run that fails for its own reason, such as a missing dependency in the scratch worktree, reproduces nothing. If every failure reproduces, name each one in your output with that result and proceed. If any does not, or you cannot run the check, the red is not proven inherited: gate, and report what the base run showed. Do not call a failure branch-caused only because it passed on the base; it may be a flake, and the operator decides. ⛔ A failure the branch's own commits cause is never inherited, even though it was already on the feature branch before rebase and even when the rebase changed nothing.
 
 ### 4. Land on main
 
@@ -133,12 +136,12 @@ Apply this same rule to every later failure. There is no attempt limit: a retry 
 Stop and gate on any of these:
 
 - A rebase conflict that cannot be resolved unambiguously (see step 2).
-- Validation fails for a reason attributable to the branch. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs; if the failure was already present on the feature branch before rebase, step 3's exception applies — note it and proceed. Gate only when neither applies.
+- Validation fails and the failure is not a proven inherited red. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs. If every failure reproduces on the validated base as the same test with the same error, step 3's exception applies: note each one with that proof and proceed. Every other failure gates, including one the branch's own commits caused.
 - The original repo is not on main or master and cannot be switched safely.
 - A merge or push failed while the remote base was unchanged.
 - The remote base cannot be fetched or read.
 - The four restore checks above do not all pass.
-- Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you cannot attribute to either exception above.
+- Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you have not proven inherited.
 
 Losing a merge race is not a terminal condition. That list is deliberately open-ended at the end: gating is the only correct way to stop this stage short of a completed merge. Never end this stage by reporting a failure as prose — nothing reads the pane, so a prose report leaves the lode silently idle until it is parked as stuck.
 
