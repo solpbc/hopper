@@ -51,6 +51,7 @@ from hopper.server import (
     Server,
     ServerLockHeld,
     SpawnOutcome,
+    _observe_action_retention,
     get_git_hash,
     start_server_with_tui,
 )
@@ -2299,8 +2300,8 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     assert blocked_response["expected_generation"] == blocked["expected_generation"]
     assert blocked_response["disposition"] == blocked["target_disposition"]
     assert blocked_response["containment"]["state"] == expected_cursor
-    assert blocked_response["preserved"]["worktree"] is True
-    assert blocked_response["preserved"]["branch"] is True
+    assert blocked_response["preserved"]["worktree"] is None
+    assert blocked_response["preserved"]["branch"] is None
     assert expected_command in blocked_response["status"]
 
     retry_conn = _mock_client(server)
@@ -3209,7 +3210,12 @@ def test_evicted_action_retry_refuses_stale_generation_without_reexecution(socke
         current = copy.deepcopy(source)
         current["action_id"] = f"{index + 1:032x}"
         actions.append_action_result(
-            lode, actions.new_action_result(current, completed_ms=2_000 + index)
+            lode,
+            actions.new_action_result(
+                current,
+                retained={"worktree": True, "branch": True, "session": False},
+                completed_ms=2_000 + index,
+            ),
         )
     server = Server(socket_path)
     server.lodes = [lode]
@@ -3474,7 +3480,7 @@ def test_pending_action_does_not_enable_legacy_manual_wire(socket_path, make_lod
     assert response["reason"] == "protocol_upgrade_required"
     assert "retired mixed-version control message" in response["status"]
     assert f"Action {record['action_id']} (completion) owns generation" in response["status"]
-    assert "Preserved: worktree, branch, stage session" in response["status"]
+    assert "Preserved: stage session; worktree, branch: not determined" in response["status"]
     assert f"Inspect with: hop lode status {record['lode_id']}" in response["status"]
 
 
@@ -3554,7 +3560,7 @@ def test_legacy_stage_restart_refuses_without_mutation(socket_path, make_lode):
     assert response["reason"] == "protocol_upgrade_required"
     assert "retired mixed-version control message" in response["status"]
     assert f"Action {record['action_id']} (completion) owns generation" in response["status"]
-    assert "Preserved: worktree, branch, stage session" in response["status"]
+    assert "Preserved: stage session; worktree, branch: not determined" in response["status"]
     assert f"Inspect with: hop lode status {record['lode_id']}" in response["status"]
 
 
@@ -13742,3 +13748,423 @@ def test_cleanup_does_not_guess_between_unrecorded_candidates(socket_path, make_
 
     find_project.assert_not_called()
     remove.assert_not_called()
+
+
+def _setup_test_project_git(tmp_path, repo_name="myproj", branch="hopper-testid22"):
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    repo_dir = tmp_path / repo_name
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True
+    )
+    (repo_dir / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
+    if branch:
+        subprocess.run(["git", "branch", branch], cwd=repo_dir, check=True, capture_output=True)
+    with config_transaction() as stored:
+        stored.setdefault("projects", []).append(
+            {"path": str(repo_dir), "name": repo_name, "disabled": False, "last_used_at": 100}
+        )
+    return repo_dir
+
+
+@pytest.mark.parametrize(
+    "action_type, stage, expected_session",
+    [
+        ("completion", "mill", True),
+        ("pause", "mill", True),
+        ("kill", "mill", True),
+        ("archive", "mill", True),
+        ("restart", "mill", False),
+    ],
+)
+def test_observation_retained_present_cases(
+    socket_path, make_lode, tmp_path, action_type, stage, expected_session
+):
+    lode_id = "testid22"
+    branch_name = f"hopper-{lode_id}"
+    _setup_test_project_git(tmp_path, repo_name="proj1", branch=branch_name)
+
+    worktree_dir = config.worktree_root().resolve() / lode_id
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+
+    lode = make_lode(
+        id=lode_id,
+        project="proj1",
+        stage=stage,
+        branch=branch_name,
+        worktree_path=str(worktree_dir),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    if action_type == "completion":
+        record = _pending_completion_record(lode_id=lode_id, stage=stage)
+        server._clear_completed_action(record)
+    else:
+        record = actions.new_pending_action(
+            lode_id=lode_id,
+            stage=stage,
+            expected_generation=None,
+            action_type=action_type,
+            target_disposition=actions.TARGET_DISPOSITIONS[action_type].copy().pop(),
+            force_consent=False,
+            action_id="a" * 32,
+            already_empty=True,
+        )
+        server._clear_completed_manual_action(record)
+
+    receipt = lode["action_results"][-1]
+    assert receipt["retained"] == {
+        "worktree": True,
+        "branch": True,
+        "session": expected_session,
+    }
+
+
+def test_observation_retained_removed_and_deleted_cases(socket_path, make_lode, tmp_path):
+    import shutil
+    import subprocess
+
+    names = {"pause": "tpause22", "kill": "tkill222", "archive": "tarch222"}
+    for action_type in ("pause", "kill", "archive"):
+        lode_id = names[action_type]
+        branch_name = f"hopper-{lode_id}"
+        repo_dir = _setup_test_project_git(
+            tmp_path, repo_name=f"proj_{action_type}", branch=branch_name
+        )
+
+        worktree_dir = config.worktree_root().resolve() / lode_id
+        worktree_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(worktree_dir)
+        subprocess.run(
+            ["git", "branch", "-D", branch_name], cwd=repo_dir, check=True, capture_output=True
+        )
+
+        lode = make_lode(
+            id=lode_id,
+            project=f"proj_{action_type}",
+            stage="mill",
+            branch=branch_name,
+            worktree_path=str(worktree_dir),
+        )
+        server = Server(socket_path)
+        server.lodes = [lode]
+
+        record = actions.new_pending_action(
+            lode_id=lode_id,
+            stage="mill",
+            expected_generation=None,
+            action_type=action_type,
+            target_disposition=actions.TARGET_DISPOSITIONS[action_type].copy().pop(),
+            force_consent=False,
+            action_id="b" * 32,
+            already_empty=True,
+        )
+        server._clear_completed_manual_action(record)
+        receipt = lode["action_results"][-1]
+        assert receipt["retained"] == {
+            "worktree": False,
+            "branch": False,
+            "session": True,
+        }
+
+    # Direct helper calls for restart and non-ship completion false cases
+    lode_id = "testfals"
+    branch_name = f"hopper-{lode_id}"
+    repo_dir = _setup_test_project_git(tmp_path, repo_name="proj_direct", branch=branch_name)
+    worktree_dir = config.worktree_root().resolve() / lode_id
+    subprocess.run(
+        ["git", "branch", "-D", branch_name], cwd=repo_dir, check=True, capture_output=True
+    )
+
+    lode_false = make_lode(
+        id=lode_id,
+        project="proj_direct",
+        stage="refine",
+        branch=branch_name,
+        worktree_path=str(worktree_dir),
+    )
+    rec_completion = _pending_completion_record(lode_id=lode_id, stage="refine")
+    assert _observe_action_retention(rec_completion, lode_false) == {
+        "worktree": False,
+        "branch": False,
+    }
+
+    rec_restart = actions.new_pending_action(
+        lode_id=lode_id,
+        stage="refine",
+        expected_generation=None,
+        action_type="restart",
+        target_disposition="replacement_spawned",
+        force_consent=False,
+        action_id="c" * 32,
+        already_empty=True,
+    )
+    assert _observe_action_retention(rec_restart, lode_false) == {
+        "worktree": False,
+        "branch": False,
+    }
+
+
+def test_ship_clear_observation_uses_quarantine_without_io(socket_path, make_lode):
+    lode_id = "testship"
+    record = _pending_completion_record(lode_id=lode_id, stage="ship")
+    record["ship"]["quarantine"]["removal_outcome"] = "removed"
+    record["ship"]["quarantine"]["branch_outcome"] = "deleted"
+
+    server = Server(socket_path)
+    archived_lode = make_lode(id=lode_id, stage="ship", state="ready")
+    server.archived_lodes = [archived_lode]
+
+    with (
+        patch("hopper.server.resolve_worktree_path") as mock_resolve,
+        patch("hopper.server.os.stat") as mock_stat,
+        patch("hopper.server.find_project") as mock_find,
+        patch("hopper.server.branch_exists") as mock_branch,
+    ):
+        observed = _observe_action_retention(record, archived_lode)
+        mock_resolve.assert_not_called()
+        mock_stat.assert_not_called()
+        mock_find.assert_not_called()
+        mock_branch.assert_not_called()
+        assert observed == {"worktree": False, "branch": False}
+
+    server._clear_completed_action(record)
+
+    receipt = archived_lode["action_results"][-1]
+    assert receipt["retained"] == {
+        "worktree": False,
+        "branch": False,
+        "session": False,
+    }
+
+    # Test already_absent -> branch is False, retained -> branch is True
+    rec_absent = _pending_completion_record(lode_id=lode_id, stage="ship")
+    rec_absent["ship"]["quarantine"]["removal_outcome"] = "removed"
+    rec_absent["ship"]["quarantine"]["branch_outcome"] = "already_absent"
+    archived_lode2 = make_lode(id=lode_id, stage="ship", state="ready")
+    server.archived_lodes = [archived_lode2]
+    server._clear_completed_action(rec_absent)
+    assert archived_lode2["action_results"][-1]["retained"]["branch"] is False
+
+    rec_retained = _pending_completion_record(lode_id=lode_id, stage="ship")
+    rec_retained["ship"]["quarantine"]["removal_outcome"] = "retained"
+    rec_retained["ship"]["quarantine"]["branch_outcome"] = "retained"
+    archived_lode3 = make_lode(id=lode_id, stage="ship", state="ready")
+    server.archived_lodes = [archived_lode3]
+    server._clear_completed_action(rec_retained)
+    assert archived_lode3["action_results"][-1]["retained"]["branch"] is True
+
+
+def test_observation_edges_worktree_and_branch(socket_path, make_lode, tmp_path, caplog):
+    import errno
+
+    lode_id = "testedge"
+    branch_name = f"hopper-{lode_id}"
+    _setup_test_project_git(tmp_path, repo_name="proj_edge", branch=branch_name)
+    record = _pending_completion_record(lode_id=lode_id, stage="refine")
+
+    # no_existing_candidate -> worktree False
+    lode_no_cand = make_lode(id=lode_id, project="proj_edge", worktree_path=None)
+    assert _observe_action_retention(record, lode_no_cand)["worktree"] is False
+
+    # ambiguous_candidates -> worktree None
+    (config.worktree_root().resolve() / lode_id).mkdir(parents=True, exist_ok=True)
+    (config.hopper_dir() / "lodes" / lode_id / "worktree").mkdir(parents=True, exist_ok=True)
+    lode_ambig = make_lode(id=lode_id, project="proj_edge", worktree_path=None)
+    assert _observe_action_retention(record, lode_ambig)["worktree"] is None
+
+    # recorded_identity_mismatch -> worktree None
+    mismatch_path = config.worktree_root().resolve() / "other_lode"
+    lode_mismatch = make_lode(id=lode_id, project="proj_edge", worktree_path=str(mismatch_path))
+    assert _observe_action_retention(record, lode_mismatch)["worktree"] is None
+
+    # recorded path with PermissionError on os.stat for that path only -> None
+    managed_path = config.worktree_root().resolve() / lode_id
+    lode_managed = make_lode(id=lode_id, project="proj_edge", worktree_path=str(managed_path))
+    real_stat = os.stat
+
+    def perm_stat(path, *args, **kwargs):
+        if str(path) == str(managed_path):
+            raise PermissionError("permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    with patch("hopper.server.os.stat", side_effect=perm_stat):
+        assert _observe_action_retention(record, lode_managed)["worktree"] is None
+
+    # ELOOP on os.stat for that path only -> None
+    def eloop_stat(path, *args, **kwargs):
+        if str(path) == str(managed_path):
+            raise OSError(errno.ELOOP, "too many levels of symbolic links")
+        return real_stat(path, *args, **kwargs)
+
+    with patch("hopper.server.os.stat", side_effect=eloop_stat):
+        assert _observe_action_retention(record, lode_managed)["worktree"] is None
+
+    # NotADirectoryError on os.stat for that path only -> False
+    def notadir_stat(path, *args, **kwargs):
+        if str(path) == str(managed_path):
+            raise NotADirectoryError("not a directory")
+        return real_stat(path, *args, **kwargs)
+
+    with patch("hopper.server.os.stat", side_effect=notadir_stat):
+        assert _observe_action_retention(record, lode_managed)["worktree"] is False
+
+    # lode with project key removed -> branch None, warning contains lode_id and "branch"
+    lode_no_proj = make_lode(id=lode_id, worktree_path=str(managed_path))
+    del lode_no_proj["project"]
+    caplog.clear()
+    observed_no_proj = _observe_action_retention(record, lode_no_proj)
+    assert observed_no_proj["branch"] is None
+    assert any(
+        lode_id in record_entry.message and "branch" in record_entry.message
+        for record_entry in caplog.records
+    )
+
+    # branch_exists returns None -> branch is None
+    with patch("hopper.server.branch_exists", return_value=None):
+        assert _observe_action_retention(record, lode_managed)["branch"] is None
+
+    # find_project returns None -> branch is None and branch_exists not called
+    with (
+        patch("hopper.server.find_project", return_value=None),
+        patch("hopper.server.branch_exists") as mock_branch_exists,
+    ):
+        assert _observe_action_retention(record, lode_managed)["branch"] is None
+        mock_branch_exists.assert_not_called()
+
+
+def test_manual_clear_absent_lode_records_none_and_blocks(socket_path):
+    lode_id = "testabnt"
+    record = actions.new_pending_action(
+        lode_id=lode_id,
+        stage="mill",
+        expected_generation=None,
+        action_type="archive",
+        target_disposition="archived",
+        force_consent=False,
+        action_id="d" * 32,
+        already_empty=True,
+    )
+    server = Server(socket_path)
+    server.lodes = []
+    server.archived_lodes = []
+
+    server._clear_completed_manual_action(record)
+
+    loaded = actions.load_pending_action(lode_id)
+    assert loaded is not None
+    assert loaded["result"]["retained"]["worktree"] is None
+    assert loaded["result"]["retained"]["branch"] is None
+    assert loaded["result"]["retained"]["session"] is True
+    assert loaded["phase"] == "cleanup_blocked"
+    assert loaded["recovery"]["message"] == "action lode is absent"
+
+
+def test_observation_replay_idempotency(socket_path, make_lode, tmp_path):
+    lode_id = "testrply"
+    branch_name = f"hopper-{lode_id}"
+    _setup_test_project_git(tmp_path, repo_name="proj_rply", branch=branch_name)
+
+    lode = make_lode(
+        id=lode_id,
+        project="proj_rply",
+        stage="mill",
+        branch=branch_name,
+        worktree_path=None,
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    record = actions.new_pending_action(
+        lode_id=lode_id,
+        stage="mill",
+        expected_generation=None,
+        action_type="archive",
+        target_disposition="archived",
+        force_consent=False,
+        action_id="e" * 32,
+        already_empty=True,
+    )
+
+    with (
+        patch(
+            "hopper.server.resolve_worktree_path",
+            return_value={"path": None, "basis": "unavailable", "reason": "no_existing_candidate"},
+        ) as mock_resolve,
+        patch("hopper.server.branch_exists", return_value=True) as mock_branch,
+    ):
+        server._clear_completed_manual_action(record)
+        assert mock_resolve.call_count == 1
+        assert mock_branch.call_count == 1
+        receipt1 = copy.deepcopy(lode["action_results"][-1])
+
+        # Second clear with result already set
+        server._clear_completed_manual_action(record)
+        assert mock_resolve.call_count == 1
+        assert mock_branch.call_count == 1
+        receipt2 = lode["action_results"][-1]
+        assert receipt1 == receipt2
+
+
+def test_manual_ack_preserves_stage_session_on_cleanup(socket_path, make_lode, tmp_path):
+    import shutil
+    import subprocess
+
+    lode_id = "testackk"
+    branch_name = f"hopper-{lode_id}"
+    repo_dir = _setup_test_project_git(tmp_path, repo_name="proj_ack", branch=branch_name)
+
+    worktree_dir = config.worktree_root().resolve() / lode_id
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(worktree_dir)
+    subprocess.run(
+        ["git", "branch", "-D", branch_name], cwd=repo_dir, check=True, capture_output=True
+    )
+
+    lode = make_lode(
+        id=lode_id,
+        project="proj_ack",
+        stage="mill",
+        branch=branch_name,
+        worktree_path=str(worktree_dir),
+    )
+    server = Server(socket_path)
+    server.lodes = [lode]
+
+    record = actions.new_pending_action(
+        lode_id=lode_id,
+        stage="mill",
+        expected_generation=None,
+        action_type="archive",
+        target_disposition="archived",
+        force_consent=False,
+        action_id="f" * 32,
+        already_empty=True,
+    )
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [(conn, None)]
+
+    server._clear_completed_manual_action(record)
+
+    response = _decode_mock_response(conn)
+    assert response["accepted"] is True
+    assert response["preserved"] == {
+        "worktree": False,
+        "branch": False,
+        "stage_session": True,
+    }
+    assert response["status"].endswith("Preserved: stage session.")

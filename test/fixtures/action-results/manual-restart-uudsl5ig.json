@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "action_id": "054a2cbe308443dab9e76f9530778051",
+  "lode_id": "uudsl5ig",
+  "expected_generation": "35bddd9db8a14c89be22b39580bc54a2",
+  "action_type": "restart",
+  "target_disposition": "replacement_spawned",
+  "force_consent": false,
+  "terminal_disposition": "replacement_spawned",
+  "completed_at_ms": 1789706154470,
+  "containment_proof": "strict Linux containment proven",
+  "retained": {
+    "worktree": true,
+    "branch": true,
+    "session": false
+  },
+  "successor": {
+    "lode_id": "uudsl5ig",
+    "generation": "749c96d121d144789a9d003390a5a57a",
+    "pane_id": "%15934"
+  }
+}

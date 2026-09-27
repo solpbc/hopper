@@ -2366,10 +2366,11 @@ def format_lode_detail(lode: dict) -> str:
 
     pending_action = lode.get("pending_action")
     if isinstance(pending_action, dict):
+        from hopper import actions
+
         containment = pending_action.get("containment", {})
         preserved = pending_action.get("preserved", {})
         recovery = pending_action.get("recovery", {})
-        preserved_names = [name.replace("_", " ") for name, kept in preserved.items() if kept]
         recovery_command = recovery.get("command") or f"hop lode status {lode.get('id', '')}"
         containment_truth = (
             containment.get("proof_label")
@@ -2386,7 +2387,7 @@ def format_lode_detail(lode: dict) -> str:
                 f"    disposition: {pending_action.get('target_disposition', '')}",
                 f"    phase:       {pending_action.get('phase', '')}",
                 f"    containment: {containment_truth}",
-                f"    preserved:   {', '.join(preserved_names) or 'none'}",
+                f"    preserved:   {actions._preserved_text(preserved)}",
                 f"    recovery:    {recovery_command}",
             ]
         )

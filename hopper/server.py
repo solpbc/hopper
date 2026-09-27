@@ -17,6 +17,7 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -166,6 +167,62 @@ def _prove_terminal_oom_scope_archiveable(lode: dict) -> None:
     if observed["state"] != "absent":
         detail = observed["error"] or observed["state"]
         raise RuntimeError(f"OOM scope is not proven absent: {detail}")
+
+
+def _observe_action_retention(record: dict, lode: dict | None) -> dict:
+    """Observe worktree and branch retention for a terminal action receipt."""
+    if record.get("action_type") == "completion" and record.get("stage") == "ship":
+        return actions._ship_quarantine_retained(record["ship"]["quarantine"])
+
+    if lode is None:
+        return {"worktree": None, "branch": None}
+
+    lode_id = lode.get("id") or record.get("lode_id", "")
+    worktree = None
+    branch = None
+
+    try:
+        resolved = resolve_worktree_path(lode)
+        basis = resolved.get("basis")
+        path = resolved.get("path")
+        reason = resolved.get("reason")
+        if basis in {"recorded", "existing"} and path is not None:
+            try:
+                st = os.stat(path)
+                worktree = stat.S_ISDIR(st.st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                worktree = False
+            except OSError:
+                worktree = None
+        elif path is None and reason == "no_existing_candidate":
+            worktree = False
+        else:
+            worktree = None
+    except Exception as error:
+        worktree = None
+        logger.warning("Observation failed for worktree on lode %s: %s", lode_id, error)
+
+    try:
+        if "project" not in lode or not lode.get("project"):
+            logger.warning(
+                "Observation failed for branch on lode %s: project is unavailable", lode_id
+            )
+            branch = None
+        else:
+            project = find_project(lode["project"])
+            if project is None:
+                logger.warning(
+                    "Observation failed for branch on lode %s: project not found", lode_id
+                )
+                branch = None
+            else:
+                branch_name = lode.get("branch") or f"hopper-{lode_id}"
+                branch = branch_exists(project.path, branch_name)
+    except Exception as error:
+        branch = None
+        logger.warning("Observation failed for branch on lode %s: %s", lode_id, error)
+
+    return {"worktree": worktree, "branch": branch}
 
 
 PROGRESS_REJECT_STATES = frozenset({"new", "gated", "ready", "reconnecting", "teardown", "error"})
@@ -4244,11 +4301,12 @@ class Server:
                     "generation": record["spawn"]["target_generation"],
                     "pane_id": record["spawn"]["pane_id"],
                 }
+            observed = _observe_action_retention(record, self._find_action_lode(record["lode_id"]))
             record["result"] = actions.new_action_result(
                 record,
                 retained={
-                    "worktree": True,
-                    "branch": True,
+                    "worktree": observed["worktree"],
+                    "branch": observed["branch"],
                     "session": record["stage"] != "ship",
                 },
                 successor=successor,
@@ -4292,11 +4350,12 @@ class Server:
                     "generation": record["spawn"]["target_generation"],
                     "pane_id": record["spawn"]["pane_id"],
                 }
+            observed = _observe_action_retention(record, self._find_action_lode(record["lode_id"]))
             record["result"] = actions.new_action_result(
                 record,
                 retained={
-                    "worktree": True,
-                    "branch": True,
+                    "worktree": observed["worktree"],
+                    "branch": observed["branch"],
                     "session": record["action_type"] != "restart",
                 },
                 successor=successor,

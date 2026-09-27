@@ -574,6 +574,31 @@ def _validate_ship(value) -> None:
     _string(value["cleanup_failure"], "ship.cleanup_failure", nullable=True)
 
 
+def _ship_quarantine_retained(quarantine: dict) -> dict:
+    """Map validated ship-quarantine outcomes to observed retention."""
+    removal_outcome = quarantine.get("removal_outcome")
+    branch_outcome = quarantine.get("branch_outcome")
+    if removal_outcome == "removed":
+        worktree = False
+    elif removal_outcome == "retained":
+        worktree = True
+    elif removal_outcome == "pending":
+        worktree = None
+    else:
+        raise ValueError(f"unsupported ship quarantine removal_outcome {removal_outcome!r}")
+
+    if branch_outcome in {"deleted", "already_absent"}:
+        branch = False
+    elif branch_outcome == "retained":
+        branch = True
+    elif branch_outcome == "pending":
+        branch = None
+    else:
+        raise ValueError(f"unsupported ship quarantine branch_outcome {branch_outcome!r}")
+
+    return {"worktree": worktree, "branch": branch}
+
+
 def _next_action(action_type: str, stage: str, target_disposition: str) -> dict:
     expected = {
         ("completion", "mill", "advance_refine"): {
@@ -680,6 +705,12 @@ def _validate_durability(value, action_type: str, force_consent: bool) -> None:
         raise ValueError("only a forced kill may override durability")
 
 
+def _boolean_or_null(value, name: str) -> None:
+    if value is None:
+        return
+    _boolean(value, name)
+
+
 def _validate_action_result(result: dict) -> dict:
     result = _object(
         result,
@@ -716,7 +747,7 @@ def _validate_action_result(result: dict) -> dict:
         result["retained"], "action result retained", {"worktree", "branch", "session"}
     )
     for name in retained:
-        _boolean(retained[name], f"action result retained.{name}")
+        _boolean_or_null(retained[name], f"action result retained.{name}")
     if result["successor"] is not None:
         successor = _object(
             result["successor"],
@@ -1149,8 +1180,8 @@ def load_pending_action(lode_id: str) -> dict | None:
 def new_action_result(
     record: dict,
     *,
+    retained: dict,
     completed_ms: int | None = None,
-    retained: dict | None = None,
     successor: dict | None = None,
 ) -> dict:
     """Build the immutable terminal receipt for a validated pending action."""
@@ -1166,7 +1197,7 @@ def new_action_result(
         "terminal_disposition": record["target_disposition"],
         "completed_at_ms": completed_ms if completed_ms is not None else accepted_at_ms(),
         "containment_proof": record["containment"]["proof_label"],
-        "retained": retained or {"worktree": True, "branch": True, "session": False},
+        "retained": retained,
         "successor": successor,
     }
     return _validate_action_result(result)
@@ -1586,16 +1617,15 @@ def _preserved_artifacts(
 ) -> dict:
     """Describe user-owned artifacts retained while an action is blocked.
 
-    Prefer observed facts: ship-quarantine outcomes on a pending record, then
-    the lode row. A pending-action record carries no footprint, so that path
-    keeps the historical asserted default. With neither source, do not name
-    artifacts that were never checked.
+    Ship completion follows quarantine (pending is not determined); then the
+    lode row; a record with a receipt copies retained; a record without one
+    leaves worktree and branch not determined; with neither source, name nothing.
     """
     if action_type == "completion" and record is not None and record["stage"] == "ship":
-        quarantine = record["ship"]["quarantine"]
+        quarantine_retained = _ship_quarantine_retained(record["ship"]["quarantine"])
         return {
-            "worktree": quarantine["removal_outcome"] != "removed",
-            "branch": quarantine["branch_outcome"] != "deleted",
+            "worktree": quarantine_retained["worktree"],
+            "branch": quarantine_retained["branch"],
             "stage_session": False,
         }
     if lode is not None:
@@ -1605,9 +1635,16 @@ def _preserved_artifacts(
             "stage_session": _stage_session_started(lode) and action_type != "restart",
         }
     if record is not None:
+        if record["result"] is not None:
+            retained = record["result"]["retained"]
+            return {
+                "worktree": retained["worktree"],
+                "branch": retained["branch"],
+                "stage_session": retained["session"],
+            }
         return {
-            "worktree": True,
-            "branch": True,
+            "worktree": None,
+            "branch": None,
             "stage_session": action_type != "restart",
         }
     return {
@@ -1618,8 +1655,17 @@ def _preserved_artifacts(
 
 
 def _preserved_text(preserved: dict) -> str:
-    names = [name.replace("_", " ") for name, kept in preserved.items() if kept]
-    return ", ".join(names) if names else "none"
+    kept = [name.replace("_", " ") for name, value in preserved.items() if value is True]
+    unknown = [name.replace("_", " ") for name, value in preserved.items() if value is None]
+    kept_text = ", ".join(kept) if kept else ""
+    unknown_text = f"{', '.join(unknown)}: not determined" if unknown else ""
+    if kept_text and unknown_text:
+        return f"{kept_text}; {unknown_text}"
+    if kept_text:
+        return kept_text
+    if unknown_text:
+        return unknown_text
+    return "none"
 
 
 def _blocked_facts(record: dict) -> str:

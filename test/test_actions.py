@@ -169,7 +169,7 @@ def _ship_pending_without_io() -> dict:
 def _blocked_facts_text(*, truth="not_started") -> str:
     return (
         f"Action {'1' * 32} owns generation {'2' * 32} for advance refine; "
-        f"containment: {truth}. Preserved: worktree, branch, stage session"
+        f"containment: {truth}. Preserved: stage session; worktree, branch: not determined"
     )
 
 
@@ -645,7 +645,11 @@ def test_action_results_keep_eight_newest_in_publication_order():
     for index in range(9):
         current = copy.deepcopy(pending)
         current["action_id"] = f"{index + 1:032x}"
-        result = actions.new_action_result(current, completed_ms=2_000 + index)
+        result = actions.new_action_result(
+            current,
+            retained={"worktree": True, "branch": True, "session": False},
+            completed_ms=2_000 + index,
+        )
         actions.append_action_result(lode, result)
 
     assert [item["action_id"] for item in lode["action_results"]] == [
@@ -920,8 +924,8 @@ def test_blocked_archive_recovery_names_the_cli_action_and_complete_projection()
     assert projection["recovery"]["command"] == f"hop lode archive {pending['lode_id']}"
     assert projection["containment"]["state"] == "proven"
     assert projection["preserved"] == {
-        "worktree": True,
-        "branch": True,
+        "worktree": None,
+        "branch": None,
         "stage_session": True,
     }
     assert "Inspect with" not in projection["status"]
@@ -976,3 +980,198 @@ def test_recovery_command_landing_other_cause_falls_back_to_restart():
     }
     cmd = actions.recovery_command(record, "landing")
     assert cmd == "hop lode restart test1234"
+
+
+def test_ship_quarantine_retained_mappings_and_refusals():
+    assert actions._ship_quarantine_retained(
+        {"removal_outcome": "removed", "branch_outcome": "deleted"}
+    ) == {"worktree": False, "branch": False}
+    assert actions._ship_quarantine_retained(
+        {"removal_outcome": "removed", "branch_outcome": "already_absent"}
+    ) == {"worktree": False, "branch": False}
+    assert actions._ship_quarantine_retained(
+        {"removal_outcome": "retained", "branch_outcome": "retained"}
+    ) == {"worktree": True, "branch": True}
+    assert actions._ship_quarantine_retained(
+        {"removal_outcome": "pending", "branch_outcome": "pending"}
+    ) == {"worktree": None, "branch": None}
+
+    with pytest.raises(ValueError, match="unsupported ship quarantine removal_outcome"):
+        actions._ship_quarantine_retained(
+            {"removal_outcome": "unknown", "branch_outcome": "deleted"}
+        )
+
+    with pytest.raises(ValueError, match="unsupported ship quarantine branch_outcome"):
+        actions._ship_quarantine_retained(
+            {"removal_outcome": "removed", "branch_outcome": "unknown"}
+        )
+
+
+def test_preserved_artifacts_and_status_ship_completion():
+    pending = _ship_pending_without_io()
+    pending["ship"]["quarantine"]["removal_outcome"] = "pending"
+    pending["ship"]["quarantine"]["branch_outcome"] = "pending"
+    assert actions._preserved_artifacts("completion", record=pending) == {
+        "worktree": None,
+        "branch": None,
+        "stage_session": False,
+    }
+
+    pending["phase"] = "ship_blocked"
+    pending["recovery"] = {
+        "kind": "landing",
+        "message": "ship landing unproven",
+        "command": "hop processed",
+    }
+    status = actions.action_status(pending)
+    assert status.endswith("Preserved: worktree, branch: not determined")
+
+    pending_clean = _ship_pending_without_io()
+    pending_clean["ship"]["quarantine"]["removal_outcome"] = "removed"
+    pending_clean["ship"]["quarantine"]["branch_outcome"] = "already_absent"
+    assert actions._preserved_artifacts("completion", record=pending_clean) == {
+        "worktree": False,
+        "branch": False,
+        "stage_session": False,
+    }
+
+    pending_retained = _ship_pending_without_io()
+    pending_retained["ship"]["quarantine"]["removal_outcome"] = "retained"
+    pending_retained["ship"]["quarantine"]["branch_outcome"] = "retained"
+    assert actions._preserved_artifacts("completion", record=pending_retained) == {
+        "worktree": True,
+        "branch": True,
+        "stage_session": False,
+    }
+
+    pending_retained["phase"] = "cleanup_blocked"
+    pending_retained["ship"]["archive_published"] = True
+    pending_retained["recovery"] = {
+        "kind": "cleanup",
+        "message": "worktree cleanup retained",
+        "command": "hop processed",
+    }
+    status_retained = actions.action_status(pending_retained)
+    assert status_retained.endswith("Preserved: worktree, branch")
+
+
+def test_preserved_text_table_cases():
+    assert (
+        actions._preserved_text({"worktree": True, "branch": True, "stage_session": True})
+        == "worktree, branch, stage session"
+    )
+    assert (
+        actions._preserved_text({"worktree": False, "branch": False, "stage_session": False})
+        == "none"
+    )
+    assert (
+        actions._preserved_text({"worktree": False, "branch": True, "stage_session": False})
+        == "branch"
+    )
+    assert (
+        actions._preserved_text({"worktree": None, "branch": None, "stage_session": True})
+        == "stage session; worktree, branch: not determined"
+    )
+    assert (
+        actions._preserved_text({"worktree": None, "branch": None, "stage_session": False})
+        == "worktree, branch: not determined"
+    )
+    assert (
+        actions._preserved_text({"worktree": None, "branch": False, "stage_session": False})
+        == "worktree: not determined"
+    )
+
+
+def test_action_result_retained_validator_tri_state_and_errors():
+    _output, pending = _stage()
+    for val in (True, False, None):
+        receipt = actions.new_action_result(
+            pending,
+            retained={"worktree": val, "branch": val, "session": val},
+            completed_ms=1000,
+        )
+        assert actions._validate_action_result(receipt) is receipt
+
+    base_receipt = actions.new_action_result(
+        pending,
+        retained={"worktree": True, "branch": True, "session": False},
+        completed_ms=1000,
+    )
+
+    bad_val = copy.deepcopy(base_receipt)
+    bad_val["retained"]["worktree"] = "unknown"
+    with pytest.raises(ValueError, match="must be a boolean"):
+        actions._validate_action_result(bad_val)
+
+    bad_int = copy.deepcopy(base_receipt)
+    bad_int["retained"]["worktree"] = 0
+    with pytest.raises(ValueError, match="must be a boolean"):
+        actions._validate_action_result(bad_int)
+
+    missing_key = copy.deepcopy(base_receipt)
+    del missing_key["retained"]["branch"]
+    with pytest.raises(ValueError, match="missing keys"):
+        actions._validate_action_result(missing_key)
+
+    extra_key = copy.deepcopy(base_receipt)
+    extra_key["retained"]["extra"] = True
+    with pytest.raises(ValueError, match="unknown keys"):
+        actions._validate_action_result(extra_key)
+
+    bad_non_retained = copy.deepcopy(base_receipt)
+    bad_non_retained["force_consent"] = None
+    with pytest.raises(ValueError, match="must be a boolean"):
+        actions._validate_action_result(bad_non_retained)
+
+
+def test_record_only_preserved_text_without_lode():
+    _output, pending = _stage()
+    assert actions._preserved_artifacts("completion", record=pending) == {
+        "worktree": None,
+        "branch": None,
+        "stage_session": True,
+    }
+    assert (
+        actions._preserved_text(actions._preserved_artifacts("completion", record=pending))
+        == "stage session; worktree, branch: not determined"
+    )
+
+    restart_pending = copy.deepcopy(pending)
+    restart_pending["action_type"] = "restart"
+    restart_pending["target_disposition"] = "replacement_spawned"
+    restart_pending["next_action"] = {"kind": "restart", "target_stage": "mill"}
+    restart_pending["output"] = None
+    restart_pending["ownership"] = None
+    assert actions._preserved_artifacts("restart", record=restart_pending) == {
+        "worktree": None,
+        "branch": None,
+        "stage_session": False,
+    }
+    assert (
+        actions._preserved_text(actions._preserved_artifacts("restart", record=restart_pending))
+        == "worktree, branch: not determined"
+    )
+
+
+def test_pending_action_projection_retained_tri_state():
+    _output, pending = _stage()
+    pending_none = copy.deepcopy(pending)
+    projection_none = actions.pending_action_projection(pending_none)
+    assert projection_none["preserved"] == {
+        "worktree": None,
+        "branch": None,
+        "stage_session": True,
+    }
+
+    receipt = actions.new_action_result(
+        pending,
+        retained={"worktree": None, "branch": True, "session": False},
+        completed_ms=1000,
+    )
+    pending["result"] = receipt
+    projection = actions.pending_action_projection(pending)
+    assert projection["preserved"] == {
+        "worktree": None,
+        "branch": True,
+        "stage_session": False,
+    }

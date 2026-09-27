@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "action_id": "252fcb4f1cf641c5bed00ae8db27b232",
+  "lode_id": "ste6ema2",
+  "expected_generation": "ceb6275f95e540bb94f063bee704a838",
+  "action_type": "pause",
+  "target_disposition": "paused",
+  "force_consent": false,
+  "terminal_disposition": "paused",
+  "completed_at_ms": 1788811439028,
+  "containment_proof": "strict Linux containment proven",
+  "retained": {
+    "worktree": true,
+    "branch": true,
+    "session": true
+  },
+  "successor": null
+}

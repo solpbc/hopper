@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "action_id": "9bb73cc71b7d4a09876d4bc9ed4fec18",
+  "lode_id": "rjklpm77",
+  "expected_generation": "9ad66777639244f596c71295a2a9fe7c",
+  "action_type": "kill",
+  "target_disposition": "killed_archived",
+  "force_consent": false,
+  "terminal_disposition": "killed_archived",
+  "completed_at_ms": 1790030293286,
+  "containment_proof": "strict Linux containment proven",
+  "retained": {
+    "worktree": true,
+    "branch": true,
+    "session": true
+  },
+  "successor": null
+}

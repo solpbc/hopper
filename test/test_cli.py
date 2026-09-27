@@ -7557,6 +7557,34 @@ def test_format_lode_detail_expands_pending_action_recovery(make_lode):
     assert "preserved:   worktree, branch" in detail
     assert "recovery:    hop lode restart test-id --force" in detail
 
+    lode_none = make_lode(
+        id="test-id",
+        stage="mill",
+        state="teardown",
+        pending_action={
+            "action_id": "a" * 32,
+            "action_type": "archive",
+            "expected_generation": None,
+            "target_disposition": "archived",
+            "phase": "durability_blocked",
+            "containment": {
+                "state": "proven",
+                "result": "proven",
+                "proof_label": "strict",
+                "last_error": None,
+            },
+            "preserved": {"worktree": None, "branch": None, "stage_session": True},
+            "recovery": {
+                "kind": "durability",
+                "message": "unproven",
+                "command": "hop lode archive test-id",
+            },
+            "status": "Archive blocked",
+        },
+    )
+    detail_none = format_lode_detail(lode_none)
+    assert "preserved:   stage session; worktree, branch: not determined" in detail_none
+
 
 @pytest.mark.parametrize("failure_kind", ["oom", "runner_exit_unverified"])
 def test_terminal_failure_renders_without_generic_retry(make_lode, failure_kind):

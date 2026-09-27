@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "action_id": "3752865313184a919e8946cfe7fe2f57",
+  "lode_id": "bvvqtsmb",
+  "expected_generation": null,
+  "action_type": "archive",
+  "target_disposition": "archived",
+  "force_consent": false,
+  "terminal_disposition": "archived",
+  "completed_at_ms": 1789102883738,
+  "containment_proof": "no active runner identity was recorded at acceptance",
+  "retained": {
+    "worktree": true,
+    "branch": true,
+    "session": true
+  },
+  "successor": null
+}
