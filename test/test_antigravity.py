@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hopper.antigravity import (
     ANTIGRAVITY_MODEL,
     ANTIGRAVITY_PRINT_TIMEOUT,
@@ -26,6 +28,19 @@ from hopper.antigravity import (
 )
 
 CONVERSATION_ID = "conversation-123"
+
+
+@pytest.fixture(autouse=True)
+def _no_host_gemini_key(monkeypatch):
+    """Keep every test independent of the host's key and live tmux server.
+
+    `_antigravity_env` falls back to `tmux show-environment -g` when
+    GEMINI_API_KEY is unset, so without this a test's outcome depends on the
+    caller's environment. A test that exercises the fallback patches
+    `_tmux_global_env` itself, which overrides this default.
+    """
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr("hopper.antigravity._tmux_global_env", lambda name: None)
 
 
 def _line(event: dict) -> str:
