@@ -26,6 +26,8 @@ Invoke via Bash: `hop <command> [flags]`.
 
 ## Creating work
 
+Sol pbc operators: before running `hop implement` or `hop lode create`, consult the private org guide, `shared/playbooks/hopper.md` (§ “hopper vs. direct”).
+
 Submit scope for immediate implementation **(outside lode only)**. Scope is always provided via stdin:
 
 ```bash
