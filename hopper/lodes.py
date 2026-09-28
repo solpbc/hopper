@@ -1421,6 +1421,62 @@ def find_lode_by_prefix(lodes: list[dict], prefix: str) -> dict | None:
     return None
 
 
+def newest_gate_command_run(gate_runs: list[dict]) -> dict | None:
+    """Return the newest run matching the first run's command, or None if empty."""
+    if not gate_runs:
+        return None
+    gate_command = gate_runs[0].get("command")
+    for run in reversed(gate_runs):
+        if run.get("command") == gate_command:
+            return run
+    return None
+
+
+def freeze_ship_gate(gate_runs: list[dict], landed_head: str | None) -> dict:
+    """Compute the immutable ship-gate summary object from recorded gate runs."""
+    if not gate_runs:
+        return {
+            "state": "none",
+            "command": None,
+            "exit": None,
+            "head": None,
+            "generation": None,
+            "landed_head": landed_head,
+            "earlier_reds": 0,
+            "other_gate_runs": 0,
+        }
+
+    newest = newest_gate_command_run(gate_runs)
+    assert newest is not None
+    cmd = newest["command"]
+    same_cmd_runs = [run for run in gate_runs if run.get("command") == cmd]
+    earlier_runs = same_cmd_runs[:-1]
+    earlier_reds = sum(1 for run in earlier_runs if run.get("exit") != 0)
+    other_gate_runs = sum(1 for run in gate_runs if run.get("command") != cmd)
+
+    head = newest.get("head")
+    dirty = newest.get("dirty")
+    exit_code = newest.get("exit")
+
+    if head is None or head != landed_head or dirty is True:
+        state = "stale"
+    elif exit_code != 0:
+        state = "red"
+    else:
+        state = "green"
+
+    return {
+        "state": state,
+        "command": newest.get("command"),
+        "exit": exit_code,
+        "head": head,
+        "generation": newest.get("generation"),
+        "landed_head": landed_head,
+        "earlier_reds": earlier_reds,
+        "other_gate_runs": other_gate_runs,
+    }
+
+
 # --- Status rendering ---
 
 PARK_STATUS_TEMPLATE = """Parked (idle): {reason}. The agent is ALIVE and was NOT terminated. Inspect: hop lode peek {lode_id} | Resume: hop lode nudge {lode_id} (or hop lode answer {lode_id} 1)"""  # noqa: E501

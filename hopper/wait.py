@@ -116,6 +116,7 @@ FINAL_RECORD_KEYS = {
     "worktree_path_basis",
     "worktree_exists",
     "worktree_exists_observed_age_s",
+    "ship_gate",
 }
 
 
@@ -1055,6 +1056,11 @@ def _final_record(
         "pane_liveness": annotated["pane_liveness"],
         "tmux_pane": current_pane,
         "last_tmux_pane": stale_pane,
+        "ship_gate": (
+            dict(snapshot["ship_gate"])
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("ship_gate"), dict)
+            else None
+        ),
         **worktree,
     }
     assert set(final) == FINAL_RECORD_KEYS
@@ -1161,6 +1167,23 @@ def _emit_outcome(
         print(f"  {_snapshot_summary(final_record)}")
     elif outcome == "shipped":
         print(f"{STATUS_SHIPPED} {lid} shipped")
+        sg = final_record.get("ship_gate")
+        if isinstance(sg, dict):
+            st = sg.get("state")
+            if st == "red":
+                print(
+                    "⚠ shipped over a red gate — the ship output says whether the red was "
+                    "proven inherited"
+                )
+            elif st == "stale":
+                print("⚠ shipped on a gate that did not run on the landed commit")
+            elif st == "none":
+                print("⚠ shipped with no gate recorded")
+            elif st == "green":
+                er = sg.get("earlier_reds", 0)
+                if type(er) is int and er > 0:
+                    unit = "time" if er == 1 else "times"
+                    print(f"note: the ship gate failed {er} {unit} before passing")
     elif outcome == "archived":
         status = f": {final_record['status']}" if final_record["status"] else ""
         print(f"{STATUS_ERROR} {lid} archived before shipping{status}")

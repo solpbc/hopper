@@ -30,7 +30,7 @@ import hopper.code as hopper_code
 from hopper import __version__, config, oom
 from hopper import deadline as deadline_utils
 from hopper.cleanup import reap_swiftpm_testing_helpers
-from hopper.client import set_lode_progress
+from hopper.client import record_ship_gate, set_lode_progress
 from hopper.coder import (
     CODER_PROVIDERS,
     DEFAULT_CODER_PROVIDER,
@@ -57,6 +57,7 @@ from hopper.lodes import (
     lode_icon,
     lode_status_for_display,
     lode_with_status_annotations,
+    newest_gate_command_run,
     resolve_worktree_path,
 )
 from hopper.runner import _sum_process_tree_cpu_ms
@@ -109,6 +110,8 @@ RESOLUTION_TIMEOUT_SECONDS = 5.5
 LOCAL_DISCOVERY_PROBE_TIMEOUT_SEC = 2.0
 LOAD_WARNING_PER_CPU = 1.0
 DISK_WARNING_FREE_GB = 30.0
+SHIP_GATE_GIT_DEADLINE_SEC = 1.0
+SHIP_GATE_SEND_TIMEOUT_SEC = 1.0
 _watch_monotonic = time.monotonic
 
 
@@ -2331,6 +2334,41 @@ def format_lode_detail(lode: dict) -> str:
         progress_at = lode.get("last_progress_at")
         progress_age = f" ({_age_phrase(progress_at)})" if progress_at else ""
         lines.append(f"  progress: {progress_text}{progress_age}")
+
+    stage = lode.get("stage")
+    gate_runs = lode.get("gate_runs")
+    ship_gate = lode.get("ship_gate")
+    if stage == "ship" and isinstance(gate_runs, list):
+        if not gate_runs:
+            lines.append("  ship gate (live): no gate has been recorded yet")
+        else:
+            newest = newest_gate_command_run(gate_runs)
+            if newest:
+                head = newest.get("head")
+                head7 = head[:7] if isinstance(head, str) and head else "unknown"
+                cmd = newest.get("command")
+                rc = newest.get("exit")
+                lines.append(f"  ship gate (live): `{cmd}` exited {rc} at {head7}")
+    elif stage == "shipped" and isinstance(ship_gate, dict):
+        state = ship_gate.get("state")
+        landed = ship_gate.get("landed_head")
+        landed7 = landed[:7] if isinstance(landed, str) and landed else "unknown"
+        if state == "none":
+            lines.append(f"  ship gate: none — no gate recorded (landed {landed7})")
+        else:
+            head = ship_gate.get("head")
+            head7 = head[:7] if isinstance(head, str) and head else "unknown"
+            cmd = ship_gate.get("command")
+            rc = ship_gate.get("exit")
+            lines.append(
+                f"  ship gate: {state} — `{cmd}` exited {rc} at {head7} (landed {landed7})"
+            )
+        earlier_reds = ship_gate.get("earlier_reds")
+        if type(earlier_reds) is int and earlier_reds > 0:
+            lines.append(f"  earlier reds: {earlier_reds}")
+        other_runs = ship_gate.get("other_gate_runs")
+        if type(other_runs) is int and other_runs > 0:
+            lines.append(f"  other gate runs: {other_runs}")
 
     title = lode.get("title", "")
     if title:
@@ -5402,6 +5440,11 @@ def cmd_check(args: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--ship-gate",
+        action="store_true",
+        help="Record this check as the lode's ship gate.",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Command to run, e.g. -- make ci",
@@ -5428,14 +5471,53 @@ def cmd_check(args: list[str]) -> int:
 
     reap_swiftpm_testing_helpers()
 
+    lode_id = get_hopper_lid()
+
+    git_head: str | None = None
+    git_dirty: bool | None = None
+    if parsed.ship_gate and lode_id:
+        git_deadline = time.monotonic() + SHIP_GATE_GIT_DEADLINE_SEC
+        try:
+            rem = max(0.0, git_deadline - time.monotonic())
+            if rem <= 0:
+                raise TimeoutError("git rev-parse deadline expired")
+            rev = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=rem,
+            )
+            if rev.returncode != 0:
+                raise RuntimeError(f"git rev-parse exited {rev.returncode}")
+            parsed_head = rev.stdout.strip()
+            if not parsed_head:
+                raise RuntimeError("git rev-parse returned empty output")
+
+            rem = max(0.0, git_deadline - time.monotonic())
+            if rem <= 0:
+                raise TimeoutError("git status deadline expired")
+            stat = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=rem,
+            )
+            if stat.returncode != 0:
+                raise RuntimeError(f"git status exited {stat.returncode}")
+            git_dirty = bool(stat.stdout.strip())
+            git_head = parsed_head
+        except Exception:
+            logger.debug("Failed to read git state for ship gate", exc_info=True)
+            git_head = None
+            git_dirty = None
+
     heartbeat = None
     progress = None
-    lode_id = get_hopper_lid()
     if lode_id:
         try:
-            started_at = current_time_ms()
+            started_at_ms = current_time_ms()
             command_text = " ".join(command)
-            progress = _CheckProgress(command_text, started_at)
+            progress = _CheckProgress(command_text, started_at_ms)
             heartbeat = hopper_code.ProgressHeartbeat(
                 lambda summary: set_lode_progress(_socket(), lode_id, summary),
                 progress.summary,
@@ -5444,6 +5526,7 @@ def cmd_check(args: list[str]) -> int:
         except Exception:
             logger.debug("failed to create check heartbeat", exc_info=True)
 
+    started_at = current_time_ms()
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as output_file:
         try:
             proc = subprocess.Popen(
@@ -5453,12 +5536,26 @@ def cmd_check(args: list[str]) -> int:
                 text=True,
             )
         except FileNotFoundError:
+            finished_at = current_time_ms()
             if heartbeat:
                 try:
                     heartbeat.stop()
                 except Exception:
                     logger.debug("failed to stop check heartbeat", exc_info=True)
             print(f"hop check: command not found: {command[0]}", file=sys.stderr)
+            if parsed.ship_gate and lode_id:
+                if not record_ship_gate(
+                    _socket(),
+                    lode_id,
+                    command=" ".join(command),
+                    exit=127,
+                    head=git_head,
+                    dirty=git_dirty,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    timeout=SHIP_GATE_SEND_TIMEOUT_SEC,
+                ):
+                    logger.debug("Failed to record ship gate for %s", lode_id)
             return 127
 
         if progress:
@@ -5471,6 +5568,7 @@ def cmd_check(args: list[str]) -> int:
                 except Exception:
                     logger.debug("failed to start check heartbeat", exc_info=True)
             proc.wait()
+            finished_at = current_time_ms()
         finally:
             if heartbeat:
                 try:
@@ -5489,13 +5587,25 @@ def cmd_check(args: list[str]) -> int:
     shown = min(parsed.lines, total)
     truncated = f", showing last {shown} of {total} lines" if total > shown else ""
     verdict = f"hop check: `{' '.join(command)}` exited {proc.returncode}{truncated}"
-    # Printed on stderr for immediate visibility AND as the last stdout line: a
-    # piped caller's stdout is typically block-buffered while stderr is not, so
-    # under `2>&1 | tail -N` the stderr-only verdict can reach the pipe before a
-    # large buffered tail flushes and fall outside the kept window. Repeating it
-    # as the final stdout line makes it survive `tail -N` by construction.
     print(verdict, file=sys.stderr)
     print(verdict)
+
+    if parsed.ship_gate and lode_id:
+        rc = proc.returncode
+        recorded_exit = 128 - rc if rc < 0 else rc
+        if not record_ship_gate(
+            _socket(),
+            lode_id,
+            command=" ".join(command),
+            exit=recorded_exit,
+            head=git_head,
+            dirty=git_dirty,
+            started_at=started_at,
+            finished_at=finished_at,
+            timeout=SHIP_GATE_SEND_TIMEOUT_SEC,
+        ):
+            logger.debug("Failed to record ship gate for %s", lode_id)
+
     return proc.returncode
 
 

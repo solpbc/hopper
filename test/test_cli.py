@@ -11818,3 +11818,240 @@ def test_ages_under_a_minute_do_not_read_as_now_ago(make_lode):
     assert "  progress: make ci — running 4m00s (now)" in detail
     assert "  activity: now" in detail.splitlines()
     assert "now ago" not in detail
+
+
+def test_ship_gate_cli_resilience_and_exit_contract(tmp_path, monkeypatch, capsys):
+    # Baseline output with HOPPER_LID unset
+    monkeypatch.delenv("HOPPER_LID", raising=False)
+    cmd = ["--ship-gate", "--allow-capture", "--", "sh", "-c", "exit 3"]
+    assert cmd_check(cmd) == 3
+    base_captured = capsys.readouterr()
+
+    # 1. Missing socket
+    monkeypatch.setenv("HOPPER_LID", "test-lode")
+    monkeypatch.setattr("hopper.cli._socket", lambda: tmp_path / "missing.sock")
+    assert cmd_check(cmd) == 3
+    captured = capsys.readouterr()
+    assert captured.out == base_captured.out
+    assert captured.err == base_captured.err
+
+    # 2. Unwritable / unconnectable socket
+    unwritable_sock = tmp_path / "unwritable.sock"
+    unwritable_sock.touch(mode=0o000)
+    monkeypatch.setattr("hopper.cli._socket", lambda: unwritable_sock)
+    assert cmd_check(cmd) == 3
+    captured = capsys.readouterr()
+    assert captured.out == base_captured.out
+    assert captured.err == base_captured.err
+
+    # 3. Socket that accepts and never reads (times out within 2.0s)
+    hanging_sock_path = tmp_path / "hanging.sock"
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_sock.bind(str(hanging_sock_path))
+    server_sock.listen(1)
+
+    stop_event = threading.Event()
+
+    def hang_worker():
+        try:
+            conn, _ = server_sock.accept()
+            stop_event.wait(5.0)
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            server_sock.close()
+
+    t = threading.Thread(target=hang_worker, daemon=True)
+    t.start()
+
+    monkeypatch.setattr("hopper.cli._socket", lambda: hanging_sock_path)
+    t0 = time.monotonic()
+    assert cmd_check(cmd) == 3
+    elapsed = time.monotonic() - t0
+    stop_event.set()
+    assert elapsed < 2.0
+    captured = capsys.readouterr()
+    assert captured.out == base_captured.out
+    assert captured.err == base_captured.err
+
+    # 4. Git failing (cwd is not a repo)
+    non_repo = tmp_path / "non_repo"
+    non_repo.mkdir()
+    monkeypatch.chdir(non_repo)
+    assert cmd_check(cmd) == 3
+    captured = capsys.readouterr()
+    assert captured.out == base_captured.out
+    assert captured.err == base_captured.err
+
+    # 5. Git hanging (git script at front of PATH sleeping 5s)
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nsleep 5\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+    t0 = time.monotonic()
+    assert cmd_check(cmd) == 3
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0
+    captured = capsys.readouterr()
+    assert captured.out == base_captured.out
+    assert captured.err == base_captured.err
+
+
+def test_ship_gate_cli_suppression_and_command_not_found(tmp_path, monkeypatch, capsys):
+    sock_path = tmp_path / "record.sock"
+    messages = []
+
+    def handle_client(sock):
+        try:
+            conn, _ = sock.accept()
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            if data:
+                messages.append(json.loads(data.decode()))
+            conn.close()
+        except Exception:
+            pass
+
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_sock.bind(str(sock_path))
+    server_sock.listen(5)
+    server_sock.settimeout(0.2)
+    monkeypatch.setattr("hopper.cli._socket", lambda: sock_path)
+
+    # 1. Plain hop check with HOPPER_LID set -> no lode_record_ship_gate
+    monkeypatch.setenv("HOPPER_LID", "lode1")
+    assert cmd_check(["--allow-capture", "--", "sh", "-c", "exit 0"]) == 0
+    try:
+        handle_client(server_sock)
+    except TimeoutError:
+        pass
+    assert not any(m.get("type") == "lode_record_ship_gate" for m in messages)
+
+    # 2. --ship-gate without HOPPER_LID -> no message, does not need git
+    monkeypatch.delenv("HOPPER_LID", raising=False)
+    assert cmd_check(["--ship-gate", "--allow-capture", "--", "sh", "-c", "exit 0"]) == 0
+    try:
+        handle_client(server_sock)
+    except TimeoutError:
+        pass
+    assert not any(m.get("type") == "lode_record_ship_gate" for m in messages)
+
+    # 3. Command not found -> returns 127, message exit is 127, printed line stays command not found
+    monkeypatch.setenv("HOPPER_LID", "lode1")
+    messages.clear()
+    t = threading.Thread(target=handle_client, args=(server_sock,), daemon=True)
+    t.start()
+    assert cmd_check(["--ship-gate", "--allow-capture", "--", "hopper-no-such-cmd-xyz"]) == 127
+    t.join(timeout=1.0)
+    captured = capsys.readouterr()
+    assert "command not found: hopper-no-such-cmd-xyz" in captured.err
+    assert len(messages) == 1
+    assert messages[0]["type"] == "lode_record_ship_gate"
+    assert messages[0]["exit"] == 127
+
+    server_sock.close()
+
+
+def test_ship_gate_cli_sigkill_and_git_state_recording(tmp_path, monkeypatch, capsys):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=repo_dir, check=True, capture_output=True
+    )
+    (repo_dir / "file.txt").write_text("initial\n")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True
+    )
+    initial_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    monkeypatch.chdir(repo_dir)
+    monkeypatch.setenv("HOPPER_LID", "lode1234")
+    monkeypatch.setenv("HOPPER_RUN_GENERATION", "gen-abc-123")
+
+    sock_path = tmp_path / "test.sock"
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_sock.bind(str(sock_path))
+    server_sock.listen(5)
+    server_sock.settimeout(2.0)
+    monkeypatch.setattr("hopper.cli._socket", lambda: sock_path)
+
+    messages = []
+
+    def handle_client():
+        try:
+            conn, _ = server_sock.accept()
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            if data:
+                messages.append(json.loads(data.decode()))
+            conn.close()
+        except Exception:
+            pass
+
+    # 1. SIGKILL: returns -9, stderr has exited -9, message exit is 137
+    t = threading.Thread(target=handle_client, daemon=True)
+    t.start()
+    sig_cmd = [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"]
+    rc = cmd_check(["--ship-gate", "--allow-capture", "--", *sig_cmd])
+    assert rc == -9
+    t.join(timeout=1.0)
+    captured = capsys.readouterr()
+    assert "exited -9" in captured.err
+    assert "exited 137" not in captured.err
+    assert len(messages) == 1
+    assert messages[0]["exit"] == 137
+    assert messages[0]["head"] == initial_oid
+    assert messages[0]["dirty"] is False
+    assert messages[0]["run_generation"] == "gen-abc-123"
+
+    # 2. Command that commits and exits 1 records pre-commit rev-parse head
+    messages.clear()
+    t = threading.Thread(target=handle_client, daemon=True)
+    t.start()
+    commit_script = (
+        "git config user.email test@test.com && "
+        "git config user.name Test && "
+        "echo second > second.txt && git add second.txt && git commit -m second && exit 1"
+    )
+    rc = cmd_check(["--ship-gate", "--allow-capture", "--", "sh", "-c", commit_script])
+    assert rc == 1
+    t.join(timeout=1.0)
+    assert len(messages) == 1
+    assert messages[0]["exit"] == 1
+    assert messages[0]["head"] == initial_oid
+    assert messages[0]["dirty"] is False
+
+    # 3. Run started with uncommitted changes records dirty: True
+    (repo_dir / "dirty.txt").write_text("uncommitted\n")
+    messages.clear()
+    t = threading.Thread(target=handle_client, daemon=True)
+    t.start()
+    rc = cmd_check(["--ship-gate", "--allow-capture", "--", "sh", "-c", "exit 0"])
+    assert rc == 0
+    t.join(timeout=1.0)
+    assert len(messages) == 1
+    assert messages[0]["exit"] == 0
+    assert messages[0]["dirty"] is True
+
+    server_sock.close()

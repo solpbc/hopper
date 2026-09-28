@@ -136,8 +136,9 @@ the complete output even when the exit code is zero. The record carries:
 - `outcome`, stable `reason_code`, plain-language `reason`, and `recovery`;
 - owning `server`, `route`, and bounded source `probes`;
 - exact `stage`, `state`, `status`, active/archive state, and freshness;
-- current or last-known tmux pane; and
-- exact known worktree path, provenance, and fresh existence result.
+- current or last-known tmux pane;
+- exact known worktree path, provenance, and fresh existence result; and
+- `ship_gate` with state `green`, `red`, `stale`, `none`, or `not_tracked` (when the field is absent). Note three limits: a lost report degrades to `red`, `stale`, or `none`, and can read `green` only when an earlier green gate-command run at the landed head exists and the lost run was a later red; the first marked run's command is the gate command and `other_gate_runs` is the only trace of a later different command; a gate run without the flag is invisible and reads `none`, which is itself a warning.
 
 The command's numeric exit is the final record's exit code: `0` shipped, `1`
 error/inactive/archive/resolution failure, `2` gated or durable action attention,
@@ -388,6 +389,7 @@ hop check -- make ci                # run make ci; last 50 lines + explicit "exi
 hop check -- make test
 hop check -n 20 -- make ci          # keep only the last 20 lines of output
 hop check --allow-capture -- make ci   # from a tool call with captured stdout
+hop check --ship-gate --allow-capture -- make ci   # full ship gate recorded by hopper
 ```
 
 `hop check` buffers combined stdout+stderr, prints the trailing lines, then
@@ -395,6 +397,8 @@ prints `hop check: `<cmd>` exited N` and returns N. A non-zero exit is a failed
 check. It refuses non-terminal stdout before starting the command, so a pipe
 cannot make an unrun validation look successful. Use `-n` to bound output
 instead. Runs locally in the current directory; does not need the server.
+
+`--ship-gate` before `--` marks the command as the full ship gate hopper records. It is not for diagnostics, single tests, unreached legs, or base reproductions. A failed report does not change the command's exit code, and `hop check` still does not need the server to run.
 
 **If you are an agent calling this from a tool, add `--allow-capture`.** A tool
 call has no TTY, so the bare form refuses and nothing runs. `--allow-capture` is

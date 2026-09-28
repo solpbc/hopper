@@ -2801,3 +2801,155 @@ def test_probe_rows_update_in_place_instead_of_appending():
     assert len(record["probes"]) == 1
     assert record["probes"][0]["outcome"] == "found"
     assert record["probes"][0]["attempts"] == 3
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_phrase"),
+    [
+        ("red", "shipped over a red gate"),
+        ("stale", "shipped on a gate that did not run on the landed commit"),
+        ("none", "shipped with no gate recorded"),
+    ],
+)
+def test_wait_shipped_warning_states_print_warning_and_state(
+    monkeypatch, capsys, state, expected_phrase
+):
+    sg = {
+        "state": state,
+        "command": "make ci",
+        "exit": 1 if state == "red" else 0,
+        "head": "1234567" if state != "none" else None,
+        "generation": "gen",
+        "landed_head": "1234567",
+        "earlier_reds": 0,
+        "other_gate_runs": 0,
+    }
+    initial = snapshot(stage="shipped", active=False, ship_gate=sg)
+    rc, _, _ = run_local_wait(monkeypatch, initial)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "⚠" in out
+    assert expected_phrase in out
+
+
+def test_wait_shipped_green_prints_no_warning(monkeypatch, capsys):
+    sg = {
+        "state": "green",
+        "command": "make ci",
+        "exit": 0,
+        "head": "1234567",
+        "generation": "gen",
+        "landed_head": "1234567",
+        "earlier_reds": 0,
+        "other_gate_runs": 0,
+    }
+    initial = snapshot(stage="shipped", active=False, ship_gate=sg)
+    rc, _, _ = run_local_wait(monkeypatch, initial)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "⚠" not in out
+
+
+def test_wait_shipped_green_with_earlier_reds_prints_count_and_no_warning(monkeypatch, capsys):
+    sg = {
+        "state": "green",
+        "command": "make ci",
+        "exit": 0,
+        "head": "1234567",
+        "generation": "gen",
+        "landed_head": "1234567",
+        "earlier_reds": 1,
+        "other_gate_runs": 0,
+    }
+    initial = snapshot(stage="shipped", active=False, ship_gate=sg)
+    rc, _, _ = run_local_wait(monkeypatch, initial)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "⚠" not in out
+    assert "1" in out
+
+
+def test_wait_json_includes_ship_gate(monkeypatch, capsys):
+    sg = {
+        "state": "green",
+        "command": "make ci",
+        "exit": 0,
+        "head": "1234567",
+        "generation": "gen",
+        "landed_head": "1234567",
+        "earlier_reds": 0,
+        "other_gate_runs": 0,
+    }
+    initial = snapshot(stage="shipped", active=False, ship_gate=sg)
+    rc, _, _ = run_local_wait(monkeypatch, initial, json_output=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "ship_gate" in payload
+    assert payload["ship_gate"] == sg
+
+
+def test_wait_remote_snapshot_ship_gate_copied_or_none(monkeypatch, capsys):
+    sg = {
+        "state": "green",
+        "command": "make ci",
+        "exit": 0,
+        "head": "1234567",
+        "generation": "gen",
+        "landed_head": "1234567",
+        "earlier_reds": 0,
+        "other_gate_runs": 0,
+    }
+    snap_with_sg = snapshot(stage="shipped", active=False, ship_gate=sg)
+    remote_record = wait._new_record(
+        "rem1", snap_with_sg, "remote.host", 0.0, probes=[configured_probe(route="remote.host")]
+    )
+    final = wait._final_record(
+        remote_record,
+        "shipped",
+        0,
+        0.0,
+        None,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+    assert final["ship_gate"] == sg
+
+    snap_without_sg = snapshot(stage="shipped", active=False)
+    snap_without_sg.pop("ship_gate", None)
+    remote_record_no_sg = wait._new_record(
+        "rem2", snap_without_sg, "remote.host", 0.0, probes=[configured_probe(route="remote.host")]
+    )
+    final_no_sg = wait._final_record(
+        remote_record_no_sg,
+        "shipped",
+        0,
+        0.0,
+        None,
+        deadline=make_deadline(60),
+        child_control=remote.make_child_registry(),
+    )
+    assert final_no_sg["ship_gate"] is None
+
+    wait._emit_outcome(final_no_sg, json_output=False, deadline=make_deadline(60))
+    out = capsys.readouterr().out
+    assert "⚠" not in out
+    assert "with no gate recorded" not in out
+
+
+def test_wait_shipped_green_with_earlier_reds_plural(monkeypatch, capsys):
+    sg = {
+        "state": "green",
+        "command": "make ci",
+        "exit": 0,
+        "head": "1234567",
+        "generation": "gen",
+        "landed_head": "1234567",
+        "earlier_reds": 2,
+        "other_gate_runs": 0,
+    }
+    initial = snapshot(stage="shipped", active=False, ship_gate=sg)
+    rc, _, _ = run_local_wait(monkeypatch, initial)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "⚠" not in out
+    assert "2 times" in out

@@ -70,6 +70,7 @@ from hopper.lodes import (
     format_refusal_status,
     format_terminal_failure_status,
     format_worktree_reaped_status,
+    freeze_ship_gate,
     get_worktree_dir,
     is_terminal_failure_kind,
     is_terminal_oom_scope_archive_candidate,
@@ -3970,8 +3971,13 @@ class Server:
         if lode.get("stage") == record["stage"]:
             stop_lode_runtime(lode)
             lode["stage"] = target
-            if target == "shipped":
+            if target == "ship":
+                lode["gate_runs"] = []
+            elif target == "shipped":
                 lode["shipped_at"] = current_time_ms()
+                if "gate_runs" in lode and isinstance(lode["gate_runs"], list):
+                    head_oid = record.get("ship", {}).get("provenance", {}).get("head_oid")
+                    lode["ship_gate"] = freeze_ship_gate(lode["gate_runs"], head_oid)
             touch(lode)
             if any(item is lode for item in self.lodes):
                 save_lodes(self.lodes)
@@ -6539,6 +6545,67 @@ class Server:
                     save_lodes(self.lodes)
                     self.broadcast({"type": "lode_updated", "lode": lode})
                     logger.info(f"Lode {lode_id} progress: {lode['last_progress_summary']}")
+
+        elif msg_type == "lode_record_ship_gate":
+            lode_id = message.get("lode_id")
+            if not isinstance(lode_id, str):
+                logger.debug("lode_record_ship_gate missing lode_id")
+                return
+            lode = self._find_lode(lode_id)
+            if lode is None:
+                logger.debug("lode_record_ship_gate lode %s not found in active lodes", lode_id)
+                return
+            if lode.get("stage") != "ship":
+                logger.debug(
+                    "lode_record_ship_gate lode %s not in stage ship (stage=%s)",
+                    lode_id,
+                    lode.get("stage"),
+                )
+                return
+            gate_runs = lode.get("gate_runs")
+            if "gate_runs" not in lode or not isinstance(gate_runs, list):
+                logger.debug(
+                    "lode_record_ship_gate lode %s has missing or non-list gate_runs",
+                    lode_id,
+                )
+                return
+            command = message.get("command")
+            exit_code = message.get("exit")
+            started_at = message.get("started_at")
+            finished_at = message.get("finished_at")
+            head = message.get("head")
+            dirty = message.get("dirty")
+            run_generation = message.get("run_generation")
+            if (
+                not isinstance(command, str)
+                or type(exit_code) is not int
+                or type(started_at) is not int
+                or type(finished_at) is not int
+                or (head is not None and not isinstance(head, str))
+                or dirty not in (True, False, None)
+                or not isinstance(run_generation, str)
+            ):
+                logger.debug(
+                    "lode_record_ship_gate invalid payload for lode %s: %s",
+                    lode_id,
+                    message,
+                )
+                return
+            run_record = {
+                "command": command,
+                "exit": exit_code,
+                "head": head,
+                "dirty": dirty,
+                "generation": run_generation,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            gate_runs.append(run_record)
+            while len(gate_runs) > 50:
+                del gate_runs[0]
+            touch(lode)
+            save_lodes(self.lodes)
+            self.broadcast({"type": "lode_updated", "lode": lode})
 
         elif msg_type == "lode_set_pane_activity":
             lode_id = message.get("lode_id")

@@ -59,8 +59,10 @@ a proven inherited red, below.
 Run the gate bare through `hop check` so a failure cannot be misreported as success:
 
 ```
-hop check --allow-capture -- make ci
+hop check --ship-gate --allow-capture -- make ci
 ```
+
+`--ship-gate` marks this as the ship gate hopper records. Use it only for the full gate, never for diagnostics, single tests, unreached legs or base reproductions.
 
 `hop check` runs the command, prints only the last lines of its output (so a long log does not flood this session), and — critically — exits with the command's **real** status and prints an explicit `exited N` summary. It refuses non-terminal stdout before starting the gate; use `-n` to reduce output. A non-zero exit is a failed check; do not land the branch on it.
 

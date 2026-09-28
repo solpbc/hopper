@@ -41,6 +41,7 @@ RUNNER_MUTATION_TYPES = frozenset(
         "lode_set_claude_started",
         "lode_bind_stage_session",
         "lode_publish_gate",
+        "lode_record_ship_gate",
     }
 )
 
@@ -1113,6 +1114,36 @@ def set_lode_progress(socket_path: Path, lode_id: str, summary: str, timeout: fl
         "lode_id": lode_id,
         "summary": summary,
         "ts": current_time_ms(),
+    }
+    return _fire_and_forget(socket_path, msg, timeout)
+
+
+def record_ship_gate(
+    socket_path: Path,
+    lode_id: str,
+    command: str,
+    exit: int,
+    head: str | None,
+    dirty: bool | None,
+    started_at: int,
+    finished_at: int,
+    timeout: float = 1.0,
+) -> bool:
+    """Record one ship-stage gate run over the fast fire-and-forget channel."""
+    try:
+        if not socket_path.exists():
+            return False
+    except Exception:
+        return False
+    msg = {
+        "type": "lode_record_ship_gate",
+        "lode_id": lode_id,
+        "command": command,
+        "exit": exit,
+        "head": head,
+        "dirty": dirty,
+        "started_at": started_at,
+        "finished_at": finished_at,
     }
     return _fire_and_forget(socket_path, msg, timeout)
 

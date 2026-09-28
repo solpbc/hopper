@@ -42,7 +42,7 @@ EXPECTED_DIRECT_SAVE_CALLERS = Counter(
         "hopper/server.py::Server._gated_spawn": 1,
         "hopper/server.py::Server._gated_spawn.persist_outcome": 1,
         "hopper/server.py::Server._handle_lode_run_result": 1,
-        "hopper/server.py::Server._handle_mutation": 3,
+        "hopper/server.py::Server._handle_mutation": 4,
         "hopper/server.py::Server._handle_mutation.refuse_stage_protocol": 1,
         "hopper/server.py::Server._handle_registration_capture_result": 1,
         "hopper/server.py::Server._on_client_disconnect": 1,

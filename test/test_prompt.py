@@ -105,3 +105,8 @@ def test_load_skips_non_string_config_values(tmp_path, monkeypatch, mock_config)
 
     content = prompt.load("greet")
     assert content == "Hello, jer! Projects: $projects"
+
+
+def test_ship_prompt_contains_ship_gate_check():
+    content = prompt.load("ship")
+    assert "hop check --ship-gate --allow-capture -- make ci" in content

@@ -25,6 +25,7 @@ import hopper.client as hopper_client
 import hopper.server as hopper_server
 from hopper import actions, config, git, teardown
 from hopper.backlog import BacklogItem
+from hopper.cli import format_lode_detail
 from hopper.client import (
     HopperConnection,
     read_lode_snapshot,
@@ -36,6 +37,8 @@ from hopper.client import create_lode as request_lode_creation
 from hopper.config import config_transaction
 from hopper.lodes import (
     format_terminal_failure_status,
+    load_archived_lodes,
+    load_lodes,
     lode_driver,
     lode_gate,
     lode_stage_session,
@@ -597,7 +600,9 @@ def _manual_action_message(
     }
 
 
-def _post_containment_manual_record(action_type: str, *, force: bool = False) -> dict:
+def _post_containment_manual_record(
+    action_type: str, *, force: bool = False, stage: str = "mill"
+) -> dict:
     ownership = _completion_run_ownership()
     source = actions.write_run_ownership(ownership)
     checked = {
@@ -609,7 +614,7 @@ def _post_containment_manual_record(action_type: str, *, force: bool = False) ->
     }
     record = actions.new_pending_action(
         lode_id="abcd2345",
-        stage="mill",
+        stage=stage,
         expected_generation=TEST_RUN_GENERATION,
         action_type=action_type,
         target_disposition={
@@ -14168,3 +14173,756 @@ def test_manual_ack_preserves_stage_session_on_cleanup(socket_path, make_lode, t
         "stage_session": True,
     }
     assert response["status"].endswith("Preserved: stage session.")
+
+
+def test_ship_gate_mutation_drops_invalid_or_ungated_conditions(socket_path, make_lode):
+    server = Server(socket_path)
+    lode = make_lode(id="lode1", stage="ship", run_generation="gen1")
+    lode["gate_runs"] = []
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    # 1. Stale generation
+    server._handle_mutation(
+        conn,
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "lode1",
+            "run_generation": "stale_gen",
+            "command": "make ci",
+            "exit": 0,
+            "head": "abc",
+            "dirty": False,
+            "started_at": 100,
+            "finished_at": 200,
+        },
+    )
+    assert lode["gate_runs"] == []
+
+    # 2. Lode only in archived_lodes
+    archived = make_lode(id="arch1", stage="ship", run_generation="gen_arch")
+    archived["gate_runs"] = []
+    server.archived_lodes = [archived]
+    server._handle_mutation(
+        conn,
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "arch1",
+            "run_generation": "gen_arch",
+            "command": "make ci",
+            "exit": 0,
+            "head": "abc",
+            "dirty": False,
+            "started_at": 100,
+            "finished_at": 200,
+        },
+    )
+    assert archived["gate_runs"] == []
+
+    # 3. Unknown ID
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "unknown1",
+            "run_generation": "gen1",
+            "command": "make ci",
+            "exit": 0,
+            "head": "abc",
+            "dirty": False,
+            "started_at": 100,
+            "finished_at": 200,
+        },
+        conn,
+    )
+
+    # 4. Stage refine even with gate_runs: []
+    lode_refine = make_lode(id="ref11111", stage="refine", run_generation="gen_ref")
+    lode_refine["gate_runs"] = []
+    server.lodes.append(lode_refine)
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "ref11111",
+            "run_generation": "gen_ref",
+            "command": "make ci",
+            "exit": 0,
+            "head": "abc",
+            "dirty": False,
+            "started_at": 100,
+            "finished_at": 200,
+        },
+        conn,
+    )
+    assert lode_refine["gate_runs"] == []
+
+    # 5. Teardown intent pending action
+    pending_ship = _pending_completion_record(stage="ship")
+    lode_ship = make_lode(
+        id=pending_ship["lode_id"],
+        stage="ship",
+        run_generation=pending_ship["expected_generation"],
+        pending_action=actions.pending_action_projection(pending_ship),
+    )
+    lode_ship["gate_runs"] = []
+    server.lodes.append(lode_ship)
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": lode_ship["id"],
+            "run_generation": pending_ship["expected_generation"],
+            "command": "make ci",
+            "exit": 0,
+            "head": "abc",
+            "dirty": False,
+            "started_at": 100,
+            "finished_at": 200,
+        },
+        conn,
+    )
+    assert lode_ship["gate_runs"] == []
+
+
+def test_ship_gate_mutation_gated_ship_keeps_run(socket_path, make_lode):
+    server = Server(socket_path)
+    lode = make_lode(id="gated001", stage="ship", state="gated", run_generation="gen_gated")
+    lode["gate_runs"] = []
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "gated001",
+            "run_generation": "gen_gated",
+            "command": "make ci",
+            "exit": 1,
+            "head": "some_head",
+            "dirty": True,
+            "started_at": 1000,
+            "finished_at": 2000,
+        },
+        conn,
+    )
+    assert len(lode["gate_runs"]) == 1
+    assert lode["gate_runs"][0]["command"] == "make ci"
+    assert lode["gate_runs"][0]["exit"] == 1
+    assert lode["gate_runs"][0]["dirty"] is True
+    assert lode["gate_runs"][0]["generation"] == "gen_gated"
+
+
+def test_ship_gate_mutation_missing_gate_runs_key_does_not_gain_key(
+    socket_path, make_lode, monkeypatch
+):
+    server = Server(socket_path)
+    lode = make_lode(id="nogate01", stage="ship", run_generation="gen_no")
+    lode.pop("gate_runs", None)
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    save_called = []
+    monkeypatch.setattr("hopper.server.save_lodes", lambda rows: save_called.append(True))
+
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "nogate01",
+            "run_generation": "gen_no",
+            "command": "make ci",
+            "exit": 0,
+            "head": "head",
+            "dirty": False,
+            "started_at": 100,
+            "finished_at": 200,
+        },
+        conn,
+    )
+    assert "gate_runs" not in lode
+    assert save_called == []
+
+
+def test_apply_completion_stage_initializes_gate_runs_only_on_refine_completion(
+    socket_path, make_lode
+):
+    server = Server(socket_path)
+
+    # 1. Refine completion -> target ship sets gate_runs to []
+    record_refine = _pending_completion_record("refine22", stage="refine")
+    lode_refine = make_lode(
+        id=record_refine["lode_id"],
+        stage="refine",
+        run_generation=record_refine["expected_generation"],
+    )
+    server.lodes = [lode_refine]
+    assert server._apply_completion_stage(record_refine) is True
+    assert lode_refine["stage"] == "ship"
+    assert lode_refine["gate_runs"] == []
+
+    # 2. Mill completion -> target refine does not set gate_runs
+    record_mill = _pending_completion_record("mill2222", stage="mill")
+    lode_mill = make_lode(
+        id=record_mill["lode_id"],
+        stage="mill",
+        run_generation=record_mill["expected_generation"],
+    )
+    lode_mill.pop("gate_runs", None)
+    server.lodes = [lode_mill]
+    assert server._apply_completion_stage(record_mill) is True
+    assert lode_mill["stage"] == "refine"
+    assert "gate_runs" not in lode_mill
+
+
+def test_appended_run_persists_across_load_lodes(socket_path, make_lode):
+    server = Server(socket_path)
+    lode = make_lode(
+        id="persist1", stage="ship", state="running", active=True, run_generation="gen_p"
+    )
+    lode["gate_runs"] = []
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    conn = _mock_client(server)
+
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": "persist1",
+            "run_generation": "gen_p",
+            "command": "make test",
+            "exit": 0,
+            "head": "full_oid_abc123",
+            "dirty": False,
+            "started_at": 10,
+            "finished_at": 20,
+        },
+        conn,
+    )
+
+    reloaded = load_lodes()
+    match = next(item for item in reloaded if item["id"] == "persist1")
+    assert len(match["gate_runs"]) == 1
+    assert match["gate_runs"][0]["command"] == "make test"
+    assert match["gate_runs"][0]["head"] == "full_oid_abc123"
+
+
+def test_restart_in_ship_preserves_gate_runs_and_successor_records(socket_path, make_lode):
+    record = _post_containment_manual_record("restart", force=True, stage="ship")
+    server = Server(socket_path)
+    existing_runs = [
+        {
+            "command": "make ci",
+            "exit": 1,
+            "head": "head1",
+            "dirty": False,
+            "generation": record["expected_generation"],
+            "started_at": 1,
+            "finished_at": 2,
+        }
+    ]
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="ship",
+        state="teardown",
+        active=False,
+        tmux_pane="%1",
+        pid=101,
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    lode["gate_runs"] = list(existing_runs)
+    _mark_stage_started(lode, "ship")
+    server.lodes = [lode]
+
+    with (
+        patch.object(server, "_schedule_action_step") as schedule,
+        patch.object(server, "_gated_spawn") as ordinary_spawn,
+    ):
+        server._continue_action(record)
+
+    assert lode["gate_runs"] == existing_runs
+    target_generation = record["spawn"]["target_generation"]
+    assert lode["run_generation"] == target_generation
+    schedule.assert_called_once_with(record, "spawn", "spawning")
+    ordinary_spawn.assert_not_called()
+
+    # Successor run with the replacement generation appends
+    conn = _mock_client(server)
+    server._handle_mutation(
+        {
+            "type": "lode_record_ship_gate",
+            "lode_id": lode["id"],
+            "run_generation": target_generation,
+            "command": "make ci",
+            "exit": 0,
+            "head": "head2",
+            "dirty": False,
+            "started_at": 3,
+            "finished_at": 4,
+        },
+        conn,
+    )
+    assert len(lode["gate_runs"]) == 2
+    assert lode["gate_runs"][1]["generation"] == target_generation
+
+
+def test_accepted_runs_cap_at_50(socket_path, make_lode):
+    server = Server(socket_path)
+    lode = make_lode(
+        id="cap50000", stage="ship", state="running", active=True, run_generation="gen_cap"
+    )
+    lode["gate_runs"] = []
+    server.lodes = [lode]
+    conn = _mock_client(server)
+
+    for i in range(55):
+        server._handle_mutation(
+            {
+                "type": "lode_record_ship_gate",
+                "lode_id": "cap50000",
+                "run_generation": "gen_cap",
+                "command": "make ci",
+                "exit": i,
+                "head": f"head_{i}",
+                "dirty": False,
+                "started_at": i,
+                "finished_at": i + 1,
+            },
+            conn,
+        )
+
+    assert len(lode["gate_runs"]) == 50
+    assert lode["gate_runs"][0]["exit"] == 5
+    assert lode["gate_runs"][-1]["exit"] == 54
+
+
+def test_ship_gate_flow_table_freeze_matrix(tmp_path, socket_path, make_lode):
+    # Setup real git repository with worktree to get real oids
+    repo_dir = tmp_path / "git_repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=repo_dir, check=True, capture_output=True
+    )
+    (repo_dir / "f1.txt").write_text("c1\n")
+    subprocess.run(["git", "add", "f1.txt"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "c1"], cwd=repo_dir, check=True, capture_output=True)
+    first_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    worktree_path = tmp_path / "wt"
+    subprocess.run(
+        ["git", "worktree", "add", str(worktree_path), "-b", "feature"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+
+    (repo_dir / "f2.txt").write_text("c2\n")
+    subprocess.run(["git", "add", "f2.txt"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "c2"], cwd=repo_dir, check=True, capture_output=True)
+    landed_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    server = Server(socket_path)
+
+    cases = [
+        # 1. Inherited red at landed head plus later different command -> red, other_gate_runs == 1
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 1,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+                {
+                    "command": "pytest test/single.py",
+                    "exit": 0,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 3,
+                    "finished_at": 4,
+                },
+            ],
+            "red",
+            1,  # exit
+            0,  # earlier_reds
+            1,  # other_gate_runs
+        ),
+        # 2. Red on pre-amend oid then green on landed head -> green, earlier_reds == 1
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 1,
+                    "head": first_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+                {
+                    "command": "make ci",
+                    "exit": 0,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 3,
+                    "finished_at": 4,
+                },
+            ],
+            "green",
+            0,
+            1,
+            0,
+        ),
+        # 3. Original command on pre-amend oid, different command on landed -> stale with exit 1
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 1,
+                    "head": first_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+                {
+                    "command": "make test",
+                    "exit": 0,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 3,
+                    "finished_at": 4,
+                },
+            ],
+            "stale",
+            1,
+            0,
+            1,
+        ),
+        # 4. Gate-command exit 0, clean, head equals landed -> green
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 0,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+            ],
+            "green",
+            0,
+            0,
+            0,
+        ),
+        # 5. Newest gate-command head is pre-merge oid -> stale
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 0,
+                    "head": first_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+            ],
+            "stale",
+            0,
+            0,
+            0,
+        ),
+        # 6. Red then green at landed head -> green, earlier_reds == 1
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 1,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+                {
+                    "command": "make ci",
+                    "exit": 0,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "g1",
+                    "started_at": 3,
+                    "finished_at": 4,
+                },
+            ],
+            "green",
+            0,
+            1,
+            0,
+        ),
+        # 7. Red at gen A then green at gen B, same command, landed head -> green, earlier_reds == 1
+        (
+            [
+                {
+                    "command": "make ci",
+                    "exit": 1,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "genA",
+                    "started_at": 1,
+                    "finished_at": 2,
+                },
+                {
+                    "command": "make ci",
+                    "exit": 0,
+                    "head": landed_oid,
+                    "dirty": False,
+                    "generation": "genB",
+                    "started_at": 3,
+                    "finished_at": 4,
+                },
+            ],
+            "green",
+            0,
+            1,
+            0,
+        ),
+        # 8. gate_runs: [] -> state == "none", null command/exit/head/generation, counts 0
+        (
+            [],
+            "none",
+            None,
+            0,
+            0,
+        ),
+    ]
+
+    flow_ids = [
+        "flowtwoa",
+        "flowtwob",
+        "flowtwoc",
+        "flowtwod",
+        "flowtwoe",
+        "flowtwof",
+        "flowtwog",
+        "flowtwoh",
+    ]
+
+    for idx, (
+        runs,
+        expected_state,
+        expected_exit,
+        expected_earlier_reds,
+        expected_other_runs,
+    ) in enumerate(cases):
+        lid = flow_ids[idx]
+        lode = make_lode(id=lid, stage="ship", run_generation="gen_flow")
+        lode["gate_runs"] = list(runs)
+        server.lodes = [lode]
+
+        record = _pending_completion_record(lid, stage="ship")
+        record["ship"]["provenance"]["head_oid"] = landed_oid
+
+        assert server._apply_completion_stage(record) is True
+        assert lode["stage"] == "shipped"
+        sg = lode["ship_gate"]
+        assert sg["state"] == expected_state
+        assert sg["exit"] == expected_exit
+        assert sg["earlier_reds"] == expected_earlier_reds
+        assert sg["other_gate_runs"] == expected_other_runs
+        assert sg["landed_head"] == landed_oid
+
+
+def test_ship_gate_persistence_and_stale_reasons(tmp_path, socket_path, make_lode):
+    repo_dir = tmp_path / "git_repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=repo_dir, check=True, capture_output=True
+    )
+    (repo_dir / "f.txt").write_text("c\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "c"], cwd=repo_dir, check=True, capture_output=True)
+    real_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    server = Server(socket_path)
+
+    # 1. Newest green head differs from provenance head -> stored stale
+    lode1 = make_lode(id="staletw2", stage="ship", run_generation="gen1")
+    lode1["gate_runs"] = [
+        {
+            "command": "make ci",
+            "exit": 0,
+            "head": "different_head",
+            "dirty": False,
+            "generation": "gen1",
+            "started_at": 1,
+            "finished_at": 2,
+        }
+    ]
+    server.lodes = [lode1]
+    rec1 = _pending_completion_record("staletw2", stage="ship")
+    rec1["ship"]["provenance"]["head_oid"] = real_oid
+    assert server._apply_completion_stage(rec1) is True
+
+    # 2. Dirty true, exit 0, head equals landed -> stored stale with exit 0
+    lode2 = make_lode(id="staleth3", stage="ship", run_generation="gen2")
+    lode2["gate_runs"] = [
+        {
+            "command": "make ci",
+            "exit": 0,
+            "head": real_oid,
+            "dirty": True,
+            "generation": "gen2",
+            "started_at": 1,
+            "finished_at": 2,
+        }
+    ]
+    server.lodes.append(lode2)
+    rec2 = _pending_completion_record("staleth3", stage="ship")
+    rec2["ship"]["provenance"]["head_oid"] = real_oid
+    assert server._apply_completion_stage(rec2) is True
+
+    reloaded = load_lodes()
+    m1 = next(item for item in reloaded if item["id"] == "staletw2")
+    assert m1["ship_gate"]["state"] == "stale"
+    assert m1["ship_gate"]["exit"] == 0
+
+    m2 = next(item for item in reloaded if item["id"] == "staleth3")
+    assert m2["ship_gate"]["state"] == "stale"
+    assert m2["ship_gate"]["exit"] == 0
+
+
+def test_ship_completion_crash_recovery_resumes_and_freezes_ship_gate(
+    tmp_path, socket_path, make_lode, monkeypatch
+):
+    repo_dir = tmp_path / "git_repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=repo_dir, check=True, capture_output=True
+    )
+    (repo_dir / "f.txt").write_text("c\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "c"], cwd=repo_dir, check=True, capture_output=True)
+    real_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    record = _pending_completion_record("crash222", stage="ship")
+    record["ship"]["provenance"]["head_oid"] = real_oid
+
+    for marker_name in (
+        "output_publish",
+        "ownership_capture",
+        "pane_close",
+        "containment",
+        "ship_landing",
+        "quarantine_rename",
+        "worktree_repair",
+        "cleanup_authorization",
+    ):
+        _complete_marker(record, marker_name)
+    _earn_degraded_containment_proof(record)
+    record["phase"] = "publishing_terminal"
+    actions.write_pending_action(record)
+
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="ship",
+        state="teardown",
+        run_generation=record["expected_generation"],
+        pending_action=actions.pending_action_projection(record),
+    )
+    lode["gate_runs"] = [
+        {
+            "command": "make ci",
+            "exit": 0,
+            "head": real_oid,
+            "dirty": False,
+            "generation": record["expected_generation"],
+            "started_at": 1,
+            "finished_at": 2,
+        }
+    ]
+    save_lodes([lode])
+
+    monkeypatch.setattr(
+        "hopper.server.git.authorize_quarantine_cleanup",
+        lambda *a, **kw: {"authorized": True, "error": None},
+    )
+    monkeypatch.setattr(
+        "hopper.server.git.remove_quarantined_worktree",
+        lambda *a, **kw: {"state": "already-absent", "error": None},
+    )
+    monkeypatch.setattr(
+        "hopper.server.git.delete_branch_if_unchanged",
+        lambda *a, **kw: {"state": "already-absent", "error": None},
+    )
+
+    server = Server(socket_path)
+    server.lodes = load_lodes()
+    server._resume_action(record["lode_id"], startup=True)
+
+    reloaded = load_lodes() + load_archived_lodes()
+    match = next(item for item in reloaded if item["id"] == record["lode_id"])
+    assert match["stage"] == "shipped"
+    assert match["ship_gate"]["state"] == "green"
+    assert match["ship_gate"]["landed_head"] == real_oid
+
+
+def test_legacy_lode_without_gate_fields_loads_and_renders_cleanly(make_lode):
+    lode = make_lode(id="legacy01", stage="ship")
+    lode.pop("gate_runs", None)
+    lode.pop("ship_gate", None)
+
+    lode_shipped = make_lode(id="legacy02", stage="shipped")
+    lode_shipped.pop("gate_runs", None)
+    lode_shipped.pop("ship_gate", None)
+
+    save_lodes([lode, lode_shipped])
+    reloaded = load_lodes()
+
+    m1 = next(item for item in reloaded if item["id"] == "legacy01")
+    assert "gate_runs" not in m1
+    assert "ship_gate" not in m1
+    detail1 = format_lode_detail(m1)
+    assert "ship gate" not in detail1
+    assert "⚠" not in detail1
+
+    m2 = next(item for item in reloaded if item["id"] == "legacy02")
+    assert "gate_runs" not in m2
+    assert "ship_gate" not in m2
+    detail2 = format_lode_detail(m2)
+    assert "ship gate" not in detail2
+    assert "⚠" not in detail2
