@@ -71,6 +71,7 @@ from hopper.lodes import (
     format_terminal_failure_status,
     format_worktree_reaped_status,
     freeze_ship_gate,
+    get_lode_dir,
     get_worktree_dir,
     is_terminal_failure_kind,
     is_terminal_oom_scope_archive_candidate,
@@ -1354,7 +1355,35 @@ def _deliver_pane_input(
             outcome,
             rendered_title,
         )
+        _persist_failed_pane_capture(lode_id, reason, result, driver_name)
     return result
+
+
+_PANE_CAPTURE_LOG_LIMIT = 64 * 1024
+
+
+def _persist_failed_pane_capture(lode_id: str, reason: str, result: dict, driver_name: str) -> None:
+    """Keep the pane text a failed delivery classified, so the miss is diagnosable.
+
+    The pane closes with its lode, and the log line carries only the reason. Three
+    grok `pane_state_unknown` misses (09-17, 09-22, 09-28) left no evidence of what
+    the classifier saw. Best effort: a diagnostic write never fails the delivery.
+    """
+    capture = result.get("capture")
+    if not capture:
+        return
+    try:
+        path = get_lode_dir(lode_id) / "pane-delivery-failures.log"
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = (
+            f"=== {stamp} driver={driver_name} reason={reason} "
+            f"title={_render_observed_title(result.get('title'))}\n{capture.rstrip()}\n"
+        )
+        previous = path.read_text() if path.exists() else ""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((previous + entry)[-_PANE_CAPTURE_LOG_LIMIT:])
+    except Exception:
+        logger.debug("Failed to persist pane capture lode=%s", lode_id, exc_info=True)
 
 
 def _deliver_lode_pane_input(

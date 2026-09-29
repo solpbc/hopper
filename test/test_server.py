@@ -12013,6 +12013,29 @@ def test_pane_delivery_logs_exactly_once_for_every_reason(reason, outcome, level
     assert delivered_text not in message
 
 
+def test_failed_pane_delivery_persists_the_classified_capture(tmp_path):
+    attempt_result = {
+        "reason": "pane_state_unknown",
+        "capture": "UNRECOGNIZED PANE TEXT",
+        "title": "grok",
+    }
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        hopper_server._deliver_pane_input("lode-x", "%1", "body", paste=True, driver_name="grok")
+    log = (tmp_path / "lodes" / "lode-x" / "pane-delivery-failures.log").read_text()
+    assert "driver=grok reason=pane_state_unknown" in log
+    assert "UNRECOGNIZED PANE TEXT" in log
+
+
+def test_accepted_pane_delivery_persists_no_capture(tmp_path):
+    attempt_result = {"reason": "accepted", "capture": "PANE", "title": None}
+    with (
+        patch("hopper.server._attempt_pane_delivery", return_value=attempt_result),
+        patch("hopper.server._ACCEPTED_DELIVERY_REASONS", {"accepted"}),
+    ):
+        hopper_server._deliver_pane_input("lode-y", "%1", "body", paste=True)
+    assert not (tmp_path / "lodes" / "lode-y").exists()
+
+
 def test_pane_delivery_exception_logs_once_without_body_and_propagates(caplog):
     delivered_text = "DISTINCTIVE_EXCEPTION_BODY_MUST_NOT_BE_LOGGED"
 
