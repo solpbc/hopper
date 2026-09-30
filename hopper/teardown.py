@@ -741,8 +741,10 @@ def discover_owned_set(
         run=run,
     )
     if table["state"] != "complete":
-        # This lode moves an existing capture-phase wedge to pane close rather than creating one;
-        # cto-70 carries the fix for the underlying persistently rejecting process table.
+        # A partial table blocks here, and the same gate blocks worker capture in
+        # capture_ownership. Both are an accepted residual risk, reopened on the first observed
+        # occurrence: extro records/decisions/260930-cto-hopper-partial-process-table-gates-are-
+        # an-accepted-residual-risk.md (the draft fix and its open review defects are linked there).
         return {
             "state": "cannot-tell",
             "descendants": None,

@@ -2705,7 +2705,8 @@ def test_pane_close_ownership_retry_repeats_real_discovery(
         assert lode["state"] == "paused"
         assert lode["action_results"][-1]["terminal_disposition"] == "paused"
     else:
-        # cto-70 carries the fix for persistently rejecting process tables.
+        # A persistently unreadable table still blocks pane close by design (accepted residual
+        # risk: extro records/decisions/260930-cto-hopper-partial-process-table-gates-are-...).
         durable = actions.load_pending_action(record["lode_id"])
         assert durable["markers"]["ownership_capture"]["state"] == "done"
         assert durable["markers"]["pane_close"]["state"] == "blocked"
