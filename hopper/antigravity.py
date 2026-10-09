@@ -27,7 +27,7 @@ ANTIGRAVITY_PRINT_TIMEOUT = "20m"
 # non-TTY/headless conditions even with --print-timeout set. run_antigravity
 # has no external bound today; this gives one.
 ANTIGRAVITY_RUN_TIMEOUT_SEC = 25 * 60
-ANTIGRAVITY_MODEL = "gemini-3.7-flash-high"
+ANTIGRAVITY_MODEL = "gemini-3.8-flash-high"
 # Observed live: a resumed conversation's cumulative usage grows from ~4M
 # tokens early to ~118M by round 10 (~12.7M/round average). At that rate,
 # usage crosses 20M during round 3, so the fresh bootstrap starts on round 4's
