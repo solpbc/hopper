@@ -452,7 +452,11 @@ before taking another action; do not submit the output again blindly.
   body is accepted** (for example `y`) — the multi-character examples below are
   refused with `gated_character_only` and nothing is pasted. The refusal names the
   recovery itself: retry with exactly one character. This holds for every supervisor,
-  not claude only.
+  not claude only. A refused multi-character send also re-gates the lode.
+- **A lone `y` is a turn, and the agent decides for itself what it approves.** If you
+  have a decision (which option, what to change), send it first with
+  `hop lode nudge <lode-id> --text '…' --wait-for-idle` (a long one as a doc pointer),
+  then release the gate with the single character.
 - If failure says the delivery outcome is unknown, run `hop lode peek <lode-id>`
   before deciding whether to retry; never resend blindly. `hop feedback <lode-id>`
   is an alias with the same contract and input forms.
