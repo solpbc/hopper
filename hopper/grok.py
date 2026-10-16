@@ -46,7 +46,12 @@ _SUPERVISOR_FLAGS = (
     "--disallowed-tools",
     "ask_user_question",
 )
-_TURN_ACTIVE_RE = re.compile(r"⇣\S+\s+\[stop\]\s*$", re.MULTILINE)
+# The live status line ends "<elapsed>s ⇣<tokens> [stop]" -- or, while a
+# foreground shell tool runs, "⇣<tokens> [↓][stop]" (the send-to-background
+# affordance, measured on 1.0.52 and 1.0.60). Missing that token read a busy
+# pane as BACKGROUND, so delivery never saw processing and timed out as
+# pane_state_unknown (fnk6oy3f, 2026-10-05).
+_TURN_ACTIVE_RE = re.compile(r"⇣\S+\s+(?:\[[^\]\n]*\]\s*)*\[stop\]\s*$", re.MULTILINE)
 _HINT_LINE_RE = re.compile(r"^\s*\S+:\S[^│]*(?:│[^│]*\S+:\S[^│]*)+$")
 _BACKGROUND_RE = re.compile(
     r"\b[1-9]\d*\s+commands?\s+still\s+running\b|^\s*[▾▸]\s*Tasks\s+[1-9]\d*\s*$",

@@ -77,6 +77,29 @@ GROK_BUSY = """
 ╰──────────────── Grok 4.6 (high) ─────╯
 Shift+Tab:mode  │  Esc:cancel  │  Ctrl+x:shortcuts
 """
+# Real capture (fnk6oy3f, 2026-10-05, trimmed): a foreground shell tool is
+# running, so the status line carries "[↓]" before "[stop]" and the footer
+# offers Ctrl+b:send to bg. It is busy, not background.
+GROK_BUSY_FOREGROUND_TOOL = """
+   ⠼ Poll make ci progress after three minute… 1m2s        38m49s ⇣165k [↓][stop]
+
+   ▾ Tasks 1
+   ⋅ Run Dispatch implement stage for catalogue revisions     9m56s
+
+  ╭──────────────────────────────────────╮
+  │ ❯                                    │
+  ╰──────────────── Grok 4.7 (high) ─────╯
+
+  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+b:send to bg  │  Ctrl+x:shortcuts
+"""
+# A reply that merely quotes the token is not a turn in flight.
+GROK_IDLE_QUOTING_STOP = """
+     The footer shows [↓][stop] while a shell tool runs.
+╭──────────────────────────────────────╮
+│ ❯                                    │
+╰──────────────── Grok 4.7 (high) ─────╯
+Shift+Tab:mode  │  Ctrl+x:shortcuts
+"""
 GROK_BACKGROUND = """
 ◎ 1 command still running
 ╭──────────────────────────────────────╮
@@ -372,6 +395,8 @@ def test_grok_pane_states_and_composer(decorator):
     assert grok.read_pane_input(decorator(GROK_STAGED)) == "Please inspect the failing test"
     assert grok.observe_pane(None, decorator(GROK_BUSY))[0] is PanePhase.BUSY
     assert grok.observe_pane(None, decorator(GROK_BACKGROUND))[0] is PanePhase.BACKGROUND
+    assert grok.observe_pane(None, decorator(GROK_BUSY_FOREGROUND_TOOL))[0] is PanePhase.BUSY
+    assert grok.observe_pane(None, decorator(GROK_IDLE_QUOTING_STOP))[0] is PanePhase.IDLE
     assert grok.observe_pane(None, decorator(GROK_CARD)) == (
         PanePhase.BLOCKED,
         KeyboardOwnership.CARD,
