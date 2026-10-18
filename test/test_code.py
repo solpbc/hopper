@@ -690,6 +690,253 @@ class TestRunCode:
             "Antigravity reset bootstrap did not return a conversation ID"
         )
 
+    def test_unmarked_operator_notes_printed_on_success_and_failure(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Unmarked notes are printed after output on success and failure;
+        printed is recorded first.
+        """
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        notes = [
+            {
+                "id": "n1",
+                "text": "first note text",
+                "stage": "refine",
+                "queued_at": 100,
+                "printed_at": None,
+                "shown_at": None,
+            },
+            {
+                "id": "n2",
+                "text": "second note text",
+                "stage": "refine",
+                "queued_at": 200,
+                "printed_at": None,
+                "shown_at": None,
+            },
+        ]
+        lode_data = {
+            "id": "test-sid",
+            "stage": "refine",
+            "operator_notes": notes,
+        }
+
+        call_order = []
+        printed_messages = []
+
+        def mock_run_coder_success(
+            provider, prompt, cwd, output_file, session_id, env=None, on_event=None
+        ):
+            Path(output_file).write_text("coder output\n")
+            return 0, MOCK_CMD
+
+        def mock_run_coder_failure(
+            provider, prompt, cwd, output_file, session_id, env=None, on_event=None
+        ):
+            Path(output_file).write_text("coder failure output\n")
+            return 1, MOCK_CMD
+
+        def mock_record(sock, lid, ids, mark):
+            assert any("coder output" in m for m in printed_messages)
+            assert not any(
+                "Operator notes that arrived while the coder ran." in m for m in printed_messages
+            )
+            call_order.append((lid, ids, mark))
+            return {"type": "operator_notes_recorded", "lode_id": lid, "ids": ids, "mark": mark}
+
+        import builtins
+
+        real_print = builtins.print
+
+        def spy_print(*args, **kwargs):
+            if args:
+                printed_messages.append(str(args[0]))
+            real_print(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "print", spy_print)
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.get_recent_commit_log", return_value=""),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder_success),
+            patch("hopper.code.get_lode", return_value=lode_data) as mock_get_lode,
+            patch("hopper.code.record_operator_notes", side_effect=mock_record),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "request")
+
+        assert exit_code == 0
+        assert mock_get_lode.called
+        assert call_order == [("test-sid", ["n1", "n2"], "printed")]
+        captured = capsys.readouterr()
+        assert "coder output" in captured.out
+        assert (
+            "Operator notes that arrived while the coder ran. "
+            "Address them before gating or submitting.\n"
+            "first note text\n"
+            "second note text\n"
+        ) in captured.out
+
+        # Test failure run as well
+        call_order.clear()
+        printed_messages.clear()
+
+        def mock_record_fail(sock, lid, ids, mark):
+            assert any("coder failure output" in m for m in printed_messages)
+            assert not any(
+                "Operator notes that arrived while the coder ran." in m for m in printed_messages
+            )
+            call_order.append((lid, ids, mark))
+            return {"type": "operator_notes_recorded", "lode_id": lid, "ids": ids, "mark": mark}
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.get_recent_commit_log", return_value=""),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder_failure),
+            patch("hopper.code.get_lode", return_value=lode_data),
+            patch("hopper.code.record_operator_notes", side_effect=mock_record_fail),
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "request")
+
+        assert exit_code == 1
+        assert call_order == [("test-sid", ["n1", "n2"], "printed")]
+        captured = capsys.readouterr()
+        assert "coder failure output" in captured.out
+        assert "first note text\nsecond note text" in captured.out
+
+    def test_operator_notes_record_none_omits_heading(self, tmp_path, monkeypatch, capsys):
+        """If record_operator_notes returns None, the operator notes heading is absent."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        notes = [
+            {
+                "id": "n1",
+                "text": "first note text",
+                "stage": "refine",
+                "queued_at": 100,
+                "printed_at": None,
+                "shown_at": None,
+            }
+        ]
+        lode_data = {"id": "test-sid", "stage": "refine", "operator_notes": notes}
+
+        def mock_run_coder(provider, prompt, cwd, output_file, session_id, env=None, on_event=None):
+            Path(output_file).write_text("coder output\n")
+            return 0, MOCK_CMD
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.get_recent_commit_log", return_value=""),
+            patch("hopper.code.run_coder", side_effect=mock_run_coder),
+            patch("hopper.code.get_lode", return_value=lode_data),
+            patch("hopper.code.record_operator_notes", return_value=None) as mock_record,
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "request")
+
+        assert exit_code == 0
+        mock_record.assert_called_once_with(
+            Path("/tmp/test.sock"), "test-sid", ["n1"], mark="printed"
+        )
+        captured = capsys.readouterr()
+        assert "coder output" in captured.out
+        assert "Operator notes that arrived while the coder ran" not in captured.out
+        assert "first note text" not in captured.out
+
+    def test_operator_notes_second_run_skips_already_printed(self, tmp_path, monkeypatch, capsys):
+        """A second run_code does not print notes that already have printed_at set."""
+        session_dir = tmp_path / "lodes" / "test-sid"
+        worktree = session_dir / "worktree"
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+        (session_dir / "audit.out.md").write_text("coder output\n")
+
+        notes = [
+            {
+                "id": "n1",
+                "text": "old note",
+                "stage": "refine",
+                "queued_at": 100,
+                "printed_at": 150,
+                "shown_at": None,
+            },
+            {
+                "id": "n2",
+                "text": "new note",
+                "stage": "refine",
+                "queued_at": 200,
+                "printed_at": None,
+                "shown_at": None,
+            },
+        ]
+        lode_data = {"id": "test-sid", "stage": "refine", "operator_notes": notes}
+
+        with (
+            patch("hopper.code.prompt.load", return_value="prompt text"),
+            patch("hopper.code.connect", return_value=_mock_response()),
+            patch("hopper.code.find_project", return_value=None),
+            patch("hopper.code.get_lode_dir", return_value=session_dir),
+            patch("hopper.code.set_lode_state", return_value=True),
+            patch("hopper.code.set_lode_status", return_value=True),
+            patch("hopper.code.get_recent_commit_log", return_value=""),
+            patch("hopper.code.run_coder", return_value=(0, MOCK_CMD)),
+            patch("hopper.code.get_lode", return_value=lode_data),
+            patch(
+                "hopper.code.record_operator_notes",
+                return_value={
+                    "type": "operator_notes_recorded",
+                    "lode_id": "test-sid",
+                    "ids": ["n2"],
+                    "mark": "printed",
+                },
+            ) as mock_record,
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "request")
+
+        assert exit_code == 0
+        mock_record.assert_called_once_with(
+            Path("/tmp/test.sock"), "test-sid", ["n2"], mark="printed"
+        )
+        captured = capsys.readouterr()
+        assert "new note" in captured.out
+        assert "old note" not in captured.out
+
+    def test_operator_notes_preflight_wrong_stage_does_not_print_or_record(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Wrong-stage preflight exits 1 without recording or printing notes."""
+        with (
+            patch("hopper.code.connect", return_value=_mock_response(stage="mill")),
+            patch("hopper.code.get_lode") as mock_get_lode,
+            patch("hopper.code.record_operator_notes") as mock_record,
+        ):
+            exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "request")
+
+        assert exit_code == 1
+        mock_get_lode.assert_not_called()
+        mock_record.assert_not_called()
+        assert "Operator notes" not in capsys.readouterr().err
+
 
 class TestNextVersion:
     def test_no_existing_files_returns_none(self, tmp_path):

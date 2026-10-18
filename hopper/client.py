@@ -725,6 +725,47 @@ def send_pane_input(
     )
 
 
+def queue_operator_note(
+    socket_path: Path,
+    lode_id: str,
+    text: str,
+    timeout: float = 15.0,
+) -> dict | None:
+    """Queue an operator note for a lode. Returns the server response dict."""
+    return send_message(
+        socket_path,
+        {
+            "type": "lode_queue_operator_note",
+            "lode_id": lode_id,
+            "text": text,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
+def record_operator_notes(
+    socket_path: Path,
+    lode_id: str,
+    ids: list[str],
+    *,
+    mark: str,
+    timeout: float = 2.0,
+) -> dict | None:
+    """Record printed or shown mark for operator notes."""
+    return send_message(
+        socket_path,
+        {
+            "type": "lode_record_operator_notes",
+            "lode_id": lode_id,
+            "ids": ids,
+            "mark": mark,
+        },
+        timeout=timeout,
+        wait_for_response=True,
+    )
+
+
 def get_gate(socket_path: Path, lode_id: str, timeout: float = 2.0) -> dict | None:
     """Look up one lode's durable gate. Returns None when no gate is active."""
 

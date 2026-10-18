@@ -58,6 +58,7 @@ from hopper.driver import (
 )
 from hopper.git import branch_exists, delete_branch, is_dirty, remove_worktree
 from hopper.lodes import (
+    OPERATOR_NOTE_MAX_CHARS,
     REFUSAL_STATUS_PREFIXES,
     archive_lode,
     archive_lode_for_action,
@@ -67,6 +68,7 @@ from hopper.lodes import (
     create_lode,
     current_time_ms,
     find_lodes_by_prefix,
+    format_operator_notes_refusal,
     format_refusal_status,
     format_terminal_failure_status,
     format_worktree_reaped_status,
@@ -91,6 +93,7 @@ from hopper.lodes import (
     set_lode_gate_fields,
     stop_lode_runtime,
     touch,
+    unacknowledged_operator_notes,
     unarchive_lode,
     update_lode_branch,
     update_lode_coder_session,
@@ -316,6 +319,24 @@ def _pending_action_file_exists(lode_id: str) -> bool:
     except ValueError:
         # Legacy/corrupt lode IDs cannot name a valid pending-completion record.
         return False
+
+
+def completion_is_taken(server: object, lode_id: str) -> bool:
+    """Return whether a completion action is taken for the specified lode."""
+    acceptance = getattr(server, "action_acceptances", {}).get(lode_id)
+    if acceptance is not None:
+        try:
+            if acceptance[1][2] == "completion":
+                return True
+        except (IndexError, TypeError):
+            pass
+    try:
+        pending = actions.load_pending_action(lode_id)
+        if pending and pending.get("action_type") == "completion":
+            return True
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return False
 
 
 def _capture_ship_acceptance(
@@ -969,6 +990,7 @@ def _attempt_pane_delivery(
     paste: bool,
     pane_title_observation: dict | None = None,
     driver_name: str = "claude",
+    observe_only: bool = False,
 ) -> dict:
     """Attempt one pane delivery and return its reason and latest observations."""
     driver = resolve_driver(driver_name)
@@ -1104,6 +1126,14 @@ def _attempt_pane_delivery(
             reason = "pane_state_unknown"
         return {
             "reason": reason,
+            "capture": latest_capture,
+            "title": observed_title,
+            "phase": last_observed_phase.value if last_observed_phase is not None else None,
+        }
+
+    if observe_only:
+        return {
+            "reason": "idle_ready",
             "capture": latest_capture,
             "title": observed_title,
             "phase": last_observed_phase.value if last_observed_phase is not None else None,
@@ -2013,6 +2043,9 @@ class Server:
         request: dict | None = None,
         record: dict | None = None,
         receipt: dict | None = None,
+        status_override: str | None = None,
+        accepted_override: bool | None = None,
+        operator_note_ids: list[str] | None = None,
     ) -> None:
         request = request or getattr(self._request_context, "message", {})
         legacy_action = {
@@ -2064,6 +2097,12 @@ class Server:
             lode=lode,
         )
         response["type"] = "lode_action_ack"
+        if status_override is not None:
+            response["status"] = status_override
+        if accepted_override is not None:
+            response["accepted"] = accepted_override
+        if operator_note_ids is not None:
+            response["operator_note_ids"] = list(operator_note_ids)
         if outcome == "refused" and conn is None and isinstance(lode_id, str):
             try:
                 actions.validate_action_id(response.get("action_id"))
@@ -2457,6 +2496,10 @@ class Server:
             "record": record,
         }
 
+    def completion_is_taken(self, lode_id: str) -> bool:
+        """Return whether a completion action is taken for the specified lode."""
+        return completion_is_taken(self, lode_id)
+
     def _handle_lode_action(self, message: dict, conn: socket.socket | None) -> None:
         """Validate completion and prepare server-owned bytes off-loop."""
         lode_id = message.get("lode_id")
@@ -2650,6 +2693,19 @@ class Server:
                 outcome="refused",
                 reason="ship_provenance_unavailable",
                 action_id=action_id,
+            )
+            return
+
+        unacked = unacknowledged_operator_notes(lode)
+        if unacked:
+            self._send_action_ack(
+                conn,
+                outcome="refused",
+                reason="operator_notes_pending",
+                action_id=action_id,
+                action_type=action_type,
+                status_override=format_operator_notes_refusal(unacked),
+                operator_note_ids=[note["id"] for note in unacked],
             )
             return
 
@@ -6626,6 +6682,21 @@ class Server:
                 if conn:
                     self._send_response(conn, {"type": "error", "error": "lode not found"})
                 return
+
+            if not runner_gate_publication:
+                unacked = unacknowledged_operator_notes(lode)
+                if unacked:
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "lode_gate_refused",
+                                "status": format_operator_notes_refusal(unacked),
+                                "operator_note_ids": [note["id"] for note in unacked],
+                            },
+                        )
+                    return
+
             try:
                 published, changed = publish_lode_gate(
                     self.lodes,
@@ -7132,6 +7203,167 @@ class Server:
                     "tmux_pane": pane_id,
                 }
             else:
+                formatted_error = _PANE_INPUT_MESSAGES[reason].format(
+                    pane=pane_id or "<unknown>",
+                    lode_id=lode_id,
+                    title=_render_observed_title(result["title"]),
+                )
+                if paste is True and reason in {"idle_timeout", "background_active", "pane_frozen"}:
+                    formatted_error += (
+                        " Hold it for the supervisor's next Hopper command with "
+                        "`hop lode nudge --queue`."
+                    )
+                response = {
+                    "type": "error",
+                    "error": formatted_error,
+                    "outcome": _DELIVERY_FAILURE_OUTCOMES[reason],
+                }
+                if result["capture"] is not None:
+                    response["tail"] = "\n".join(result["capture"].splitlines()[-10:])
+            if conn:
+                self._send_response(conn, response)
+
+        elif msg_type == "lode_queue_operator_note":
+            lode_id = message.get("lode_id")
+            text = message.get("text")
+            if not isinstance(text, str):
+                text = ""
+            trimmed = text.strip()
+            if not trimmed:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": "operator note is empty. Nothing was stored.",
+                            "outcome": "empty_note",
+                        },
+                    )
+                return
+            if len(trimmed) > OPERATOR_NOTE_MAX_CHARS:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                f"operator note is {len(trimmed)} characters, over the "
+                                "2000 character cap. Send a short note pointing at a file."
+                            ),
+                            "outcome": "note_too_long",
+                        },
+                    )
+                return
+
+            if not lode_id:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                "No lode ID was provided. No pane was touched. Supply a lode "
+                                "ID, then retry."
+                            ),
+                            "outcome": "unknown_lode",
+                        },
+                    )
+                return
+
+            lode = self._find_lode(lode_id)
+            if not lode:
+                archived_lode = next(
+                    (archived for archived in self.archived_lodes if archived.get("id") == lode_id),
+                    None,
+                )
+                if archived_lode:
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": f"lode {lode_id} is archived. Nothing was stored.",
+                                "outcome": "lode_archived",
+                            },
+                        )
+                else:
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": (
+                                    f"Lode {lode_id} was not found on this server. No pane was "
+                                    "touched. Check the lode ID, then retry."
+                                ),
+                                "outcome": "unknown_lode",
+                            },
+                        )
+                return
+
+            if lode.get("active") is not True:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                f"lode {lode_id} has no supervisor session that will read a "
+                                "Hopper command. Nothing was stored."
+                            ),
+                            "outcome": "lode_inactive",
+                        },
+                    )
+                return
+
+            if self.completion_is_taken(lode_id):
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": (
+                                f"lode {lode_id} stage is ending, so a note would reach nobody. "
+                                "Nothing was stored."
+                            ),
+                            "outcome": "stage_ending",
+                        },
+                    )
+                return
+
+            pane_id = lode.get("tmux_pane")
+            if not pane_id:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": _PANE_INPUT_MESSAGES["pane_unavailable"].format(
+                                pane="<unknown>",
+                                lode_id=lode_id,
+                                title="",
+                            ),
+                            "outcome": _DELIVERY_FAILURE_OUTCOMES["pane_unavailable"],
+                        },
+                    )
+                return
+
+            prior_unacked = unacknowledged_operator_notes(lode)
+            if prior_unacked:
+                result = _attempt_pane_delivery(
+                    pane_id,
+                    trimmed,
+                    paste=True,
+                    pane_title_observation=dict(lode.get("pane_title_observation") or {}),
+                    driver_name=lode_driver(lode),
+                    observe_only=True,
+                )
+            else:
+                result = _deliver_lode_pane_input(self.lodes, lode, trimmed, paste=True)
+
+            reason = result["reason"]
+
+            if reason in {"pane_unavailable", "pane_blocked", "pane_awaiting_choice"}:
                 response = {
                     "type": "error",
                     "error": _PANE_INPUT_MESSAGES[reason].format(
@@ -7143,8 +7375,227 @@ class Server:
                 }
                 if result["capture"] is not None:
                     response["tail"] = "\n".join(result["capture"].splitlines()[-10:])
+                if conn:
+                    self._send_response(conn, response)
+                return
+
+            dup = next(
+                (
+                    note
+                    for note in unacknowledged_operator_notes(lode)
+                    if note.get("text") == trimmed
+                ),
+                None,
+            )
+            if dup is not None:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "operator_note_already_queued",
+                            "lode_id": lode_id,
+                            "queued_at": dup.get("queued_at"),
+                        },
+                    )
+                return
+
+            would_store = bool(prior_unacked) or reason in {
+                "idle_timeout",
+                "background_active",
+                "pane_frozen",
+                "pane_state_unknown",
+            }
+            if would_store:
+                if self.completion_is_taken(lode_id):
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": (
+                                    f"lode {lode_id} stage is ending, so a note would reach "
+                                    "nobody. Nothing was stored."
+                                ),
+                                "outcome": "stage_ending",
+                            },
+                        )
+                    return
+
+                existing_ids = {
+                    n["id"] for n in lode.get("operator_notes", []) if isinstance(n, dict)
+                }
+                note_id = secrets.token_hex(4)
+                while note_id in existing_ids:
+                    note_id = secrets.token_hex(4)
+
+                note = {
+                    "id": note_id,
+                    "text": trimmed,
+                    "queued_at": current_time_ms(),
+                    "stage": lode.get("stage", ""),
+                    "printed_at": None,
+                    "shown_at": None,
+                }
+                prior_notes = copy.deepcopy(lode.get("operator_notes"))
+                if "operator_notes" not in lode or not isinstance(lode["operator_notes"], list):
+                    lode["operator_notes"] = []
+                lode["operator_notes"].append(note)
+                try:
+                    save_lodes(self.lodes)
+                except Exception as e:
+                    if prior_notes is None:
+                        lode.pop("operator_notes", None)
+                    else:
+                        lode["operator_notes"] = prior_notes
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": f"failed to save operator note: {e}",
+                                "outcome": "save_failed",
+                            },
+                        )
+                    return
+                self.broadcast({"type": "lode_updated", "lode": lode})
+                is_idle = bool(prior_unacked and reason == "idle_ready")
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "operator_note_queued",
+                            "lode_id": lode_id,
+                            "note": note,
+                            "idle": is_idle,
+                        },
+                    )
+                return
+
+            if not prior_unacked and reason in _ACCEPTED_DELIVERY_REASONS:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "pane_input_sent",
+                            "lode_id": lode_id,
+                            "tmux_pane": pane_id,
+                        },
+                    )
+                return
+
+            error_msg = _PANE_INPUT_MESSAGES.get(reason, f"Pane delivery failed: {reason}").format(
+                pane=pane_id or "<unknown>",
+                lode_id=lode_id,
+                title=_render_observed_title(result["title"]),
+            )
+            response = {
+                "type": "error",
+                "error": error_msg,
+                "outcome": _DELIVERY_FAILURE_OUTCOMES.get(reason, "delivery_failed"),
+            }
+            if result["capture"] is not None:
+                response["tail"] = "\n".join(result["capture"].splitlines()[-10:])
             if conn:
                 self._send_response(conn, response)
+            return
+
+        elif msg_type == "lode_record_operator_notes":
+            lode_id = message.get("lode_id")
+            ids = message.get("ids", [])
+            mark = message.get("mark")
+            if mark not in {"printed", "shown"}:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": f"Invalid mark: {mark}",
+                            "outcome": "invalid_mark",
+                        },
+                    )
+                return
+            if not lode_id:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": "No lode ID was provided.",
+                            "outcome": "unknown_lode",
+                        },
+                    )
+                return
+            lode = self._find_lode(lode_id)
+            if not lode:
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": f"Lode {lode_id} was not found on this server.",
+                            "outcome": "unknown_lode",
+                        },
+                    )
+                return
+            if not lode.get("active"):
+                if conn:
+                    self._send_response(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": f"Lode {lode_id} is not active.",
+                            "outcome": "lode_inactive",
+                        },
+                    )
+                return
+
+            notes = lode.get("operator_notes")
+            if not isinstance(notes, list):
+                notes = []
+            target_ids = set(ids) if isinstance(ids, list) else set()
+            existing_requested_ids = [
+                n["id"] for n in notes if isinstance(n, dict) and n.get("id") in target_ids
+            ]
+            now_ms = current_time_ms()
+            prior_notes = copy.deepcopy(notes)
+            changed = False
+            for n in notes:
+                if isinstance(n, dict) and n.get("id") in target_ids:
+                    if mark == "printed" and n.get("printed_at") is None:
+                        n["printed_at"] = now_ms
+                        changed = True
+                    elif mark == "shown" and n.get("shown_at") is None:
+                        n["shown_at"] = now_ms
+                        changed = True
+
+            if changed:
+                try:
+                    save_lodes(self.lodes)
+                except Exception as e:
+                    lode["operator_notes"] = prior_notes
+                    if conn:
+                        self._send_response(
+                            conn,
+                            {
+                                "type": "error",
+                                "error": f"failed to save operator notes: {e}",
+                                "outcome": "save_failed",
+                            },
+                        )
+                    return
+                self.broadcast({"type": "lode_updated", "lode": lode})
+
+            if conn:
+                self._send_response(
+                    conn,
+                    {
+                        "type": "operator_notes_recorded",
+                        "lode_id": lode_id,
+                        "ids": existing_requested_ids,
+                        "mark": mark,
+                    },
+                )
+            return
 
         elif msg_type == "lode_promote_backlog":
             # Compound: create lode from backlog item, remove backlog item
@@ -7398,8 +7849,19 @@ class Server:
             logger.warning("Skipping message without type field")
             return False
 
+        message_to_queue = message
+        if message.get("type") == "lode_updated":
+            lode = message.get("lode")
+            if isinstance(lode, dict):
+                notes = lode.get("operator_notes")
+                if isinstance(notes, list) and notes:
+                    stripped_notes = [
+                        {k: v for k, v in note.items() if k != "text"} for note in notes
+                    ]
+                    message_to_queue = dict(message, lode=dict(lode, operator_notes=stripped_notes))
+
         try:
-            self.broadcast_queue.put_nowait(message)
+            self.broadcast_queue.put_nowait(message_to_queue)
             return True
         except queue.Full:
             logger.warning(f"Broadcast queue full, dropping: {message.get('type')}")

@@ -10943,7 +10943,8 @@ def test_lode_nudge_wait_for_idle_expires_while_processing(monkeypatch, capsys):
     assert captured.err == (
         f"{_nudge_begin_line(budget=budget)}\n"
         "Observed: pane %1 was still processing after 5s of a 5s --wait-for-idle budget. "
-        "Hopper did not send the nudge. Recover with: hop lode peek abc123\n"
+        "Hopper did not send the nudge. Recover with: hop lode peek abc123. "
+        "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`.\n"
     )
 
 
@@ -10968,7 +10969,8 @@ def test_lode_nudge_wait_for_idle_expires_after_busy(monkeypatch, capsys):
         f"{_nudge_begin_line(budget=budget)}\n"
         f"{error}\n"
         "Observed: pane %1 was still processing after 5s of a 5s --wait-for-idle budget. "
-        "Hopper did not send another nudge. Recover with: hop lode peek abc123\n"
+        "Hopper did not send another nudge. Recover with: hop lode peek abc123. "
+        "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`.\n"
     )
 
 
@@ -10997,7 +10999,8 @@ def test_lode_nudge_wait_for_idle_expires_when_busy_send_overshoots(monkeypatch,
         f"{_nudge_begin_line(budget=budget)}\n"
         f"{error}\n"
         "Observed: pane %1 was still processing after 6s of a 5s --wait-for-idle budget. "
-        "Hopper did not send another nudge. Recover with: hop lode peek abc123\n"
+        "Hopper did not send another nudge. Recover with: hop lode peek abc123. "
+        "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`.\n"
     )
 
 
@@ -12090,7 +12093,11 @@ def test_lode_nudge_wait_for_idle_retries_and_expires_background_active(monkeypa
         "after 5s of a 5s --wait-for-idle budget." in captured.err
     )
     assert "still processing" not in captured.err
-    assert "Retry once that work finishes. Recover with: hop lode peek abc123" in captured.err
+    assert (
+        "Retry once that work finishes. Recover with: hop lode peek abc123. "
+        "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`."
+        in captured.err
+    )
 
     # 3. If busy was seen, keep existing processing sentence
     clock[0] = 0.0
@@ -12106,6 +12113,10 @@ def test_lode_nudge_wait_for_idle_retries_and_expires_background_active(monkeypa
 
     captured_busy = capsys.readouterr()
     assert "was still processing after 5s of a 5s --wait-for-idle budget." in captured_busy.err
+    assert (
+        "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`."
+        in captured_busy.err
+    )
 
 
 def test_worktree_reap_status_display_full_and_partial(monkeypatch):
@@ -12179,3 +12190,337 @@ def test_worktree_reap_status_display_full_and_partial(monkeypatch):
         worktree_reap_status_for_display(lode_partial_nobranch)
         == "Worktree removed 2m ago; branch hopper-abc12345 delete not completed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Operator note CLI tests
+# ---------------------------------------------------------------------------
+
+
+def test_lode_nudge_queue_mutual_exclusions_before_lookup(capsys):
+    """--queue mutual exclusions and validations happen before server lookup."""
+    with (
+        patch("hopper.cli.require_server") as require,
+        patch("hopper.client.read_lode_snapshot") as snapshot,
+        patch("hopper.cli._resolve_lode") as resolver,
+        patch("hopper.client.queue_operator_note") as queue_mock,
+    ):
+        # 1. --queue and --wait-for-idle together
+        assert cmd_lode(["nudge", "abc", "--queue", "--wait-for-idle", "10", "hello"]) == 1
+        out = capsys.readouterr().out
+        assert "--queue and --wait-for-idle cannot be used together" in out
+
+        # 2. --queue without text
+        assert cmd_lode(["nudge", "abc", "--queue"]) == 1
+        out = capsys.readouterr().out
+        assert "--queue requires text to submit" in out
+
+        # 3. --queue with whitespace text
+        assert cmd_lode(["nudge", "abc", "--queue", "   "]) == 1
+        out = capsys.readouterr().out
+        assert "--queue requires text to submit" in out
+
+        # 4. Over cap (> 2000 chars)
+        assert cmd_lode(["nudge", "abc", "--queue", "x" * 2001]) == 1
+        out = capsys.readouterr().out
+        assert "over the 2000 character cap" in out
+
+    require.assert_not_called()
+    snapshot.assert_not_called()
+    resolver.assert_not_called()
+    queue_mock.assert_not_called()
+
+
+def test_lode_nudge_help_contains_queue(capsys):
+    """hop lode nudge --help mentions --queue."""
+    assert cmd_lode(["nudge", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "--queue" in out
+
+
+def test_lode_nudge_queue_remote_forwarding():
+    """Remote lode with --queue forwards --queue and text without --wait-for-idle."""
+    lode = {"id": "abc12345", "host": "resident.example", "active": True, "state": "running"}
+    resolution = {
+        "outcome": "found",
+        "lode": lode,
+        "host": "resident.example",
+        "canonical_id": "abc12345",
+        "error": None,
+        "probe_summary": "",
+        "exit_code": 0,
+    }
+    with (
+        patch("hopper.cli._resolve_lode", return_value=resolution),
+        patch("hopper.cli._run_remote_cli", return_value=0) as run_remote,
+        patch("hopper.client.queue_operator_note") as queue_mock,
+    ):
+        assert cmd_lode(["nudge", "abc", "--queue", "my operator note"]) == 0
+
+    assert run_remote.call_args.args[:2] == (
+        "resident.example",
+        ["lode", "nudge", "--queue", "abc12345", "--", "my operator note"],
+    )
+    queue_mock.assert_not_called()
+
+
+def test_lode_nudge_queue_stdout_outcomes(capsys):
+    """Queued stdout reports lode id; idle reports plain nudge reaches supervisor."""
+    lode = {"id": "abc12345", "tmux_pane": "%1", "active": True, "state": "running"}
+
+    # 1. Not idle
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.queue_operator_note",
+            return_value={"type": "operator_note_queued", "lode_id": "abc12345", "idle": False},
+        ),
+    ):
+        assert cmd_lode(["nudge", "abc12345", "--queue", "check this"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Queued an operator note for abc12345." in out
+    assert "submitted" not in out
+    assert "The supervisor is idle" not in out
+
+    # 2. Idle adds plain nudge reminder
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.queue_operator_note",
+            return_value={"type": "operator_note_queued", "lode_id": "abc12345", "idle": True},
+        ),
+    ):
+        assert cmd_lode(["nudge", "abc12345", "--queue", "check this"]) == 0
+
+    out_idle = capsys.readouterr().out
+    assert "Queued an operator note for abc12345." in out_idle
+    assert (
+        "The supervisor is idle and will not see the note until it runs a Hopper command."
+        in out_idle
+    )
+    assert "A plain `hop lode nudge` reaches it now." in out_idle
+
+    # 3. Already queued
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch(
+            "hopper.client.queue_operator_note",
+            return_value={
+                "type": "operator_note_already_queued",
+                "lode_id": "abc12345",
+                "queued_at": 1700000000,
+            },
+        ),
+    ):
+        assert cmd_lode(["nudge", "abc12345", "--queue", "check this"]) == 0
+
+    out_dup = capsys.readouterr().out
+    assert "Already queued at 1700000000. Nothing stored." in out_dup
+
+
+def test_lode_nudge_queue_unknown_outcome_when_response_is_none(capsys):
+    """When queue_operator_note returns None, stderr warns and does not claim Queued."""
+    lode = {"id": "abc12345", "tmux_pane": "%1", "active": True, "state": "running"}
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", lode)),
+        patch("hopper.client.queue_operator_note", return_value=None),
+    ):
+        assert cmd_lode(["nudge", "abc12345", "--queue", "check this"]) == 1
+
+    captured = capsys.readouterr()
+    assert (
+        "error: the operator-note outcome is unknown. Inspect with `hop lode status abc12345`"
+        in captured.err
+    )
+    assert "Queued" not in captured.out
+
+
+def test_gate_publish_unknown_outcome_when_response_is_none(capsys):
+    """When publish_lode_gate returns None, stderr warns and does not claim was not changed."""
+    from io import StringIO
+
+    lode_id = "test-gate-1234"
+    review_text = "Review\n"
+    lode_data = {"id": lode_id, "stage": "refine"}
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value=lode_data),
+        patch("hopper.client.publish_lode_gate", return_value=None),
+        patch("sys.stdin", StringIO(review_text)),
+    ):
+        assert cmd_gate([]) == 1
+
+    captured = capsys.readouterr()
+    assert (
+        "error: the gate outcome is unknown. "
+        "Inspect with `hop lode status test-gate-1234` before retrying." in captured.err
+    )
+    assert "was not changed" not in captured.err
+
+
+def test_gate_refused_prints_status_and_records_shown(capsys):
+    """When gate is refused with operator notes, prints status to stderr and records shown."""
+    from io import StringIO
+
+    lode_id = "test-gate-1234"
+    review_text = "Review\n"
+    lode_data = {"id": lode_id, "stage": "refine"}
+    refusal = {
+        "type": "lode_gate_refused",
+        "status": (
+            "Refusing completion: operator notes arrived. This is not a failure. Note: check tests"
+        ),
+        "operator_note_ids": ["n1", "n2"],
+    }
+    with (
+        patch.dict(os.environ, {"HOPPER_LID": lode_id}),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value=lode_data),
+        patch("hopper.client.publish_lode_gate", return_value=refusal),
+        patch("hopper.client.record_operator_notes") as mock_record,
+        patch("sys.stdin", StringIO(review_text)),
+    ):
+        assert cmd_gate([]) == 1
+
+    captured = capsys.readouterr()
+    assert "This is not a failure" in captured.err
+    assert "Note: check tests" in captured.err
+    mock_record.assert_called_once_with(ANY, lode_id, ["n1", "n2"], mark="shown")
+
+
+def test_cmd_processed_prints_status_before_record_call(capsys):
+    """cmd_processed prints refusal before recording shown, and None status does not record."""
+    import io
+
+    lode_id = "test-session"
+    stdin = MagicMock()
+    stdin.buffer = io.BytesIO(b"stage output\n")
+
+    call_order = []
+
+    def mock_record(sock, lid, ids, mark):
+        call_order.append(("record", lid, ids, mark))
+        return {"type": "operator_notes_recorded"}
+
+    refusal_ack = {
+        "type": "lode_action_ack",
+        "accepted": False,
+        "status": "Refusing completion: operator notes arrived. This is not a failure.",
+        "operator_note_ids": ["n1"],
+    }
+
+    import builtins
+
+    real_print = builtins.print
+
+    def spy_print(*args, **kwargs):
+        call_order.append(("print", args[0] if args else ""))
+        real_print(*args, **kwargs)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"HOPPER_LID": lode_id, "HOPPER_RUN_GENERATION": "a" * 32},
+        ),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
+        patch("hopper.client.complete_lode", return_value=refusal_ack),
+        patch("hopper.client.record_operator_notes", side_effect=mock_record),
+        patch("sys.stdin", stdin),
+        patch("builtins.print", side_effect=spy_print),
+    ):
+        assert cmd_processed([]) == 1
+
+    print_idx = next(
+        i
+        for i, c in enumerate(call_order)
+        if c[0] == "print" and "This is not a failure" in str(c[1])
+    )
+    record_idx = next(i for i, c in enumerate(call_order) if c[0] == "record")
+    assert print_idx < record_idx
+    assert call_order[record_idx] == ("record", lode_id, ["n1"], "shown")
+
+    # If status is None, does NOT record
+    stdin2 = MagicMock()
+    stdin2.buffer = io.BytesIO(b"stage output\n")
+    none_ack = {"type": "lode_action_ack", "accepted": False, "status": None}
+    with (
+        patch.dict(
+            os.environ,
+            {"HOPPER_LID": lode_id, "HOPPER_RUN_GENERATION": "a" * 32},
+        ),
+        patch("hopper.client.probe_server", return_value="up"),
+        patch("hopper.client.lode_exists", return_value=True),
+        patch("hopper.client.get_lode", return_value={"id": lode_id, "stage": "mill"}),
+        patch("hopper.client.complete_lode", return_value=none_ack),
+        patch("hopper.client.record_operator_notes") as mock_record_none,
+        patch("sys.stdin", stdin2),
+    ):
+        assert cmd_processed([]) == 1
+
+    mock_record_none.assert_not_called()
+
+
+def test_status_display_human_and_json_operator_notes(capsys):
+    """Human and --json lode status display all operator note fields and computed state."""
+    from hopper.cli import _show_lode_status
+
+    note = {
+        "id": "note1",
+        "text": "fix lint in parser.py",
+        "stage": "refine",
+        "queued_at": 1700000000123,
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode = {
+        "id": "abc12345",
+        "stage": "refine",
+        "state": "running",
+        "active": True,
+        "operator_notes": [note],
+    }
+
+    resolution = {
+        "outcome": "found",
+        "host": "local",
+        "canonical_id": "abc12345",
+        "lode": lode,
+        "exit_code": 0,
+    }
+
+    # 1. Human format
+    with patch("hopper.cli._resolve_lode_once", return_value=resolution):
+        assert _show_lode_status(Path("/tmp/test.sock"), "abc12345", json_output=False) == 0
+
+    human_out = capsys.readouterr().out
+    assert "operator notes:" in human_out
+    assert "id:         note1" in human_out
+    assert "state:      pending" in human_out
+    assert "stage:      refine" in human_out
+    assert "queued_at:  1700000000123" in human_out
+    assert "text:       fix lint in parser.py" in human_out
+
+    # 2. JSON format
+    with patch("hopper.cli._resolve_lode_once", return_value=resolution):
+        assert _show_lode_status(Path("/tmp/test.sock"), "abc12345", json_output=True) == 0
+
+    json_out = capsys.readouterr().out
+    data = json.loads(json_out)
+    assert "operator_notes" in data
+    assert len(data["operator_notes"]) == 1
+    out_note = data["operator_notes"][0]
+    assert out_note["id"] == "note1"
+    assert out_note["state"] == "pending"
+    assert out_note["text"] == "fix lint in parser.py"
+    assert out_note["stage"] == "refine"
+    assert out_note["queued_at"] == 1700000000123

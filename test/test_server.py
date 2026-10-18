@@ -15427,3 +15427,653 @@ def test_reap_sweep_deduplicates_warnings_for_same_reason(
         "retaining /tmp/fake"
     )
     assert caplog.messages.count(different_msg) == 1
+
+
+# ---------------------------------------------------------------------------
+# Operator note server tests
+# ---------------------------------------------------------------------------
+
+
+def test_operator_note_queue_idle_no_prior_note_pastes_and_does_not_store(socket_path, make_lode):
+    """When supervisor is idle and has no prior notes, note is pasted directly and not stored."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    attempt_result = {
+        "reason": "composer_cleared",
+        "capture": _IDLE_EMPTY_CAPTURE,
+        "title": "✳ Ready",
+    }
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result) as mock_deliv:
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "do something"},
+            conn,
+        )
+
+    mock_deliv.assert_called_once()
+    assert mock_deliv.call_args.kwargs.get("observe_only") is not True
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "pane_input_sent"
+    assert resp["lode_id"] == "test-id"
+    assert resp["tmux_pane"] == "%1"
+    assert not lode.get("operator_notes")
+
+
+def test_operator_note_queue_post_paste_unverified_returns_error_and_does_not_store(
+    socket_path, make_lode
+):
+    """Unverified delivery returns error and stores no note."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    attempt_result = {
+        "reason": "paste_not_staged",
+        "capture": "pane text line 1\npane text line 2",
+        "title": "✳ Ready",
+    }
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "do something"},
+            conn,
+        )
+
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "error"
+    assert resp["outcome"] == "unverified"
+    assert not lode.get("operator_notes")
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["idle_timeout", "background_active", "pane_state_unknown", "pane_frozen"],
+)
+def test_operator_note_queue_busy_background_unknown_stores_note_idle_false(
+    socket_path, make_lode, reason
+):
+    """Busy/background/unknown pane states queue a note with idle=False without pasting."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    attempt_result = {
+        "reason": reason,
+        "capture": "some pane text",
+        "title": "Working",
+    }
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "  note body  "},
+            conn,
+        )
+
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "operator_note_queued"
+    assert resp["lode_id"] == "test-id"
+    assert resp["idle"] is False
+    note = resp["note"]
+    assert note["text"] == "note body"
+    assert note["stage"] == "refine"
+    assert isinstance(note["queued_at"], int)
+    assert note["printed_at"] is None
+    assert note["shown_at"] is None
+    assert len(lode["operator_notes"]) == 1
+    assert lode["operator_notes"][0] == note
+
+
+def test_operator_note_queue_older_unacknowledged_note_plus_idle_stores_second_note_idle_true(
+    socket_path, make_lode
+):
+    """An unacknowledged note plus idle pane stores a second note with idle=True."""
+    srv = Server(socket_path)
+    existing_note = {
+        "id": "old-id",
+        "text": "first note",
+        "queued_at": 1000,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode = make_lode(
+        id="test-id",
+        active=True,
+        tmux_pane="%1",
+        stage="refine",
+        operator_notes=[existing_note],
+    )
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    attempt_result = {
+        "reason": "idle_ready",
+        "capture": _IDLE_EMPTY_CAPTURE,
+        "title": "✳ Ready",
+    }
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result) as mock_deliv:
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "second note"},
+            conn,
+        )
+
+    mock_deliv.assert_called_once()
+    assert mock_deliv.call_args.kwargs.get("observe_only") is True
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "operator_note_queued"
+    assert resp["idle"] is True
+    assert len(lode["operator_notes"]) == 2
+    assert lode["operator_notes"][0] == existing_note
+    assert lode["operator_notes"][1]["text"] == "second note"
+
+
+def test_operator_note_queue_duplicate_text_returns_already_queued(socket_path, make_lode):
+    """Duplicate trimmed text returns operator_note_already_queued with stored timestamp."""
+    srv = Server(socket_path)
+    existing_note = {
+        "id": "n1",
+        "text": "check this",
+        "queued_at": 12345,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode = make_lode(
+        id="test-id",
+        active=True,
+        tmux_pane="%1",
+        stage="refine",
+        operator_notes=[existing_note],
+    )
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    with patch(
+        "hopper.server._attempt_pane_delivery",
+        return_value={"reason": "idle_ready", "capture": None, "title": None},
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "  check this  "},
+            conn,
+        )
+
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "operator_note_already_queued"
+    assert resp["lode_id"] == "test-id"
+    assert resp["queued_at"] == 12345
+    assert len(lode["operator_notes"]) == 1
+
+    # Distinct text is stored, even explicit "continue"
+    with patch(
+        "hopper.server._attempt_pane_delivery",
+        return_value={"reason": "idle_ready", "capture": None, "title": None},
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "continue"},
+            conn,
+        )
+
+    resp2 = _decode_mock_response(conn)
+    assert resp2["type"] == "operator_note_queued"
+    assert len(lode["operator_notes"]) == 2
+
+
+def test_operator_note_queue_refusals_and_precedence(socket_path, make_lode):
+    """Verify queue refusals and verify blocked pane precedes duplicate text check."""
+    srv = Server(socket_path)
+
+    # 1. Unknown lode
+    conn = _mock_client(srv)
+    srv._handle_mutation(
+        {"type": "lode_queue_operator_note", "lode_id": "unknown-id", "text": "hi"},
+        conn,
+    )
+    assert _decode_mock_response(conn)["outcome"] == "unknown_lode"
+
+    # 2. Archived lode
+    archived = make_lode(id="arch-1", stage="shipped", active=False)
+    srv.archived_lodes = [archived]
+    srv._handle_mutation(
+        {"type": "lode_queue_operator_note", "lode_id": "arch-1", "text": "hi"},
+        conn,
+    )
+    assert _decode_mock_response(conn)["outcome"] == "lode_archived"
+
+    # 3. Active is not True (e.g. False or None)
+    lode_inactive = make_lode(id="inact-1", active=False, tmux_pane="%1")
+    srv.lodes = [lode_inactive]
+    srv._handle_mutation(
+        {"type": "lode_queue_operator_note", "lode_id": "inact-1", "text": "hi"},
+        conn,
+    )
+    assert _decode_mock_response(conn)["outcome"] == "lode_inactive"
+
+    # 4. No tmux pane
+    lode_nopane = make_lode(id="nopane-1", active=True, tmux_pane=None)
+    srv.lodes = [lode_nopane]
+    srv._handle_mutation(
+        {"type": "lode_queue_operator_note", "lode_id": "nopane-1", "text": "hi"},
+        conn,
+    )
+    assert _decode_mock_response(conn)["outcome"] == "pane_unavailable"
+
+    # 5. Pane awaiting choice
+    lode_choice = make_lode(id="choice-1", active=True, tmux_pane="%1")
+    srv.lodes = [lode_choice]
+    with patch(
+        "hopper.server._attempt_pane_delivery",
+        return_value={"reason": "pane_awaiting_choice", "capture": "choose: 1 or 2", "title": None},
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "choice-1", "text": "hi"},
+            conn,
+        )
+    assert _decode_mock_response(conn)["outcome"] == "awaiting_choice"
+
+    # 6. Pane blocked precedes duplicate text check
+    existing_note = {
+        "id": "n1",
+        "text": "blocked text",
+        "queued_at": 555,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode_blocked = make_lode(
+        id="block-1",
+        active=True,
+        tmux_pane="%1",
+        operator_notes=[existing_note],
+    )
+    srv.lodes = [lode_blocked]
+    with patch(
+        "hopper.server._attempt_pane_delivery",
+        return_value={"reason": "pane_blocked", "capture": "blocked", "title": None},
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "block-1", "text": "blocked text"},
+            conn,
+        )
+    resp_block = _decode_mock_response(conn)
+    assert resp_block["outcome"] == "awaiting_operator"
+    assert resp_block["type"] == "error"
+
+
+def test_operator_note_queue_completion_is_taken_checks(socket_path, make_lode):
+    """Completion taken up front or racing after delivery prevents queueing."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    # 1. Up front refusal if in action_acceptances
+    srv.action_acceptances = {
+        "test-id": ("act-1", ("test-id", "gen-1", "completion", "main", False), [])
+    }
+    with patch("hopper.server._attempt_pane_delivery") as mock_deliv:
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "note"},
+            conn,
+        )
+    mock_deliv.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "stage_ending"
+    assert not lode.get("operator_notes")
+
+    srv.action_acceptances.clear()
+
+    # 2. Race condition: completion_is_taken returns False before delivery, True after delivery
+    with (
+        patch.object(srv, "completion_is_taken", side_effect=[False, True]),
+        patch(
+            "hopper.server._attempt_pane_delivery",
+            return_value={"reason": "idle_timeout", "capture": None, "title": None},
+        ),
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "racing note"},
+            conn,
+        )
+    assert _decode_mock_response(conn)["outcome"] == "stage_ending"
+    assert not lode.get("operator_notes")
+
+
+def test_operator_note_queue_save_failure_reverts_list_and_returns_error(socket_path, make_lode):
+    """When save_lodes fails, operator_notes list is reverted and save_failed is returned."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    attempt_result = {"reason": "idle_timeout", "capture": None, "title": None}
+    with (
+        patch("hopper.server._attempt_pane_delivery", return_value=attempt_result),
+        patch("hopper.server.save_lodes", side_effect=OSError("disk full")),
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "test note"},
+            conn,
+        )
+
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "error"
+    assert resp["outcome"] == "save_failed"
+    assert "failed to save operator note" in resp["error"]
+    assert "operator_notes" not in lode or not lode["operator_notes"]
+
+
+def test_operator_notes_persist_across_save_and_reload(socket_path, temp_config, make_lode):
+    """Operator notes survive save_lodes and reload via Server(socket_path) / load_lodes()."""
+    srv = Server(socket_path)
+    notes = [
+        {
+            "id": "n1",
+            "text": "first",
+            "queued_at": 100,
+            "stage": "mill",
+            "printed_at": None,
+            "shown_at": None,
+        },
+        {
+            "id": "n2",
+            "text": "second",
+            "queued_at": 200,
+            "stage": "refine",
+            "printed_at": 250,
+            "shown_at": 300,
+        },
+    ]
+    lode = make_lode(id="test-id", operator_notes=notes)
+    srv.lodes = [lode]
+    save_lodes(srv.lodes)
+
+    loaded = load_lodes()
+    assert len(loaded) == 1
+    assert loaded[0]["operator_notes"] == notes
+
+    srv2 = Server(socket_path)
+    srv2.lodes = load_lodes()
+    loaded_lode = srv2._find_lode("test-id")
+    assert loaded_lode is not None
+    assert loaded_lode.get("operator_notes") == notes
+
+
+def test_operator_note_broadcast_omits_text_and_snapshot_retains_it(socket_path, make_lode):
+    """broadcast strips note text; live lode and snapshot retain it."""
+    srv = Server(socket_path)
+    note = {
+        "id": "n1",
+        "text": "confidential note body",
+        "queued_at": 1000,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode = make_lode(id="test-id", operator_notes=[note])
+    srv.lodes = [lode]
+
+    srv.broadcast({"type": "lode_updated", "lode": lode})
+    bcast_msg = srv.broadcast_queue.get_nowait()
+    bcast_note = bcast_msg["lode"]["operator_notes"][0]
+    assert "text" not in bcast_note
+    assert bcast_note["id"] == "n1"
+
+    # Live lode retains text
+    assert lode["operator_notes"][0]["text"] == "confidential note body"
+
+    # snapshot query retains text
+    conn = _mock_client(srv)
+    srv._handle_mutation({"type": "lode_snapshot", "prefix": "test-id"}, conn)
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "lode_snapshot"
+    assert resp["lode"]["operator_notes"][0]["text"] == "confidential note body"
+
+    # Lode with no notes queues identical message
+    lode_no_notes = make_lode(id="other-id")
+    msg_no_notes = {"type": "lode_updated", "lode": lode_no_notes}
+    srv.broadcast(msg_no_notes)
+    bcast_msg2 = srv.broadcast_queue.get_nowait()
+    assert bcast_msg2["lode"]["id"] == "other-id"
+
+
+def test_completion_refused_when_unacknowledged_notes_pending_and_shown_clears(
+    socket_path, make_lode
+):
+    """Refuse completion when unacknowledged notes exist; marking shown allows completion."""
+    srv = Server(socket_path)
+    note = {
+        "id": "n1",
+        "text": "fix that test",
+        "queued_at": 1000,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode = make_lode(
+        id="test2345",
+        stage="refine",
+        state="running",
+        active=True,
+        run_generation="a" * 32,
+        operator_notes=[note],
+    )
+    srv.lodes = [lode]
+    srv.lode_clients["test2345"] = MagicMock()
+    conn = _mock_client(srv)
+
+    action_id = "f" * 32
+    action_msg = {
+        "type": "lode_action",
+        "action_id": action_id,
+        "action_type": "completion",
+        "stage": "refine",
+        "lode_id": "test2345",
+        "expected_generation": "a" * 32,
+        "target_disposition": "advance_ship",
+        "force_consent": False,
+        "digest_algorithm": actions.DIGEST_ALGORITHM,
+        "byte_length": 4,
+        "digest_hex": hashlib.sha256(b"done").hexdigest(),
+        "output_base64": base64.b64encode(b"done").decode("ascii"),
+    }
+
+    with (
+        patch("hopper.actions.load_run_ownership", return_value={"proof_mode": "mock"}),
+        patch.object(srv, "_open_lode_action") as mock_open,
+    ):
+        srv._handle_lode_action(action_msg, conn)
+
+    mock_open.assert_not_called()
+    assert "test2345" not in srv.action_acceptances
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "lode_action_ack"
+    assert resp["accepted"] is False
+    assert resp["operator_note_ids"] == ["n1"]
+    assert "This is not a failure" in resp["status"]
+    assert "fix that test" in resp["status"]
+    assert "acknowledged" not in resp["status"].lower()
+
+    # Now mark shown
+    srv._handle_mutation(
+        {
+            "type": "lode_record_operator_notes",
+            "lode_id": "test2345",
+            "ids": ["n1"],
+            "mark": "shown",
+        },
+        conn,
+    )
+    assert _decode_mock_response(conn)["type"] == "operator_notes_recorded"
+    assert note["shown_at"] is not None
+
+    # Next completion attempt is accepted
+    with (
+        patch("hopper.actions.load_run_ownership", return_value={"proof_mode": "mock"}),
+        patch.object(
+            srv, "_open_lode_action", return_value={"outcome": "accepted", "record": None}
+        ),
+    ):
+        srv._handle_lode_action(action_msg, conn)
+
+    assert "test2345" in srv.action_acceptances
+
+
+def test_publish_gate_refused_without_run_generation_and_allowed_with_it(socket_path, make_lode):
+    """Explicit gate publication without run_generation is refused if unacknowledged notes exist."""
+    srv = Server(socket_path)
+    note = {
+        "id": "n1",
+        "text": "check regression",
+        "queued_at": 1000,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    lode = make_lode(
+        id="test-id",
+        stage="refine",
+        state="running",
+        active=True,
+        run_generation="gen-1",
+        operator_notes=[note],
+    )
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    # 1. Explicit gate publication without run_generation
+    srv._handle_mutation(
+        {
+            "type": "lode_publish_gate",
+            "lode_id": "test-id",
+            "body": "review doc",
+            "kind": "explicit",
+        },
+        conn,
+    )
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "lode_gate_refused"
+    assert resp["operator_note_ids"] == ["n1"]
+    assert "This is not a failure" in resp["status"]
+    assert "check regression" in resp["status"]
+    assert lode["state"] != "gated"
+
+    # 2. Runner gate publication with run_generation
+    with patch("hopper.server._sync_gate_artifact", return_value=True):
+        srv._handle_mutation(
+            {
+                "type": "lode_publish_gate",
+                "lode_id": "test-id",
+                "body": "runner gate",
+                "kind": "explicit",
+                "run_generation": "gen-1",
+            },
+            conn,
+        )
+    assert lode["state"] == "gated"
+
+
+def test_operator_note_display_states_kill_archive_pause():
+    """Verify operator_note_state for kill, pause, archive, error."""
+    from hopper.lodes import operator_note_state
+
+    note_unmarked = {
+        "id": "n1",
+        "text": "test",
+        "queued_at": 100,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": None,
+    }
+    note_shown = {
+        "id": "n2",
+        "text": "test",
+        "queued_at": 100,
+        "stage": "refine",
+        "printed_at": None,
+        "shown_at": 150,
+    }
+    note_printed = {
+        "id": "n3",
+        "text": "test",
+        "queued_at": 100,
+        "stage": "refine",
+        "printed_at": 120,
+        "shown_at": None,
+    }
+
+    # Active running lode
+    lode_active = {"id": "x", "active": True, "state": "running", "stage": "refine"}
+    assert operator_note_state(lode_active, note_unmarked) == "pending"
+
+    # Paused lode
+    lode_paused = {"id": "x", "active": True, "state": "paused", "stage": "refine"}
+    assert operator_note_state(lode_paused, note_unmarked) == "pending"
+
+    # Killed lode
+    lode_killed = {"id": "x", "active": False, "state": "killed", "stage": "refine"}
+    assert operator_note_state(lode_killed, note_unmarked) == "undelivered"
+    assert operator_note_state(lode_killed, note_shown) == "shown"
+    assert operator_note_state(lode_killed, note_printed) == "undelivered"
+
+    # Shipped / archived lode
+    lode_archived = {
+        "id": "x",
+        "active": False,
+        "state": "running",
+        "stage": "shipped",
+        "archived_at": 1000,
+    }
+    assert operator_note_state(lode_archived, note_unmarked) == "undelivered"
+    assert operator_note_state(lode_archived, note_shown) == "shown"
+
+    # Error state
+    lode_error = {"id": "x", "active": False, "state": "error", "stage": "refine"}
+    assert operator_note_state(lode_error, note_unmarked) == "undelivered"
+
+
+@pytest.mark.parametrize("reason", ["idle_timeout", "background_active", "pane_frozen"])
+def test_plain_nudge_errors_append_queue_hint_only_for_paste_true(socket_path, make_lode, reason):
+    """plain nudge with paste=True appends queue hint for retryable reasons."""
+    srv = Server(socket_path)
+    lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
+    srv.lodes = [lode]
+    conn = _mock_client(srv)
+
+    attempt_result = {"reason": reason, "capture": "line1\nline2", "title": "working"}
+
+    # 1. lode_send_pane_input with paste=True -> has queue hint
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        srv._handle_mutation(
+            {
+                "type": "lode_send_pane_input",
+                "lode_id": "test-id",
+                "text": "continue",
+                "paste": True,
+            },
+            conn,
+        )
+    resp = _decode_mock_response(conn)
+    assert resp["type"] == "error"
+    assert (
+        "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`."
+        in resp["error"]
+    )
+
+    # 2. lode_send_pane_input with paste=False -> NO queue hint
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        srv._handle_mutation(
+            {"type": "lode_send_pane_input", "lode_id": "test-id", "text": "1", "paste": False},
+            conn,
+        )
+    resp = _decode_mock_response(conn)
+    assert "hop lode nudge --queue" not in resp["error"]
+
+    # 3. lode_send_feedback -> NO queue hint
+    with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "continue"},
+            conn,
+        )
+    resp = _decode_mock_response(conn)
+    assert "hop lode nudge --queue" not in resp["error"]

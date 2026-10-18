@@ -44,6 +44,7 @@ from hopper.coder import (
     validate_coder_provider,
 )
 from hopper.lodes import (
+    OPERATOR_NOTE_MAX_CHARS,
     current_time_ms,
     format_age,
     format_worktree_reaped_status,
@@ -58,6 +59,7 @@ from hopper.lodes import (
     lode_status_for_display,
     lode_with_status_annotations,
     newest_gate_command_run,
+    operator_note_state,
     resolve_worktree_path,
 )
 from hopper.runner import _sum_process_tree_cpu_ms
@@ -1540,6 +1542,14 @@ def cmd_processed(args: list[str]) -> int:
         return 1
     if acknowledgement["accepted"] is False:
         print(status, file=sys.stderr)
+        note_ids = acknowledgement.get("operator_note_ids")
+        if isinstance(note_ids, list) and note_ids:
+            try:
+                import hopper.client as client
+
+                client.record_operator_notes(_socket(), lode_id, note_ids, mark="shown")
+            except Exception:
+                pass
         return 1
 
     print(status)
@@ -1719,7 +1729,26 @@ def cmd_gate(args: list[str]) -> int:
         return 1
 
     response = publish_lode_gate(_socket(), lode_id, output, kind="explicit")
-    if not response or response.get("type") != "lode_gate_published":
+    if response is None:
+        print(
+            "error: the gate outcome is unknown. "
+            f"Inspect with `hop lode status {lode_id}` before retrying.",
+            file=sys.stderr,
+        )
+        return 1
+    resp_type = response.get("type")
+    if resp_type == "lode_gate_refused":
+        print(response.get("status", ""), file=sys.stderr)
+        note_ids = response.get("operator_note_ids")
+        if isinstance(note_ids, list) and note_ids:
+            try:
+                import hopper.client as client
+
+                client.record_operator_notes(_socket(), lode_id, note_ids, mark="shown")
+            except Exception:
+                pass
+        return 1
+    if resp_type != "lode_gate_published":
         print("Gate publication failed. The lode was not changed.", file=sys.stderr)
         return 1
 
@@ -2480,6 +2509,21 @@ def format_lode_detail(lode: dict) -> str:
         lines.append(f"    branch:    {recovery.get('branch') or 'unavailable'}")
         lines.append(f"    worktree:  {recovery.get('worktree_path') or 'unavailable'}")
         lines.append(f"    reason:    {recovery.get('reason', '')}")
+    notes = lode.get("operator_notes")
+    if isinstance(notes, list) and notes:
+        lines.append("")
+        lines.append("  operator notes:")
+        for note in notes:
+            state = note.get("state") or operator_note_state(lode, note)
+            lines.append(f"    id:         {note.get('id', '')}")
+            lines.append(f"    state:      {state}")
+            lines.append(f"    stage:      {note.get('stage', '')}")
+            lines.append(f"    queued_at:  {note.get('queued_at', '')}")
+            if note.get("printed_at") is not None:
+                lines.append(f"    printed_at: {note['printed_at']}")
+            if note.get("shown_at") is not None:
+                lines.append(f"    shown_at:   {note['shown_at']}")
+            lines.append(f"    text:       {note.get('text', '')}")
     if lode.get("state") == "gated" and not archived_row:
         lines.append("")
         lines.append(f"Gate blocked. Review with: hop gate show {lode.get('id', '')}")
@@ -4047,7 +4091,8 @@ def _nudge_wait_for_idle(
             print(
                 f"Observed: pane {pane} was still processing after {elapsed:g}s "
                 f"of a {budget_s:g}s --wait-for-idle budget. {verb} "
-                f"Recover with: hop lode peek {lode_id}",
+                f"Recover with: hop lode peek {lode_id}. "
+                "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`.",
                 file=sys.stderr,
             )
         else:
@@ -4055,7 +4100,8 @@ def _nudge_wait_for_idle(
                 f"Observed: pane {pane} still had background work active (tasks or watchers) "
                 f"after {elapsed:g}s of a {budget_s:g}s --wait-for-idle budget. Hopper did not "
                 f"send the nudge. Retry once that work finishes. "
-                f"Recover with: hop lode peek {lode_id}",
+                f"Recover with: hop lode peek {lode_id}. "
+                "Hold it for the supervisor's next Hopper command with `hop lode nudge --queue`.",
                 file=sys.stderr,
             )
         return _NUDGE_IDLE_EXPIRED
@@ -4219,6 +4265,11 @@ def cmd_lode(args: list[str]) -> int:
     nudge_p.add_argument("text", nargs="?", default=None, help="Text to submit (default: continue)")
     nudge_p.add_argument("--text", dest="text_option", default=None, help="Text to submit")
     nudge_p.add_argument(
+        "--queue",
+        action="store_true",
+        help="Queue an operator note held for the supervisor's next Hopper command",
+    )
+    nudge_p.add_argument(
         "--wait-for-idle",
         dest="wait_for_idle",
         nargs="?",
@@ -4261,18 +4312,37 @@ def cmd_lode(args: list[str]) -> int:
                 "calling hop CLI and retry"
             )
             return 1
-    if subcommand == "nudge" and parsed.text is not None and parsed.text_option is not None:
-        print("error: positional text and --text cannot be used together")
-        nudge_p.print_usage()
-        return 1
     if subcommand == "nudge":
-        parsed.nudge_text = (
-            parsed.text_option
-            if parsed.text_option is not None
-            else parsed.text
-            if parsed.text is not None
-            else "continue"
-        )
+        if parsed.text is not None and parsed.text_option is not None:
+            print("error: positional text and --text cannot be used together")
+            nudge_p.print_usage()
+            return 1
+        if getattr(parsed, "queue", False) and getattr(parsed, "wait_for_idle", None) is not None:
+            print("error: --queue and --wait-for-idle cannot be used together")
+            nudge_p.print_usage()
+            return 1
+        if getattr(parsed, "queue", False):
+            raw_text = parsed.text_option if parsed.text_option is not None else parsed.text
+            if raw_text is None or not raw_text.strip():
+                print("error: --queue requires text to submit")
+                nudge_p.print_usage()
+                return 1
+            trimmed_text = raw_text.strip()
+            if len(trimmed_text) > OPERATOR_NOTE_MAX_CHARS:
+                print(
+                    f"error: operator note is {len(trimmed_text)} characters, over the "
+                    "2000 character cap. Send a short note pointing at a file."
+                )
+                return 1
+            parsed.nudge_text = trimmed_text
+        else:
+            parsed.nudge_text = (
+                parsed.text_option
+                if parsed.text_option is not None
+                else parsed.text
+                if parsed.text is not None
+                else "continue"
+            )
     socket_path = _socket()
 
     if subcommand in ("list", "ls"):
@@ -5137,15 +5207,18 @@ def cmd_lode(args: list[str]) -> int:
         wait_for_idle = getattr(parsed, "wait_for_idle", None)
         if resolved["host"] != "local":
             remote_args = ["lode", subcommand]
-            if subcommand == "nudge" and wait_for_idle is not None:
-                remote_args.extend(["--wait-for-idle", f"{wait_for_idle:g}"])
-            remote_args.append(resolved["canonical_id"])
-            if subcommand == "peek":
-                remote_args.extend(["-n", str(parsed.lines)])
-            elif subcommand == "nudge":
-                remote_args.extend(["--", parsed.nudge_text])
+            if subcommand == "nudge" and getattr(parsed, "queue", False):
+                remote_args.extend(["--queue", resolved["canonical_id"], "--", parsed.nudge_text])
             else:
-                remote_args.append(parsed.choice)
+                if subcommand == "nudge" and wait_for_idle is not None:
+                    remote_args.extend(["--wait-for-idle", f"{wait_for_idle:g}"])
+                remote_args.append(resolved["canonical_id"])
+                if subcommand == "peek":
+                    remote_args.extend(["-n", str(parsed.lines)])
+                elif subcommand == "nudge":
+                    remote_args.extend(["--", parsed.nudge_text])
+                else:
+                    remote_args.append(parsed.choice)
             return _run_remote_cli(resolved["host"], remote_args, reason=f"lode {lode['id']}")
 
         if subcommand == "peek":
@@ -5166,6 +5239,44 @@ def cmd_lode(args: list[str]) -> int:
         if subcommand == "answer" and parsed.choice not in {str(i) for i in range(1, 10)}:
             print("choice must be a digit 1..9")
             return 1
+        if subcommand == "nudge" and getattr(parsed, "queue", False):
+            response = client.queue_operator_note(socket_path, lode["id"], parsed.nudge_text)
+            if response is None:
+                print(
+                    "error: the operator-note outcome is unknown. "
+                    f"Inspect with `hop lode status {lode['id']}` before deciding whether it was "
+                    "stored.",
+                    file=sys.stderr,
+                )
+                return 1
+            resp_type = response.get("type")
+            if resp_type == "pane_input_sent":
+                print("submitted")
+                return 0
+            if resp_type == "operator_note_queued":
+                print(
+                    f"Queued an operator note for {lode['id']}. It was not delivered to the pane. "
+                    "The supervisor sees it on its next Hopper command: `hop code` output, then "
+                    "`hop processed` or `hop gate` until the note has been shown there."
+                )
+                if response.get("idle"):
+                    print(
+                        "The supervisor is idle and will not see the note until it runs a Hopper "
+                        "command. A plain `hop lode nudge` reaches it now."
+                    )
+                return 0
+            if resp_type == "operator_note_already_queued":
+                queued_at = response.get("queued_at")
+                print(f"Already queued at {queued_at}. Nothing stored.")
+                return 0
+            error = response.get("error", "Failed to queue operator note")
+            print(error, file=sys.stderr)
+            if response.get("outcome") == "unverified" and response.get("tail"):
+                print("--- pane tail ---", file=sys.stderr)
+                print(response["tail"], file=sys.stderr)
+                print("--- end pane tail ---", file=sys.stderr)
+            return 1
+
         text = parsed.nudge_text if subcommand == "nudge" else parsed.choice
         if subcommand == "nudge" and wait_for_idle is not None and lode.get("tmux_pane"):
             response = _nudge_wait_for_idle(socket_path, lode, text, wait_for_idle)

@@ -492,9 +492,16 @@ hop lode nudge <lode-id> "focus the failing test"
 hop lode nudge <lode-id> --text "..."
 hop lode nudge <lode-id> -- -leading-dash-text
 hop lode nudge <lode-id> --text "..." --wait-for-idle
-hop lode nudge <lode-id> --text "..." --wait-for-idle 60
+hop lode nudge <lode-id> --text "..." --queue
 hop lode answer <lode-id> 1         # answer numbered prompts
 ```
+
+`--queue` is how to send a correction or decision to a lode that is working. The
+note is shown from `hop code`, and `hop processed` and `hop gate` do not proceed
+until it has been shown there. Read delivery from `hop lode status`. A queued
+note is durable, so check status instead of resending. `--wait-for-idle` delivers
+text as the very next turn and cannot reach a supervisor that is waiting on `hop
+code`. A queued note is not a gate release.
 
 If `hop lode status <lode-id>` reports that an already accepted output cannot
 be published, restore only those missing server-owned staged bytes with the

@@ -50,6 +50,9 @@ Lodes are plain dicts with these fields:
      "refine": {"session_id": "<uuid>", "started": false},
      "ship": {"session_id": "<uuid>", "started": false}}. This is a bounded
   rolling-version compatibility field.
+- operator_notes: optional list of dicts - queued operator notes for this lode:
+    [{"id": str, "text": str, "queued_at": int, "stage": str,
+      "printed_at": int | None, "shown_at": int | None}, ...]
 """
 
 import copy
@@ -64,6 +67,7 @@ from hopper import config, oom
 from hopper.coder import DEFAULT_CODER_PROVIDER, validate_coder_provider
 from hopper.tmux import Liveness, pane_liveness
 
+OPERATOR_NOTE_MAX_CHARS = 2000
 ID_LEN = 8  # Lode ID length (8 base32 chars)
 ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"  # lowercase base32
 REFUSAL_STATUS_PREFIXES = (
@@ -1631,6 +1635,42 @@ def lode_status_for_display(lode: dict, *, pane_timeout: float | None = None) ->
     return status
 
 
+def operator_note_state(lode: dict, note: dict) -> str:
+    """Compute the lifecycle display state of one operator note."""
+    if note.get("shown_at") is not None:
+        return "shown"
+    if (
+        lode.get("archived") is True
+        or isinstance(lode.get("archived_at"), int)
+        or lode.get("state") in {"error", "killed"}
+    ):
+        return "undelivered"
+    if note.get("printed_at") is not None:
+        return "printed"
+    return "pending"
+
+
+def unacknowledged_operator_notes(lode: dict) -> list[dict]:
+    """Return all notes that have not yet been shown, in list order."""
+    notes = lode.get("operator_notes")
+    if not isinstance(notes, list):
+        return []
+    return [note for note in notes if note.get("shown_at") is None]
+
+
+def format_operator_notes_refusal(notes: list[dict]) -> str:
+    """Format refusal text for unacknowledged operator notes."""
+    blocks = [
+        f"[{note['id']}] stage={note['stage']} queued_at={note['queued_at']}\n{note['text']}"
+        for note in notes
+    ]
+    return (
+        "This is not a failure. Operator notes are waiting.\n"
+        "Address the notes and run the command again. "
+        "Update the output, or the gate review, if the work changed.\n\n" + "\n\n".join(blocks)
+    )
+
+
 def lode_with_status_annotations(lode: dict, *, pane_timeout: float | None = None) -> dict:
     """Return a copied lode with additive display status and pane liveness."""
     status, liveness = _lode_status_and_liveness(lode, pane_timeout=pane_timeout)
@@ -1639,6 +1679,11 @@ def lode_with_status_annotations(lode: dict, *, pane_timeout: float | None = Non
     annotated["pane_liveness"] = (
         liveness.value if liveness is not None else PANE_LIVENESS_NOT_PROBED
     )
+    notes = lode.get("operator_notes")
+    if isinstance(notes, list) and notes:
+        annotated["operator_notes"] = [
+            dict(note, state=operator_note_state(lode, note)) for note in notes
+        ]
     return annotated
 
 

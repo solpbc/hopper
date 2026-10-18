@@ -18,6 +18,8 @@ from hopper.antigravity import (
 )
 from hopper.client import (
     connect,
+    get_lode,
+    record_operator_notes,
     set_coder_session,
     set_lode_progress,
     set_lode_state,
@@ -556,6 +558,31 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
         content = output_path.read_text()
         if content:
             print(content)
+
+    fresh_lode = get_lode(socket_path, lode_id)
+    if fresh_lode:
+        notes = fresh_lode.get("operator_notes")
+        if isinstance(notes, list):
+            unmarked_notes = [
+                n
+                for n in notes
+                if isinstance(n, dict) and n.get("printed_at") is None and n.get("shown_at") is None
+            ]
+            if unmarked_notes:
+                unmarked_ids = [n["id"] for n in unmarked_notes]
+                rec_resp = record_operator_notes(
+                    socket_path,
+                    lode_id,
+                    unmarked_ids,
+                    mark="printed",
+                )
+                if rec_resp and rec_resp.get("type") == "operator_notes_recorded":
+                    print(
+                        "Operator notes that arrived while the coder ran. "
+                        "Address them before gating or submitting."
+                    )
+                    for note in unmarked_notes:
+                        print(note["text"])
 
     return exit_code
 

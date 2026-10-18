@@ -135,3 +135,5 @@ one more thing. The command returns after Hopper durably accepts your output or
 refuses it. After acceptance, Hopper closes this pane, waits for its processes to
 end, and advances the stage. If the disposition is unknown, inspect
 `hop lode status $HOPPER_LID` and follow its recovery; do not submit again blindly.
+
+A refusal for operator notes is the one exception: address the notes, then run `hop processed` again, and update the output if the work changed.

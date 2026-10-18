@@ -166,6 +166,8 @@ EOF
 
 `hop gate` leaves this lode in the `gated` state, and feedback arrives in this same session. Stop after the gate: run no further git commands, and do not call `hop processed` on this path.
 
+A refusal for operator notes is the one exception: re-validate first, address the notes, then run `hop gate` again, and update the gate review if the work changed.
+
 ### 5. Signal completion
 
 `hop processed` performs one final independent landing proof before it records
@@ -196,3 +198,5 @@ one more thing. The command returns after Hopper durably accepts your output or
 refuses it. After acceptance, Hopper closes this pane, waits for its processes to
 end, and archives the shipped lode. If the disposition is unknown, inspect
 `hop lode status $HOPPER_LID` and follow its recovery; do not submit again blindly.
+
+A refusal for operator notes is the one exception: re-validate first, address the notes, then run `hop processed` again, and update the output if the work changed.
