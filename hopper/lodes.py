@@ -1667,7 +1667,8 @@ def format_operator_notes_refusal(notes: list[dict]) -> str:
     return (
         "This is not a failure. Operator notes are waiting.\n"
         "Address the notes and run the command again. "
-        "Update the output, or the gate review, if the work changed.\n\n" + "\n\n".join(blocks)
+        "Update the output, or the gate review, if the work changed. "
+        "In ship, re-validate the landing before retrying.\n\n" + "\n\n".join(blocks)
     )
 
 

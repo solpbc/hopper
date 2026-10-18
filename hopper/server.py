@@ -321,18 +321,22 @@ def _pending_action_file_exists(lode_id: str) -> bool:
         return False
 
 
-def completion_is_taken(server: object, lode_id: str) -> bool:
-    """Return whether a completion action is taken for the specified lode."""
+# Actions after which the lode's supervisor will run no further Hopper command.
+_LODE_ENDING_ACTIONS = frozenset({"completion", "kill", "archive"})
+
+
+def ending_action_is_taken(server: object, lode_id: str) -> bool:
+    """Return whether a completion, kill or archive action is taken for the lode."""
     acceptance = getattr(server, "action_acceptances", {}).get(lode_id)
     if acceptance is not None:
         try:
-            if acceptance[1][2] == "completion":
+            if acceptance[1][2] in _LODE_ENDING_ACTIONS:
                 return True
         except (IndexError, TypeError):
             pass
     try:
         pending = actions.load_pending_action(lode_id)
-        if pending and pending.get("action_type") == "completion":
+        if pending and pending.get("action_type") in _LODE_ENDING_ACTIONS:
             return True
     except (OSError, ValueError, json.JSONDecodeError):
         pass
@@ -2496,9 +2500,9 @@ class Server:
             "record": record,
         }
 
-    def completion_is_taken(self, lode_id: str) -> bool:
-        """Return whether a completion action is taken for the specified lode."""
-        return completion_is_taken(self, lode_id)
+    def ending_action_is_taken(self, lode_id: str) -> bool:
+        """Return whether a completion, kill or archive action is taken for the lode."""
+        return ending_action_is_taken(self, lode_id)
 
     def _handle_lode_action(self, message: dict, conn: socket.socket | None) -> None:
         """Validate completion and prepare server-owned bytes off-loop."""
@@ -7316,15 +7320,15 @@ class Server:
                     )
                 return
 
-            if self.completion_is_taken(lode_id):
+            if self.ending_action_is_taken(lode_id):
                 if conn:
                     self._send_response(
                         conn,
                         {
                             "type": "error",
                             "error": (
-                                f"lode {lode_id} stage is ending, so a note would reach nobody. "
-                                "Nothing was stored."
+                                f"lode {lode_id} is ending (a completion, kill or archive is in "
+                                "progress), so a note would reach nobody. Nothing was stored."
                             ),
                             "outcome": "stage_ending",
                         },
@@ -7406,15 +7410,16 @@ class Server:
                 "pane_state_unknown",
             }
             if would_store:
-                if self.completion_is_taken(lode_id):
+                if self.ending_action_is_taken(lode_id):
                     if conn:
                         self._send_response(
                             conn,
                             {
                                 "type": "error",
                                 "error": (
-                                    f"lode {lode_id} stage is ending, so a note would reach "
-                                    "nobody. Nothing was stored."
+                                    f"lode {lode_id} is ending (a completion, kill or archive is "
+                                    "in progress), so a note would reach nobody. "
+                                    "Nothing was stored."
                                 ),
                                 "outcome": "stage_ending",
                             },

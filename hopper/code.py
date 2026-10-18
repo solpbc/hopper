@@ -6,6 +6,7 @@
 import json
 import logging
 import os
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -569,20 +570,21 @@ def run_code(lode_id: str, socket_path: Path, stage_name: str, request: str) -> 
                 if isinstance(n, dict) and n.get("printed_at") is None and n.get("shown_at") is None
             ]
             if unmarked_notes:
-                unmarked_ids = [n["id"] for n in unmarked_notes]
-                rec_resp = record_operator_notes(
+                # Print before recording: a lost record reply may show a note twice,
+                # but a note must never be recorded as printed without being printed.
+                print(
+                    "Operator notes that arrived while the coder ran. "
+                    "Address them before gating or submitting."
+                )
+                for note in unmarked_notes:
+                    print(note["text"])
+                sys.stdout.flush()
+                record_operator_notes(
                     socket_path,
                     lode_id,
-                    unmarked_ids,
+                    [n["id"] for n in unmarked_notes],
                     mark="printed",
                 )
-                if rec_resp and rec_resp.get("type") == "operator_notes_recorded":
-                    print(
-                        "Operator notes that arrived while the coder ran. "
-                        "Address them before gating or submitting."
-                    )
-                    for note in unmarked_notes:
-                        print(note["text"])
 
     return exit_code
 

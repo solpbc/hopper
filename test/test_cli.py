@@ -12333,10 +12333,11 @@ def test_lode_nudge_queue_unknown_outcome_when_response_is_none(capsys):
         assert cmd_lode(["nudge", "abc12345", "--queue", "check this"]) == 1
 
     captured = capsys.readouterr()
-    assert (
-        "error: the operator-note outcome is unknown. Inspect with `hop lode status abc12345`"
-        in captured.err
-    )
+    assert "error: the operator-note outcome is unknown" in captured.err
+    assert "already delivered to the pane" in captured.err
+    assert "`hop lode status abc12345`" in captured.err
+    assert "`hop lode peek abc12345`" in captured.err
+    assert "do not resend blindly" in captured.err
     assert "Queued" not in captured.out
 
 
@@ -12476,10 +12477,10 @@ def test_status_display_human_and_json_operator_notes(capsys):
 
     note = {
         "id": "note1",
-        "text": "fix lint in parser.py",
+        "text": "fix lint in parser.py\nthen rerun make ci",
         "stage": "refine",
         "queued_at": 1700000000123,
-        "printed_at": None,
+        "printed_at": 1700000000123 + 3_600_000,
         "shown_at": None,
     }
     lode = {
@@ -12499,16 +12500,21 @@ def test_status_display_human_and_json_operator_notes(capsys):
     }
 
     # 1. Human format
-    with patch("hopper.cli._resolve_lode_once", return_value=resolution):
+    with (
+        patch("hopper.cli._resolve_lode_once", return_value=resolution),
+        patch("hopper.lodes.current_time_ms", return_value=1700000000123 + 3 * 3_600_000),
+    ):
         assert _show_lode_status(Path("/tmp/test.sock"), "abc12345", json_output=False) == 0
 
     human_out = capsys.readouterr().out
     assert "operator notes:" in human_out
     assert "id:         note1" in human_out
-    assert "state:      pending" in human_out
+    assert "state:      printed" in human_out
     assert "stage:      refine" in human_out
-    assert "queued_at:  1700000000123" in human_out
-    assert "text:       fix lint in parser.py" in human_out
+    assert "queued:     3h ago" in human_out
+    assert "printed:    2h ago" in human_out
+    assert "shown:" not in human_out
+    assert "text:       fix lint in parser.py\n                then rerun make ci" in human_out
 
     # 2. JSON format
     with patch("hopper.cli._resolve_lode_once", return_value=resolution):
@@ -12520,7 +12526,7 @@ def test_status_display_human_and_json_operator_notes(capsys):
     assert len(data["operator_notes"]) == 1
     out_note = data["operator_notes"][0]
     assert out_note["id"] == "note1"
-    assert out_note["state"] == "pending"
-    assert out_note["text"] == "fix lint in parser.py"
+    assert out_note["state"] == "printed"
+    assert out_note["text"] == "fix lint in parser.py\nthen rerun make ci"
     assert out_note["stage"] == "refine"
     assert out_note["queued_at"] == 1700000000123

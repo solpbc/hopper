@@ -15701,8 +15701,9 @@ def test_operator_note_queue_refusals_and_precedence(socket_path, make_lode):
     assert resp_block["type"] == "error"
 
 
-def test_operator_note_queue_completion_is_taken_checks(socket_path, make_lode):
-    """Completion taken up front or racing after delivery prevents queueing."""
+@pytest.mark.parametrize("action_type", ["completion", "kill", "archive"])
+def test_operator_note_queue_ending_action_is_taken_checks(socket_path, make_lode, action_type):
+    """A completion, kill or archive taken up front or racing after delivery prevents queueing."""
     srv = Server(socket_path)
     lode = make_lode(id="test-id", active=True, tmux_pane="%1", stage="refine")
     srv.lodes = [lode]
@@ -15710,7 +15711,7 @@ def test_operator_note_queue_completion_is_taken_checks(socket_path, make_lode):
 
     # 1. Up front refusal if in action_acceptances
     srv.action_acceptances = {
-        "test-id": ("act-1", ("test-id", "gen-1", "completion", "main", False), [])
+        "test-id": ("act-1", ("test-id", "gen-1", action_type, "main", False), [])
     }
     with patch("hopper.server._attempt_pane_delivery") as mock_deliv:
         srv._handle_mutation(
@@ -15723,9 +15724,25 @@ def test_operator_note_queue_completion_is_taken_checks(socket_path, make_lode):
 
     srv.action_acceptances.clear()
 
-    # 2. Race condition: completion_is_taken returns False before delivery, True after delivery
+    # 2. A durable pending-action file alone also refuses
     with (
-        patch.object(srv, "completion_is_taken", side_effect=[False, True]),
+        patch(
+            "hopper.server.actions.load_pending_action",
+            return_value={"action_type": action_type},
+        ),
+        patch("hopper.server._attempt_pane_delivery") as mock_deliv,
+    ):
+        srv._handle_mutation(
+            {"type": "lode_queue_operator_note", "lode_id": "test-id", "text": "note"},
+            conn,
+        )
+    mock_deliv.assert_not_called()
+    assert _decode_mock_response(conn)["outcome"] == "stage_ending"
+    assert not lode.get("operator_notes")
+
+    # 3. Race: no ending action before delivery, one taken by the store step
+    with (
+        patch.object(srv, "ending_action_is_taken", side_effect=[False, True]),
         patch(
             "hopper.server._attempt_pane_delivery",
             return_value={"reason": "idle_timeout", "capture": None, "title": None},
@@ -15892,9 +15909,25 @@ def test_completion_refused_when_unacknowledged_notes_pending_and_shown_clears(
     assert resp["operator_note_ids"] == ["n1"]
     assert "This is not a failure" in resp["status"]
     assert "fix that test" in resp["status"]
+    assert "re-validate" in resp["status"]
     assert "acknowledged" not in resp["status"].lower()
+    # Sending the refusal acknowledges nothing: only the client's record call does.
+    assert note["shown_at"] is None
 
-    # Now mark shown
+    # The refusal reply is lost, so the client never records: the next call refuses again.
+    with (
+        patch("hopper.actions.load_run_ownership", return_value={"proof_mode": "mock"}),
+        patch.object(srv, "_open_lode_action") as mock_open,
+    ):
+        srv._handle_lode_action(action_msg, conn)
+    mock_open.assert_not_called()
+    resp = _decode_mock_response(conn)
+    assert resp["accepted"] is False
+    assert resp["operator_note_ids"] == ["n1"]
+
+    # A note queued after the CLI read the refusal is not covered by its record call.
+    late = {**note, "id": "n2", "text": "one more thing"}
+    lode["operator_notes"].append(late)
     srv._handle_mutation(
         {
             "type": "lode_record_operator_notes",
@@ -15906,6 +15939,24 @@ def test_completion_refused_when_unacknowledged_notes_pending_and_shown_clears(
     )
     assert _decode_mock_response(conn)["type"] == "operator_notes_recorded"
     assert note["shown_at"] is not None
+    assert late["shown_at"] is None
+    with (
+        patch("hopper.actions.load_run_ownership", return_value={"proof_mode": "mock"}),
+        patch.object(srv, "_open_lode_action") as mock_open,
+    ):
+        srv._handle_lode_action(action_msg, conn)
+    mock_open.assert_not_called()
+    assert _decode_mock_response(conn)["operator_note_ids"] == ["n2"]
+    srv._handle_mutation(
+        {
+            "type": "lode_record_operator_notes",
+            "lode_id": "test2345",
+            "ids": ["n2"],
+            "mark": "shown",
+        },
+        conn,
+    )
+    assert _decode_mock_response(conn)["type"] == "operator_notes_recorded"
 
     # Next completion attempt is accepted
     with (
@@ -15957,6 +16008,7 @@ def test_publish_gate_refused_without_run_generation_and_allowed_with_it(socket_
     assert "This is not a failure" in resp["status"]
     assert "check regression" in resp["status"]
     assert lode["state"] != "gated"
+    assert note["shown_at"] is None
 
     # 2. Runner gate publication with run_generation
     with patch("hopper.server._sync_gate_artifact", return_value=True):

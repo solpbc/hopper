@@ -742,7 +742,7 @@ class TestRunCode:
 
         def mock_record(sock, lid, ids, mark):
             assert any("coder output" in m for m in printed_messages)
-            assert not any(
+            assert any(
                 "Operator notes that arrived while the coder ran." in m for m in printed_messages
             )
             call_order.append((lid, ids, mark))
@@ -791,7 +791,7 @@ class TestRunCode:
 
         def mock_record_fail(sock, lid, ids, mark):
             assert any("coder failure output" in m for m in printed_messages)
-            assert not any(
+            assert any(
                 "Operator notes that arrived while the coder ran." in m for m in printed_messages
             )
             call_order.append((lid, ids, mark))
@@ -817,8 +817,10 @@ class TestRunCode:
         assert "coder failure output" in captured.out
         assert "first note text\nsecond note text" in captured.out
 
-    def test_operator_notes_record_none_omits_heading(self, tmp_path, monkeypatch, capsys):
-        """If record_operator_notes returns None, the operator notes heading is absent."""
+    def test_operator_notes_printed_before_record_and_kept_when_record_lost(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Notes print before they are recorded, so a lost record reply still shows them."""
         session_dir = tmp_path / "lodes" / "test-sid"
         worktree = session_dir / "worktree"
         worktree.mkdir(parents=True)
@@ -840,6 +842,12 @@ class TestRunCode:
             Path(output_file).write_text("coder output\n")
             return 0, MOCK_CMD
 
+        printed_before_record = []
+
+        def record_after_print(*args, **kwargs):
+            printed_before_record.append(capsys.readouterr().out)
+            return None
+
         with (
             patch("hopper.code.prompt.load", return_value="prompt text"),
             patch("hopper.code.connect", return_value=_mock_response()),
@@ -850,7 +858,9 @@ class TestRunCode:
             patch("hopper.code.get_recent_commit_log", return_value=""),
             patch("hopper.code.run_coder", side_effect=mock_run_coder),
             patch("hopper.code.get_lode", return_value=lode_data),
-            patch("hopper.code.record_operator_notes", return_value=None) as mock_record,
+            patch(
+                "hopper.code.record_operator_notes", side_effect=record_after_print
+            ) as mock_record,
         ):
             exit_code = run_code("test-sid", Path("/tmp/test.sock"), "audit", "request")
 
@@ -858,10 +868,10 @@ class TestRunCode:
         mock_record.assert_called_once_with(
             Path("/tmp/test.sock"), "test-sid", ["n1"], mark="printed"
         )
-        captured = capsys.readouterr()
-        assert "coder output" in captured.out
-        assert "Operator notes that arrived while the coder ran" not in captured.out
-        assert "first note text" not in captured.out
+        [before] = printed_before_record
+        assert "coder output" in before
+        assert "Operator notes that arrived while the coder ran" in before
+        assert "first note text" in before
 
     def test_operator_notes_second_run_skips_already_printed(self, tmp_path, monkeypatch, capsys):
         """A second run_code does not print notes that already have printed_at set."""

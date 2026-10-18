@@ -2518,12 +2518,16 @@ def format_lode_detail(lode: dict) -> str:
             lines.append(f"    id:         {note.get('id', '')}")
             lines.append(f"    state:      {state}")
             lines.append(f"    stage:      {note.get('stage', '')}")
-            lines.append(f"    queued_at:  {note.get('queued_at', '')}")
-            if note.get("printed_at") is not None:
-                lines.append(f"    printed_at: {note['printed_at']}")
-            if note.get("shown_at") is not None:
-                lines.append(f"    shown_at:   {note['shown_at']}")
-            lines.append(f"    text:       {note.get('text', '')}")
+            for label, field in (
+                ("queued:", "queued_at"),
+                ("printed:", "printed_at"),
+                ("shown:", "shown_at"),
+            ):
+                if isinstance(note.get(field), int):
+                    age = format_age(note[field])
+                    lines.append(f"    {label:<11} {age if age == 'now' else age + ' ago'}")
+            text = str(note.get("text", "")).replace("\n", "\n                ")
+            lines.append(f"    text:       {text}")
     if lode.get("state") == "gated" and not archived_row:
         lines.append("")
         lines.append(f"Gate blocked. Review with: hop gate show {lode.get('id', '')}")
@@ -5243,9 +5247,10 @@ def cmd_lode(args: list[str]) -> int:
             response = client.queue_operator_note(socket_path, lode["id"], parsed.nudge_text)
             if response is None:
                 print(
-                    "error: the operator-note outcome is unknown. "
-                    f"Inspect with `hop lode status {lode['id']}` before deciding whether it was "
-                    "stored.",
+                    "error: the operator-note outcome is unknown; it may have been stored or "
+                    f"already delivered to the pane. Inspect with `hop lode status {lode['id']}` "
+                    f"and `hop lode peek {lode['id']}` before deciding whether to retry; "
+                    "do not resend blindly.",
                     file=sys.stderr,
                 )
                 return 1
