@@ -1,0 +1,22 @@
+  hopper-eiwl4phm worktree ~/.h/worktrees/eiwl4phm    56K / 256K │ [Dashboard]
+
+
+     ❯ # Senior Engineer                                             2:43 PM
+
+
+                                                                               █
+
+   ⠙ Waiting…                                                           [stop]
+
+
+
+   ▾ Tasks 1
+   : Run Rerun make ci after UITest repair                               3m26s
+   ▾ Watchers 1
+   : Monitor Watch make ci until pass or a test failure                  1m07s
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰─────────────────────────────────────── Grok 4.7 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts

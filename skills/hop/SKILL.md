@@ -310,7 +310,7 @@ that scope absent, and the recorded worktree is absent. The server repeats that
 proof before accepting the archive action. A live, unknown, or mismatched scope
 still refuses; no command treats a missing pane or process as sufficient evidence.
 
-Kill a lode (the pane and process go; the worktree and branch are retained):
+Kill a lode (the pane and process go; a clean worktree with zero unpushed commits is reaped on a later sweep; pause, then archive, to keep the worktree and branch):
 
 ```bash
 hop lode kill <lode-id>
@@ -532,10 +532,9 @@ human approval.
 `--force` consents only to discarding an active or already-started stage. The
 server still closes the owned pane and proves containment is empty before it
 spawns a replacement. Restart re-runs the lode you already have, which is not
-appropriate when the premise was wrong. `hop lode kill` retains **both** the
-worktree and the branch, so "killed" is not "cleaned up": push the branch,
-verify the SHA from a **second** clone, kill, run
-`git worktree remove --force`, then confirm with `ls ~/.hopper/worktrees/`.
+appropriate when the premise was wrong. A killed lode whose worktree is clean and
+has zero unpushed commits is reaped on a later sweep; pause, then archive, keeps
+the worktree and branch.
 
 **Workspace trust is Hopper-managed.** Before opening Claude, Hopper records
 trust for the exact workspace it will open, including each lode worktree. Treat
@@ -563,8 +562,12 @@ but neither bypasses the 60-minute pane-silence cap.
 
 If a stage remains quiet or stuck, Hopper parks it at a gate and keeps the agent
 alive for operator inspection. Use `hop lode peek <id>` to inspect it, then
-choose an explicit pause, restart, or kill action. These actions retain the
-worktree; none treats terminal silence as permission to clean it up.
+choose an explicit pause, restart, or kill action; none treats terminal silence
+as permission to clean up the worktree. Pause, then archive, keeps the worktree
+and branch. A killed lode whose worktree is clean and has zero unpushed commits is
+reaped on a later sweep. A shipped lode is reaped after the 6h shipped grace. An
+errored lode that is still `state == error` and is not a terminal failure kind is
+reaped after the 48h error grace.
 
 On a fresh Make-based worktree, refine setup prefers `make hopper-install` (or
 its publicly-meaningful alias, `make agent-setup`, for a repo that keeps no

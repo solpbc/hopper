@@ -99,6 +99,7 @@ NUDGE_WAIT_FOR_IDLE_SECONDS = 300.0
 NUDGE_IDLE_POLL_SECONDS = 2.0
 NUDGE_IDLE_HEARTBEAT_SECONDS = 30.0
 NUDGE_RETRYABLE_OUTCOME = "busy"
+NUDGE_RETRYABLE_OUTCOMES = frozenset({"busy", "background_active"})
 # Budget expired, output already emitted; can never collide with a server response dict.
 _NUDGE_IDLE_EXPIRED = object()
 WAIT_EXTRA_LODE_IDS_REFUSAL = (
@@ -4031,22 +4032,32 @@ def _nudge_wait_for_idle(
     deadline = deadline_utils.make_deadline(budget_s, clock=_watch_monotonic)
     last_busy_error = None
     sent_busy = False
+    saw_busy = False
     heartbeats_emitted = 0
 
     def expire() -> object:
         elapsed = budget_s - deadline_utils.remaining_seconds(deadline)
-        if sent_busy:
-            if last_busy_error:
-                print(last_busy_error, file=sys.stderr)
-            verb = "Hopper did not send another nudge."
+        if saw_busy:
+            if sent_busy:
+                if last_busy_error:
+                    print(last_busy_error, file=sys.stderr)
+                verb = "Hopper did not send another nudge."
+            else:
+                verb = "Hopper did not send the nudge."
+            print(
+                f"Observed: pane {pane} was still processing after {elapsed:g}s "
+                f"of a {budget_s:g}s --wait-for-idle budget. {verb} "
+                f"Recover with: hop lode peek {lode_id}",
+                file=sys.stderr,
+            )
         else:
-            verb = "Hopper did not send the nudge."
-        print(
-            f"Observed: pane {pane} was still processing after {elapsed:g}s "
-            f"of a {budget_s:g}s --wait-for-idle budget. {verb} "
-            f"Recover with: hop lode peek {lode_id}",
-            file=sys.stderr,
-        )
+            print(
+                f"Observed: pane {pane} still had background work active (tasks or watchers) "
+                f"after {elapsed:g}s of a {budget_s:g}s --wait-for-idle budget. Hopper did not "
+                f"send the nudge. Retry once that work finishes. "
+                f"Recover with: hop lode peek {lode_id}",
+                file=sys.stderr,
+            )
         return _NUDGE_IDLE_EXPIRED
 
     print(f"waiting for pane {pane} to become idle (budget {budget_s:g}s)", file=sys.stderr)
@@ -4068,6 +4079,7 @@ def _nudge_wait_for_idle(
         title = pane_title(pane)
         phase = classify_pane_phase(title)
         if phase is PanePhase.BUSY:
+            saw_busy = True
             remaining = deadline_utils.remaining_seconds(deadline)
             sleep_s = min(NUDGE_IDLE_POLL_SECONDS, remaining)
             if sleep_s <= 0:
@@ -4082,9 +4094,12 @@ def _nudge_wait_for_idle(
         response = client.send_pane_input(socket_path, lode_id, text, paste=True)
         if response and response.get("type") == "pane_input_sent":
             return response
-        if response and response.get("outcome") == NUDGE_RETRYABLE_OUTCOME:
-            last_busy_error = response.get("error")
-            sent_busy = True
+        if response and response.get("outcome") in NUDGE_RETRYABLE_OUTCOMES:
+            outcome = response.get("outcome")
+            if outcome == "busy":
+                saw_busy = True
+                sent_busy = True
+                last_busy_error = response.get("error")
             remaining = deadline_utils.remaining_seconds(deadline)
             sleep_s = min(NUDGE_IDLE_POLL_SECONDS, remaining)
             if sleep_s <= 0:
@@ -4180,7 +4195,14 @@ def cmd_lode(args: list[str]) -> int:
     log_p.add_argument("lode_id", help="Lode ID (or prefix)")
     log_p.add_argument("-n", "--tail", type=int, default=0, help="Show last N entries")
     log_p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
-    kill_p = subs.add_parser("kill", help="Safely kill and archive a lode", exit_on_error=False)
+    kill_p = subs.add_parser(
+        "kill",
+        help=(
+            "Kill and archive a lode. A clean worktree with no unpushed commits is "
+            "reaped on a later sweep; pause, then archive, to keep the worktree and branch."
+        ),
+        exit_on_error=False,
+    )
     kill_p.add_argument("lode_id", help="Lode ID to kill")
     kill_p.add_argument(
         "-f",

@@ -4504,11 +4504,10 @@ def test_degraded_identity_survives_block_step_and_server_restart(socket_path):
     restarted = Server(socket_path.with_name("restarted.sock"))
     persisted = actions.load_pending_action(record["lode_id"])
     assert persisted["ownership"]["descendants"] == [descendant]
-    assert persisted["containment"]["state"] == "grace"
+    assert persisted["containment"]["state"] == "kill_pending"
     assert persisted["containment"]["proof_label"] is None
     projection = actions.pending_action_projection(persisted)
-    assert "ambiguous" in projection["recovery"]["message"]
-    assert "containment: grace" in projection["status"]
+    assert projection["phase"] == "force_killing"
     assert restarted._load_action_slot(record["lode_id"])["ownership"]["descendants"] == [
         descendant
     ]
@@ -11409,6 +11408,7 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
         "submit_failed",
         "acceptance_timeout",
         "pane_lost_after_submit",
+        "background_active",
     }
     choice_only = {
         "pane_not_awaiting_choice",
@@ -11445,6 +11445,7 @@ def test_delivery_taxonomy_tables_cover_shared_and_choice_only_failures():
         "pane_frozen",
         "pane_awaiting_choice",
         "gated_body_refused",
+        "background_active",
     }
 
 
@@ -11984,6 +11985,7 @@ def test_lode_send_pane_input_unknown_state_does_not_mutate_or_broadcast(socket_
         ("submit_failed", "not_sent", logging.WARNING),
         ("acceptance_timeout", "unverified", logging.WARNING),
         ("pane_lost_after_submit", "unverified", logging.WARNING),
+        ("background_active", "background_active", logging.WARNING),
     ],
 )
 def test_pane_delivery_logs_exactly_once_for_every_reason(reason, outcome, level, caplog):
@@ -12023,7 +12025,7 @@ def test_failed_pane_delivery_persists_the_classified_capture(tmp_path):
     with patch("hopper.server._attempt_pane_delivery", return_value=attempt_result):
         hopper_server._deliver_pane_input("lode-x", "%1", "body", paste=True, driver_name="grok")
     log = (tmp_path / "lodes" / "lode-x" / "pane-delivery-failures.log").read_text()
-    assert "driver=grok reason=pane_state_unknown" in log
+    assert "driver=grok reason=pane_state_unknown phase=unknown" in log
     assert "UNRECOGNIZED PANE TEXT" in log
 
 
@@ -14950,3 +14952,478 @@ def test_legacy_lode_without_gate_fields_loads_and_renders_cleanly(make_lode):
     detail2 = format_lode_detail(m2)
     assert "ship gate" not in detail2
     assert "⚠" not in detail2
+
+
+def test_stuck_bounded_lode_retry_force_kill_and_fixture_load(socket_path, temp_config, make_lode):
+    lode_id = "stuck222"
+    generation = "f" * 32
+
+    def ps_proc(pid, ppid):
+        return {
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": 100,
+            "birth": {
+                "kind": "ps-lstart",
+                "boot_id": None,
+                "value": f"Mon Aug 10 22:29:{pid % 60:02d} 2026",
+            },
+        }
+
+    ownership = {
+        "schema_version": 1,
+        "lode_id": lode_id,
+        "run_generation": generation,
+        "registered_at_ms": 1_000,
+        "boot_id": "boot-one",
+        "platform": "darwin",
+        "proof_mode": "darwin-bounded",
+        "degraded_reason": "bounded macOS session",
+        "pane": {
+            "pane_id": "%1",
+            "window_id": "@1",
+            "root_process": ps_proc(100, 1),
+        },
+        "supervisor": ps_proc(101, 100),
+        "worker": ps_proc(102, 101),
+        "process_group": 100,
+        "descendants": [ps_proc(103, 102)],
+        "unit": None,
+        "cgroup": None,
+        "unit_name": None,
+    }
+    source = actions.write_run_ownership(ownership)
+    output = actions.stage_output(lode_id, b"accepted\n", blob_id="b" * 32)
+    record = actions.new_pending_action(
+        lode_id=lode_id,
+        stage="mill",
+        expected_generation=generation,
+        action_type="completion",
+        target_disposition="advance_refine",
+        force_consent=False,
+        output_facts=output,
+        ownership_record=ownership,
+        source_record_sha256=actions.durable_json_sha256(source),
+        action_id="c" * 32,
+        accepted_ms=1_001,
+    )
+    for marker_name in ("output_publish", "ownership_capture", "pane_close"):
+        _complete_marker(record, marker_name)
+    record["ownership"].update(captured=True, captured_at_ms=1_001)
+    actions.transition_marker(record, "containment", "intent", attempt_id="e" * 32)
+    actions.transition_marker(
+        record, "containment", "blocked", attempt_id="e" * 32, detail="transient ambiguity"
+    )
+    record["containment"].update(
+        state="grace",
+        started_monotonic_ns=1_000,
+        deadline_monotonic_ns=2_000,
+        last_cgroup_observation=None,
+        last_error="transient ambiguity",
+    )
+    record["phase"] = "containment_blocked"
+    record["recovery"] = {
+        "kind": "containment",
+        "message": "transient ambiguity",
+        "command": actions.recovery_command(record, "containment"),
+    }
+    actions.write_pending_action(record)
+
+    loaded = actions.load_pending_action(lode_id)
+    assert loaded["action_id"] == "c" * 32
+    assert loaded["phase"] == "containment_blocked"
+    assert loaded["containment"]["state"] == "grace"
+
+    server = Server(socket_path)
+    lode = make_lode(
+        id=lode_id,
+        state="teardown",
+        run_generation=generation,
+        pending_action=actions.pending_action_projection(record),
+    )
+    server.lodes = [lode]
+    with patch.object(server, "_schedule_action_step") as mock_schedule:
+        server._resume_action(lode_id, startup=True)
+    mock_schedule.assert_not_called()
+    assert actions.load_pending_action(lode_id)["phase"] == "containment_blocked"
+
+    signal_calls = []
+    fake_obs = {
+        "state": "populated",
+        "identities": [ps_proc(103, 102)],
+        "unresolved_pids": [],
+        "resolution": "complete",
+    }
+    with (
+        patch("hopper.server.teardown.read_host_boot_identity", return_value="boot-one"),
+        patch("hopper.server.teardown.observe_bounded_processes", return_value=fake_obs),
+        patch("hopper.server.pane_liveness", return_value=hopper_server.Liveness.GONE),
+        patch(
+            "hopper.server.teardown.signal_bounded_process",
+            side_effect=lambda ident, **kw: (
+                signal_calls.append(ident) or {"state": "signalled", "error": None}
+            ),
+        ),
+        patch("hopper.server.teardown.read_process_basename", return_value="worker"),
+        patch("hopper.server.teardown.read_process_zombie", return_value=False),
+    ):
+        server._retry_action(lode_id, None)
+        observed = _join_action_step(server, record, "observing_containment")
+        server._handle_action_step_result(observed)
+
+    persisted = actions.load_pending_action(lode_id)
+    assert persisted["phase"] == "force_killing"
+    assert persisted["containment"]["state"] == "kill_pending"
+    assert persisted["markers"]["scope_kill"]["state"] == "not_started"
+    assert persisted["markers"]["supervisor_kill"]["state"] == "not_started"
+    assert len(signal_calls) == 0
+
+    poll_count = 0
+
+    def bounded_second(*args, **kwargs):
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            return fake_obs
+        return {
+            "state": "empty",
+            "identities": [],
+            "unresolved_pids": [],
+            "resolution": "complete",
+        }
+
+    with (
+        patch("hopper.server.teardown.read_host_boot_identity", return_value="boot-one"),
+        patch("hopper.server.teardown.observe_bounded_processes", side_effect=bounded_second),
+        patch("hopper.server.pane_liveness", return_value=hopper_server.Liveness.GONE),
+        patch(
+            "hopper.server.teardown.signal_bounded_process",
+            side_effect=lambda ident, **kw: (
+                signal_calls.append(ident) or {"state": "signalled", "error": None}
+            ),
+        ),
+        patch("hopper.server.teardown.read_process_basename", return_value="worker"),
+        patch("hopper.server.teardown.read_process_zombie", return_value=False),
+        patch("hopper.server.time.sleep", return_value=None),
+        patch.object(server, "_continue_action"),
+    ):
+        forced = _join_action_step(server, persisted, "force_killing")
+        server._handle_action_step_result(forced)
+
+    final = actions.load_pending_action(lode_id)
+    assert final["phase"] == "publishing_terminal"
+    assert final["containment"]["state"] == "proven"
+    assert final["containment"]["result"] == "darwin-bounded-empty"
+    assert "; ended 103 worker" in final["containment"]["proof_label"]
+    assert len(signal_calls) == 1
+    assert signal_calls[0]["pid"] == 103
+
+
+def test_wedged_populated_scope_fixture_loads_successfully(temp_config):
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "pending-actions"
+        / "wedged-populated-scope-5tuofgwh.json"
+    )
+    raw = fixture_path.read_bytes()
+    pending_path = actions.pending_action_path("5tuofgwh")
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_bytes(raw)
+    loaded = actions.load_pending_action("5tuofgwh")
+    assert loaded["action_id"] == "3c136555a8b742f68e7780e84632a8de"
+    assert loaded["lode_id"] == "5tuofgwh"
+    assert loaded["phase"] == "containment_blocked"
+
+
+def test_startup_resume_in_progress_force_arms_fresh_deadline_and_re_verifies(
+    socket_path, temp_config, make_lode
+):
+    lode_id = "force222"
+    generation = "e" * 32
+
+    def ps_proc(pid):
+        return {
+            "pid": pid,
+            "ppid": 1,
+            "pgid": 100,
+            "birth": {"kind": "ps-lstart", "boot_id": None, "value": "Mon Aug 10 22:29:26 2026"},
+        }
+
+    ownership = {
+        "schema_version": 1,
+        "lode_id": lode_id,
+        "run_generation": generation,
+        "registered_at_ms": 1_000,
+        "boot_id": "boot-one",
+        "platform": "darwin",
+        "proof_mode": "darwin-bounded",
+        "degraded_reason": "bounded macOS session",
+        "pane": {"pane_id": "%1", "window_id": "@1", "root_process": ps_proc(100)},
+        "supervisor": ps_proc(101),
+        "worker": ps_proc(102),
+        "process_group": 100,
+        "descendants": [ps_proc(103)],
+        "unit": None,
+        "cgroup": None,
+        "unit_name": None,
+    }
+    source = actions.write_run_ownership(ownership)
+    output = actions.stage_output(lode_id, b"accepted\n", blob_id="c" * 32)
+    record = actions.new_pending_action(
+        lode_id=lode_id,
+        stage="mill",
+        expected_generation=generation,
+        action_type="completion",
+        target_disposition="advance_refine",
+        force_consent=False,
+        output_facts=output,
+        ownership_record=ownership,
+        source_record_sha256=actions.durable_json_sha256(source),
+        action_id="f" * 32,
+        accepted_ms=1_001,
+    )
+    for marker_name in ("output_publish", "ownership_capture", "pane_close"):
+        _complete_marker(record, marker_name)
+    record["ownership"].update(captured=True, captured_at_ms=1_001)
+    actions.transition_marker(record, "containment", "intent", attempt_id="a" * 32)
+    record["containment"].update(
+        state="kill_pending",
+        started_monotonic_ns=1_000_000_000,
+        deadline_monotonic_ns=31_000_000_000,
+    )
+    record["phase"] = "force_killing"
+    actions.write_pending_action(record)
+
+    server = Server(socket_path)
+    server.lodes = [make_lode(id=lode_id, state="teardown", run_generation=generation)]
+
+    calls = []
+    fake_obs = {
+        "state": "populated",
+        "identities": [ps_proc(103)],
+        "unresolved_pids": [],
+        "resolution": "complete",
+    }
+
+    poll_count = 0
+
+    def record_observe(*args, **kwargs):
+        nonlocal poll_count
+        poll_count += 1
+        calls.append("observe")
+        if poll_count == 1:
+            return fake_obs
+        return {
+            "state": "empty",
+            "identities": [],
+            "unresolved_pids": [],
+            "resolution": "complete",
+        }
+
+    def record_signal(ident, **kw):
+        calls.append(f"signal-{ident['pid']}")
+        return {"state": "signalled", "error": None}
+
+    test_now_ns = 100_000_000_000
+    with (
+        patch("hopper.server.teardown.read_host_boot_identity", return_value="boot-one"),
+        patch("hopper.server.teardown.observe_bounded_processes", side_effect=record_observe),
+        patch("hopper.server.pane_liveness", return_value=hopper_server.Liveness.GONE),
+        patch("hopper.server.teardown.signal_bounded_process", side_effect=record_signal),
+        patch("hopper.server.teardown.read_process_basename", return_value="worker"),
+        patch("hopper.server.teardown.read_process_zombie", return_value=False),
+        patch("hopper.server.time.monotonic_ns", return_value=test_now_ns),
+        patch("hopper.server.time.sleep", return_value=None),
+    ):
+        server._resume_action(lode_id, startup=True)
+        resumed = _join_action_step(server, record, "force_killing")
+
+    assert calls[0] == "observe"
+    assert calls[1] == "signal-103"
+    containment_res = resumed["result"]["containment"]
+    assert containment_res["started_monotonic_ns"] == test_now_ns
+    assert containment_res["deadline_monotonic_ns"] == test_now_ns + int(
+        teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000
+    )
+
+    blocked_id = "block222"
+    blocked_rec = copy.deepcopy(record)
+    blocked_rec["lode_id"] = blocked_id
+    blocked_rec["action_id"] = "b" * 32
+    blocked_rec["phase"] = "containment_blocked"
+    actions.write_pending_action(blocked_rec)
+    server.lodes.append(make_lode(id=blocked_id, state="teardown"))
+    with patch.object(server, "_schedule_action_step") as mock_sched:
+        server._resume_action(blocked_id, startup=True)
+    mock_sched.assert_not_called()
+
+
+def test_blocked_bounded_action_recovery_message_contains_blocked_on_owned_processes():
+    record = _pending_completion_record()
+    error_msg = (
+        "blocked on 1 owned process: 80695 DTServiceHub; could not be signalled: "
+        "[Errno 1] Operation not permitted "
+        "Retry the same action once the process has exited or can be signalled."
+    )
+    record["phase"] = "containment_blocked"
+    record["containment"]["last_error"] = error_msg
+    record["recovery"] = {
+        "kind": "containment",
+        "message": error_msg,
+        "command": actions.recovery_command(record, "containment"),
+    }
+    status = actions.action_status(record)
+    assert "blocked on 1 owned process" in status
+    assert "80695 DTServiceHub" in status
+    assert "blocked on 1 owned process" in record["recovery"]["message"]
+
+
+def test_delivery_grok_background_fixtures_and_precedence(tmp_path, socket_path, make_lode):
+    import itertools
+
+    from hopper import grok, tmux
+
+    b1_path = Path("test/fixtures/pane-captures/grok-background-b1.txt")
+    b2_path = Path("test/fixtures/pane-captures/grok-background-b2.txt")
+    b1_text = b1_path.read_text()
+    b2_text = b2_path.read_text()
+
+    if Path("/tmp/sc3/b1.txt").exists():
+        assert b1_path.read_bytes() == Path("/tmp/sc3/b1.txt").read_bytes()
+    if Path("/tmp/sc3/b2.txt").exists():
+        assert b2_path.read_bytes() == Path("/tmp/sc3/b2.txt").read_bytes()
+
+    assert grok.observe_pane(None, b1_text)[0] is tmux.PanePhase.BACKGROUND
+    assert grok.observe_pane(None, b2_text)[0] is tmux.PanePhase.BACKGROUND
+
+    srv = Server(socket_path)
+    srv.lodes = [make_lode(id="test-id", state="running", tmux_pane="%1", driver="grok")]
+    conn = _mock_client(srv)
+
+    with (
+        patch("hopper.server.capture_pane", side_effect=itertools.cycle([b1_text, b2_text])),
+        patch("hopper.server.pane_title", return_value="grok"),
+        patch("hopper.server.paste_buffer") as mock_paste,
+        patch("hopper.server.time.sleep"),
+    ):
+        srv._handle_mutation(
+            {"type": "lode_send_feedback", "lode_id": "test-id", "text": "Please revise"},
+            conn,
+        )
+
+    mock_paste.assert_not_called()
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert response["outcome"] == "background_active"
+    assert srv.lodes[0]["status"] == "Feedback blocked: background work active"
+    assert lode_gate(srv.lodes[0])["body"] == "Feedback blocked: background work active"
+
+    with (
+        patch("hopper.server.capture_pane", return_value=_PROCESSING_CAPTURE),
+        patch("hopper.server.pane_title", return_value="⠐ Working"),
+        patch("hopper.server._observe_processing_pane_title", return_value=True),
+        patch("hopper.server.time.sleep"),
+    ):
+        res_frozen = hopper_server._attempt_pane_delivery(
+            "%1", "test", paste=True, driver_name="claude"
+        )
+    assert res_frozen["reason"] == "pane_frozen"
+
+    with (
+        patch("hopper.server.capture_pane", return_value=_PROCESSING_CAPTURE),
+        patch("hopper.server.pane_title", return_value="⠐ Working"),
+        patch("hopper.server._observe_processing_pane_title", return_value=False),
+        patch("hopper.server.time.sleep"),
+    ):
+        res_timeout = hopper_server._attempt_pane_delivery(
+            "%1", "test", paste=True, driver_name="claude"
+        )
+    assert res_timeout["reason"] == "idle_timeout"
+
+    with (
+        patch(
+            "hopper.server.capture_pane",
+            side_effect=itertools.cycle([b1_text, "unknown text", b2_text]),
+        ),
+        patch("hopper.server.pane_title", return_value="grok"),
+        patch("hopper.server.time.sleep"),
+    ):
+        res_bg = hopper_server._attempt_pane_delivery("%1", "test", paste=True, driver_name="grok")
+    assert res_bg["reason"] == "background_active"
+    assert res_bg["phase"] == "background"
+
+    with (
+        patch("hopper.server.capture_pane", return_value="unknown text"),
+        patch("hopper.server.pane_title", return_value="grok"),
+        patch("hopper.server.time.sleep"),
+    ):
+        res_unk = hopper_server._attempt_pane_delivery("%1", "test", paste=True, driver_name="grok")
+    assert res_unk["reason"] == "pane_state_unknown"
+
+    with (
+        patch("hopper.server.capture_pane", return_value=b1_text),
+        patch("hopper.server.pane_title", return_value="grok"),
+        patch("hopper.server.time.sleep"),
+    ):
+        hopper_server._deliver_pane_input("lode-bg", "%1", "body", paste=True, driver_name="grok")
+    log_content = (tmp_path / "lodes" / "lode-bg" / "pane-delivery-failures.log").read_text()
+    assert "reason=background_active phase=background" in log_content
+
+
+def test_reap_sweep_deduplicates_warnings_for_same_reason(
+    socket_path, temp_config, make_lode, caplog
+):
+    now = 1_000_000_000
+    lode = make_lode(
+        id="dedup-1",
+        stage="shipped",
+        shipped_at=now - hopper_server.SHIPPED_WORKTREE_REAP_GRACE_MS - 1,
+        run_generation="gen-1",
+        project="missing-proj",
+        worktree_reap={
+            "path": "/tmp/fake",
+            "trigger": "shipped",
+            "worktree_removed_at": None,
+            "reaped_at": None,
+        },
+    )
+    srv = Server(socket_path)
+    srv.lodes = [lode]
+
+    with (
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        patch("hopper.server.current_time_ms", return_value=now),
+        patch("hopper.server.find_project", return_value=None),
+    ):
+        srv._reap_eligible_worktrees()
+
+    expected_msg = "Worktree reap skipped for dedup-1: project not found"
+    assert caplog.messages.count(expected_msg) == 1
+
+    with (
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        patch("hopper.server.current_time_ms", return_value=now + 1000),
+        patch("hopper.server.find_project", return_value=None),
+        patch.object(srv, "_cleanup_worktree", wraps=srv._cleanup_worktree) as cleanup_spy,
+    ):
+        srv._reap_eligible_worktrees()
+
+    assert caplog.messages.count(expected_msg) == 1
+    assert cleanup_spy.call_count == 1
+
+    project = MagicMock()
+    project.path = "/fake/repo"
+    with (
+        caplog.at_level(logging.WARNING, logger="hopper.server"),
+        patch("hopper.server.current_time_ms", return_value=now + 2000),
+        patch("hopper.server.find_project", return_value=project),
+        patch("hopper.server.is_dirty", return_value=True),
+    ):
+        srv._reap_eligible_worktrees()
+
+    different_msg = (
+        "Worktree reap skipped for dedup-1: worktree is dirty or cleanliness could not be proven; "
+        "retaining /tmp/fake"
+    )
+    assert caplog.messages.count(different_msg) == 1

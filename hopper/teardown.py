@@ -5,6 +5,7 @@
 
 import ctypes
 import errno
+import logging
 import os
 import re
 import select
@@ -16,6 +17,8 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from hopper import actions, oom, tmux
+
+logger = logging.getLogger(__name__)
 
 CONTAINMENT_TIMEOUT_SEC = 30.0
 PROCESS_QUERY_TIMEOUT_SEC = 1.0
@@ -237,6 +240,93 @@ def read_process_identity(pid: int, *, platform: str | None = None, **kwargs) ->
     if platform_name(platform) == "linux":
         return read_linux_process_identity(pid, **kwargs)
     return read_ps_process_identity(pid, **kwargs)
+
+
+def read_process_zombie(
+    identity: dict,
+    *,
+    platform: str | None = None,
+    proc_root: Path = Path("/proc"),
+    run: Callable | None = None,
+    timeout: float = PROCESS_QUERY_TIMEOUT_SEC,
+) -> bool | None:
+    """Read whether one platform process identity is an exited zombie."""
+    pid = identity.get("pid") if isinstance(identity, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+        return None
+    plat = platform_name(platform)
+    if plat == "linux":
+        try:
+            text = oom._read_text(proc_root / str(pid) / "stat")
+        except (OSError, ValueError):
+            return None
+        closing = text.rfind(")")
+        if closing < 0:
+            return None
+        fields = text[closing + 1 :].split()
+        if not fields:
+            return None
+        return fields[0] == "Z"
+
+    run_fn = subprocess.run if run is None else run
+    try:
+        result = run_fn(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    if not out:
+        return None
+    return out.startswith("Z")
+
+
+def read_process_basename(
+    identity: dict,
+    *,
+    platform: str | None = None,
+    proc_root: Path = Path("/proc"),
+    run: Callable | None = None,
+    timeout: float = PROCESS_QUERY_TIMEOUT_SEC,
+) -> str | None:
+    """Read one process's executable basename, rejecting delimiters and spaces."""
+    pid = identity.get("pid") if isinstance(identity, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+        return None
+    plat = platform_name(platform)
+    if plat == "linux":
+        try:
+            name = oom._read_text(proc_root / str(pid) / "comm").strip()
+        except (OSError, ValueError):
+            return None
+        if not name or any(ch in name for ch in " ,;"):
+            return None
+        return name
+
+    run_fn = subprocess.run if run is None else run
+    try:
+        result = run_fn(
+            ["ps", "-o", "comm=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    name = PurePosixPath(lines[0]).name
+    if not name or any(ch in name for ch in " ,;"):
+        return None
+    return name
 
 
 def _read_linux_process_table(*, proc_root: Path, boot_id: str) -> dict:
@@ -889,6 +979,7 @@ def reopen_process_pidfd(
             "state": "cannot-tell",
             "fd": None,
             "error": "pidfd_open and pidfd_send_signal are unavailable",
+            "reason": "pidfd-unavailable",
         }
     try:
         fd = interface["open"](identity["pid"], 0)
@@ -897,11 +988,35 @@ def reopen_process_pidfd(
     except OSError as error:
         if error.errno == errno.ESRCH:
             return {"state": "gone", "fd": None, "error": None}
-        return {"state": "cannot-tell", "fd": None, "error": str(error)}
+        if error.errno == getattr(errno, "ENOSYS", 38):
+            return {
+                "state": "cannot-tell",
+                "fd": None,
+                "error": str(error),
+                "reason": "pidfd-unsupported",
+            }
+        if error.errno in {getattr(errno, "EPERM", 1), getattr(errno, "EACCES", 13)}:
+            return {
+                "state": "cannot-tell",
+                "fd": None,
+                "error": str(error),
+                "reason": "pidfd-refused",
+            }
+        return {
+            "state": "cannot-tell",
+            "fd": None,
+            "error": str(error),
+            "reason": "not-verifiable",
+        }
     current_boot = read_boot_id(proc_root=proc_root)
     if current_boot is None:
         os.close(fd)
-        return {"state": "cannot-tell", "fd": None, "error": "Linux boot identity unavailable"}
+        return {
+            "state": "cannot-tell",
+            "fd": None,
+            "error": "Linux boot identity unavailable",
+            "reason": "not-verifiable",
+        }
     if current_boot != identity["birth"]["boot_id"]:
         os.close(fd)
         return {"state": "gone", "fd": None, "error": None}
@@ -915,7 +1030,12 @@ def reopen_process_pidfd(
         return {"state": "gone", "fd": None, "error": None}
     if observed["state"] != "alive":
         os.close(fd)
-        return {"state": "cannot-tell", "fd": None, "error": observed["error"]}
+        return {
+            "state": "cannot-tell",
+            "fd": None,
+            "error": observed["error"],
+            "reason": "not-verifiable",
+        }
     if not same_birth(identity, observed["identity"]):
         os.close(fd)
         return {"state": "gone", "fd": None, "error": None}
@@ -977,6 +1097,94 @@ def signal_process_pidfd(
     return _force_result("signalled")
 
 
+def signal_bounded_process(
+    identity: dict,
+    *,
+    platform: str | None = None,
+    proc_root: Path = Path("/proc"),
+    pidfd_interface: dict | None = None,
+    process_reader: Callable[..., dict] | None = None,
+    kill: Callable[[int, int], None] | None = None,
+    run: Callable | None = None,
+) -> dict:
+    """SIGKILL one birth-verified bounded process, never a negative PID or PGID."""
+    pid = identity.get("pid") if isinstance(identity, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+        return _force_result("unaddressable", "invalid PID")
+
+    plat = platform_name(platform)
+    if plat == "linux":
+        birth = identity.get("birth")
+        if not isinstance(birth, dict) or birth.get("kind") != "linux-proc-starttime":
+            return _force_result("unaddressable", "not verifiable")
+        reopened = reopen_process_pidfd(
+            identity,
+            proc_root=proc_root,
+            pidfd_interface=pidfd_interface,
+        )
+        if reopened["state"] == "gone":
+            return _force_result("already-gone")
+        if reopened["state"] == "alive":
+            fd = reopened["fd"]
+            try:
+                return signal_process_pidfd(
+                    fd,
+                    identity,
+                    proc_root=proc_root,
+                    pidfd_interface=pidfd_interface,
+                )
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        reason = reopened.get("reason")
+        if reason in {"pidfd-unavailable", "pidfd-unsupported", "pidfd-refused"}:
+            current_boot = read_boot_id(proc_root=proc_root)
+            if current_boot is None or current_boot != birth.get("boot_id"):
+                return _force_result("already-gone")
+            reader = read_linux_process_identity if process_reader is None else process_reader
+            observed = reader(pid, proc_root=proc_root, boot_id=current_boot)
+            if observed["state"] == "gone":
+                return _force_result("already-gone")
+            if observed["state"] != "alive":
+                return _force_result("unaddressable", "not verifiable")
+            if not same_birth(identity, observed["identity"]):
+                return _force_result("already-gone")
+            kill_fn = os.kill if kill is None else kill
+            try:
+                kill_fn(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return _force_result("already-gone")
+            except OSError as error:
+                if error.errno == errno.ESRCH:
+                    return _force_result("already-gone")
+                return _force_result("unaddressable", str(error))
+            return _force_result("signalled")
+        return _force_result("unaddressable", "not verifiable")
+
+    reader = read_process_identity if process_reader is None else process_reader
+    read_kwargs = {"run": run} if run is not None else {}
+    observed = reader(pid, platform=plat, **read_kwargs)
+    if observed["state"] == "gone":
+        return _force_result("already-gone")
+    if observed["state"] != "alive":
+        return _force_result("unaddressable", "not verifiable")
+    if not same_birth(identity, observed["identity"]):
+        return _force_result("already-gone")
+    kill_fn = os.kill if kill is None else kill
+    try:
+        kill_fn(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return _force_result("already-gone")
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return _force_result("already-gone")
+        return _force_result("unaddressable", str(error))
+    return _force_result("signalled")
+
+
 def close_owned_pane(
     ownership: dict,
     *,
@@ -1034,6 +1242,7 @@ def observe_bounded_processes(
             "resolution": resolution,
             "platform": platform_name(platform),
             "replaced_pids": [],
+            "unresolved_pids": sorted({identity["pid"] for identity in owned}),
         }
 
     current = {identity["pid"]: identity for identity in process_table["identities"]}
@@ -1097,6 +1306,7 @@ def observe_bounded_processes(
         "resolution": resolution,
         "platform": platform_name(platform),
         "replaced_pids": sorted(replaced_pids),
+        "unresolved_pids": sorted(unresolved_pids),
     }
 
 
@@ -1321,6 +1531,7 @@ def _observe_degraded(
     *,
     now_ns: Callable[[], int],
     poll: Callable[[float], None],
+    lode_id: str | None = None,
 ) -> dict:
     deadline = containment["deadline_monotonic_ns"]
     result_and_label = {
@@ -1337,6 +1548,27 @@ def _observe_degraded(
             "degraded teardown observed; birth identity and leak-free cleanup unproven",
         ),
     }[mode]
+
+    state = containment["state"]
+    is_force = state in {"kill_pending", "verify_after_kill"}
+    if is_force:
+        for name in (
+            "observe_bounded",
+            "observe_pane",
+            "signal_owned",
+            "read_basename",
+            "read_zombie",
+        ):
+            if name not in handles or not callable(handles[name]):
+                return _blocked(
+                    containment,
+                    _programming_error("handle", name, ValueError(f"handle is required: {name}")),
+                )
+
+    signalled_pids: set[int] = set()
+    signal_errors: dict[int, str] = {}
+    basenames: dict[int, str | None] = {}
+
     while True:
         observed, programming_errors = _scalar_observations(
             handles, ("observe_bounded", "observe_pane")
@@ -1362,24 +1594,199 @@ def _observe_degraded(
                 )
             )
             pane = None
-        if isinstance(bounded, dict):
-            containment["last_owned_process_count"] = bounded.get("count")
-        if isinstance(bounded, dict) and bounded.get("state") == "empty" and pane == "gone":
-            return _proven(containment, *result_and_label)
         if programming_errors:
             return _blocked(containment, programming_errors[0])
-        ambiguous = (
-            not isinstance(bounded, dict)
-            or bounded.get("state") == "cannot-tell"
-            or pane == "cannot-tell"
+
+        if isinstance(bounded, dict):
+            containment["last_owned_process_count"] = bounded.get("count")
+
+        unresolved_pids = (
+            set(bounded.get("unresolved_pids", ())) if isinstance(bounded, dict) else set()
         )
-        if now_ns() >= deadline:
-            error = (
-                "bounded containment remained ambiguous until budget expiry"
-                if ambiguous
-                else "bounded containment budget expired"
+        replaced_pids = (
+            set(bounded.get("replaced_pids", ())) if isinstance(bounded, dict) else set()
+        )
+        identities = bounded.get("identities", []) if isinstance(bounded, dict) else []
+
+        if not is_force:
+            if isinstance(bounded, dict) and bounded.get("state") == "empty" and pane == "gone":
+                return _proven(containment, *result_and_label)
+            ambiguous = (
+                not isinstance(bounded, dict)
+                or bounded.get("state") == "cannot-tell"
+                or pane == "cannot-tell"
             )
+            if now_ns() >= deadline:
+                if mode == "other-bounded-no-birth":
+                    error = (
+                        "bounded containment remained ambiguous until budget expiry"
+                        if ambiguous
+                        else "bounded containment budget expired"
+                    )
+                    return _blocked(containment, error)
+                if isinstance(bounded, dict) and bounded.get("state") == "empty" and pane != "gone":
+                    return _blocked(containment, "bounded containment budget expired")
+                return arm_phase(containment, "kill_pending", now_ns=now_ns)
+            _poll(now_ns, poll, deadline)
+            continue
+
+        exited_this_poll = set()
+        for identity in identities:
+            pid = identity.get("pid")
+            if (
+                not isinstance(pid, int)
+                or pid < 1
+                or pid in unresolved_pids
+                or pid in replaced_pids
+                or pid in signalled_pids
+            ):
+                continue
+            try:
+                zombie = handles["read_zombie"](identity)
+            except Exception as error:
+                return _blocked(containment, _programming_error("observer", "read_zombie", error))
+            if zombie is True:
+                continue
+            if pid not in basenames:
+                try:
+                    basenames[pid] = handles["read_basename"](identity)
+                except Exception as error:
+                    return _blocked(
+                        containment, _programming_error("observer", "read_basename", error)
+                    )
+            try:
+                outcome = handles["signal_owned"](identity)
+            except Exception as error:
+                return _blocked(
+                    containment, _programming_error("force action", "signal_owned", error)
+                )
+            if not isinstance(outcome, dict) or outcome.get("state") not in {
+                "signalled",
+                "already-gone",
+                "unaddressable",
+            }:
+                return _blocked(
+                    containment,
+                    _programming_error(
+                        "force action",
+                        "signal_owned",
+                        ValueError(f"invalid force outcome: {outcome!r}"),
+                    ),
+                )
+            state = outcome["state"]
+            if state == "signalled":
+                signalled_pids.add(pid)
+                signal_errors.pop(pid, None)
+                containment["state"] = "verify_after_kill"
+            elif state == "already-gone":
+                exited_this_poll.add(pid)
+            elif state == "unaddressable":
+                signal_errors[pid] = outcome.get("error") or "not verifiable"
+
+        if pane == "gone" and not unresolved_pids:
+            survivors = []
+            for identity in identities:
+                pid = identity["pid"]
+                if pid in replaced_pids or pid in exited_this_poll:
+                    continue
+                try:
+                    if handles["read_zombie"](identity) is True:
+                        continue
+                except Exception as error:
+                    return _blocked(
+                        containment, _programming_error("observer", "read_zombie", error)
+                    )
+                survivors.append(identity)
+            if not survivors:
+                base_result, base_label = result_and_label
+                if signalled_pids:
+                    ended_items = []
+                    for pid in sorted(signalled_pids):
+                        name = basenames.get(pid)
+                        if isinstance(name, str) and name and not any(ch in name for ch in " ,;"):
+                            ended_items.append(f"{pid} {name}")
+                        else:
+                            ended_items.append(f"{pid}")
+                    ended_str = ", ".join(ended_items)
+                    proof_label = f"{base_label}; ended {ended_str}"
+                    logger.info(
+                        "Bounded force ended owned processes lode=%s ended=%s",
+                        lode_id or "",
+                        ended_str,
+                    )
+                else:
+                    proof_label = base_label
+                return _proven(containment, base_result, proof_label)
+
+        if now_ns() >= deadline:
+            blocking_identities = []
+            seen_blocking = set()
+            for identity in identities:
+                pid = identity["pid"]
+                if pid in replaced_pids or pid in exited_this_poll:
+                    continue
+                try:
+                    if handles["read_zombie"](identity) is True:
+                        continue
+                except Exception:
+                    pass
+                blocking_identities.append(identity)
+                seen_blocking.add(pid)
+            for u_pid in unresolved_pids:
+                if (
+                    u_pid not in seen_blocking
+                    and u_pid not in replaced_pids
+                    and u_pid not in exited_this_poll
+                ):
+                    blocking_identities.append({"pid": u_pid})
+                    seen_blocking.add(u_pid)
+            blocking_identities.sort(key=lambda ident: ident["pid"])
+
+            containment["state"] = "verify_after_kill" if signalled_pids else "kill_pending"
+
+            if not blocking_identities:
+                return _blocked(
+                    containment,
+                    "bounded containment budget expired",
+                )
+
+            items = []
+            tags = []
+            for identity in blocking_identities:
+                pid = identity["pid"]
+                if pid not in basenames or not basenames[pid]:
+                    try:
+                        basenames[pid] = handles["read_basename"](identity)
+                    except Exception:
+                        pass
+                name = basenames.get(pid)
+                if isinstance(name, str) and name and not any(ch in name for ch in " ,;"):
+                    pid_text = f"{pid} {name}"
+                else:
+                    pid_text = f"{pid}"
+                if pid in signalled_pids:
+                    tag = "survived SIGKILL"
+                elif pid in signal_errors:
+                    tag = f"could not be signalled: {signal_errors[pid]}"
+                else:
+                    tag = "could not be signalled: not verifiable"
+                items.append((pid_text, tag))
+                tags.append(tag)
+
+            count = len(items)
+            noun = "process" if count == 1 else "processes"
+            trailer = " Retry the same action once the process has exited or can be signalled."
+
+            all_same_tag = len(set(tags)) == 1
+            if all_same_tag:
+                pids_str = ", ".join(pid_text for pid_text, _ in items)
+                error = f"blocked on {count} owned {noun}: {pids_str}; {tags[0]}{trailer}"
+            else:
+                parts_str = ", ".join(f"{pid_text} ({tag})" for pid_text, tag in items)
+                error = f"blocked on {count} owned {noun}: {parts_str}{trailer}"
+
             return _blocked(containment, error)
+
         _poll(now_ns, poll, deadline)
 
 
@@ -1399,6 +1806,14 @@ def observe_containment(
         containment = normalize_legacy_blocked_containment(record, now_ns=now_ns)
     elif original_state in {"not_started", "pane_close_pending"}:
         containment = arm_phase(record["containment"], "grace", now_ns=now_ns)
+    elif (
+        record["ownership"]["proof_mode"] in {"darwin-bounded", "linux-degraded"}
+        and original_state in {"kill_pending", "verify_after_kill"}
+        and host_boot_identity == record["boot_id"]
+        and isinstance(record["containment"].get("deadline_monotonic_ns"), int)
+        and now_ns() >= record["containment"]["deadline_monotonic_ns"]
+    ):
+        containment = arm_phase(record["containment"], original_state, now_ns=now_ns)
     elif host_boot_identity != record["boot_id"]:
         containment = arm_phase(record["containment"], original_state, now_ns=now_ns)
     else:
@@ -1417,4 +1832,11 @@ def observe_containment(
             now_ns=now_ns,
             poll=poll,
         )
-    return _observe_degraded(mode, containment, handles, now_ns=now_ns, poll=poll)
+    return _observe_degraded(
+        mode,
+        containment,
+        handles,
+        now_ns=now_ns,
+        poll=poll,
+        lode_id=record.get("lode_id"),
+    )

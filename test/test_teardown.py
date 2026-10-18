@@ -4,15 +4,17 @@
 """Tests for ownership capture and deterministic containment."""
 
 import errno
+import json
 import os
 import select
 import signal
 import subprocess
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hopper import oom, teardown, tmux
+from hopper import actions, oom, teardown, tmux
 
 
 def _linux_stat(pid=100, ppid=10, pgid=100, starttime=12345, command="worker (inner)"):
@@ -1670,3 +1672,662 @@ def test_explicit_kill_still_escalates_when_the_runner_will_not_exit():
     )
 
     assert result["state"] == "kill_pending"
+
+
+def test_bounded_force_reparented_owned_pid_signalled_by_positive_pid():
+    clock, now_ns, poll = _fake_clock()
+    record = _expired_grace("darwin-bounded")
+    signalled = []
+
+    def fail_signal(identity):
+        signalled.append(identity)
+        return _force("signalled")
+
+    grace_result = _observe(
+        record,
+        {
+            "observe_bounded": lambda: {
+                "state": "populated",
+                "identities": [_ps_process(pid=42, ppid=1, pgid=99)],
+                "unresolved_pids": [],
+            },
+            "observe_pane": lambda: "alive",
+            "signal_owned": fail_signal,
+            "read_basename": lambda ident: "worker",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert grace_result["state"] == "kill_pending"
+    assert grace_result["last_error"] is None
+    assert len(signalled) == 0
+
+    record["containment"] = grace_result
+    signal_calls = []
+    poll_count = 0
+
+    def bounded_obs():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            return {
+                "state": "populated",
+                "identities": [_ps_process(pid=42, ppid=1, pgid=99)],
+                "unresolved_pids": [],
+            }
+        return {"state": "empty", "identities": [], "unresolved_pids": []}
+
+    def record_signal(identity):
+        signal_calls.append(identity)
+        return _force("signalled")
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone" if poll_count > 1 else "alive",
+            "signal_owned": record_signal,
+            "read_basename": lambda ident: "worker",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "proven"
+    assert result["result"] == "darwin-bounded-empty"
+    assert "bounded Darwin teardown observed" in result["proof_label"]
+    assert "; ended 42 worker" in result["proof_label"]
+    assert len(signal_calls) == 1
+    assert signal_calls[0]["pid"] == 42
+    assert signal_calls[0]["pid"] > 0
+
+
+def test_bounded_force_child_of_present_owned_parent_is_signalled_and_bystander_is_not():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    signal_calls = []
+    poll_count = 0
+
+    def bounded_obs():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            return {
+                "state": "populated",
+                "identities": [
+                    _ps_process(pid=10, ppid=1),
+                    _ps_process(pid=20, ppid=10),
+                ],
+                "unresolved_pids": [],
+            }
+        return {"state": "empty", "identities": [], "unresolved_pids": []}
+
+    def record_signal(identity):
+        signal_calls.append(identity["pid"])
+        return _force("signalled")
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone" if poll_count > 1 else "alive",
+            "signal_owned": record_signal,
+            "read_basename": lambda ident: f"proc{ident['pid']}",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "proven"
+    assert set(signal_calls) == {10, 20}
+    assert 30 not in signal_calls
+    assert "; ended 10 proc10, 20 proc20" in result["proof_label"]
+
+
+def test_bounded_force_birth_mismatch_not_signalled_and_does_not_block():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    signal_calls = []
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": lambda: {
+                "state": "empty",
+                "identities": [],
+                "replaced_pids": [55],
+                "unresolved_pids": [],
+            },
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: signal_calls.append(ident["pid"]) or _force("signalled"),
+            "read_basename": lambda ident: "worker",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "proven"
+    assert result["result"] == "darwin-bounded-empty"
+    assert "; ended" not in result["proof_label"]
+    assert len(signal_calls) == 0
+
+    signal_calls.clear()
+    record_b = _containment_record("darwin-bounded", state="kill_pending")
+    record_b["containment"] = teardown.arm_phase(
+        record_b["containment"], "kill_pending", now_ns=now_ns
+    )
+    result_b = _observe(
+        record_b,
+        {
+            "observe_bounded": lambda: {
+                "state": "populated",
+                "identities": [_ps_process(pid=77)],
+                "unresolved_pids": [],
+            },
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: (
+                signal_calls.append(ident["pid"]) or _force("already-gone")
+            ),
+            "read_basename": lambda ident: "worker",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result_b["state"] == "proven"
+    assert result_b["result"] == "darwin-bounded-empty"
+    assert "; ended" not in result_b["proof_label"]
+    assert signal_calls == [77]
+
+
+def test_bounded_force_unresolved_pid_blocks_while_sibling_signalled():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    signal_calls = []
+
+    def bounded_obs():
+        clock["now"] += int(teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
+        return {
+            "state": "populated",
+            "identities": [_ps_process(pid=102)],
+            "unresolved_pids": [101],
+        }
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: signal_calls.append(ident["pid"]) or _force("signalled"),
+            "read_basename": lambda ident: "worker" if ident.get("pid") == 102 else None,
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "verify_after_kill"
+    assert result["last_error"] == (
+        "blocked on 2 owned processes: 101 (could not be signalled: not verifiable), "
+        "102 worker (survived SIGKILL) "
+        "Retry the same action once the process has exited or can be signalled."
+    )
+    assert signal_calls == [102]
+
+    # If the sibling was signalled and is gone by the deadline:
+    clock2, now_ns2, poll2 = _fake_clock()
+    record2 = _containment_record("darwin-bounded", state="kill_pending")
+    record2["containment"] = teardown.arm_phase(
+        record2["containment"], "kill_pending", now_ns=now_ns2
+    )
+    poll_count = 0
+
+    def bounded_obs2():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            return {
+                "state": "populated",
+                "identities": [_ps_process(pid=102)],
+                "unresolved_pids": [101],
+            }
+        clock2["now"] += int(teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
+        return {
+            "state": "cannot-tell",
+            "identities": [],
+            "unresolved_pids": [101],
+        }
+
+    result2 = _observe(
+        record2,
+        {
+            "observe_bounded": bounded_obs2,
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: _force("signalled"),
+            "read_basename": lambda ident: "worker" if ident.get("pid") == 102 else None,
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns2,
+        poll=poll2,
+    )
+    assert result2["state"] == "verify_after_kill"
+    assert result2["last_error"] == (
+        "blocked on 1 owned process: 101; could not be signalled: not verifiable "
+        "Retry the same action once the process has exited or can be signalled."
+    )
+
+
+def test_bounded_force_signal_owned_unaddressable_blocks():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+
+    def bounded_obs():
+        clock["now"] += int(teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
+        return {
+            "state": "populated",
+            "identities": [_ps_process(pid=80695)],
+            "unresolved_pids": [],
+        }
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: _force(
+                "unaddressable", "[Errno 1] Operation not permitted"
+            ),
+            "read_basename": lambda ident: "DTServiceHub",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "kill_pending"
+    assert result["last_error"] == (
+        "blocked on 1 owned process: 80695 DTServiceHub; "
+        "could not be signalled: [Errno 1] Operation not permitted "
+        "Retry the same action once the process has exited or can be signalled."
+    )
+
+
+def test_bounded_force_basename_missing_or_space_omits_name():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+
+    def bounded_obs():
+        clock["now"] += int(teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
+        return {
+            "state": "populated",
+            "identities": [_ps_process(pid=12)],
+            "unresolved_pids": [],
+        }
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: _force("unaddressable", None),
+            "read_basename": lambda ident: "name with spaces",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["last_error"] == (
+        "blocked on 1 owned process: 12; could not be signalled: not verifiable"
+        " Retry the same action once the process has exited or can be signalled."
+    )
+
+
+def test_bounded_force_zombies_alone_prove_empty_without_signals():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    signals = []
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": lambda: {
+                "state": "populated",
+                "identities": [_ps_process(pid=33)],
+                "unresolved_pids": [],
+            },
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: signals.append(ident) or _force("signalled"),
+            "read_basename": lambda ident: "zomb",
+            "read_zombie": lambda ident: True,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "proven"
+    assert result["result"] == "darwin-bounded-empty"
+    assert "; ended" not in result["proof_label"]
+    assert len(signals) == 0
+
+
+def test_bounded_force_survived_sigkill_at_deadline():
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+
+    def bounded_obs():
+        clock["now"] += int(teardown.CONTAINMENT_TIMEOUT_SEC * 1_000_000_000)
+        return {
+            "state": "populated",
+            "identities": [_ps_process(pid=44)],
+            "unresolved_pids": [],
+        }
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone",
+            "signal_owned": lambda ident: _force("signalled"),
+            "read_basename": lambda ident: "stubborn",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "verify_after_kill"
+    assert result["last_error"] == (
+        "blocked on 1 owned process: 44 stubborn; survived SIGKILL"
+        " Retry the same action once the process has exited or can be signalled."
+    )
+
+
+def test_bounded_force_post_force_entry_arms_fresh_deadline_and_re_signals():
+    clock, now_ns, poll = _fake_clock(start=100_000_000_000)
+    record = _containment_record("darwin-bounded", state="verify_after_kill")
+    record["containment"]["started_monotonic_ns"] = 1_000_000_000
+    record["containment"]["deadline_monotonic_ns"] = 31_000_000_000
+    record["containment"]["last_error"] = "old error"
+
+    calls = []
+    poll_count = 0
+
+    def bounded_obs():
+        nonlocal poll_count
+        poll_count += 1
+        calls.append(("observe", poll_count))
+        if poll_count == 1:
+            return {
+                "state": "populated",
+                "identities": [_ps_process(pid=88)],
+                "unresolved_pids": [],
+            }
+        return {"state": "empty", "identities": [], "unresolved_pids": []}
+
+    def record_signal(identity):
+        calls.append(("signal", identity["pid"]))
+        return _force("signalled")
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": bounded_obs,
+            "observe_pane": lambda: "gone" if poll_count > 1 else "alive",
+            "signal_owned": record_signal,
+            "read_basename": lambda ident: "worker",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "proven"
+    assert result["last_error"] is None
+    assert result["started_monotonic_ns"] == 100_000_000_000
+    assert result["deadline_monotonic_ns"] == 130_000_000_000
+    assert calls[0] == ("observe", 1)
+    assert calls[1] == ("signal", 88)
+
+
+def test_other_bounded_no_birth_never_signals_on_populated_set():
+    clock, now_ns, poll = _fake_clock()
+    record = _expired_grace("other-bounded-no-birth")
+
+    def fail_signal(_ident):
+        pytest.fail("signal_owned must never be called for other-bounded-no-birth")
+
+    result = _observe(
+        record,
+        {
+            "observe_bounded": lambda: {
+                "state": "populated",
+                "identities": [{"pid": 50}],
+                "unresolved_pids": [],
+            },
+            "observe_pane": lambda: "alive",
+            "signal_owned": fail_signal,
+            "read_basename": lambda ident: "proc",
+            "read_zombie": lambda ident: False,
+        },
+        now_ns=now_ns,
+        poll=poll,
+    )
+    assert result["state"] == "grace"
+    assert result["last_error"] == "bounded containment budget expired"
+
+
+def test_signal_bounded_process_linux_and_macos(tmp_path, monkeypatch):
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    (proc_root / "sys" / "kernel" / "random").mkdir(parents=True)
+    (proc_root / "sys" / "kernel" / "random" / "boot_id").write_text("boot-one\n")
+    (proc_root / "42").mkdir()
+    (proc_root / "42" / "stat").write_text(_linux_stat(pid=42, starttime=123))
+
+    killed = []
+
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+
+    ident = _linux_process(pid=42, start=123)
+
+    def fake_reader(pid, **kwargs):
+        return {"state": "alive", "identity": ident, "error": None}
+
+    monkeypatch.setattr(teardown, "resolve_pidfd_interface", lambda: None)
+    res_unavailable = teardown.signal_bounded_process(
+        ident,
+        platform="linux",
+        proc_root=proc_root,
+        pidfd_interface=None,
+        process_reader=fake_reader,
+        kill=fake_kill,
+    )
+    assert res_unavailable == {"state": "signalled", "error": None}
+    assert killed == [(42, signal.SIGKILL)]
+    assert "pidfd" not in res_unavailable["state"]
+    assert "pidfd" not in str(res_unavailable.get("error"))
+
+    killed.clear()
+
+    def pidfd_enosys_open(pid, flags):
+        err = OSError()
+        err.errno = errno.ENOSYS
+        raise err
+
+    pidfd_interface_enosys = {
+        "open": pidfd_enosys_open,
+        "send_signal": lambda *args: None,
+    }
+    res_unsupported = teardown.signal_bounded_process(
+        ident,
+        platform="linux",
+        proc_root=proc_root,
+        pidfd_interface=pidfd_interface_enosys,
+        process_reader=fake_reader,
+        kill=fake_kill,
+    )
+    assert res_unsupported == {"state": "signalled", "error": None}
+    assert killed == [(42, signal.SIGKILL)]
+    assert "pidfd" not in res_unsupported["state"]
+    assert "pidfd" not in str(res_unsupported.get("error"))
+
+    killed.clear()
+
+    def pidfd_refused_open(pid, flags):
+        err = OSError()
+        err.errno = errno.EPERM
+        raise err
+
+    pidfd_interface_refused = {
+        "open": pidfd_refused_open,
+        "send_signal": lambda *args: None,
+    }
+    res_refused = teardown.signal_bounded_process(
+        ident,
+        platform="linux",
+        proc_root=proc_root,
+        pidfd_interface=pidfd_interface_refused,
+        process_reader=fake_reader,
+        kill=fake_kill,
+    )
+    assert res_refused == {"state": "signalled", "error": None}
+    assert killed == [(42, signal.SIGKILL)]
+
+    killed.clear()
+
+    def pidfd_eperm_send(fd, sig, info, flags):
+        err = OSError(errno.EPERM, "Operation not permitted")
+        err.errno = errno.EPERM
+        raise err
+
+    pidfd_interface_b = {
+        "open": lambda pid, flags: 99,
+        "send_signal": pidfd_eperm_send,
+    }
+    with patch("os.close"):
+        res_send_eperm = teardown.signal_bounded_process(
+            ident,
+            platform="linux",
+            proc_root=proc_root,
+            pidfd_interface=pidfd_interface_b,
+            process_reader=fake_reader,
+            kill=fake_kill,
+        )
+    assert res_send_eperm["state"] == "unaddressable"
+    assert res_send_eperm["error"] == str(OSError(errno.EPERM, "Operation not permitted"))
+    assert len(killed) == 0
+
+    killed.clear()
+    ident_unknown_birth = {"pid": 42, "birth": {"kind": "ps-lstart", "value": "x"}}
+    res_not_verifiable = teardown.signal_bounded_process(
+        ident_unknown_birth,
+        platform="linux",
+        proc_root=proc_root,
+        kill=fake_kill,
+    )
+    assert res_not_verifiable == {"state": "unaddressable", "error": "not verifiable"}
+    assert len(killed) == 0
+
+    def fake_mismatched_reader(pid, **kwargs):
+        return {"state": "alive", "identity": _linux_process(pid=42, start=999), "error": None}
+
+    res_mismatch = teardown.signal_bounded_process(
+        ident,
+        platform="linux",
+        proc_root=proc_root,
+        pidfd_interface=pidfd_interface_refused,
+        process_reader=fake_mismatched_reader,
+        kill=fake_kill,
+    )
+    assert res_mismatch == {"state": "already-gone", "error": None}
+    assert len(killed) == 0
+
+    mac_ident = _ps_process(pid=77, start="Mon Aug 10 22:29:26 2026")
+
+    def mac_reader(pid, **kwargs):
+        return {"state": "alive", "identity": mac_ident, "error": None}
+
+    killed.clear()
+    res_mac = teardown.signal_bounded_process(
+        mac_ident,
+        platform="darwin",
+        process_reader=mac_reader,
+        kill=fake_kill,
+    )
+    assert res_mac == {"state": "signalled", "error": None}
+    assert killed == [(77, signal.SIGKILL)]
+
+
+def test_bounded_force_proof_label_and_receipt_validation(caplog):
+    clock, now_ns, poll = _fake_clock()
+    record = _containment_record("darwin-bounded", state="kill_pending")
+    record["containment"] = teardown.arm_phase(record["containment"], "kill_pending", now_ns=now_ns)
+    record["lode_id"] = "abcd2345"
+    poll_count = 0
+
+    def bounded_obs():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            return {
+                "state": "populated",
+                "identities": [_ps_process(pid=12), _ps_process(pid=80695)],
+                "unresolved_pids": [],
+            }
+        return {"state": "empty", "identities": [], "unresolved_pids": []}
+
+    basenames = {12: None, 80695: "DTServiceHub"}
+    with caplog.at_level("INFO", logger="hopper.teardown"):
+        result = teardown.observe_containment(
+            record,
+            {
+                "observe_bounded": bounded_obs,
+                "observe_pane": lambda: "gone" if poll_count > 1 else "alive",
+                "signal_owned": lambda ident: _force("signalled"),
+                "read_basename": lambda ident: basenames.get(ident["pid"]),
+                "read_zombie": lambda ident: False,
+            },
+            host_boot_identity="boot-one",
+            now_ns=now_ns,
+            poll=poll,
+        )
+
+    assert result["state"] == "proven"
+    assert result["proof_label"] == (
+        "bounded Darwin teardown observed; leak-free cleanup unproven; ended 12, 80695 DTServiceHub"
+    )
+    assert actions.scope_release_residual({"containment": result}) is None
+    log_messages = [rec.getMessage() for rec in caplog.records if rec.name == "hopper.teardown"]
+    assert any(
+        "Bounded force ended owned processes lode=abcd2345 ended=12, 80695 DTServiceHub" in msg
+        for msg in log_messages
+    )
+
+    receipt = {
+        "schema_version": 2,
+        "action_id": "11112222333344445555666677778888",
+        "lode_id": "abcd2345",
+        "expected_generation": "99990000111122223333444455556666",
+        "action_type": "completion",
+        "target_disposition": "advance_refine",
+        "force_consent": False,
+        "terminal_disposition": "advance_refine",
+        "completed_at_ms": 1789600000000,
+        "containment_proof": result["proof_label"],
+        "retained": {
+            "worktree": None,
+            "branch": None,
+            "session": None,
+        },
+        "successor": None,
+    }
+    fixture_path = (
+        Path(__file__).parent / "fixtures" / "action-results" / "manual-pause-ste6ema2.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert set(receipt) == set(fixture)
+    assert actions._validate_action_result(receipt) is receipt

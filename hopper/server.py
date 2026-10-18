@@ -535,6 +535,7 @@ _ACCEPTED_DELIVERY_REASONS = frozenset(
 _DELIVERY_FAILURE_OUTCOMES = {
     "pane_unavailable": "pane_unavailable",
     "idle_timeout": "busy",
+    "background_active": "background_active",
     "pane_state_unknown": "pane_state_unknown",
     "pane_blocked": "awaiting_operator",
     "pane_frozen": "pane_frozen",
@@ -560,6 +561,7 @@ _DELIVERY_FAILURE_OUTCOMES = {
 _GATE_FEEDBACK_STATUSES = {
     "pane_unavailable": "Feedback blocked: pane unavailable",
     "busy": "Feedback blocked: pane busy",
+    "background_active": "Feedback blocked: background work active",
     "not_sent": "Feedback not sent; gate remains blocked",
     "unverified": "Feedback outcome unknown; inspect pane",
     "pane_state_unknown": "Feedback blocked: pane state unrecognized",
@@ -579,6 +581,10 @@ _GATE_FEEDBACK_MESSAGES = {
         f"{_FEEDBACK_IDLE_WAIT_SECONDS:.1f}s. No feedback was pasted or submitted, and "
         "Hopper does not know when the pane will be ready. Wait for the current turn to "
         "finish, then retry the same feedback."
+    ),
+    "background_active": (
+        "Feedback was not sent because pane {pane} has background work active (tasks or watchers). "
+        "Nothing was pasted or submitted. Retry the same feedback once that work finishes."
     ),
     "pane_state_unknown": (
         "Feedback was not sent because Hopper does not recognize the pane state reported "
@@ -667,6 +673,10 @@ _PANE_INPUT_MESSAGES = {
         f"Input was not sent because pane {{pane}} did not become idle within "
         f"{_FEEDBACK_IDLE_WAIT_SECONDS:.1f}s. Hopper observed the pane processing a turn. "
         "Wait for the turn to finish, then retry."
+    ),
+    "background_active": (
+        "Input was not sent because pane {pane} has background work active (tasks or watchers). "
+        "Nothing was pasted or submitted. Retry once that work finishes."
     ),
     "pane_state_unknown": (
         "Input was not sent because Hopper does not recognize the pane state reported for "
@@ -766,6 +776,7 @@ _PRE_PASTE_REASONS = frozenset(
     {
         "pane_unavailable",
         "idle_timeout",
+        "background_active",
         "pane_state_unknown",
         "pane_frozen",
         "pane_awaiting_choice",
@@ -809,6 +820,24 @@ def _containment_phase_for_cursor(cursor: str) -> str | None:
     if cursor in {"kill_pending", "verify_after_kill"}:
         return "force_killing"
     return None
+
+
+def _required_force_kill_markers(record: dict) -> list[str]:
+    """Return required force kill markers; empty for non-strict records."""
+    ownership = record.get("ownership")
+    if not isinstance(ownership, dict) or ownership.get("proof_mode") != "linux-strict":
+        return []
+    containment = record["containment"]
+    distinct_pane_root = (
+        record["ownership"]["pane"]["root_process"]["pid"]
+        != record["ownership"]["supervisor"]["pid"]
+    )
+    required = []
+    if containment["last_cgroup_observation"] != "empty":
+        required.append("scope_kill")
+    if containment["last_supervisor_observation"] != "gone" or distinct_pane_root:
+        required.append("supervisor_kill")
+    return required
 
 
 def _clear_spawn_refusal(lode: dict, *, clear_status: bool = True) -> bool:
@@ -944,16 +973,28 @@ def _attempt_pane_delivery(
     """Attempt one pane delivery and return its reason and latest observations."""
     driver = resolve_driver(driver_name)
     observed_title = None
+    last_observed_phase = None
     if not pane_id:
-        return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
+        return {
+            "reason": "pane_unavailable",
+            "capture": None,
+            "title": observed_title,
+            "phase": None,
+        }
 
     latest_capture = capture_pane(pane_id, plain=True)
     if latest_capture is None:
-        return {"reason": "pane_unavailable", "capture": None, "title": observed_title}
+        return {
+            "reason": "pane_unavailable",
+            "capture": None,
+            "title": observed_title,
+            "phase": None,
+        }
 
     pre_delivery_input = None
     answer_state = None
     saw_processing = False
+    saw_background = False
     processing_frozen = False
     for _ in range(_FEEDBACK_IDLE_POLL_COUNT):
         time.sleep(_FEEDBACK_POLL_INTERVAL)
@@ -963,16 +1004,20 @@ def _attempt_pane_delivery(
                 "reason": "pane_unavailable",
                 "capture": latest_capture,
                 "title": observed_title,
+                "phase": last_observed_phase.value if last_observed_phase is not None else None,
             }
         latest_capture = capture
         observed_title = pane_title(pane_id)
         phase, keyboard = driver.observe_pane(observed_title, latest_capture)
+        last_observed_phase = phase
         if phase is PanePhase.BUSY:
             saw_processing = True
             processing_frozen = _observe_processing_pane_title(
                 observed_title,
                 pane_title_observation,
             )
+        elif phase is PanePhase.BACKGROUND:
+            saw_background = True
         elif phase is PanePhase.IDLE:
             if pane_title_observation is not None:
                 pane_title_observation.clear()
@@ -985,12 +1030,14 @@ def _attempt_pane_delivery(
                     "reason": "pane_awaiting_choice",
                     "capture": latest_capture,
                     "title": observed_title,
+                    "phase": last_observed_phase.value if last_observed_phase is not None else None,
                 }
             if paste and keyboard is not KeyboardOwnership.COMPOSER:
                 return {
                     "reason": "pane_state_unknown",
                     "capture": latest_capture,
                     "title": observed_title,
+                    "phase": last_observed_phase.value if last_observed_phase is not None else None,
                 }
             if not paste:
                 if keyboard is KeyboardOwnership.UNKNOWN:
@@ -998,6 +1045,9 @@ def _attempt_pane_delivery(
                         "reason": "pane_state_unknown",
                         "capture": latest_capture,
                         "title": observed_title,
+                        "phase": last_observed_phase.value
+                        if last_observed_phase is not None
+                        else None,
                     }
                 answer_state = driver.pane_answer_choices(latest_capture)
                 if answer_state is None:
@@ -1005,6 +1055,9 @@ def _attempt_pane_delivery(
                         "reason": "pane_not_awaiting_choice",
                         "capture": latest_capture,
                         "title": observed_title,
+                        "phase": last_observed_phase.value
+                        if last_observed_phase is not None
+                        else None,
                     }
             pre_delivery_input = driver.read_pane_input(latest_capture)
             break
@@ -1018,6 +1071,7 @@ def _attempt_pane_delivery(
                     "reason": "pane_awaiting_choice",
                     "capture": latest_capture,
                     "title": observed_title,
+                    "phase": last_observed_phase.value if last_observed_phase is not None else None,
                 }
             answer_state = driver.pane_answer_choices(latest_capture)
             if answer_state is None:
@@ -1025,6 +1079,7 @@ def _attempt_pane_delivery(
                     "reason": "pane_not_awaiting_choice",
                     "capture": latest_capture,
                     "title": observed_title,
+                    "phase": last_observed_phase.value if last_observed_phase is not None else None,
                 }
             break
         elif phase in {PanePhase.BLOCKED, PanePhase.AUTH}:
@@ -1032,19 +1087,27 @@ def _attempt_pane_delivery(
                 "reason": "pane_blocked",
                 "capture": latest_capture,
                 "title": observed_title,
+                "phase": last_observed_phase.value if last_observed_phase is not None else None,
             }
         else:
             processing_frozen = False
             if pane_title_observation is not None:
                 pane_title_observation.clear()
     else:
-        if not saw_processing:
-            reason = "pane_state_unknown"
-        elif processing_frozen:
+        if saw_processing and processing_frozen:
             reason = "pane_frozen"
-        else:
+        elif saw_processing:
             reason = "idle_timeout"
-        return {"reason": reason, "capture": latest_capture, "title": observed_title}
+        elif saw_background:
+            reason = "background_active"
+        else:
+            reason = "pane_state_unknown"
+        return {
+            "reason": reason,
+            "capture": latest_capture,
+            "title": observed_title,
+            "phase": last_observed_phase.value if last_observed_phase is not None else None,
+        }
 
     if not paste:
         try:
@@ -1375,8 +1438,9 @@ def _persist_failed_pane_capture(lode_id: str, reason: str, result: dict, driver
     try:
         path = get_lode_dir(lode_id) / "pane-delivery-failures.log"
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        phase = result.get("phase") or "unknown"
         entry = (
-            f"=== {stamp} driver={driver_name} reason={reason} "
+            f"=== {stamp} driver={driver_name} reason={reason} phase={phase} "
             f"title={_render_observed_title(result.get('title'))}\n{capture.rstrip()}\n"
         )
         previous = path.read_text() if path.exists() else ""
@@ -1488,6 +1552,7 @@ class Server:
         self.client_generations: dict[socket.socket, str] = {}
         self.pending_disconnects: dict[tuple[str, str], dict] = {}
         self._last_worktree_reap_sweep_at: float | None = None
+        self._reap_warnings_seen: set[tuple[str, str]] = set()
         self.runner_results: dict[tuple[str, str], tuple[str | None, int]] = {}
         self.action_threads: dict[tuple[str, str], threading.Thread] = {}
         self.registration_threads: dict[str, threading.Thread] = {}
@@ -1510,6 +1575,23 @@ class Server:
         self._socket_bound = False
         self.ready = threading.Event()
         self.startup_error: Exception | None = None
+
+    def _log_reap_warning(
+        self,
+        lode_id: str,
+        message: str,
+        *args: object,
+        exc_info: bool = False,
+    ) -> None:
+        """Log a worktree reap warning exactly once for each (lode_id, formatted_message) pair."""
+        formatted = message % args if args else message
+        key = (lode_id, formatted)
+        if key not in self._reap_warnings_seen:
+            self._reap_warnings_seen.add(key)
+            if exc_info:
+                logger.exception("%s", formatted)
+            else:
+                logger.warning("%s", formatted)
 
     def _find_lode(self, lode_id: str) -> dict | None:
         """Find a lode by ID."""
@@ -3288,10 +3370,14 @@ class Server:
         record: dict,
         retained_pidfd: int | None,
         *,
-        now_ns: Callable[[], int] = time.monotonic_ns,
-        poll: Callable[[float], None] = time.sleep,
+        now_ns: Callable[[], int] | None = None,
+        poll: Callable[[float], None] | None = None,
     ) -> dict:
         """Build identity-bound observers and run the bounded state machine."""
+        if now_ns is None:
+            now_ns = time.monotonic_ns
+        if poll is None:
+            poll = time.sleep
         result_handles = {}
         try:
             return self._observe_action_containment_impl(
@@ -3473,7 +3559,22 @@ class Server:
                     return "alive"
                 return "cannot-tell"
 
-            handles = {"observe_bounded": observe_bounded, "observe_pane": observe_pane}
+            def signal_owned(identity: dict) -> dict:
+                return teardown.signal_bounded_process(identity, platform=ownership["platform"])
+
+            def read_basename(identity: dict) -> str | None:
+                return teardown.read_process_basename(identity, platform=ownership["platform"])
+
+            def read_zombie(identity: dict) -> bool | None:
+                return teardown.read_process_zombie(identity, platform=ownership["platform"])
+
+            handles = {
+                "observe_bounded": observe_bounded,
+                "observe_pane": observe_pane,
+                "signal_owned": signal_owned,
+                "read_basename": read_basename,
+                "read_zombie": read_zombie,
+            }
 
         containment = teardown.observe_containment(
             record,
@@ -3748,15 +3849,7 @@ class Server:
         record["containment"] = containment
         if containment["state"] == "kill_pending":
             attempt = uuid.uuid4().hex
-            distinct_pane_root = (
-                record["ownership"]["pane"]["root_process"]["pid"]
-                != record["ownership"]["supervisor"]["pid"]
-            )
-            required_kill_markers = []
-            if containment["last_cgroup_observation"] != "empty":
-                required_kill_markers.append("scope_kill")
-            if containment["last_supervisor_observation"] != "gone" or distinct_pane_root:
-                required_kill_markers.append("supervisor_kill")
+            required_kill_markers = _required_force_kill_markers(record)
             for kill_marker in required_kill_markers:
                 state = record["markers"][kill_marker]["state"]
                 if state in {"not_started", "blocked"}:
@@ -4549,19 +4642,9 @@ class Server:
                         {"type": "error", "error": record["recovery"]["message"]},
                     )
                 return
-            distinct_pane_root = (
-                record["ownership"]["pane"]["root_process"]["pid"]
-                != record["ownership"]["supervisor"]["pid"]
+            required_kill_markers = (
+                _required_force_kill_markers(record) if cursor == "kill_pending" else []
             )
-            required_kill_markers = []
-            if cursor == "kill_pending":
-                if record["containment"]["last_cgroup_observation"] != "empty":
-                    required_kill_markers.append("scope_kill")
-                if (
-                    record["containment"]["last_supervisor_observation"] != "gone"
-                    or distinct_pane_root
-                ):
-                    required_kill_markers.append("supervisor_kill")
             for kill_marker in required_kill_markers:
                 state = record["markers"][kill_marker]["state"]
                 if state in {"not_started", "blocked"}:
@@ -5561,16 +5644,21 @@ class Server:
         worktree_reap = lode["worktree_reap"]
         project_name = lode.get("project", "")
         if not project_name:
-            logger.warning("Worktree reap skipped for %s: project is unavailable", lode_id)
+            self._log_reap_warning(
+                lode_id, "Worktree reap skipped for %s: project is unavailable", lode_id
+            )
             return False
         project = find_project(project_name)
         if not project:
-            logger.warning("Worktree reap skipped for %s: project not found", lode_id)
+            self._log_reap_warning(
+                lode_id, "Worktree reap skipped for %s: project not found", lode_id
+            )
             return False
 
         if type(worktree_reap.get("worktree_removed_at")) is not int:
             if is_dirty(str(worktree_path)) is not False:
-                logger.warning(
+                self._log_reap_warning(
+                    lode_id,
                     "Worktree reap skipped for %s: worktree is dirty or cleanliness could not be "
                     "proven; retaining %s",
                     lode_id,
@@ -5578,8 +5666,11 @@ class Server:
                 )
                 return False
             if not remove_worktree(project.path, str(worktree_path)):
-                logger.warning(
-                    "Worktree reap failed for %s: could not remove %s", lode_id, worktree_path
+                self._log_reap_warning(
+                    lode_id,
+                    "Worktree reap failed for %s: could not remove %s",
+                    lode_id,
+                    worktree_path,
                 )
                 return False
             worktree_reap["worktree_removed_at"] = current_time_ms()
@@ -5588,13 +5679,18 @@ class Server:
         branch = lode.get("branch", "") or f"hopper-{lode_id}"
         exists = branch_exists(project.path, branch)
         if exists is None:
-            logger.warning(
-                "Worktree reap incomplete for %s: branch existence is unverified", lode_id
+            self._log_reap_warning(
+                lode_id,
+                "Worktree reap incomplete for %s: branch existence is unverified",
+                lode_id,
             )
             return False
         if exists and not delete_branch(project.path, branch):
-            logger.warning(
-                "Worktree reap incomplete for %s: could not remove branch %s", lode_id, branch
+            self._log_reap_warning(
+                lode_id,
+                "Worktree reap incomplete for %s: could not remove branch %s",
+                lode_id,
+                branch,
             )
             return False
 
@@ -5690,7 +5786,8 @@ class Server:
                 ):
                     count, _basis = git.unpushed_commits(str(worktree_path))
                     if count != 0:
-                        logger.warning(
+                        self._log_reap_warning(
+                            lode_id,
                             "Worktree reap skipped for %s: unpushed commit count is %s",
                             lode_id,
                             "unknown" if count is None else count,
@@ -5699,7 +5796,12 @@ class Server:
 
                 completed = self._cleanup_worktree(lode, trigger=trigger)
             except Exception:
-                logger.exception("Worktree reap failed unexpectedly for lode=%s", lode.get("id"))
+                self._log_reap_warning(
+                    lode.get("id") or "<unknown>",
+                    "Worktree reap failed unexpectedly for lode=%s",
+                    lode.get("id"),
+                    exc_info=True,
+                )
             finally:
                 if (
                     lode.get("worktree_reap") != reap_before

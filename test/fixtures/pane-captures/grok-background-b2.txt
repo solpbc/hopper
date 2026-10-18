@@ -1,0 +1,22 @@
+  hopper-eiwl4phm worktree ~/.h/worktrees/eiwl4phm    59K / 256K │ [Dashboard]
+
+
+     ❯ # Senior Engineer                                             2:43 PM
+
+                                        ▲
+                                                                               █
+
+  Help improve Grok                                         [Opt out] [Opt in]
+  Off by default. Opt-in to allow SpaceXAI to retain coding
+  Read Terms and Privacy Policy.
+
+   ▾ Tasks 1
+   ⸬ Run Rerun make ci after UITest repair                               5m44s
+   ▾ Watchers 1
+   ⸬ Monitor Watch make ci until pass or a test failure                  3m25s
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰─────────────────────────────────────── Grok 4.7 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

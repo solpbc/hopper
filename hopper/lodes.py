@@ -1557,12 +1557,34 @@ def format_worktree_reaped_status(lode_id: str, worktree_reap: dict) -> str:
     )
 
 
+def worktree_reap_status_for_display(lode: dict) -> str | None:
+    """Return the derived reap status string for display when a worktree was removed."""
+    worktree_reap = lode.get("worktree_reap")
+    if not isinstance(worktree_reap, dict):
+        return None
+    removed_at = worktree_reap.get("worktree_removed_at")
+    if type(removed_at) is not int:
+        return None
+    age = format_age(removed_at)
+    phrase = age if age == "now" else f"{age} ago"
+    reaped_at = worktree_reap.get("reaped_at")
+    if type(reaped_at) is int:
+        return f"Worktree removed {phrase}; branch removed"
+    lode_id = lode.get("id", "")
+    branch = lode.get("branch", "") or f"hopper-{lode_id}"
+    return f"Worktree removed {phrase}; branch {branch} delete not completed"
+
+
 def _lode_status_and_liveness(
     lode: dict,
     *,
     pane_timeout: float | None = None,
 ) -> tuple[str, Liveness | None]:
     """Return display status and current local pane evidence, if probed."""
+    reap_status = worktree_reap_status_for_display(lode)
+    if reap_status is not None:
+        return reap_status, None
+
     status = lode.get("status", "")
     if not status:
         return status, None

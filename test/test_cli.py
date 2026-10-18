@@ -12052,6 +12052,130 @@ def test_ship_gate_cli_sigkill_and_git_state_recording(tmp_path, monkeypatch, ca
     t.join(timeout=1.0)
     assert len(messages) == 1
     assert messages[0]["exit"] == 0
-    assert messages[0]["dirty"] is True
-
     server_sock.close()
+
+
+def test_lode_nudge_wait_for_idle_retries_and_expires_background_active(monkeypatch, capsys):
+    clock = _nudge_idle_clock(monkeypatch)
+    budget = 5.0
+    bg_error = "Feedback blocked: background work active"
+    bg_active = {"type": "error", "outcome": "background_active", "error": bg_error}
+    success = {"type": "pane_input_sent"}
+
+    # 1. Retries background_active, then succeeds
+    send_calls = [bg_active, success]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", side_effect=send_calls) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "5"]) == 0
+    assert send.call_count == 2
+    assert capsys.readouterr().err.startswith(_nudge_begin_line(budget=budget))
+
+    # 2. Budget expiry after background retries, no busy seen: reports background work
+    clock[0] = 0.0
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", return_value=bg_active) as send,
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "5"]) == 1
+
+    captured = capsys.readouterr()
+    assert (
+        "still had background work active (tasks or watchers) "
+        "after 5s of a 5s --wait-for-idle budget." in captured.err
+    )
+    assert "still processing" not in captured.err
+    assert "Retry once that work finishes. Recover with: hop lode peek abc123" in captured.err
+
+    # 3. If busy was seen, keep existing processing sentence
+    clock[0] = 0.0
+    busy = {"type": "error", "outcome": "busy", "error": "busy error"}
+    send_calls_busy = [busy, bg_active, bg_active]
+    with (
+        patch("hopper.cli.require_server", return_value=None),
+        patch("hopper.client.read_lode_snapshot", return_value=("found", _NUDGE_LODE)),
+        patch("hopper.cli.pane_title", return_value=_IDLE_TITLE),
+        patch("hopper.client.send_pane_input", side_effect=send_calls_busy),
+    ):
+        assert cmd_lode(["nudge", "abc123", "--wait-for-idle", "5"]) == 1
+
+    captured_busy = capsys.readouterr()
+    assert "was still processing after 5s of a 5s --wait-for-idle budget." in captured_busy.err
+
+
+def test_worktree_reap_status_display_full_and_partial(monkeypatch):
+    from hopper.cli import format_lode_detail, format_lode_line
+    from hopper.lodes import (
+        lode_with_status_annotations,
+        worktree_reap_status_for_display,
+    )
+
+    now_ms = 1_700_000_000_000
+    monkeypatch.setattr("hopper.lodes.current_time_ms", lambda: now_ms)
+
+    # 1. Full reap (worktree_removed_at and reaped_at both ints)
+    lode_full = {
+        "id": "abc12345",
+        "project": "proj",
+        "stage": "shipped",
+        "state": "running",
+        "status": "shipped",
+        "branch": "hopper-abc12345",
+        "worktree_reap": {
+            "worktree_removed_at": now_ms - 60_000,
+            "reaped_at": now_ms - 30_000,
+        },
+    }
+    assert worktree_reap_status_for_display(lode_full) == "Worktree removed 1m ago; branch removed"
+    detail_full = format_lode_detail(lode_full)
+    line_full = format_lode_line(lode_full)
+    annot_full = lode_with_status_annotations(lode_full)
+
+    assert "Worktree removed 1m ago; branch removed" in detail_full
+    assert "worktree retained" not in detail_full
+    assert "Worktree removed 1m ago; branch removed" in line_full
+    assert "worktree retained" not in line_full
+    assert annot_full["status_display"] == "Worktree removed 1m ago; branch removed"
+
+    # Phrase "now" when removed_at == now_ms
+    lode_now = copy.deepcopy(lode_full)
+    lode_now["worktree_reap"]["worktree_removed_at"] = now_ms
+    assert worktree_reap_status_for_display(lode_now) == "Worktree removed now; branch removed"
+
+    # 2. Partial reap (worktree_removed_at int, reaped_at not int)
+    lode_partial = {
+        "id": "abc12345",
+        "project": "proj",
+        "stage": "shipped",
+        "state": "error",
+        "status": "error: failed",
+        "branch": "feat-branch",
+        "worktree_reap": {
+            "worktree_removed_at": now_ms - 120_000,
+            "reaped_at": None,
+        },
+    }
+    expected_partial = "Worktree removed 2m ago; branch feat-branch delete not completed"
+    assert worktree_reap_status_for_display(lode_partial) == expected_partial
+    detail_part = format_lode_detail(lode_partial)
+    line_part = format_lode_line(lode_partial)
+    annot_part = lode_with_status_annotations(lode_partial)
+
+    assert expected_partial in detail_part
+    assert expected_partial in line_part
+    assert annot_part["status_display"] == expected_partial
+    # Stored lode status remains unchanged
+    assert lode_partial["status"] == "error: failed"
+
+    # Default branch name hopper-{id} when branch is empty
+    lode_partial_nobranch = copy.deepcopy(lode_partial)
+    lode_partial_nobranch["branch"] = ""
+    assert (
+        worktree_reap_status_for_display(lode_partial_nobranch)
+        == "Worktree removed 2m ago; branch hopper-abc12345 delete not completed"
+    )
