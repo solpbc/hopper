@@ -4656,7 +4656,10 @@ class Server:
         lode["pending_action"] = None
         if is_ship:
             lode["state"] = "ready"
-            lode["status"] = actions.action_status(record)
+            # The live record stays pre-complete until the receipt is durable
+            # and the fence is removed. Archive with the status that phase
+            # will have once it is complete.
+            lode["status"] = actions.action_status({**record, "phase": "complete"})
             lode["active"] = False
             lode["pid"] = None
             lode["tmux_pane"] = None
@@ -4722,13 +4725,6 @@ class Server:
         record["phase"] = "complete"
         actions.write_pending_action(record)
         actions.clear_pending_action(record)
-        lode["pending_action"] = None
-        touch(lode)
-        if save_list is self.lodes:
-            save_lodes(self.lodes)
-        else:
-            save_archived_lodes(self.archived_lodes)
-        self.broadcast({"type": "lode_updated", "lode": lode})
 
     def _clear_completed_manual_action(self, record: dict) -> None:
         if record["result"] is None:
