@@ -14,6 +14,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hopper.client import (
+    DISPOSITION_RESPONSE_OVERHEAD_SEC,
+    DISPOSITION_WAIT_TIMEOUT_SEC,
+    MUTATION_ACK_TIMEOUT_SEC,
     RUN_GENERATION_ENV,
     RUNNER_MUTATION_TYPES,
     HopperConnection,
@@ -44,8 +47,10 @@ from hopper.client import (
     set_lode_progress,
     set_lode_state,
     set_lode_title,
+    submit_lode_action,
 )
 from hopper.server import Server
+from hopper.teardown import CONTAINMENT_TIMEOUT_SEC
 
 TEST_RUN_GENERATION = "a" * 32
 
@@ -1539,3 +1544,175 @@ class TestHopperConnection:
         assert result is False
 
         conn.stop()
+
+
+def test_disposition_wait_budget_is_containment_plus_overhead():
+    assert DISPOSITION_RESPONSE_OVERHEAD_SEC == 5.0
+    assert (
+        DISPOSITION_WAIT_TIMEOUT_SEC == CONTAINMENT_TIMEOUT_SEC + DISPOSITION_RESPONSE_OVERHEAD_SEC
+    )
+    assert DISPOSITION_WAIT_TIMEOUT_SEC == 35.0
+    assert MUTATION_ACK_TIMEOUT_SEC == 15.0
+
+
+def _submit_for_disposition(socket_path, *, wait_for_disposition, prepare):
+    """Exchange one submit_lode_action call against a local socket."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    listener.settimeout(2)
+    ready = threading.Event()
+    release = threading.Event()
+    found = {}
+
+    def serve():
+        conn, _ = listener.accept()
+        conn.settimeout(2)
+        try:
+            request = _read_request(conn)
+            found["request"] = request
+            ready.set()
+            if not release.wait(2):
+                return
+            conn.sendall(found["body"])
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    outcome = {}
+
+    def client():
+        outcome["value"] = submit_lode_action(
+            socket_path,
+            action_id="c" * 32,
+            lode_id="abcd2345",
+            expected_generation="a" * 32,
+            action_type="completion",
+            target_disposition="advance_refine",
+            force_consent=False,
+            stage="mill",
+            wait_for_disposition=wait_for_disposition,
+        )
+
+    client_thread = threading.Thread(target=client, daemon=True)
+    client_thread.start()
+    try:
+        assert ready.wait(2)
+        prepare(found)
+        release.set()
+        client_thread.join(2)
+        thread.join(2)
+    finally:
+        release.set()
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+    assert not client_thread.is_alive()
+    assert not thread.is_alive()
+    return outcome.get("value"), found.get("request")
+
+
+def _ack_body(request):
+    payload = {
+        "type": "lode_action_ack",
+        "exchange_id": request["exchange_id"],
+        "outcome": "completed",
+    }
+    return (json.dumps(payload) + "\n").encode()
+
+
+def test_disposition_wait_returns_ack_after_mutation_budget(monkeypatch, tmp_path):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("hopper.client.time.monotonic", lambda: clock["now"])
+
+    def prepare(found):
+        clock["now"] = 1016.0
+        found["body"] = _ack_body(found["request"])
+
+    response, request = _submit_for_disposition(
+        tmp_path / "late.sock",
+        wait_for_disposition=True,
+        prepare=prepare,
+    )
+    assert request["wait_for_disposition"] is True
+    assert response is not None
+    assert response["type"] == "lode_action_ack"
+    assert response["outcome"] == "completed"
+    assert response["exchange_id"] == request["exchange_id"]
+
+
+def test_disposition_wait_returns_none_when_budget_is_exhausted(monkeypatch, tmp_path):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("hopper.client.time.monotonic", lambda: clock["now"])
+
+    def prepare(found):
+        clock["now"] = 1035.0
+        found["body"] = _ack_body(found["request"])
+
+    response, _request = _submit_for_disposition(
+        tmp_path / "expired.sock",
+        wait_for_disposition=True,
+        prepare=prepare,
+    )
+    assert response is None
+
+
+def test_mutation_ack_budget_stays_fifteen_seconds(monkeypatch, tmp_path):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("hopper.client.time.monotonic", lambda: clock["now"])
+
+    def prepare(found):
+        clock["now"] = 1016.0
+        found["body"] = _ack_body(found["request"])
+
+    response, request = _submit_for_disposition(
+        tmp_path / "mutation.sock",
+        wait_for_disposition=False,
+        prepare=prepare,
+    )
+    assert "wait_for_disposition" not in request
+    assert response is None
+
+
+def test_disposition_wait_rejects_malformed_and_non_ack_responses(tmp_path):
+    def malformed(found):
+        found["body"] = b"[]\n"
+
+    response, _request = _submit_for_disposition(
+        tmp_path / "malformed.sock",
+        wait_for_disposition=True,
+        prepare=malformed,
+    )
+    assert response is None
+
+    def retrying(found):
+        payload = {
+            "type": "lode_action_retrying",
+            "exchange_id": found["request"]["exchange_id"],
+            "lode_id": "abcd2345",
+        }
+        found["body"] = (json.dumps(payload) + "\n").encode()
+
+    response, _request = _submit_for_disposition(
+        tmp_path / "retrying.sock",
+        wait_for_disposition=True,
+        prepare=retrying,
+    )
+    assert response is None
+
+
+def test_disposition_wait_returns_none_when_transport_fails(tmp_path):
+    assert (
+        submit_lode_action(
+            tmp_path / "missing.sock",
+            action_id="c" * 32,
+            lode_id="abcd2345",
+            expected_generation="a" * 32,
+            action_type="completion",
+            target_disposition="advance_refine",
+            force_consent=False,
+            stage="mill",
+            wait_for_disposition=True,
+        )
+        is None
+    )

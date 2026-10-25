@@ -2922,7 +2922,6 @@ def _resolve_lode(
         LodeCacheError,
         load_lode_cache,
         prune_lode_cache,
-        remote_lode_cache_path,
     )
 
     wait_path = deadline.get("wait_path", True)
@@ -3221,8 +3220,8 @@ def _resolve_lode(
                 probes=probe_rows,
             )
         message = (
-            f"Resident route unavailable for '{resident_id}': host {resident_host} from "
-            f"cache {remote_lode_cache_path()} could not return the cached lode. "
+            f"Resident route unavailable for '{resident_id}': live probe of host "
+            f"{resident_host} failed and did not return the lode. "
             "Hopper did NOT fan out to another pool member. "
             f"Recover with: {recovery}."
         )
@@ -4181,7 +4180,11 @@ def cmd_lode(args: list[str]) -> int:
     create_p = subs.add_parser("create", help="Create a new lode", exit_on_error=False)
     _add_create_args(create_p)
 
-    restart_p = subs.add_parser("restart", help="Safely restart a lode stage", exit_on_error=False)
+    restart_p = subs.add_parser(
+        "restart",
+        help=("Restart a lode stage, or recover a blocked completion and wait for its disposition"),
+        exit_on_error=False,
+    )
     restart_p.add_argument("lode_id", help="Lode ID to restart")
     restart_p.add_argument(
         "-f",
@@ -5414,11 +5417,19 @@ def cmd_watch(args: list[str]) -> int:
     return _run_wait_command(args, command_name="watch")
 
 
-@command("restart", "Safely restart a lode stage (alias for lode restart)", group="aliases")
+@command(
+    "restart",
+    "Restart a lode stage, or recover a blocked completion and wait (alias for lode restart)",
+    group="aliases",
+)
 def cmd_restart(args: list[str]) -> int:
     """Alias for hop lode restart."""
     if "-h" in args or "--help" in args:
-        p = make_parser("restart", "Safely restart a lode stage (alias for lode restart)")
+        p = make_parser(
+            "restart",
+            "Restart a lode stage, or recover a blocked completion and wait "
+            "(alias for lode restart)",
+        )
         p.add_argument("lode_id", help="Lode ID to restart")
         p.add_argument(
             "-f",

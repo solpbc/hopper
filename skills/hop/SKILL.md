@@ -283,12 +283,14 @@ earlier can be complete, committed, clean, and entirely absent from the remote.
 archive enforce this durability proof at the server boundary, including a
 second check after containment is empty and before archive publication.
 
-Restart an inactive lode (error, stuck, or failed ship):
+Restart an inactive lode (error, stuck, or failed ship), or recover a blocked completion:
 
 ```bash
 hop lode restart <lode-id>
 hop lode restart <lode-id> --force   # also restarts active lodes with a dead pane
 ```
+
+`hop lode restart <lode-id>` also recovers a blocked completion and waits for that action's disposition. That recovery resumes the accepted action rather than starting a new stage run.
 
 Archive an already-inactive lode whose recorded run ownership is unavailable:
 

@@ -17,12 +17,15 @@ from typing import Any, Callable, Literal
 from hopper import deadline as deadline_utils
 from hopper.coder import validate_coder_provider
 from hopper.lodes import current_time_ms
+from hopper.teardown import CONTAINMENT_TIMEOUT_SEC
 
 logger = logging.getLogger(__name__)
 
 RUN_GENERATION_ENV = "HOPPER_RUN_GENERATION"
 OOM_SCOPE_ENV = "HOPPER_OOM_SCOPE"
 MUTATION_ACK_TIMEOUT_SEC = 15.0
+DISPOSITION_RESPONSE_OVERHEAD_SEC = 5.0
+DISPOSITION_WAIT_TIMEOUT_SEC = CONTAINMENT_TIMEOUT_SEC + DISPOSITION_RESPONSE_OVERHEAD_SEC
 RUNNER_MUTATION_TYPES = frozenset(
     {
         "lode_register",
@@ -812,9 +815,11 @@ def submit_lode_action(
     stage: str,
     payload: dict | None = None,
     wait_for_disposition: bool = False,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+    timeout: float | None = None,
 ) -> dict | None:
     """Submit one identity-bound lode action and await its final server response."""
+    if timeout is None:
+        timeout = DISPOSITION_WAIT_TIMEOUT_SEC if wait_for_disposition else MUTATION_ACK_TIMEOUT_SEC
     request = {
         "type": "lode_action",
         "action_id": action_id,

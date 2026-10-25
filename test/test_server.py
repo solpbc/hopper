@@ -2060,7 +2060,7 @@ def test_pause_publishes_terminal_identity_only_after_empty_proof(socket_path, m
     )
     server.lodes = [lode]
     conn = _mock_client(server)
-    server.action_waiters[record["action_id"]] = [(conn, None)]
+    server.action_waiters[record["action_id"]] = [(conn, None, actions.record_binding(record))]
 
     server._continue_action(record)
 
@@ -2137,7 +2137,7 @@ def test_archive_publication_requires_post_empty_durability_recheck(
     )
     server.lodes = [lode]
     conn = _mock_client(server)
-    server.action_waiters[record["action_id"]] = [(conn, None)]
+    server.action_waiters[record["action_id"]] = [(conn, None, actions.record_binding(record))]
 
     with (
         patch("hopper.server.git.unpushed_commits", return_value=(count, "origin/main")) as probe,
@@ -2236,7 +2236,9 @@ def test_manual_action_containment_failure_preserves_identity_and_exact_recovery
     server = Server(socket_path)
     server.lodes = [lode]
     blocked_conn = _mock_client(server)
-    server.action_waiters[record["action_id"]] = [(blocked_conn, None)]
+    server.action_waiters[record["action_id"]] = [
+        (blocked_conn, None, actions.record_binding(record))
+    ]
     containment = copy.deepcopy(record["containment"])
     containment.update(
         state="grace" if failure_point == "inspection" else "kill_pending",
@@ -3000,7 +3002,7 @@ def test_manual_action_fault_matrix_converges_after_fresh_server_reconciliation(
         actions.write_pending_action(record)
         first._project_action(record, via="test_action_acceptance")
         waiter = _mock_client(first)
-        first.action_waiters[record["action_id"]] = [(waiter, None)]
+        first.action_waiters[record["action_id"]] = [(waiter, None, actions.record_binding(record))]
         real_persist = first._persist_action
         real_save_lodes = hopper_server.save_lodes
         real_archive = hopper_server.archive_lode_for_action
@@ -5160,8 +5162,10 @@ def test_shipped_cleanup_retry_reaches_retry_for_matching_completion(
     with patch.object(server, "_retry_action") as retry:
         server._handle_lode_action(_shipped_cleanup_retry_message(record), conn)
 
-    retry.assert_called_once_with(record["lode_id"], None)
-    assert server.action_waiters == {record["action_id"]: [(conn, None)]}
+    retry.assert_called_once_with(record["lode_id"], None, action_id=record["action_id"])
+    assert server.action_waiters == {
+        record["action_id"]: [(conn, None, actions.record_binding(record))]
+    }
 
 
 @pytest.mark.parametrize(
@@ -9246,7 +9250,19 @@ def test_in_band_action_refusal_reports_divergent_owner_without_persisting(socke
         },
     )
     server.lodes = [lode]
-    server.action_waiters[action_id] = [(object(), None)]
+    server.action_waiters[action_id] = [
+        (
+            object(),
+            None,
+            (
+                lode["id"],
+                request_generation,
+                "restart",
+                "replacement_spawned",
+                False,
+            ),
+        )
+    ]
 
     with patch.object(server, "_send_response") as send_response:
         server._send_action_ack(
@@ -14187,7 +14203,7 @@ def test_manual_ack_preserves_stage_session_on_cleanup(socket_path, make_lode, t
         already_empty=True,
     )
     conn = _mock_client(server)
-    server.action_waiters[record["action_id"]] = [(conn, None)]
+    server.action_waiters[record["action_id"]] = [(conn, None, actions.record_binding(record))]
 
     server._clear_completed_manual_action(record)
 
@@ -16129,3 +16145,841 @@ def test_plain_nudge_errors_append_queue_hint_only_for_paste_true(socket_path, m
         )
     resp = _decode_mock_response(conn)
     assert "hop lode nudge --queue" not in resp["error"]
+
+
+def _completion_retry_message(record, *, stage, exchange_id="exch-1", wait=True):
+    return {
+        "type": "lode_action",
+        "action_id": record["action_id"],
+        "lode_id": record["lode_id"],
+        "expected_generation": record["expected_generation"],
+        "action_type": "completion",
+        "target_disposition": record["target_disposition"],
+        "force_consent": False,
+        "stage": stage,
+        "wait_for_disposition": wait,
+        "exchange_id": exchange_id,
+    }
+
+
+def _register_completion_waiters(server, record, exchange_ids=("exch-1",)):
+    binding = actions.record_binding(record)
+    waiters = []
+    for exchange_id in exchange_ids:
+        conn = _mock_client(server)
+        waiters.append((conn, exchange_id, binding))
+    server.action_waiters[record["action_id"]] = waiters
+    return waiters
+
+
+def _call_with_unreadable_retry(callback):
+    entered = {"retry": False}
+    real_retry = Server._retry_action
+    real_load = Server._load_action_slot
+
+    def retry(self, lode_id, conn, *, action_id=None):
+        entered["retry"] = True
+        return real_retry(self, lode_id, conn, action_id=action_id)
+
+    def load(self, lode_id):
+        if entered["retry"]:
+            raise OSError("pending unreadable")
+        return real_load(self, lode_id)
+
+    with (
+        patch.object(Server, "_retry_action", retry),
+        patch.object(Server, "_load_action_slot", load),
+    ):
+        callback()
+    assert entered["retry"] is True
+
+
+def _assert_refused_binding(response, binding, *, exchange_id, reason, detail):
+    lode_id, generation, action_type, target, force = binding
+    assert response["type"] == "lode_action_ack"
+    assert response["outcome"] == "refused"
+    assert response["reason"] == reason
+    assert response["detail"] == (f"{detail} (refused request generation: {generation or 'none'})")
+    assert response["exchange_id"] == exchange_id
+    assert response["lode_id"] == lode_id
+    assert response["expected_generation"] == generation
+    assert response["action_type"] == action_type
+    assert response["target_disposition"] == target
+    assert response["force_consent"] is force
+
+
+@pytest.mark.parametrize(("worktree", "branch"), [(True, False), (False, True), (None, None)])
+def test_completion_clear_acks_durable_non_ship_receipt(socket_path, make_lode, worktree, branch):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="mill",
+        state="teardown",
+        active=True,
+        run_generation=record["expected_generation"],
+    )
+    server.lodes = [lode]
+    waiters = _register_completion_waiters(server, record, ("exch-1", "exch-2"))
+    observed = {"worktree": worktree, "branch": branch}
+    with patch("hopper.server._observe_action_retention", return_value=observed):
+        server._clear_completed_action(record)
+
+    for conn, exchange_id, _binding in waiters:
+        response = _decode_mock_response(conn)
+        assert response["type"] == "lode_action_ack"
+        assert response["outcome"] == "completed"
+        assert response["exchange_id"] == exchange_id
+        assert response["action_id"] == record["action_id"]
+    receipt = actions.find_action_result(lode, record["action_id"])
+    assert receipt["retained"]["worktree"] is worktree
+    assert receipt["retained"]["branch"] is branch
+    assert receipt["retained"]["session"] is True
+    assert lode["state"] == "running"
+    assert actions.load_pending_action(record["lode_id"]) is None
+    stored = load_lodes()
+    assert stored[0]["state"] == "running"
+    assert stored[0]["action_results"][-1]["action_id"] == record["action_id"]
+    assert stored[0]["action_results"][-1]["retained"]["worktree"] is worktree
+
+
+def test_ship_clear_acks_archived_lode_without_worktree_stat(socket_path, make_lode):
+    record = _pending_completion_record(stage="ship")
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="ship",
+        state="teardown",
+        active=True,
+        pid=9,
+        tmux_pane="%9",
+        oom_scope="scope-a",
+        run_generation=record["expected_generation"],
+    )
+    server.archived_lodes = [lode]
+    waiters = _register_completion_waiters(server, record, ("exch-ship", "exch-ship-2"))
+    with (
+        patch("hopper.server.resolve_worktree_path", side_effect=AssertionError("stat")),
+        patch("hopper.server.branch_exists", side_effect=AssertionError("branch")),
+    ):
+        server._clear_completed_action(record)
+
+    for conn, exchange_id, _binding in waiters:
+        response = _decode_mock_response(conn)
+        assert response["type"] == "lode_action_ack"
+        assert response["outcome"] == "completed"
+        assert response["exchange_id"] == exchange_id
+    assert lode["state"] == "ready"
+    assert lode["active"] is False
+    assert lode["pid"] is None
+    assert lode["tmux_pane"] is None
+    assert lode["oom_scope"] is None
+    receipt = actions.find_action_result(lode, record["action_id"])
+    assert receipt["retained"]["worktree"] is None
+    assert receipt["retained"]["branch"] is None
+    assert receipt["retained"]["session"] is False
+    assert actions.load_pending_action(record["lode_id"]) is None
+    stored = load_archived_lodes()
+    assert stored[0]["action_results"][-1]["action_id"] == record["action_id"]
+    assert stored[0]["state"] == "ready"
+    assert stored[0]["active"] is False
+
+
+def test_completed_action_resubmit_is_idempotent_without_another_spawn(socket_path, make_lode):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="mill",
+        state="teardown",
+        active=True,
+        run_generation="f" * 32,
+    )
+    server.lodes = [lode]
+    with patch(
+        "hopper.server._observe_action_retention",
+        return_value={"worktree": True, "branch": False},
+    ):
+        server._clear_completed_action(record)
+    assert actions.load_pending_action(record["lode_id"]) is None
+    conn = _mock_client(server)
+    message = _completion_retry_message(record, stage="mill", wait=False)
+    with (
+        patch.object(server, "_spawn_action_successor") as spawn,
+        patch.object(server, "_continue_completion_action") as continuation,
+    ):
+        server._handle_lode_action(message, conn)
+    spawn.assert_not_called()
+    continuation.assert_not_called()
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "idempotent"
+    assert response["reason"] == "already_completed"
+    assert actions.load_pending_action(record["lode_id"]) is None
+    opened = server._open_lode_action(
+        action_type="completion", message=message, prepared={"ok": False}
+    )
+    assert opened["reason"] == "already_completed"
+
+
+def test_completion_reblock_acks_waiter_and_keeps_fence(socket_path, make_lode):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    server.lodes = [make_lode(id=record["lode_id"], run_generation=record["expected_generation"])]
+    waiters = _register_completion_waiters(server, record, ("exch-block",))
+    server._block_action(record, "pending_clear", "cleanup", "spawn blocked")
+    response = _decode_mock_response(waiters[0][0])
+    assert response["type"] == "lode_action_ack"
+    assert response["outcome"] == "blocked"
+    assert response["reason"] == "cleanup_blocked"
+    assert response["detail"] == "spawn blocked"
+    assert response["exchange_id"] == "exch-block"
+    assert response["action_id"] == record["action_id"]
+    loaded = actions.load_pending_action(record["lode_id"])
+    assert loaded is not None
+    assert loaded["phase"] == "cleanup_blocked"
+    assert actions.pending_action_path(record["lode_id"]).exists()
+
+
+def test_retry_refusals_use_the_registering_binding(socket_path):
+    server = Server(socket_path)
+    staged_blob = actions.staging_dir("abcd2345") / ("b" * 32 + ".blob")
+
+    def next_record():
+        staged_blob.unlink(missing_ok=True)
+        return _pending_completion_record()
+
+    binding = actions.action_binding(
+        {
+            "lode_id": "abcd2345",
+            "expected_generation": TEST_RUN_GENERATION,
+            "action_type": "completion",
+            "target_disposition": "advance_refine",
+            "force_consent": False,
+        }
+    )
+    action_id = "c" * 32
+    conn = _mock_client(server)
+    server.action_waiters[action_id] = [(conn, "exch-miss", binding)]
+    server._retry_action("abcd2345", None, action_id=action_id)
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        binding,
+        exchange_id="exch-miss",
+        reason="invalid_pending_action",
+        detail="no pending action",
+    )
+
+    record = next_record()
+    path = actions.pending_action_path(record["lode_id"])
+    path.write_text("{", encoding="utf-8")
+    try:
+        actions.load_pending_action(record["lode_id"])
+    except json.JSONDecodeError as error:
+        expected_detail = str(error)
+    else:
+        raise AssertionError("garbage pending record was readable")
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [(conn, "exch-bad", binding)]
+    server._retry_action(record["lode_id"], None, action_id=record["action_id"])
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        binding,
+        exchange_id="exch-bad",
+        reason="invalid_pending_action",
+        detail=expected_detail,
+    )
+
+    record = next_record()
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [(conn, "exch-os", binding)]
+    with patch.object(server, "_load_action_slot", side_effect=OSError("disk unreadable")):
+        server._retry_action(record["lode_id"], None, action_id=record["action_id"])
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        binding,
+        exchange_id="exch-os",
+        reason="invalid_pending_action",
+        detail="disk unreadable",
+    )
+
+    record = next_record()
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [(conn, "exch-phase", binding)]
+    server._retry_action(record["lode_id"], None, action_id=record["action_id"])
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        binding,
+        exchange_id="exch-phase",
+        reason="invalid_action",
+        detail="action is not retryable",
+    )
+
+    staged_blob.unlink(missing_ok=True)
+    record = _blocked_output_record()
+    output_binding = actions.record_binding(record)
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [(conn, "exch-output", output_binding)]
+    server._retry_action(record["lode_id"], None, action_id=record["action_id"])
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "refused"
+    assert response["reason"] == "invalid_action"
+    assert response["detail"] == (
+        "accepted output requires repair-output "
+        f"(refused request generation: {record['expected_generation']})"
+    )
+    assert response["exchange_id"] == "exch-output"
+
+
+def test_retry_action_id_mismatch_does_not_pop_the_loaded_action(socket_path):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    kept = _mock_client(server)
+    binding = actions.record_binding(record)
+    server.action_waiters[record["action_id"]] = [(kept, "keep", binding)]
+    other_id = "e" * 32
+    conn = _mock_client(server)
+    server.action_waiters[other_id] = [(conn, "exch-mis", binding)]
+    server._retry_action(record["lode_id"], None, action_id=other_id)
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "refused"
+    assert response["reason"] == "invalid_action"
+    assert response["action_id"] == other_id
+    assert record["action_id"] in response["detail"]
+    assert response["exchange_id"] == "exch-mis"
+    assert server.action_waiters[record["action_id"]] == [(kept, "keep", binding)]
+    kept.sendall.assert_not_called()
+
+
+def test_retry_without_a_waiter_sends_nothing(socket_path):
+    server = Server(socket_path)
+    with patch.object(server, "_send_response") as send:
+        server._retry_action("abcd2345", None)
+    send.assert_not_called()
+
+
+def test_spawn_retry_without_proof_blocks_once_and_keeps_the_fence(socket_path):
+    record = _pending_completion_record()
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "spawn",
+        "message": "spawn blocked",
+        "command": f"hop lode restart {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [
+        (conn, "exch-proof", actions.record_binding(record))
+    ]
+    server._retry_action(record["lode_id"], None, action_id=record["action_id"])
+    assert conn.sendall.call_count == 1
+    response = _decode_mock_response(conn)
+    assert response["type"] == "lode_action_ack"
+    assert response["outcome"] == "blocked"
+    assert response["reason"] == "containment_blocked"
+    assert response["exchange_id"] == "exch-proof"
+    assert actions.pending_action_path(record["lode_id"]).exists()
+
+
+def test_direct_spawn_retry_without_proof_keeps_the_error_envelope(socket_path):
+    record = _pending_completion_record()
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "spawn",
+        "message": "spawn blocked",
+        "command": f"hop lode restart {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    conn = _mock_client(server)
+    server._retry_action(record["lode_id"], conn)
+    assert conn.sendall.call_count == 1
+    response = _decode_mock_response(conn)
+    assert response["type"] == "error"
+    assert "spawn retry refused" in response["error"]
+
+
+def test_successful_spawn_retry_leaves_disposition_waiters_registered(socket_path):
+    record = _pending_completion_record()
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "spawn",
+        "message": "spawn blocked",
+        "command": f"hop lode restart {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    conn = _mock_client(server)
+    binding = actions.record_binding(record)
+    server.action_waiters[record["action_id"]] = [(conn, "exch-go", binding)]
+    with (
+        patch("hopper.server.actions.containment_is_proven", return_value=True),
+        patch.object(server, "_continue_action") as continuation,
+    ):
+        server._retry_action(record["lode_id"], None, action_id=record["action_id"])
+    continuation.assert_called_once()
+    assert server.action_waiters[record["action_id"]] == [(conn, "exch-go", binding)]
+    conn.sendall.assert_not_called()
+
+
+def test_completion_handler_refusal_reaches_the_disposition_waiter(socket_path, make_lode):
+    record = _pending_completion_record()
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "spawn",
+        "message": "spawn blocked",
+        "command": f"hop lode restart {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(
+            id=record["lode_id"],
+            stage="refine",
+            state="teardown",
+            run_generation="f" * 32,
+            pending_action=actions.pending_action_projection(record),
+        )
+    ]
+    conn = _mock_client(server)
+    message = _completion_retry_message(record, stage="refine", exchange_id="exch-h1")
+
+    def invoke():
+        server._handle_lode_action(message, conn)
+
+    _call_with_unreadable_retry(invoke)
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        actions.record_binding(record),
+        exchange_id="exch-h1",
+        reason="invalid_pending_action",
+        detail="pending unreadable",
+    )
+
+
+def test_manual_handler_refusal_reaches_the_disposition_waiter(socket_path, make_lode):
+    record = _post_containment_manual_record("pause")
+    record["phase"] = "containment_blocked"
+    record["recovery"] = {
+        "kind": "containment",
+        "message": "containment blocked",
+        "command": f"hop lode pause {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(
+            id=record["lode_id"],
+            stage="mill",
+            state="teardown",
+            run_generation=record["expected_generation"],
+            pending_action=actions.pending_action_projection(record),
+        )
+    ]
+    conn = _mock_client(server)
+    message = _manual_action_message("pause")
+    message["exchange_id"] = "exch-h2"
+
+    def invoke():
+        server._handle_lode_action(message, conn)
+
+    _call_with_unreadable_retry(invoke)
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        actions.record_binding(record),
+        exchange_id="exch-h2",
+        reason="invalid_pending_action",
+        detail="pending unreadable",
+    )
+
+
+def test_acceptance_handler_refusal_reaches_the_pause_waiter(socket_path, make_lode):
+    record = _post_containment_manual_record("pause")
+    record["phase"] = "containment_blocked"
+    record["recovery"] = {
+        "kind": "containment",
+        "message": "containment blocked",
+        "command": f"hop lode pause {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    binding = actions.record_binding(record)
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(
+            id=record["lode_id"],
+            stage="mill",
+            state="teardown",
+            run_generation=record["expected_generation"],
+        )
+    ]
+    conn = _mock_client(server)
+    server.action_acceptances[record["lode_id"]] = (
+        record["action_id"],
+        binding,
+        [(conn, "exch-h3", binding)],
+    )
+    message = {
+        "type": "_action_acceptance_result",
+        "request": _manual_action_message("pause"),
+        "result": {"ok": False},
+    }
+
+    def invoke():
+        server._handle_action_acceptance_result(message, None)
+
+    _call_with_unreadable_retry(invoke)
+    _assert_refused_binding(
+        _decode_mock_response(conn),
+        binding,
+        exchange_id="exch-h3",
+        reason="invalid_pending_action",
+        detail="pending unreadable",
+    )
+
+
+def _fail_first_save(real):
+    calls = {"n": 0}
+
+    def flaky(items):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("terminal save failed")
+        return real(items)
+
+    return flaky
+
+
+def test_failed_completion_save_keeps_the_fence_until_a_fresh_server(socket_path, make_lode):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="mill",
+        state="teardown",
+        active=True,
+        run_generation=record["expected_generation"],
+    )
+    server.lodes = [lode]
+    save_lodes(server.lodes)
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [
+        (conn, "exch-fail", actions.record_binding(record))
+    ]
+    with (
+        patch(
+            "hopper.server._observe_action_retention",
+            return_value={"worktree": True, "branch": False},
+        ),
+        patch("hopper.server.save_lodes", side_effect=_fail_first_save(hopper_server.save_lodes)),
+    ):
+        server._clear_completed_action(record)
+    assert actions.find_action_result(lode, record["action_id"]) is None
+    assert actions.load_pending_action(record["lode_id"]) is not None
+    blocked = _decode_mock_response(conn)
+    assert blocked["outcome"] == "blocked"
+    opened = server._open_lode_action(
+        action_type="completion",
+        message=_completion_retry_message(record, stage="mill", wait=False),
+        prepared={"ok": False},
+    )
+    assert opened["reason"] == "already_accepted"
+    fresh = Server(socket_path)
+    fresh.lodes = load_lodes()
+    fresh_conn = _mock_client(fresh)
+    fresh.action_waiters[record["action_id"]] = [
+        (fresh_conn, "exch-fresh", actions.record_binding(record))
+    ]
+    with patch(
+        "hopper.server._observe_action_retention",
+        return_value={"worktree": True, "branch": False},
+    ):
+        fresh._clear_completed_action(actions.load_pending_action(record["lode_id"]))
+    assert actions.load_pending_action(record["lode_id"]) is None
+    stored = load_lodes()
+    assert stored[0]["action_results"][-1]["action_id"] == record["action_id"]
+    assert stored[0]["state"] == "running"
+    completed = _decode_mock_response(fresh_conn)
+    assert completed["type"] == "lode_action_ack"
+    assert completed["outcome"] == "completed"
+    assert completed["exchange_id"] == "exch-fresh"
+
+
+def test_failed_archived_completion_save_keeps_the_fence(socket_path, make_lode):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="mill",
+        state="teardown",
+        active=False,
+        run_generation=record["expected_generation"],
+    )
+    server.archived_lodes = [lode]
+    save_archived_lodes(server.archived_lodes)
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [
+        (conn, "exch-arch", actions.record_binding(record))
+    ]
+    with (
+        patch(
+            "hopper.server._observe_action_retention",
+            return_value={"worktree": None, "branch": True},
+        ),
+        patch(
+            "hopper.server.save_archived_lodes",
+            side_effect=_fail_first_save(hopper_server.save_archived_lodes),
+        ),
+    ):
+        server._clear_completed_action(record)
+    assert actions.find_action_result(lode, record["action_id"]) is None
+    assert actions.pending_action_path(record["lode_id"]).exists()
+    assert _decode_mock_response(conn)["outcome"] == "blocked"
+    fresh = Server(socket_path)
+    fresh.archived_lodes = load_archived_lodes()
+    with patch(
+        "hopper.server._observe_action_retention",
+        return_value={"worktree": None, "branch": True},
+    ):
+        fresh._clear_completed_action(actions.load_pending_action(record["lode_id"]))
+    assert actions.load_pending_action(record["lode_id"]) is None
+    stored = load_archived_lodes()
+    assert stored[0]["action_results"][-1]["retained"]["worktree"] is None
+    assert stored[0]["action_results"][-1]["retained"]["branch"] is True
+    assert stored[0]["state"] == "running"
+
+
+def test_missing_completion_lode_blocks_without_clearing_the_fence(socket_path):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    server.lodes = []
+    server.archived_lodes = []
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [
+        (conn, "exch-absent", actions.record_binding(record))
+    ]
+    server._clear_completed_action(record)
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "blocked"
+    assert response["detail"] == "action lode is absent"
+    assert response["exchange_id"] == "exch-absent"
+    loaded = actions.load_pending_action(record["lode_id"])
+    assert loaded is not None
+    assert loaded["phase"] == "cleanup_blocked"
+    assert load_lodes() == []
+    assert load_archived_lodes() == []
+
+
+def test_completion_receipt_mismatch_does_not_clear_the_fence(socket_path, make_lode):
+    record = _pending_completion_record()
+    seed = actions.new_action_result(
+        record,
+        retained={"worktree": True, "branch": True, "session": True},
+        completed_ms=5,
+    )
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="mill",
+        state="teardown",
+        active=True,
+        run_generation=record["expected_generation"],
+        action_results=[seed],
+    )
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    server.action_waiters[record["action_id"]] = [
+        (conn, "exch-mismatch", actions.record_binding(record))
+    ]
+    with patch(
+        "hopper.server._observe_action_retention",
+        return_value={"worktree": False, "branch": True},
+    ):
+        server._clear_completed_action(record)
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "blocked"
+    assert "different facts" in response["detail"]
+    assert actions.load_pending_action(record["lode_id"]) is not None
+    assert lode["action_results"][0]["retained"]["worktree"] is True
+    assert lode["action_results"][0]["completed_at_ms"] == 5
+    assert len(lode["action_results"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("record_stage", "lode_stage"),
+    [("mill", "refine"), ("refine", "ship")],
+)
+def test_post_advance_blocked_completion_restart_is_admitted(
+    socket_path, make_lode, record_stage, lode_stage
+):
+    record = _pending_completion_record(stage=record_stage)
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "spawn",
+        "message": "spawn blocked",
+        "command": f"hop lode restart {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(
+            id=record["lode_id"],
+            stage=lode_stage,
+            state="teardown",
+            run_generation="f" * 32,
+            pending_action=actions.pending_action_projection(record),
+        )
+    ]
+    conn = _mock_client(server)
+    message = _completion_retry_message(record, stage=lode_stage)
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(message, conn)
+    retry.assert_called_once_with(record["lode_id"], None, action_id=record["action_id"])
+    conn.sendall.assert_not_called()
+
+
+def test_post_advance_output_repair_stays_refused(socket_path, make_lode):
+    record = _blocked_output_record()
+    server = Server(socket_path)
+    server.lodes = [
+        make_lode(
+            id=record["lode_id"],
+            stage="refine",
+            state="teardown",
+            run_generation="f" * 32,
+            pending_action=actions.pending_action_projection(record),
+        )
+    ]
+    conn = _mock_client(server)
+    message = _completion_retry_message(record, stage="refine")
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(message, conn)
+    retry.assert_not_called()
+    response = _decode_mock_response(conn)
+    assert response["outcome"] == "refused"
+    assert response["reason"] == "invalid_action"
+
+
+def _active_completion_lode(server, make_lode, lode_id, generation):
+    actions.write_run_ownership(_completion_run_ownership(lode_id, generation))
+    lode = make_lode(
+        id=lode_id,
+        state="running",
+        active=True,
+        tmux_pane="%1",
+        pid=101,
+        run_generation=generation,
+    )
+    server.lodes = [lode]
+    owner = _mock_client(server)
+    server.lode_clients[lode_id] = owner
+    server.client_lodes[owner] = lode_id
+    server.client_generations[owner] = generation
+    return lode
+
+
+def _completion_output_message(lode_id, generation, action_id):
+    output = b"durable output\n"
+    return {
+        "type": "lode_action",
+        "action_id": action_id,
+        "lode_id": lode_id,
+        "expected_generation": generation,
+        "action_type": "completion",
+        "target_disposition": "advance_refine",
+        "force_consent": False,
+        "stage": "mill",
+        "output_base64": base64.b64encode(output).decode("ascii"),
+        "byte_length": len(output),
+        "digest_algorithm": "sha256",
+        "digest_hex": hashlib.sha256(output).hexdigest(),
+        "exchange_id": "exch-note",
+    }
+
+
+def test_unacknowledged_operator_notes_refuse_a_new_completion(socket_path, make_lode):
+    lode_id = "abcd2345"
+    generation = TEST_RUN_GENERATION
+    server = Server(socket_path)
+    lode = _active_completion_lode(server, make_lode, lode_id, generation)
+    lode["operator_notes"] = [
+        {
+            "id": "note-1",
+            "stage": "mill",
+            "queued_at": 10,
+            "text": "address this note",
+            "shown_at": None,
+        }
+    ]
+    submitter = _mock_client(server)
+    server._handle_lode_action(
+        _completion_output_message(lode_id, generation, "a" * 32),
+        submitter,
+    )
+    response = _decode_mock_response(submitter)
+    assert response["reason"] == "operator_notes_pending"
+    assert response["operator_note_ids"] == ["note-1"]
+    assert actions.load_pending_action(lode_id) is None
+    assert f"accept:{lode_id}:{generation}" not in server.registration_threads
+
+
+def test_accepted_completion_recovery_keeps_its_action_id(socket_path, make_lode):
+    record = _pending_completion_record()
+    record["phase"] = "cleanup_blocked"
+    record["recovery"] = {
+        "kind": "spawn",
+        "message": "spawn blocked",
+        "command": f"hop lode restart {record['lode_id']}",
+    }
+    actions.write_pending_action(record)
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="refine",
+        state="teardown",
+        run_generation="f" * 32,
+        pending_action=actions.pending_action_projection(record),
+        operator_notes=[
+            {
+                "id": "note-1",
+                "stage": "mill",
+                "queued_at": 10,
+                "text": "address this note",
+                "shown_at": None,
+            }
+        ],
+    )
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    with patch.object(server, "_retry_action") as retry:
+        server._handle_lode_action(_completion_retry_message(record, stage="refine"), conn)
+    retry.assert_called_once_with(record["lode_id"], None, action_id=record["action_id"])
+    conn.sendall.assert_not_called()
+    assert actions.load_pending_action(record["lode_id"])["action_id"] == record["action_id"]
+
+
+def test_different_action_id_does_not_skip_the_operator_note_gate(socket_path, make_lode):
+    record = _pending_completion_record()
+    server = Server(socket_path)
+    lode = make_lode(
+        id=record["lode_id"],
+        stage="mill",
+        state="running",
+        active=True,
+        run_generation=record["expected_generation"],
+        operator_notes=[
+            {
+                "id": "note-1",
+                "stage": "mill",
+                "queued_at": 10,
+                "text": "address this note",
+                "shown_at": None,
+            }
+        ],
+    )
+    server.lodes = [lode]
+    conn = _mock_client(server)
+    message = _completion_output_message(record["lode_id"], record["expected_generation"], "b" * 32)
+    server._handle_lode_action(message, conn)
+    response = _decode_mock_response(conn)
+    assert response["reason"] == "action_conflict"
+    assert actions.load_pending_action(record["lode_id"])["action_id"] == record["action_id"]

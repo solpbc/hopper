@@ -1141,7 +1141,7 @@ def new_pending_action(
                 marker_name,
                 "done",
                 attempt_id=marker["attempt_id"],
-                detail="no owned runner existed at acceptance",
+                detail="no active runner identity was recorded at acceptance",
             )
     validate_pending_action(record)
     return record
