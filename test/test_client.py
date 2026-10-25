@@ -1076,7 +1076,7 @@ def test_manual_lode_clients_send_bound_action_and_wait_for_disposition(
             "force_consent": force,
             "stage": "mill",
         },
-        timeout=15.0,
+        timeout=DISPOSITION_WAIT_TIMEOUT_SEC,
         wait_for_response=True,
     )
 

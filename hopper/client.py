@@ -852,7 +852,7 @@ def restart_lode(
     action_id: str,
     expected_generation: str | None,
     force: bool = False,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+    timeout: float = DISPOSITION_WAIT_TIMEOUT_SEC,
 ) -> dict | None:
     """Restart a lode's current stage session and await its disposition."""
     return submit_lode_action(
@@ -876,7 +876,7 @@ def kill_lode(
     expected_generation: str | None,
     stage: str,
     force: bool = False,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+    timeout: float = DISPOSITION_WAIT_TIMEOUT_SEC,
 ) -> dict | None:
     """Kill and archive a lode after its terminal disposition is durable."""
     return submit_lode_action(
@@ -899,7 +899,7 @@ def archive_lode(
     action_id: str,
     expected_generation: str | None,
     stage: str,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+    timeout: float = DISPOSITION_WAIT_TIMEOUT_SEC,
 ) -> dict | None:
     """Archive an already-inactive lode while retaining its worktree and branch."""
     return submit_lode_action(
@@ -922,7 +922,7 @@ def pause_lode(
     action_id: str,
     expected_generation: str | None,
     stage: str,
-    timeout: float = MUTATION_ACK_TIMEOUT_SEC,
+    timeout: float = DISPOSITION_WAIT_TIMEOUT_SEC,
 ) -> dict | None:
     """Pause a lode after its retained terminal disposition is durable."""
     return submit_lode_action(
