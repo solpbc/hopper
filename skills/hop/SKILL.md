@@ -279,7 +279,11 @@ worktree. It is the number of commits that exist **only** in that worktree, reac
 from no remote-tracking ref. Read it before you believe a finished-looking lode
 is finished: only `stage: shipped` merges and pushes, so a lode that stalled
 earlier can be complete, committed, clean, and entirely absent from the remote.
-`UNKNOWN` means the check could not be made; it never means zero. Kill and
+`UNKNOWN` means the check could not be made; it never means zero. ⚠ `none — every
+commit is on a remote branch` means *some* remote-tracking ref, as last fetched, holds
+every commit (a lode's local bare origin counts); it is a durability answer, not "on
+GitHub". The check never fetches. Before you say a commit is on GitHub, check there
+(`git ls-remote <github-remote> <branch>`). Kill and
 archive enforce this durability proof at the server boundary, including a
 second check after containment is empty and before archive publication.
 
