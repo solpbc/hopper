@@ -41,6 +41,9 @@ class FakeSubprocessRunner:
         self.preland_exc: Exception | None = None
         self.calls: list[tuple[list[str], str | None]] = []
         self.merged = False
+        self.pushed = False
+        self.fail_head_after_merge = False
+        self.fail_head_after_push = False
 
     def run(self, cmd, *args, **kwargs):
         cmd_list = list(cmd)
@@ -54,6 +57,12 @@ class FakeSubprocessRunner:
                     cmd_list, 0, stdout=f"{self.branch}\n", stderr=""
                 )
             if git_args == ["rev-parse", "HEAD"]:
+                if (self.merged and self.fail_head_after_merge) or (
+                    self.pushed and self.fail_head_after_push
+                ):
+                    return subprocess.CompletedProcess(
+                        cmd_list, 128, stdout="", stderr="HEAD unreadable"
+                    )
                 sha = self.post_sha if self.merged else self.pre_sha
                 return subprocess.CompletedProcess(cmd_list, 0, stdout=f"{sha}\n", stderr="")
             if git_args[:2] == ["merge", "--ff-only"]:
@@ -74,6 +83,7 @@ class FakeSubprocessRunner:
                     stderr="remote failure" if self.remote_code else "",
                 )
             if git_args == ["push"]:
+                self.pushed = True
                 return subprocess.CompletedProcess(
                     cmd_list,
                     self.push_code,
@@ -603,3 +613,56 @@ def test_hop_preland_cli_set_and_clear(capsys):
     assert "observed: config key 'preland.projA' is not set" in captured.out
     assert "Hopper did not change config.json." in captured.out
     assert "recover with: hop preland set projA <command>" in captured.out
+
+
+@pytest.mark.parametrize("remotes", [("origin",), ()])
+def test_unreadable_head_after_merge_never_reports_success_or_pushes(monkeypatch, capsys, remotes):
+    tracker = FakeSubprocessRunner(remotes=remotes)
+    tracker.fail_head_after_merge = True
+    monkeypatch.setattr(subprocess, "run", tracker.run)
+    assert (
+        cmd_land(
+            [
+                "--project",
+                "projA",
+                "--checkout",
+                "/repo/projA",
+                "--worktree",
+                "/worktree/feat",
+                "--branch",
+                "feat-abc12345",
+            ]
+        )
+        != 0
+    )
+    output = capsys.readouterr().out
+    assert "HEAD unreadable" in output
+    assert "local-moved: unknown" in output
+    assert "fast-forwarded" not in output
+    assert not tracker.pushed
+
+
+def test_failed_push_does_not_substitute_an_old_head_for_an_unreadable_one(monkeypatch, capsys):
+    tracker = FakeSubprocessRunner()
+    tracker.push_code = 1
+    tracker.fail_head_after_push = True
+    monkeypatch.setattr(subprocess, "run", tracker.run)
+    assert (
+        cmd_land(
+            [
+                "--project",
+                "projA",
+                "--checkout",
+                "/repo/projA",
+                "--worktree",
+                "/worktree/feat",
+                "--branch",
+                "feat-abc12345",
+            ]
+        )
+        != 0
+    )
+    output = capsys.readouterr().out
+    assert "current HEAD: unknown" in output
+    assert "local-moved: unknown" in output
+    assert "push failure" in output

@@ -112,7 +112,8 @@ def land_feature(project: str, checkout: str, worktree: str, branch: str) -> int
     if head_res.returncode != 0:
         print("error: landing refused")
         print(f"observed: git rev-parse HEAD failed in '{checkout}'")
-        print("Hopper did not run the pre-land command, did not merge, and did not push.")
+        print("Hopper did not merge and did not push.")
+        _print_git_output(head_res)
         return 1
     pre_merge_sha = head_res.stdout.strip()
 
@@ -145,10 +146,17 @@ def land_feature(project: str, checkout: str, worktree: str, branch: str) -> int
             text=True,
         )
         current_head = curr_res.stdout.strip() if curr_res.returncode == 0 else "unknown"
-        local_moved = "yes" if current_head != pre_merge_sha else "no"
+        local_moved = (
+            "unknown"
+            if current_head == "unknown"
+            else "yes"
+            if current_head != pre_merge_sha
+            else "no"
+        )
         print(f"local-moved: {local_moved}")
         print(f"pre-merge HEAD: {pre_merge_sha}")
         print(f"current HEAD: {current_head}")
+        _print_git_output(remote_res)
         return 1
 
     remotes = {name.strip() for name in remote_res.stdout.splitlines() if name.strip()}
@@ -157,7 +165,15 @@ def land_feature(project: str, checkout: str, worktree: str, branch: str) -> int
         capture_output=True,
         text=True,
     )
-    new_head = curr_res.stdout.strip() if curr_res.returncode == 0 else pre_merge_sha
+    if curr_res.returncode != 0 or not curr_res.stdout.strip():
+        print("error: landing refused")
+        print(f"observed: git rev-parse HEAD failed after merging in '{checkout}'")
+        print("push: not-run")
+        print("local-moved: unknown")
+        print(f"pre-merge HEAD: {pre_merge_sha}")
+        _print_git_output(curr_res)
+        return 1
+    new_head = curr_res.stdout.strip()
 
     if "origin" not in remotes:
         print(f"Checkout {checkout} fast-forwarded to {new_head}.")
@@ -169,15 +185,20 @@ def land_feature(project: str, checkout: str, worktree: str, branch: str) -> int
         capture_output=True,
         text=True,
     )
-    post_res = subprocess.run(
-        ["git", "-C", checkout, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-    )
-    current_head = post_res.stdout.strip() if post_res.returncode == 0 else new_head
-
     if push_res.returncode != 0:
-        local_moved = "yes" if current_head != pre_merge_sha else "no"
+        post_res = subprocess.run(
+            ["git", "-C", checkout, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        current_head = post_res.stdout.strip() if post_res.returncode == 0 else "unknown"
+        local_moved = (
+            "unknown"
+            if current_head == "unknown"
+            else "yes"
+            if current_head != pre_merge_sha
+            else "no"
+        )
         print("error: push failed")
         print(f"observed: git push failed in {checkout}")
         print("push: failed")
@@ -187,6 +208,6 @@ def land_feature(project: str, checkout: str, worktree: str, branch: str) -> int
         _print_git_output(push_res)
         return 1
 
-    print(f"Checkout {checkout} fast-forwarded to {current_head}.")
+    print(f"Checkout {checkout} fast-forwarded to {new_head}.")
     print("push: ok")
     return 0

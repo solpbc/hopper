@@ -72,7 +72,7 @@ Do **not** pipe validation straight through a pager yourself. `make ci 2>&1 | ta
 
 If tests fail due to rebase conflicts you resolved, fix the issues and amend the relevant commit.
 
-A red gate may land only when it is **inherited**: every failure also fails on the validated base SHA, without this branch. Ship does not repair unrelated main, so a proven inherited red is noted and landed. Prove it before you land. Check the validated base out into a detached scratch worktree (`git worktree add --detach <scratch> <validated base SHA>`), run only the failing tests there through `hop check` (the repository's single-test target when it has one), then remove the scratch worktree. A failure reproduces only when the **same test fails with the same error** on the base; a base run that fails for its own reason, such as a missing dependency in the scratch worktree, reproduces nothing. If every failure reproduces, name each one in your output with that result and proceed. If any does not, or you cannot run the check, the red is not proven inherited: gate, and report what the base run showed. Do not call a failure branch-caused only because it passed on the base; it may be a flake, and the operator decides. When the gate stops at its first failure, an inherited failure hides every leg after it. Before you land on an inherited red, run the legs the gate never reached on this branch through `hop check`; a failure there is the branch's until it is proven inherited the same way. ⛔ A failure the branch's own commits cause is never inherited, even though it was already on the feature branch before rebase and even when the rebase changed nothing. `error: pre-land command failed` and `error: pre-land command refused` are never an inherited red. Gate immediately with that output. Do not compare them to the base and do not enter the merge-race retry.
+A red gate may land only when it is **inherited**: every failure also fails on the validated base SHA, without this branch. Ship does not repair unrelated main, so a proven inherited red is noted and landed. Prove it before you land. Check the validated base out into a detached scratch worktree (`git worktree add --detach <scratch> <validated base SHA>`), run only the failing tests there through `hop check` (the repository's single-test target when it has one), then remove the scratch worktree. A failure reproduces only when the **same test fails with the same error** on the base; a base run that fails for its own reason, such as a missing dependency in the scratch worktree, reproduces nothing. If every failure reproduces, name each one in your output with that result and proceed. If any does not, or you cannot run the check, the red is not proven inherited: gate, and report what the base run showed. Do not call a failure branch-caused only because it passed on the base; it may be a flake, and the operator decides. When the gate stops at its first failure, an inherited failure hides every leg after it. Before you land on an inherited red, run the legs the gate never reached on this branch through `hop check`; a failure there is the branch's until it is proven inherited the same way. ⛔ A failure the branch's own commits cause is never inherited, even though it was already on the feature branch before rebase and even when the rebase changed nothing.
 
 ### 4. Land on main
 
@@ -89,11 +89,11 @@ If step 2 used the `origin/master` fallback, read `origin/master` instead of `or
 hop land --project "$project" --checkout "$dir" --worktree "$worktree" --branch "$branch"
 ```
 
-A checkout in `$dir` that is not on main or master is a refusal: do not checkout another branch; gate. A bare `git merge` in the worktree fast-forwards the feature branch into itself and does not land. Ship must not run `git merge` or `git push`. `hop land` is the only landing command.
+A checkout in `$dir` that is not on main or master is a refusal: do not checkout another branch; gate. A bare `git merge` in the worktree does not land the branch.
 
-`error: pre-land command failed` and `error: pre-land command refused` are never an inherited red. Gate immediately with that output. Do not compare them to the base and do not enter the merge-race retry.
+If `hop land` reports `error: pre-land command failed` or `error: pre-land command refused`, run `hop gate` with that output and stop before restore or retry. A pre-land failure is never an inherited CI red.
 
-If `hop land` fails, do not repeat the command. A pre-land failure or refusal (`error: pre-land command failed` or `error: pre-land command refused`) already gated and must not enter the restore checks or the merge-race retry. The restore checks, reset, and retry that follow apply only when the fast-forward or the push failed.
+If the fast-forward merge or push fails, do not repeat the command. Only those failures use the restore and retry steps below; gate on any other failure from `hop land`.
 
 **First, restore the original repo.** Do this immediately, before re-fetching or rebasing: the last check below is only valid while `$branch` still holds the commits that were fast-forwarded onto local main, and the rebase rewrites `$branch`. In `$dir`, confirm all four:
 
@@ -127,7 +127,7 @@ git -C "$dir" rev-parse HEAD                # the new pre-merge main SHA
 hop land --project "$project" --checkout "$dir" --worktree "$worktree" --branch "$branch"
 ```
 
-Apply this same rule to every later failure, excluding a pre-land failure or refusal (`error: pre-land command failed` or `error: pre-land command refused`). There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
+Apply this same rule to every later merge or push failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
 
 Stop and gate on any of these:
 
