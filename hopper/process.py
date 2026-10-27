@@ -31,7 +31,13 @@ from hopper.git import (
     is_dirty,
     quarantine_dirty_repo,
 )
-from hopper.lodes import get_lode_dir, get_worktree_dir, lode_coder, resolve_worktree_path
+from hopper.lodes import (
+    feature_branch_name,
+    get_lode_dir,
+    get_worktree_dir,
+    lode_coder,
+    resolve_worktree_path,
+)
 from hopper.runner import BaseRunner, _descendant_pids, _sum_descendant_cpu_ms
 
 logger = logging.getLogger(__name__)
@@ -412,7 +418,7 @@ class ProcessRunner(BaseRunner):
             return True
 
         branch_recorded = bool(self.lode_branch)
-        branch = self.lode_branch or f"hopper-{self.lode_id}"
+        branch = self.lode_branch or feature_branch_name(self.lode_id)
         set_lode_status(self.socket_path, self.lode_id, "Creating worktree...")
         try:
             self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -660,7 +666,7 @@ class ProcessRunner(BaseRunner):
             logger.debug(f"input loaded lode={self.lode_id}")
 
             self._context["branch"] = (
-                self.lode_branch if self.lode_branch else f"hopper-{self.lode_id}"
+                self.lode_branch if self.lode_branch else feature_branch_name(self.lode_id)
             )
             self._context["worktree"] = str(self.worktree_path)
             if self.project_name:

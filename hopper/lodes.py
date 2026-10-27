@@ -103,6 +103,11 @@ def is_canonical_lode_id(value: object) -> bool:
     )
 
 
+def feature_branch_name(lode_id: str) -> str:
+    """Return the neutral feature branch name for a lode."""
+    return f"feat-{lode_id}"
+
+
 def current_time_ms() -> int:
     """Return current time in milliseconds since epoch."""
     return int(time.time() * 1000)
@@ -1575,7 +1580,7 @@ def worktree_reap_status_for_display(lode: dict) -> str | None:
     if type(reaped_at) is int:
         return f"Worktree removed {phrase}; branch removed"
     lode_id = lode.get("id", "")
-    branch = lode.get("branch", "") or f"hopper-{lode_id}"
+    branch = lode.get("branch", "") or feature_branch_name(lode_id)
     return f"Worktree removed {phrase}; branch {branch} delete not completed"
 
 

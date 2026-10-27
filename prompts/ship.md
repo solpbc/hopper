@@ -72,7 +72,7 @@ Do **not** pipe validation straight through a pager yourself. `make ci 2>&1 | ta
 
 If tests fail due to rebase conflicts you resolved, fix the issues and amend the relevant commit.
 
-A red gate may land only when it is **inherited**: every failure also fails on the validated base SHA, without this branch. Ship does not repair unrelated main, so a proven inherited red is noted and landed. Prove it before you land. Check the validated base out into a detached scratch worktree (`git worktree add --detach <scratch> <validated base SHA>`), run only the failing tests there through `hop check` (the repository's single-test target when it has one), then remove the scratch worktree. A failure reproduces only when the **same test fails with the same error** on the base; a base run that fails for its own reason, such as a missing dependency in the scratch worktree, reproduces nothing. If every failure reproduces, name each one in your output with that result and proceed. If any does not, or you cannot run the check, the red is not proven inherited: gate, and report what the base run showed. Do not call a failure branch-caused only because it passed on the base; it may be a flake, and the operator decides. When the gate stops at its first failure, an inherited failure hides every leg after it. Before you land on an inherited red, run the legs the gate never reached on this branch through `hop check`; a failure there is the branch's until it is proven inherited the same way. ⛔ A failure the branch's own commits cause is never inherited, even though it was already on the feature branch before rebase and even when the rebase changed nothing.
+A red gate may land only when it is **inherited**: every failure also fails on the validated base SHA, without this branch. Ship does not repair unrelated main, so a proven inherited red is noted and landed. Prove it before you land. Check the validated base out into a detached scratch worktree (`git worktree add --detach <scratch> <validated base SHA>`), run only the failing tests there through `hop check` (the repository's single-test target when it has one), then remove the scratch worktree. A failure reproduces only when the **same test fails with the same error** on the base; a base run that fails for its own reason, such as a missing dependency in the scratch worktree, reproduces nothing. If every failure reproduces, name each one in your output with that result and proceed. If any does not, or you cannot run the check, the red is not proven inherited: gate, and report what the base run showed. Do not call a failure branch-caused only because it passed on the base; it may be a flake, and the operator decides. When the gate stops at its first failure, an inherited failure hides every leg after it. Before you land on an inherited red, run the legs the gate never reached on this branch through `hop check`; a failure there is the branch's until it is proven inherited the same way. ⛔ A failure the branch's own commits cause is never inherited, even though it was already on the feature branch before rebase and even when the rebase changed nothing. `error: pre-land command failed` and `error: pre-land command refused` are never an inherited red. Gate immediately with that output. Do not compare them to the base and do not enter the merge-race retry.
 
 ### 4. Land on main
 
@@ -83,21 +83,17 @@ The retry rule below needs two recorded facts. Record both before every merge at
 
 If step 2 used the `origin/master` fallback, read `origin/master` instead of `origin/main` everywhere in this section.
 
-⚠ **Address `$dir` explicitly in every land command — `git -C "$dir" …`, never a bare `git` after a `cd`.** Your shell's working directory can reset to the worktree between tool calls. A bare `git merge --ff-only $branch` run there merges the branch into itself ("Already up to date"), and the push then fails with no upstream, so nothing lands. This gated ship on four lodes in four repos between 2026-09-09 and 09-22.
-
-Verify the original repo is on main (or master) before merging:
+⚠ **Ship does not run `git merge` or `git push` itself; `hop land` is the only landing command.** Address `$dir` and `$worktree` explicitly:
 
 ```
-git -C "$dir" rev-parse --abbrev-ref HEAD   # must be main or master
-git -C "$dir" merge --ff-only $branch
-git -C "$dir" push
+hop land --project "$project" --checkout "$dir" --worktree "$worktree" --branch "$branch"
 ```
 
-If the branch is not main or master, switch to main first: `git -C "$dir" checkout main` (or `master`).
+A checkout in `$dir` that is not on main or master is a refusal: do not checkout another branch; gate. A bare `git merge` in the worktree fast-forwards the feature branch into itself and does not land. Ship must not run `git merge` or `git push`. `hop land` is the only landing command.
 
-If there is no remote configured, skip `git push`.
+`error: pre-land command failed` and `error: pre-land command refused` are never an inherited red. Gate immediately with that output. Do not compare them to the base and do not enter the merge-race retry.
 
-If `git merge --ff-only` or `git push` fails, do not repeat the command.
+If `hop land` fails, do not repeat the command. A pre-land failure or refusal (`error: pre-land command failed` or `error: pre-land command refused`) already gated and must not enter the restore checks or the merge-race retry. The restore checks, reset, and retry that follow apply only when the fast-forward or the push failed.
 
 **First, restore the original repo.** Do this immediately, before re-fetching or rebasing: the last check below is only valid while `$branch` still holds the commits that were fast-forwarded onto local main, and the rebase rewrites `$branch`. In `$dir`, confirm all four:
 
@@ -127,20 +123,18 @@ If the merge itself failed, this is a no-op, which is expected. If the reset doe
 5. Retry. Re-record the pre-merge main SHA first, because re-validation takes time and a sibling lode may have moved local main while it ran:
 
 ```
-git -C "$dir" rev-parse --abbrev-ref HEAD   # must be main or master
 git -C "$dir" rev-parse HEAD                # the new pre-merge main SHA
-git -C "$dir" merge --ff-only $branch
-git -C "$dir" push
+hop land --project "$project" --checkout "$dir" --worktree "$worktree" --branch "$branch"
 ```
 
-Apply this same rule to every later failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
+Apply this same rule to every later failure, excluding a pre-land failure or refusal (`error: pre-land command failed` or `error: pre-land command refused`). There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
 
 Stop and gate on any of these:
 
 - A rebase conflict that cannot be resolved unambiguously (see step 2).
 - Validation fails and the failure is not a proven inherited red. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs. If every failure reproduces on the validated base as the same test with the same error, step 3's exception applies: note each one with that proof and proceed. Every other failure gates, including one the branch's own commits caused.
-- The original repo is not on main or master and cannot be switched safely.
-- A merge or push failed while the remote base was unchanged.
+- The original repo is not on main or master.
+- A merge or push failed while the remote base was unchanged, or `hop land` failed due to pre-land failure or refusal.
 - The remote base cannot be fetched or read.
 - The four restore checks above do not all pass.
 - Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you have not proven inherited.

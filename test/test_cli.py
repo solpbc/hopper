@@ -12183,12 +12183,12 @@ def test_worktree_reap_status_display_full_and_partial(monkeypatch):
     # Stored lode status remains unchanged
     assert lode_partial["status"] == "error: failed"
 
-    # Default branch name hopper-{id} when branch is empty
+    # Default branch name feat-{id} when branch is empty
     lode_partial_nobranch = copy.deepcopy(lode_partial)
     lode_partial_nobranch["branch"] = ""
     assert (
         worktree_reap_status_for_display(lode_partial_nobranch)
-        == "Worktree removed 2m ago; branch hopper-abc12345 delete not completed"
+        == "Worktree removed 2m ago; branch feat-abc12345 delete not completed"
     )
 
 

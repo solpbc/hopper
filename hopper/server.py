@@ -67,6 +67,7 @@ from hopper.lodes import (
     clear_lode_gate,
     create_lode,
     current_time_ms,
+    feature_branch_name,
     find_lodes_by_prefix,
     format_operator_notes_refusal,
     format_refusal_status,
@@ -221,7 +222,7 @@ def _observe_action_retention(record: dict, lode: dict | None) -> dict:
                 )
                 branch = None
             else:
-                branch_name = lode.get("branch") or f"hopper-{lode_id}"
+                branch_name = lode.get("branch") or feature_branch_name(lode_id)
                 branch = branch_exists(project.path, branch_name)
     except Exception as error:
         branch = None
@@ -5998,7 +5999,7 @@ class Server:
             worktree_reap["worktree_removed_at"] = current_time_ms()
             touch(lode)
 
-        branch = lode.get("branch", "") or f"hopper-{lode_id}"
+        branch = lode.get("branch", "") or feature_branch_name(lode_id)
         exists = branch_exists(project.path, branch)
         if exists is None:
             self._log_reap_warning(

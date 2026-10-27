@@ -46,6 +46,8 @@ make install-user  # symlink hop to ~/.local/bin, skills to ~/.claude/skills
 | `hop implement` | Create a lode for an implementation request |
 | `hop coder` | Query or set the host-local refine coder default; check local install/config |
 | `hop supervisor` | Query or set the host-local supervisor default; check provider CLI install |
+| `hop preland` | Manage project pre-land commands |
+| `hop land` | Fast-forward merge and push a validated feature branch |
 | `hop ping` | Check if server is running |
 
 **Inside a lode**
@@ -167,16 +169,17 @@ those fields while ignoring additive payload and row keys.
 
 ### Ship completion proof
 
-During the ship stage, `hop processed` refuses completion unless the canonical
+Ship lands through `hop land`. Pre-land commands are configured under the exact key `preland.<project>` with `hop preland set <project> <command>` and removed with `hop preland clear <project>`. The stored string is split with shlex.split and run with no shell. An absent key leaves fast-forward-then-push unchanged. During the ship stage, `hop processed` refuses completion unless the canonical
 session worktree is clean and its HEAD is contained in a freshly fetched
 upstream `main`, falling back to upstream `master` only when `main` is absent.
 Without `origin`, the same stable, clean HEAD must be contained in local `main`,
 or local `master` only when `main` is absent; missing or unlanded local defaults
-fail closed. `hop processed` performs this proof only; it never merges, rebases,
-commits, or pushes. A refusal keeps the session and its worktree intact and
-prints recovery guidance for inspecting, cleaning, fetching, or landing before
-retrying. Once accepted, the server closes the owned pane, proves the recorded
-runner containment is empty, and publishes the terminal stage disposition.
+fail closed. `hop processed` performs this proof only; it still never merges,
+rebases, commits, or pushes. A refusal keeps the session and its worktree intact
+and prints recovery guidance for inspecting, cleaning, fetching, or landing
+before retrying. Once accepted, the server closes the owned pane, proves the
+recorded runner containment is empty, and publishes the terminal stage
+disposition.
 
 ## Key concepts
 **Lode** -- a supervised feature-delivery session with a unique ID, selected

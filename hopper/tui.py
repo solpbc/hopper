@@ -54,6 +54,7 @@ from hopper.lodes import (
     STATUS_TEARDOWN,
     compute_runtime_ms,
     current_time_ms,
+    feature_branch_name,
     format_age,
     format_duration_ms,
     format_uptime,
@@ -2179,7 +2180,7 @@ class HopperApp(App):
             if lode is None:
                 return
             branch = lode.get("branch", "") if lode else ""
-            branch = branch or f"hopper-{lode_id}"
+            branch = branch or feature_branch_name(lode_id)
             # Check for worktree with unmerged changes
             worktree_path = get_worktree_dir(lode_id)
             if worktree_path.is_dir():

@@ -34,6 +34,7 @@ from hopper.lodes import (
     compute_runtime_ms,
     create_lode,
     current_time_ms,
+    feature_branch_name,
     find_lode_by_prefix,
     find_lodes_by_prefix,
     format_age,
@@ -2060,3 +2061,14 @@ def test_archive_lode_for_action_allows_archived_only_same_action_retry(temp_con
     assert result["id"] == "retry001"
     assert result["archive_action_id"] == "a" * 32
     assert len(archived_lodes) == 1
+
+
+def test_feature_branch_name():
+    """Same id is stable, and the result contains neither hopper nor lode in any case."""
+    lode_id = "abc12345"
+    name1 = feature_branch_name(lode_id)
+    name2 = feature_branch_name(lode_id)
+    assert name1 == name2 == f"feat-{lode_id}"
+    lower = name1.lower()
+    assert "hopper" not in lower
+    assert "lode" not in lower

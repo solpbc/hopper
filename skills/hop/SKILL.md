@@ -377,6 +377,15 @@ hop config path                       # show config file path
 
 The refine-stage creation default is host-local. Query or set it with `hop coder default [provider]`; use `hop coder --help` for command usage. When this host has no saved default, Hopper uses its built-in Codex fallback. An explicit create-time `--coder` wins and does not read the saved setting. `hop -H HOST coder default <provider>` changes only `HOST`. This setting does not test readiness or quota; use `hop coder check <provider>` for readiness.
 
+Pre-land commands are configured per project under the exact key `preland.<project>`:
+
+```bash
+hop preland set <project> <command> [args...]
+hop preland clear <project>
+```
+
+The stored string is split with `shlex.split` and executed with no shell (so pipes and `&&` are not shell syntax). An absent key leaves landing as fast-forward then push. A malformed value fails the landing. Ship lands through `hop land --project <project> --checkout <path> --worktree <path> --branch <branch>`. `hop processed` still never merges, rebases, commits, or pushes.
+
 ## Status reporting (inside a lode)
 
 ```bash

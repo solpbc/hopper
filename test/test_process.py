@@ -29,6 +29,7 @@ from hopper.git import (
     quarantine_dirty_repo as git_quarantine_dirty_repo,
 )
 from hopper.lodes import (
+    feature_branch_name,
     get_lode_dir,
     get_worktree_dir,
     load_lodes,
@@ -846,7 +847,7 @@ class TestMillStage:
         worktree = get_worktree_dir("test-id")
         assert events == ["quarantine", "create"]
         assert runner.worktree_path == worktree
-        assert runner.lode_branch == "hopper-test-id"
+        assert runner.lode_branch == "feat-test-id"
         assert runner._cwd == str(worktree)
         mock_claude.assert_called_once_with()
         assert (worktree / "upstream.txt").read_text() == "upstream\n"
@@ -1330,21 +1331,18 @@ class TestMillStage:
         ):
             assert runner.run() == 0
 
-        assert runner.lode_branch == "hopper-test-id"
+        assert runner.lode_branch == "feat-test-id"
         assert not any(
             msg_type == "lode_set_state"
             and payload["state"] == "error"
             and payload["status"]
-            == (
-                "Failed to persist lode branch: hopper-test-id. Retry with: "
-                "hop lode restart test-id"
-            )
+            == ("Failed to persist lode branch: feat-test-id. Retry with: hop lode restart test-id")
             for msg_type, payload in emitted
         )
         mock_claude.assert_called_once_with()
-        assert load_lodes()[0]["branch"] == "hopper-test-id"
+        assert load_lodes()[0]["branch"] == "feat-test-id"
         raw = json.loads((tmp_path / "active.jsonl").read_text())
-        assert raw["branch"] == "hopper-test-id"
+        assert raw["branch"] == "feat-test-id"
 
     @pytest.mark.parametrize(
         "detail",
@@ -2531,7 +2529,10 @@ class TestRefineStage:
             "Failed to create git worktree: git fetch origin failed:"
         )
         assert not get_worktree_dir("test-id").exists()
-        assert _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
+        assert (
+            _run_git(project_dir, "branch", "--list", feature_branch_name("test-id")).stdout.strip()
+            == ""
+        )
 
     def test_resolution_failure_sets_specific_error_without_git_side_effects(self, tmp_path):
         runner = ProcessRunner("test-id", Path("/tmp/test.sock"), "refine")
@@ -2560,7 +2561,10 @@ class TestRefineStage:
             ),
         )
         assert not get_worktree_dir("test-id").exists()
-        assert _run_git(project_dir, "branch", "--list", "hopper-test-id").stdout.strip() == ""
+        assert (
+            _run_git(project_dir, "branch", "--list", feature_branch_name("test-id")).stdout.strip()
+            == ""
+        )
 
     def test_fails_if_input_missing_on_first_run(self, tmp_path):
         """Missing mill input emits error and exits 0."""
@@ -2756,7 +2760,7 @@ class TestShipStage:
 
         assert exit_code == 0
         context = mock_load.call_args[1]["context"]
-        assert context["branch"] == "hopper-test-id"
+        assert context["branch"] == "feat-test-id"
         assert context["worktree"] == str(session_dir / "worktree")
         assert context["input"] == "Refine summary"
         assert mock_popen.call_args[1]["cwd"] == str(session_dir / "worktree")
