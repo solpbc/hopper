@@ -83,17 +83,21 @@ The retry rule below needs two recorded facts. Record both before every merge at
 
 If step 2 used the `origin/master` fallback, read `origin/master` instead of `origin/main` everywhere in this section.
 
-⚠ **Ship does not run `git merge` or `git push` itself; `hop land` is the only landing command.** Address `$dir` and `$worktree` explicitly:
+⚠ **Address `$dir` explicitly in every land command — `git -C "$dir" …`, never a bare `git` after a `cd`.** Your shell's working directory can reset to the worktree between tool calls. A bare `git merge --ff-only $branch` run there merges the branch into itself ("Already up to date"), and the push then fails with no upstream, so nothing lands. This gated ship on four lodes in four repos between 2026-09-09 and 09-22.
+
+Verify the original repo is on main (or master) before merging:
 
 ```
-hop land --project "$project" --checkout "$dir" --worktree "$worktree" --branch "$branch"
+git -C "$dir" rev-parse --abbrev-ref HEAD   # must be main or master
+git -C "$dir" merge --ff-only $branch
+git -C "$dir" push
 ```
 
-A checkout in `$dir` that is not on main or master is a refusal: do not checkout another branch; gate. A bare `git merge` in the worktree does not land the branch.
+If the branch is not main or master, switch to main first: `git -C "$dir" checkout main` (or `master`).
 
-If `hop land` reports `error: pre-land command failed` or `error: pre-land command refused`, run `hop gate` with that output and stop before restore or retry. A pre-land failure is never an inherited CI red.
+If there is no remote configured, skip `git push`.
 
-If the fast-forward merge or push fails, do not repeat the command. Only those failures use the restore and retry steps below; gate on any other failure from `hop land`.
+If `git merge --ff-only` or `git push` fails, do not repeat the command.
 
 **First, restore the original repo.** Do this immediately, before re-fetching or rebasing: the last check below is only valid while `$branch` still holds the commits that were fast-forwarded onto local main, and the rebase rewrites `$branch`. In `$dir`, confirm all four:
 
@@ -123,18 +127,20 @@ If the merge itself failed, this is a no-op, which is expected. If the reset doe
 5. Retry. Re-record the pre-merge main SHA first, because re-validation takes time and a sibling lode may have moved local main while it ran:
 
 ```
+git -C "$dir" rev-parse --abbrev-ref HEAD   # must be main or master
 git -C "$dir" rev-parse HEAD                # the new pre-merge main SHA
-hop land --project "$project" --checkout "$dir" --worktree "$worktree" --branch "$branch"
+git -C "$dir" merge --ff-only $branch
+git -C "$dir" push
 ```
 
-Apply this same rule to every later merge or push failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
+Apply this same rule to every later failure. There is no attempt limit: a retry is earned by an advanced base, never by an attempt count.
 
 Stop and gate on any of these:
 
 - A rebase conflict that cannot be resolved unambiguously (see step 2).
 - Validation fails and the failure is not a proven inherited red. If your own conflict resolution caused it, fix it and amend the relevant commit as step 3 directs. If every failure reproduces on the validated base as the same test with the same error, step 3's exception applies: note each one with that proof and proceed. Every other failure gates, including one the branch's own commits caused.
-- The original repo is not on main or master.
-- A merge or push failed while the remote base was unchanged, or `hop land` failed due to pre-land failure or refusal.
+- The original repo is not on main or master and cannot be switched safely.
+- A merge or push failed while the remote base was unchanged.
 - The remote base cannot be fetched or read.
 - The four restore checks above do not all pass.
 - Anything else that stops progress and is not a retry earned by an advanced base: a rebase that fails for a reason other than a conflict, a reset or alignment command that fails, or a validation failure you have not proven inherited.

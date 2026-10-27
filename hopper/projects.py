@@ -278,15 +278,6 @@ def rename_project(current_name: str, new_name: str) -> None:
             if project.name == new_name:
                 raise ValueError(f"Project with name '{new_name}' already exists")
 
-        from hopper.land import PRELAND_CONFIG_PREFIX
-
-        old_key = f"{PRELAND_CONFIG_PREFIX}{current_name}"
-        new_key = f"{PRELAND_CONFIG_PREFIX}{new_name}"
-        if new_key in config:
-            raise ValueError(f"Pre-land key '{new_key}' already exists")
-        if old_key in config:
-            config[new_key] = config.pop(old_key)
-
         target.name = new_name
         _store_projects(config, projects)
 
