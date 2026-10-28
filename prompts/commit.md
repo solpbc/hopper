@@ -9,8 +9,7 @@ return to implement.
 Stage only your changes, ignore any other changes present. If something is already staged that is OK - it was staged elsewhere to be part of this commit.
 
 Write the subject and body for a contributor reading the public history.
-Describe the change and why it matters. Leave private coordination references
-out of both the subject and body.
+Describe the change and why it matters.
 
 Do the git commit and then reply with a short confirmation, we don't need to repeat or re-state the previous responses.
 
