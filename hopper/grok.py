@@ -348,6 +348,207 @@ def _emit_synthetic_failure(events_file, message: str, on_event) -> None:
             logger.debug("Failed to process synthetic Grok event", exc_info=True)
 
 
+_SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class _GrokRepairError(Exception):
+    """A Grok session log could not be reconciled before resume."""
+
+
+def _child_home(env: dict | None) -> str | None:
+    if env is None:
+        home = os.environ.get("HOME")
+    else:
+        home = env.get("HOME")
+    if isinstance(home, str) and home:
+        return home
+    return None
+
+
+def _completion_marker(session_id: str, task_id: str) -> dict:
+    return {
+        "method": "_x.ai/session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "task_completed",
+                "task_snapshot": {"task_id": task_id},
+            },
+        },
+    }
+
+
+def _find_session_log(home: str, session_id: str) -> Path | None:
+    root = Path(home) / ".grok" / "sessions"
+    try:
+        entries = list(root.iterdir())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _GrokRepairError(
+            f"Grok session {session_id} updates.jsonl could not be repaired: {exc}"
+        ) from exc
+
+    matches: list[Path] = []
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            candidate = entry / session_id
+            if candidate.is_dir():
+                matches.append(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _GrokRepairError(
+                f"Grok session {session_id} updates.jsonl could not be repaired: {exc}"
+            ) from exc
+
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise _GrokRepairError(
+            f"Grok session {session_id} matches {len(matches)} session directories; "
+            "refusing to repair updates.jsonl"
+        )
+    log = matches[0] / "updates.jsonl"
+    try:
+        return log if log.is_file() else None
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _GrokRepairError(
+            f"Grok session {session_id} updates.jsonl could not be repaired: {exc}"
+        ) from exc
+
+
+def _orphaned_task_ids(raw: bytes, session_id: str) -> list[str]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _GrokRepairError(
+            f"Grok session {session_id} has a malformed updates.jsonl record on line 1: "
+            "not valid UTF-8"
+        ) from None
+
+    backgrounded_ids: list[str] = []
+    completed_ids: set[str] = set()
+
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            raise _GrokRepairError(
+                f"Grok session {session_id} has a malformed updates.jsonl record on "
+                f"line {line_no}: not a JSON object"
+            ) from None
+        if not isinstance(record, dict):
+            raise _GrokRepairError(
+                f"Grok session {session_id} has a malformed updates.jsonl record on "
+                f"line {line_no}: not a JSON object"
+            )
+
+        params = record.get("params")
+        if not isinstance(params, dict):
+            continue
+        update = params.get("update")
+        if not isinstance(update, dict):
+            continue
+        session_update = update.get("sessionUpdate")
+        if session_update not in ("task_backgrounded", "task_completed"):
+            continue
+
+        if params.get("sessionId") != session_id:
+            raise _GrokRepairError(
+                f"Grok session {session_id} has a malformed updates.jsonl record on "
+                f"line {line_no}: sessionId does not match"
+            )
+
+        if session_update == "task_backgrounded":
+            task_id = update.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise _GrokRepairError(
+                    f"Grok session {session_id} has a malformed updates.jsonl record on line "
+                    f"{line_no}: task_backgrounded task_id is missing"
+                )
+            if task_id not in backgrounded_ids:
+                backgrounded_ids.append(task_id)
+        elif session_update == "task_completed":
+            snapshot = update.get("task_snapshot")
+            if not isinstance(snapshot, dict):
+                raise _GrokRepairError(
+                    f"Grok session {session_id} has a malformed updates.jsonl record on line "
+                    f"{line_no}: task_completed task_id is missing"
+                )
+            task_id = snapshot.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise _GrokRepairError(
+                    f"Grok session {session_id} has a malformed updates.jsonl record on line "
+                    f"{line_no}: task_completed task_id is missing"
+                )
+            completed_ids.add(task_id)
+
+    return [task_id for task_id in backgrounded_ids if task_id not in completed_ids]
+
+
+def _append_completion_markers(
+    path: Path, raw: bytes, session_id: str, task_ids: list[str]
+) -> None:
+    if not task_ids:
+        return
+    chunks: list[bytes] = []
+    if raw and not raw.endswith(b"\n"):
+        chunks.append(b"\n")
+    for task_id in task_ids:
+        marker = _completion_marker(session_id, task_id)
+        chunks.append(json.dumps(marker, separators=(",", ":")).encode("utf-8") + b"\n")
+    payload = b"".join(chunks)
+    try:
+        with path.open("ab") as f:
+            f.write(payload)
+    except OSError as exc:
+        raise _GrokRepairError(
+            f"Grok session {session_id} updates.jsonl could not be repaired: {exc}"
+        ) from exc
+
+
+def _repair_orphaned_grok_tasks(session_id: str, env: dict | None) -> None:
+    # Reconciles orphaned background tasks left in Grok's updates.jsonl before headless resume.
+    # The session dir is the UUID one level under a sessions bucket, not a cwd encoding;
+    # completion markers are reconciliation metadata and do not claim the task succeeded.
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise _GrokRepairError(
+            f"Grok session {session_id!r} is not a lowercase UUID; refusing to repair updates.jsonl"
+        )
+    home = _child_home(env)
+    if home is None:
+        return
+    log_path = _find_session_log(home, session_id)
+    if log_path is None:
+        return
+    try:
+        raw = log_path.read_bytes()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _GrokRepairError(
+            f"Grok session {session_id} updates.jsonl could not be repaired: {exc}"
+        ) from exc
+
+    task_ids = _orphaned_task_ids(raw, session_id)
+    if not task_ids:
+        return
+
+    _append_completion_markers(log_path, raw, session_id, task_ids)
+    logger.warning(
+        "Grok session %s reconciled orphaned tasks: %s",
+        session_id,
+        ", ".join(task_ids),
+    )
+
+
 def run_grok(
     prompt: str,
     cwd: str,
@@ -362,6 +563,22 @@ def run_grok(
     events: list[dict] = []
     stderr_chunks: list[str] = []
     events_path = _events_path(output_file)
+
+    try:
+        _repair_orphaned_grok_tasks(session_id, env)
+    except _GrokRepairError as exc:
+        message = str(exc)
+    except OSError as exc:
+        message = f"Grok session {session_id} updates.jsonl could not be repaired: {exc}"
+    else:
+        message = None
+    if message is not None:
+        try:
+            with events_path.open("a") as events_file:
+                _emit_synthetic_failure(events_file, message, on_event)
+        except Exception:
+            logger.debug("Failed to persist Grok session repair failure", exc_info=True)
+        return 1, cmd
 
     try:
         proc = subprocess.Popen(
