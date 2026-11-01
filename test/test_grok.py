@@ -13,7 +13,8 @@ import pytest
 
 from hopper.grok import (
     GROK_FLAGS,
-    _completion_marker,
+    _append_completion_markers,
+    _GrokRepairError,
     bootstrap_grok,
     grok_failure_message,
     run_grok,
@@ -70,10 +71,9 @@ def _completed_record(session_id: str, task_id: str, *, rich: bool = False) -> d
 
 
 def _marker_line(session_id: str, task_id: str) -> bytes:
-    return (
-        json.dumps(_completion_marker(session_id, task_id), separators=(",", ":")).encode("utf-8")
-        + b"\n"
-    )
+    marker = _completed_record(session_id, task_id)
+    del marker["timestamp"]
+    return json.dumps(marker, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
 def _mock_success_proc(session_id: str, text: str = "success"):
@@ -324,8 +324,8 @@ def test_run_grok_appends_one_marker_per_orphaned_task(tmp_path, caplog):
     # Appended lines match completion markers with no extra keys
     appended_lines = healed_bytes[len(original_bytes) :].decode("utf-8").splitlines()
     assert len(appended_lines) == 2
-    assert json.loads(appended_lines[0]) == _completion_marker(SESSION_ID, TASK_B)
-    assert json.loads(appended_lines[1]) == _completion_marker(SESSION_ID, TASK_A)
+    assert json.loads(appended_lines[0]) == json.loads(_marker_line(SESSION_ID, TASK_B))
+    assert json.loads(appended_lines[1]) == json.loads(_marker_line(SESSION_ID, TASK_A))
 
     # Decoy and bystander unchanged
     assert decoy_log.read_bytes() == decoy_bytes
@@ -492,6 +492,7 @@ def test_run_grok_repair_failure_does_not_spawn(tmp_path, monkeypatch):
         ("no_snapshot", SESSION_ID),
         ("session_mismatch", SESSION_ID),
         ("read_error", SESSION_ID),
+        ("stat_error", SESSION_ID),
         ("write_error", SESSION_ID),
     ]
 
@@ -520,6 +521,7 @@ def test_run_grok_repair_failure_does_not_spawn(tmp_path, monkeypatch):
             "no_snapshot",
             "session_mismatch",
             "read_error",
+            "stat_error",
             "write_error",
         ):
             d = case_home / ".grok" / "sessions" / "bucket-not-cwd" / sid
@@ -538,7 +540,7 @@ def test_run_grok_repair_failure_does_not_spawn(tmp_path, monkeypatch):
             elif case_name == "session_mismatch":
                 rec = _background_record(OTHER_SESSION_ID, TASK_A)
                 content = json.dumps(rec).encode("utf-8") + b"\n"
-            elif case_name == "read_error":
+            elif case_name in ("read_error", "stat_error"):
                 content = json.dumps(_background_record(sid, TASK_A)).encode("utf-8") + b"\n"
             elif case_name == "write_error":
                 content = json.dumps(_background_record(sid, TASK_A)).encode("utf-8") + b"\n"
@@ -572,12 +574,22 @@ def test_run_grok_repair_failure_does_not_spawn(tmp_path, monkeypatch):
 
                     m.setattr(Path, "read_bytes", _mock_read)
 
+                if case_name == "stat_error":
+                    original_stat = Path.stat
+
+                    def _mock_stat(self, *args, **kwargs):
+                        if self.name == "updates.jsonl":
+                            raise PermissionError("stat denied")
+                        return original_stat(self, *args, **kwargs)
+
+                    m.setattr(Path, "stat", _mock_stat)
+
                 if case_name == "write_error":
                     orig_open = Path.open
 
                     def _mock_open(self, *args, **kwargs):
                         mode = args[0] if args else kwargs.get("mode", "r")
-                        if self.name == "updates.jsonl" and "a" in mode and "b" in mode:
+                        if self.name == "updates.jsonl" and ("a" in mode or "+" in mode):
                             raise OSError("write failed")
                         return orig_open(self, *args, **kwargs)
 
@@ -618,3 +630,32 @@ def test_run_grok_repair_failure_does_not_spawn(tmp_path, monkeypatch):
         ):
             assert not (case_home / sid).exists()
             assert not (case_home / ".grok" / "sessions" / sid).exists()
+
+
+def test_repair_does_not_recreate_a_log_removed_before_append(tmp_path, monkeypatch):
+    log = tmp_path / "updates.jsonl"
+    raw = json.dumps(_background_record(SESSION_ID, TASK_A)).encode() + b"\n"
+    log.write_bytes(raw)
+    original_open = Path.open
+
+    def remove_before_append(self, mode="r", *args, **kwargs):
+        if self == log and ("a" in mode or "+" in mode):
+            self.unlink()
+        return original_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", remove_before_append)
+    with pytest.raises(_GrokRepairError):
+        _append_completion_markers(log, raw, SESSION_ID, [TASK_A])
+    assert not log.exists()
+
+
+def test_repair_failure_is_visible_when_event_file_cannot_be_written(tmp_path, caplog):
+    output = tmp_path / "missing-parent" / "turn.out.md"
+    with patch("hopper.grok.subprocess.Popen") as popen:
+        with caplog.at_level(logging.ERROR, logger="hopper.grok"):
+            result, _ = run_grok("continue", "/work", str(output), "../invalid")
+    assert result == 1
+    popen.assert_not_called()
+    assert "../invalid" in caplog.text
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    assert "turn.events.jsonl" in caplog.text

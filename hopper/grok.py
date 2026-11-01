@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import subprocess
 import threading
 import uuid
@@ -392,10 +393,10 @@ def _find_session_log(home: str, session_id: str) -> Path | None:
     matches: list[Path] = []
     for entry in entries:
         try:
-            if not entry.is_dir():
+            if not stat.S_ISDIR(entry.stat().st_mode):
                 continue
             candidate = entry / session_id
-            if candidate.is_dir():
+            if stat.S_ISDIR(candidate.stat().st_mode):
                 matches.append(candidate)
         except FileNotFoundError:
             continue
@@ -413,7 +414,9 @@ def _find_session_log(home: str, session_id: str) -> Path | None:
         )
     log = matches[0] / "updates.jsonl"
     try:
-        return log if log.is_file() else None
+        if not stat.S_ISREG(log.stat().st_mode):
+            raise _GrokRepairError(f"Grok session {session_id} updates.jsonl is not a regular file")
+        return log
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -506,7 +509,8 @@ def _append_completion_markers(
         chunks.append(json.dumps(marker, separators=(",", ":")).encode("utf-8") + b"\n")
     payload = b"".join(chunks)
     try:
-        with path.open("ab") as f:
+        with path.open("r+b") as f:
+            f.seek(0, os.SEEK_END)
             f.write(payload)
     except OSError as exc:
         raise _GrokRepairError(
@@ -576,8 +580,8 @@ def run_grok(
         try:
             with events_path.open("a") as events_file:
                 _emit_synthetic_failure(events_file, message, on_event)
-        except Exception:
-            logger.debug("Failed to persist Grok session repair failure", exc_info=True)
+        except OSError as exc:
+            logger.error("%s; failed to persist %s: %s", message, events_path, exc)
         return 1, cmd
 
     try:
